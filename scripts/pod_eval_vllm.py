@@ -513,6 +513,7 @@ def main():
     # Keeping them on GPU eliminates ~93GB of PCIe transfers per round
     # (18.7GB × 5 students). Precomputing log_softmax + probs saves ~50%
     # of KL computation (teacher side computed once, not per-student).
+    _write_phase("gpu_precompute", teacher_done=len(prompts))
     print(f"\n[eval] Moving teacher logits to GPU + precomputing softmax...", flush=True)
     t0 = time.time()
     teacher_log_probs = []  # precomputed F.log_softmax for each prompt
@@ -638,7 +639,12 @@ def main():
                 prefetch_future = prefetch_executor.submit(prefetch_model, next_name)
 
         # ── Load student (or reuse king) ──
-        live_progress["current"] = {"student_name": student_name, "prompts_done": 0}
+        live_progress["phase"] = "loading_student"
+        live_progress["current"] = {
+            "student_name": student_name,
+            "student_idx": student_idx,
+            "prompts_done": 0,
+        }
         _write_progress()
 
         is_king = (student_name == king_name)
@@ -731,9 +737,12 @@ def main():
                     prompt_kl_means.append(kl_mean)
 
                     running_mean = sum(prompt_kl_means) / len(prompt_kl_means)
+                    live_progress["phase"] = "scoring"
                     live_progress["current"] = {
                         "student_name": student_name,
+                        "student_idx": student_idx,
                         "prompts_done": i + 1,
+                        "prompts_total": len(prompts),
                         "kl_running_mean": round(running_mean, 6),
                         "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far else None,
                     }

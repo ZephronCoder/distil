@@ -1015,7 +1015,8 @@ else:
                                 # Teacher phases (generation, logit extraction, cache load)
                                 if pod_phase in ("teacher_generation", "teacher_logits",
                                                  "teacher_loading", "vllm_starting",
-                                                 "vllm_generating"):
+                                                 "vllm_generating", "gpu_precompute",
+                                                 "loading_student"):
                                     progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
                                     progress["prompts_total"] = pod_progress.get("prompts_total", n_prompts)
                                     for k in _student_keys:

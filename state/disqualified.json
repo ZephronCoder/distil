@@ -26,9 +26,9 @@
   "201": "integrity: Model maricom22/sd15-122k-ckpt-2 no longer exists on HuggingFace (404)",
   "202": "integrity: Model maricom22/sd15-122k-ckpt-3 no longer exists on HuggingFace (404)",
   "5CfxMKdFTerNC2aybzpUXCZC6jPQZvWhHbFZgX9X1CsWsn97": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later",
-  "5Dtq5LhJHe5atmgFEferFc8aXHLgUmfepWWUncUrHtWe9Hv6": "copy: functional copy of Qwen/Qwen3.5-4B (UID 179) \u2014 identical logit distribution",
-  "5DD7T2CpH5KAekkhk5VATvHAvDaUnR9LCCLa2jjsQvhTt2yQ": "copy: functional copy of Qwen/Qwen3.5-0.8B (UID 181) \u2014 identical logit distribution",
   "220": "fraud: Submitted fake 1.3KB model file with teacher config (256 experts MoE). Not a real 4B student model.",
-  "5GEFSdx4oJoYtZvNNXhU9GMMqcGVGG1S1KyzhAYFnQRQXM83": "fraud: Submitted fake 1.3KB model file with teacher config (256 experts MoE). Not a real 4B student model.",
-  "5He5zeM3CxrxfwA9zp1e5Wqj5J4UKvrKH5tPB8Av1RewHyrG": "arch: FRAUD: Model weights total 16.8GB \u2014 too large for 5.2B params (max ~11.6GB in bf16)"
+  "5Dtq5LhJHe5atmgFEferFc8aXHLgUmfepWWUncUrHtWe9Hv6:7854373": "copy: functional copy of Qwen/Qwen3.5-4B (UID 179) \u2014 identical logit distribution",
+  "5DD7T2CpH5KAekkhk5VATvHAvDaUnR9LCCLa2jjsQvhTt2yQ:7854413": "copy: functional copy of Qwen/Qwen3.5-0.8B (UID 181) \u2014 identical logit distribution",
+  "5GEFSdx4oJoYtZvNNXhU9GMMqcGVGG1S1KyzhAYFnQRQXM83:7863480": "fraud: Submitted fake 1.3KB model file with teacher config (256 experts MoE). Not a real 4B student model.",
+  "5He5zeM3CxrxfwA9zp1e5Wqj5J4UKvrKH5tPB8Av1RewHyrG:7860473": "arch: FRAUD: Model weights total 16.8GB \u2014 too large for 5.2B params (max ~11.6GB in bf16)"
 }
