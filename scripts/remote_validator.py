@@ -696,7 +696,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if p1_candidates:
                     p1_candidates.sort(key=lambda x: x[1])  # best KL first
                     
-                    # Check if we're in initial_eval phase — batch more models
+                    # Check if we're in initial_eval phase — ALL models in one round
                     top4_file = state_path / "top4_leaderboard.json"
                     in_initial_eval = True
                     if top4_file.exists():
@@ -707,21 +707,19 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                             pass
                     
                     if in_initial_eval:
-                        # Batch up to 15 untested models per round during full eval
-                        INITIAL_EVAL_BATCH = 15
-                        batch = p1_candidates[:INITIAL_EVAL_BATCH]
-                        for p1_uid, p1_kl, p1_model in batch:
+                        # Full eval: ALL untested models in one round on the SAME prompts
+                        for p1_uid, p1_kl, p1_model in p1_candidates:
                             challengers[p1_uid] = valid_models[p1_uid]
                             smart_challenger_added += 1
-                        print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: {len(batch)} models batched for initial eval "
-                              f"(best: UID {batch[0][0]} KL={batch[0][1]:.6f}, "
-                              f"{len(p1_candidates)} untested total)", flush=True)
+                        print(f"[VALIDATOR] 🏆 FULL EVAL: {len(p1_candidates)} models in one round "
+                              f"(best: UID {p1_candidates[0][0]} KL={p1_candidates[0][1]:.6f}, "
+                              f"worst: UID {p1_candidates[-1][0]} KL={p1_candidates[-1][1]:.6f})", flush=True)
                     else:
                         # Maintenance mode: pick top 1 per round
                         p1_uid, p1_kl, p1_model = p1_candidates[0]
                         challengers[p1_uid] = valid_models[p1_uid]
                         smart_challenger_added += 1
-                        print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: UID {p1_uid} ({p1_model}) selected "
+                        print(f"[VALIDATOR] 🎯 SMART CHALLENGER: UID {p1_uid} ({p1_model}) selected "
                               f"— Priority 1: best untested model vs current king (global KL={p1_kl:.6f}, "
                               f"{len(p1_candidates)} untested remain)", flush=True)
 
