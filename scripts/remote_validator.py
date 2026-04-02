@@ -1649,6 +1649,123 @@ else:
                 h2h_king_tracker_file.write_text(json.dumps(h2h_tested_against_king, indent=2))
                 print(f"[VALIDATOR] Updated h2h_tested_against_king: {len(challengers)} challengers tracked vs king UID {king_uid}", flush=True)
 
+            # ── Top-4 Leaderboard Management ──
+            # Phase 1 (initial_eval): smart challenger works through all models.
+            #   When all are tested, pick top 4 by H2H KL → switch to maintenance.
+            # Phase 2 (maintenance): new models must beat king by epsilon.
+            #   If they beat king → new king, old king → #2, #4 drops.
+            #   If they beat a contender → replace that contender.
+            try:
+                top4_file = state_path / "top4_leaderboard.json"
+                top4 = {"king": None, "contenders": [], "phase": "initial_eval", "initial_eval_complete": False}
+                if top4_file.exists():
+                    try:
+                        top4 = json.loads(top4_file.read_text())
+                    except Exception:
+                        pass
+
+                if top4.get("phase") == "initial_eval":
+                    # Check if all models have been H2H tested
+                    h2h_tracker = {}
+                    tracker_file = state_path / "h2h_tested_against_king.json"
+                    if tracker_file.exists():
+                        try:
+                            h2h_tracker = json.loads(tracker_file.read_text())
+                        except Exception:
+                            pass
+                    
+                    # Count untested models (with valid scores, not DQ'd, not permanently bad)
+                    untested_count = 0
+                    tested_results = []  # (uid, kl, model)
+                    for uid_str, score in scores.items():
+                        if score <= 0 or score > MAX_KL_THRESHOLD:
+                            continue
+                        if uid_str in disqualified:
+                            continue
+                        record = h2h_tracker.get(uid_str, {})
+                        if record.get("king_uid") == king_uid and record.get("kl"):
+                            tested_results.append((uid_str, record["kl"], record.get("model", "")))
+                        else:
+                            untested_count += 1
+
+                    if untested_count == 0 and len(tested_results) >= 4:
+                        # All models tested! Build the top-4 leaderboard
+                        tested_results.sort(key=lambda x: x[1])  # best KL first
+                        top4["king"] = {
+                            "uid": int(tested_results[0][0]),
+                            "model": tested_results[0][2],
+                            "h2h_kl": round(tested_results[0][1], 6),
+                            "block": current_block,
+                        }
+                        top4["contenders"] = [
+                            {
+                                "uid": int(tested_results[i][0]),
+                                "model": tested_results[i][2],
+                                "h2h_kl": round(tested_results[i][1], 6),
+                                "block": current_block,
+                            }
+                            for i in range(1, min(4, len(tested_results)))
+                        ]
+                        top4["phase"] = "maintenance"
+                        top4["initial_eval_complete"] = True
+                        top4["completed_at"] = time.time()
+                        top4["completed_block"] = current_block
+
+                        # Actually set the new king
+                        new_king_uid = top4["king"]["uid"]
+                        if new_king_uid != king_uid:
+                            print(f"[VALIDATOR] 👑 TOP-4 INITIAL EVAL COMPLETE — NEW KING: UID {new_king_uid} (KL={top4['king']['h2h_kl']})", flush=True)
+                        else:
+                            print(f"[VALIDATOR] 👑 TOP-4 INITIAL EVAL COMPLETE — King UID {king_uid} confirmed", flush=True)
+
+                        top4_str = ", ".join(
+                            f"#{i+1} UID {e['uid']} (KL={e['h2h_kl']})"
+                            for i, e in enumerate([top4['king']] + top4['contenders'])
+                        )
+                        print(f"[VALIDATOR] 👑 TOP-4 LEADERBOARD: {top4_str}", flush=True)
+                    else:
+                        print(f"[VALIDATOR] 📊 Initial eval progress: {len(tested_results)} tested, {untested_count} remaining", flush=True)
+
+                elif top4.get("phase") == "maintenance" and h2h_round.get("results"):
+                    # Maintenance mode: check if any challenger beat king or a contender
+                    king_kl = top4["king"]["h2h_kl"]
+                    epsilon = 0.01  # 1%
+                    for r in h2h_round["results"]:
+                        if r["uid"] == king_uid:
+                            continue
+                        challenger_kl = r.get("kl", 999)
+                        if challenger_kl <= 0 or challenger_kl > MAX_KL_THRESHOLD:
+                            continue
+                        # Check if beats king by epsilon
+                        if challenger_kl < king_kl * (1 - epsilon):
+                            # Dethrone! New king, old king → contender #2
+                            old_king = top4["king"]
+                            top4["king"] = {
+                                "uid": r["uid"],
+                                "model": r.get("model", ""),
+                                "h2h_kl": round(challenger_kl, 6),
+                                "block": current_block,
+                            }
+                            # Insert old king as #2, drop #4
+                            top4["contenders"] = [old_king] + top4["contenders"][:2]
+                            print(f"[VALIDATOR] 👑 DETHRONE! UID {r['uid']} (KL={challenger_kl:.6f}) beats king by >{epsilon*100}%", flush=True)
+                        else:
+                            # Check if beats any contender (no epsilon needed for contender replacement)
+                            for ci, contender in enumerate(top4.get("contenders", [])):
+                                if challenger_kl < contender["h2h_kl"]:
+                                    top4["contenders"][ci] = {
+                                        "uid": r["uid"],
+                                        "model": r.get("model", ""),
+                                        "h2h_kl": round(challenger_kl, 6),
+                                        "block": current_block,
+                                    }
+                                    print(f"[VALIDATOR] 🔄 UID {r['uid']} (KL={challenger_kl:.6f}) replaces contender #{ci+2}", flush=True)
+                                    break  # only replace the worst contender they beat
+
+                top4_file.write_text(json.dumps(top4, indent=2))
+            except Exception as e:
+                print(f"[VALIDATOR] Top-4 leaderboard error (non-fatal): {e}", flush=True)
+
             # ── Round complete — clear round state so next epoch starts fresh ──
             round_file = state_path / "current_round.json"
             if round_file.exists():

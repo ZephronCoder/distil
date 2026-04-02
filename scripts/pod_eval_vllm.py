@@ -535,24 +535,17 @@ def main():
     # (18.7GB × 5 students). Precomputing log_softmax + probs saves ~50%
     # of KL computation (teacher side computed once, not per-student).
     _write_phase("gpu_precompute", teacher_done=len(prompts))
-    print(f"\n[eval] Moving teacher logits to GPU + precomputing softmax...", flush=True)
+    print(f"\n[eval] Keeping teacher logits on CPU, will process in chunks during scoring...", flush=True)
     t0 = time.time()
-    teacher_log_probs = []  # precomputed F.log_softmax for each prompt
-    teacher_probs = []      # precomputed exp(log_softmax) for each prompt
-    for i in range(len(teacher_logits_list)):
-        tl = teacher_logits_list[i].to(device).float()
-        t_log_p = F.log_softmax(tl, dim=-1)
-        t_p = t_log_p.exp()
-        teacher_log_probs.append(t_log_p)
-        teacher_probs.append(t_p)
-        del tl  # raw logits no longer needed on GPU
-    # Free the CPU copies
-    del teacher_logits_list
-    gc.collect()
+    # CHANGED: Don't precompute all teacher softmax on GPU at once.
+    # With 120 prompts, the full tensor is ~68GB which OOMs on B200 (178GB - 82GB teacher).
+    # Instead, keep raw logits on CPU and compute softmax per-chunk during student scoring.
+    # This trades ~10% speed for fitting in VRAM.
+    teacher_log_probs = None  # signal to use chunked processing
+    teacher_probs = None
+    # Keep teacher_logits_list on CPU for chunked access
     timings["teacher_gpu_precompute"] = time.time() - t0
-    teacher_vram = sum(t.element_size() * t.nelement() for t in teacher_log_probs) / 1024**3
-    teacher_vram += sum(t.element_size() * t.nelement() for t in teacher_probs) / 1024**3
-    print(f"[eval] Teacher on GPU: {teacher_vram:.1f}GB, precomputed in {timings['teacher_gpu_precompute']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
+    print(f"[eval] Teacher logits: {len(teacher_logits_list)} prompts on CPU, chunked GPU processing enabled, VRAM: {gpu_mem_str()}", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 2: Student scoring
@@ -735,9 +728,17 @@ def main():
                 try:
                     full_seq = full_sequences[i]
                     prompt_len = prompt_lens[i]
-                    # Teacher side: already on GPU, precomputed
-                    t_log_p = teacher_log_probs[i]
-                    t_p = teacher_probs[i]
+                    # Teacher side: compute softmax on-the-fly per prompt (chunked to avoid OOM)
+                    if teacher_log_probs is not None:
+                        # Legacy path: precomputed (only if VRAM was sufficient)
+                        t_log_p = teacher_log_probs[i]
+                        t_p = teacher_probs[i]
+                    else:
+                        # Chunked path: move single prompt to GPU, compute, use, free
+                        tl = teacher_logits_list[i].to(device).float()
+                        t_log_p = F.log_softmax(tl, dim=-1)
+                        t_p = t_log_p.exp()
+                        del tl
                     # Student forward pass
                     s_logits = student(full_seq).logits.float()
                     cont_s = s_logits[:, prompt_len - 1:-1, :]
@@ -748,6 +749,11 @@ def main():
                     ).squeeze(0)
                     kl_mean = kl_per_pos.mean().item()
                     del s_logits, cont_s, kl_per_pos
+                    if teacher_log_probs is None:
+                        # Chunked path: free per-prompt teacher tensors
+                        del t_log_p, t_p
+                        if i % 20 == 0:
+                            torch.cuda.empty_cache()
 
                     if math.isnan(kl_mean) or math.isinf(kl_mean):
                         print(f"  [prompt {i}] KL={kl_mean} — invalid, stopping", flush=True)
