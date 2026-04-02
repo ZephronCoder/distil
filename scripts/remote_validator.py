@@ -437,7 +437,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 except Exception:
                     pass
                 if hotkey in revealed and len(revealed[hotkey]) > 0:
-                    block, data = revealed[hotkey][0]
+                    block, data = revealed[hotkey][-1]  # most recent entry
                     try:
                         parsed = json.loads(data)
                         if "model" in parsed:
