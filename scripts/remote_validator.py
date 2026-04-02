@@ -35,6 +35,15 @@ logger.setLevel(logging.DEBUG)
 
 import re as _re
 
+
+def atomic_json_write(path, data, indent=None):
+    """Write JSON atomically: write to .tmp then os.replace (atomic on Linux)."""
+    path = str(path)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=indent)
+    os.replace(tmp, path)
+
 # Patterns for sanitizing GPU logs before public exposure
 _ANSI_RE = _re.compile(r'\x1b\[[0-9;]*m')
 _SECRET_PATTERNS = _re.compile(r'hf_[a-zA-Z0-9]{6,}|sk-[a-zA-Z0-9]{6,}|key-[a-zA-Z0-9]{6,}')
@@ -137,8 +146,7 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
         },
     }
     ann_path = Path(state_dir) / "announcement.json"
-    with open(ann_path, "w") as f:
-        json.dump(announcement, f, indent=2)
+    atomic_json_write(ann_path, announcement, indent=2)
     print(f"[VALIDATOR] Announcement written: UID {new_uid} dethroned UID {old_uid}", flush=True)
 
 
@@ -216,7 +224,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             pass
 
     def save_evaluated():
-        evaluated_file.write_text(json.dumps(list(evaluated_uids)))
+        atomic_json_write(evaluated_file, list(evaluated_uids))
 
     def validate_state_consistency(scores, evaluated_uids, uid_to_hotkey, commitments, dq_reasons):
         """
@@ -297,7 +305,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if king_changed and new_king is not None and h2h_king != new_king:
                     issues.append(f"h2h_latest: king_changed=true but king_uid={h2h_king} != new_king_uid={new_king} — fixing")
                     h2h["king_uid"] = new_king
-                    h2h_file.write_text(json.dumps(h2h, indent=2))
+                    atomic_json_write(h2h_file, h2h, indent=2)
             except Exception:
                 pass
 
@@ -362,6 +370,29 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             epoch_start = time.time()
             epoch_count += 1
             print(f"\n[VALIDATOR] === EPOCH {epoch_count} ===", flush=True)
+
+            # ── Stale round detection ──
+            # If a round has been active >30 min, clear it to avoid stale dashboard data.
+            _stale_prog_path = state_path / "eval_progress.json"
+            if _stale_prog_path.exists():
+                try:
+                    _sp = json.loads(_stale_prog_path.read_text())
+                    if _sp.get("active"):
+                        _sp_age = (time.time() - _sp.get("started_at", 0)) / 60 if _sp.get("started_at") else 0
+                        if _sp_age > 30:
+                            _sp_done = len(_sp.get("completed", []))
+                            _sp_total = _sp.get("students_total", 0)
+                            print(f"[VALIDATOR] \u26a0\ufe0f STALE ROUND: active for {_sp_age:.0f}m, "
+                                  f"{_sp_done}/{_sp_total} students done", flush=True)
+                            atomic_json_write(_stale_prog_path, {"active": False, "stale_cleared": True, "stale_age_min": round(_sp_age, 1)})
+                            print("[VALIDATOR] Cleared stale eval progress", flush=True)
+                            _stale_rnd = state_path / "current_round.json"
+                            if _stale_rnd.exists():
+                                _stale_rnd.unlink()
+                                print("[VALIDATOR] Cleared stale current_round.json", flush=True)
+                except Exception as _se:
+                    print(f"[VALIDATOR] Stale check error (non-fatal): {_se}", flush=True)
+
             # ── Fetch chain state (with retry — Bittensor RPCs can be flaky) ──
             for _chain_attempt in range(3):
                 try:
@@ -451,7 +482,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             # Save current hotkey map for next epoch (stale cleanup handled by validate_state_consistency above)
             hotkey_map_file = state_path / "uid_hotkey_map.json"
-            hotkey_map_file.write_text(json.dumps({str(k): v for k, v in uid_to_hotkey.items()}))
+            atomic_json_write(hotkey_map_file, {str(k): v for k, v in uid_to_hotkey.items()})
 
             # ══════════════════════════════════════════════════════════════
             # PHASE 1: Pre-check ALL models (no GPU needed)
@@ -565,7 +596,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     continue
                 if integrity["current_hash"]:
                     known_hashes[str(uid)] = integrity["current_hash"]
-                    hash_file.write_text(json.dumps(known_hashes, indent=2))
+                    atomic_json_write(hash_file, known_hashes, indent=2)
 
                 valid_models[uid] = {
                     "model": model_repo,
@@ -861,6 +892,37 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             king_str = f"UID {king_uid}" if king_uid else "none"
             print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
 
+            # ── Pre-scoring model existence check (lightweight HF HEAD request) ──
+            _removed_uids = []
+            for uid in list(models_to_eval.keys()):
+                _mr = models_to_eval[uid]["model"]
+                try:
+                    import urllib.request
+                    _hf_req = urllib.request.Request(f"https://huggingface.co/api/models/{_mr}", method="HEAD")
+                    urllib.request.urlopen(_hf_req, timeout=10)
+                except Exception as _hf_err:
+                    if "404" in str(_hf_err) or "not found" in str(_hf_err).lower():
+                        print(f"[VALIDATOR] \u26a0\ufe0f UID {uid} ({_mr}): deleted from HF — DQ", flush=True)
+                        _hk = models_to_eval[uid].get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+                        _cb = models_to_eval[uid].get("commit_block")
+                        disqualify(_hk, f"Model {_mr} no longer exists on HuggingFace (404)", dq_reasons, commit_block=_cb)
+                        scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                        evaluated_uids.add(str(uid))
+                        _removed_uids.append(uid)
+            for _ru in _removed_uids:
+                models_to_eval.pop(_ru, None)
+                challengers.pop(_ru, None)
+            if _removed_uids:
+                print(f"[VALIDATOR] Removed {len(_removed_uids)} deleted models from eval", flush=True)
+                if not models_to_eval:
+                    print("[VALIDATOR] No models left after existence check", flush=True)
+                    save_scores(scores, state_path)
+                    save_disqualified(dq_reasons, state_path)
+                    if once:
+                        break
+                    time.sleep(60)
+                    continue
+
             # Sort challengers by commit block (earliest first) — used for both
             # progress display and eval ordering
             challenger_uids_sorted = sorted(
@@ -895,8 +957,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 "estimated_duration_s": est_total_s,
                 "estimated_completion": now + est_total_s,
             }
-            with open(progress_path, "w") as f:
-                json.dump(progress, f)
+            atomic_json_write(progress_path, progress)
 
             # ── Round resumption: reuse prompts from an incomplete round if available ──
             round_file = state_path / "current_round.json"
@@ -939,7 +1000,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 "model_names": [info["model"] for info in models_to_eval.values()],
                 "prompts": prompt_texts,
             }
-            round_file.write_text(json.dumps(round_state))
+            atomic_json_write(round_file, round_state)
 
             # Upload prompts
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -1181,8 +1242,7 @@ else:
                 progress.pop("current_student", None)
                 progress.pop("current_prompt", None)
                 progress.pop("current_kl", None)
-                with open(progress_path, "w") as f:
-                    json.dump(progress, f)
+                atomic_json_write(progress_path, progress)
 
                 # Background thread: poll live progress from pod every 10s
                 import threading
@@ -1238,8 +1298,7 @@ else:
                                 progress["completed"] = pod_completed
                                 progress["students_done"] = len(pod_completed)
 
-                                with open(progress_path, "w") as f:
-                                    json.dump(progress, f)
+                                atomic_json_write(progress_path, progress)
                         except Exception:
                             pass
 
@@ -1317,8 +1376,7 @@ else:
                 logger.error("Failed to download results after 3 attempts")
                 if not result.get('success', False):
                     print(f"[VALIDATOR] Eval failed and no results to recover, skipping", flush=True)
-                    with open(progress_path, "w") as f:
-                        json.dump({"active": False}, f)
+                    atomic_json_write(progress_path, {"active": False})
                     if once:
                         break
                     time.sleep(tempo)
@@ -1334,16 +1392,14 @@ else:
                         print(f"[VALIDATOR] Eval failed but recovered {n_students} partial results", flush=True)
                     else:
                         print(f"[VALIDATOR] Eval failed, no usable partial results", flush=True)
-                        with open(progress_path, "w") as f:
-                            json.dump({"active": False}, f)
+                        atomic_json_write(progress_path, {"active": False})
                         if once:
                             break
                         time.sleep(tempo)
                         continue
                 except Exception:
                     print(f"[VALIDATOR] Eval failed, results file corrupt", flush=True)
-                    with open(progress_path, "w") as f:
-                        json.dump({"active": False}, f)
+                    atomic_json_write(progress_path, {"active": False})
                     if once:
                         break
                     time.sleep(tempo)
@@ -1351,6 +1407,62 @@ else:
 
             with open(results_local) as f:
                 results = json.load(f)
+
+            # ══════════════════════════════════════════════════════════════
+            # CRASH RESILIENCE: Persist raw results IMMEDIATELY before
+            # post-processing. If announcement/leaderboard logic crashes,
+            # the scored data is already safely on disk.
+            # ══════════════════════════════════════════════════════════════
+            try:
+                with open(results_local, "w") as _f:
+                    json.dump(results, _f, indent=2)
+                print(f"[VALIDATOR] ✅ Results persisted to {results_local}", flush=True)
+
+                _imm_h2h = []
+                _imm_u2m = {uid: m["model"] for uid, m in models_to_eval.items()}
+                _imm_m2u = {m: uid for uid, m in _imm_u2m.items()}
+                _imm_king_kl = None
+                for _mn, _sr in results.get("students", {}).items():
+                    _mu = _imm_m2u.get(_mn)
+                    if _mu is None or "error" in _sr:
+                        continue
+                    _mkl = _sr.get("kl_global_avg")
+                    if _mkl is None:
+                        continue
+                    _ik = (_mu == king_uid)
+                    if _ik:
+                        _imm_king_kl = _mkl
+                    _imm_h2h.append({"uid": _mu, "model": _mn, "kl": round(_mkl, 6), "is_king": _ik, "vs_king": ""})
+                _imm_h2h.sort(key=lambda x: x["kl"])
+
+                if _imm_h2h:
+                    _imm_round = {
+                        "block": current_block, "timestamp": time.time(),
+                        "king_uid": king_uid, "prev_king_uid": king_uid,
+                        "king_h2h_kl": round(_imm_king_kl, 6) if _imm_king_kl else None,
+                        "king_global_kl": round(king_kl, 6),
+                        "epsilon": EPSILON,
+                        "epsilon_threshold": round(_imm_king_kl * (1.0 - EPSILON), 6) if _imm_king_kl else None,
+                        "n_prompts": n_prompts, "results": _imm_h2h,
+                        "king_changed": False, "new_king_uid": None,
+                        "type": "full_eval" if is_full_eval else "h2h",
+                        "_preliminary": True,
+                    }
+                    _hh_path = state_path / "h2h_history.json"
+                    _hh = []
+                    if _hh_path.exists():
+                        try:
+                            with open(_hh_path) as _hf:
+                                _hh = json.load(_hf)
+                        except Exception:
+                            _hh = []
+                    _hh.append(_imm_round)
+                    _hh = _hh[-50:]
+                    with open(_hh_path, "w") as _hf:
+                        json.dump(_hh, _hf, indent=2)
+                    print(f"[VALIDATOR] ✅ Preliminary H2H ({len(_imm_h2h)} results) persisted", flush=True)
+            except Exception as _persist_err:
+                print(f"[VALIDATOR] ⚠️ Failed to persist immediate results: {_persist_err}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
             # PHASE 4: Process results — update scores, crown new king
@@ -1523,7 +1635,7 @@ else:
                               f"cumulative={tracker['score']:.6f}/{CUMULATIVE_DETHRONE_THRESHOLD} "
                               f"({tracker['rounds']} rounds)", flush=True)
 
-                cumulative_file.write_text(json.dumps(cumulative_scores, indent=2))
+                atomic_json_write(cumulative_file, cumulative_scores, indent=2)
 
             # ── Determine winner from H2H round results ONLY ──
             # DO NOT use compute_winner_weights on global scores — scores from
@@ -1638,7 +1750,7 @@ else:
                         # Ensure best_kl exists for skip logic (use worst as floor)
                         if "best_kl" not in model_score_history.get(model_name, {}):
                             model_score_history.setdefault(model_name, {})["best_kl"] = round(kl, 6)
-            model_history_file.write_text(json.dumps(model_score_history, indent=2))
+            atomic_json_write(model_history_file, model_score_history, indent=2)
 
             # ── Update permanently bad models list ──
             # Models scoring >10x king's KL are clearly broken/adversarial.
@@ -1656,7 +1768,7 @@ else:
                     print(f"[VALIDATOR] 🚫 Added {len(newly_banned)} models to permanently_bad_models:", flush=True)
                     for m in newly_banned:
                         print(f"  • {m}", flush=True)
-                    permanently_bad_file.write_text(json.dumps(sorted(permanently_bad_models), indent=2))
+                    atomic_json_write(permanently_bad_file, sorted(permanently_bad_models), indent=2)
 
             # ── Append score history (non-DQ scores only) ──
             valid_scores = {
@@ -1722,11 +1834,11 @@ else:
                     "results": h2h_results,
                     "king_changed": king_changed,
                     "new_king_uid": winner_uid if king_changed else None,
+                    "type": "full_eval" if is_full_eval else "h2h",
                 }
-                # Save latest round + append to history
+                # Save latest round + replace preliminary entry in history
                 h2h_path = state_path / "h2h_latest.json"
-                with open(h2h_path, "w") as f:
-                    json.dump(h2h_round, f, indent=2)
+                atomic_json_write(h2h_path, h2h_round, indent=2)
                 h2h_history_path = state_path / "h2h_history.json"
                 history = []
                 if h2h_history_path.exists():
@@ -1735,11 +1847,12 @@ else:
                             history = json.load(f)
                     except Exception:
                         history = []
+                # Replace preliminary entry for this block
+                history = [h for h in history if not (h.get("block") == current_block and h.get("_preliminary"))]
                 history.append(h2h_round)
                 # Keep last 50 rounds
                 history = history[-50:]
-                with open(h2h_history_path, "w") as f:
-                    json.dump(history, f, indent=2)
+                atomic_json_write(h2h_history_path, history, indent=2)
 
             # ── Update h2h_tested_against_king tracker ──
             # Record that each challenger in this round was H2H tested against the current king.
@@ -1762,7 +1875,7 @@ else:
                             "model": challengers[uid].get("model", ""),
                             "timestamp": time.time(),
                         }
-                h2h_king_tracker_file.write_text(json.dumps(h2h_tested_against_king, indent=2))
+                atomic_json_write(h2h_king_tracker_file, h2h_tested_against_king, indent=2)
                 print(f"[VALIDATOR] Updated h2h_tested_against_king: {len(challengers)} challengers tracked vs king UID {king_uid}", flush=True)
 
             # ── Top-4 Leaderboard Management ──
@@ -1878,7 +1991,7 @@ else:
                                     print(f"[VALIDATOR] 🔄 UID {r['uid']} (KL={challenger_kl:.6f}) replaces contender #{ci+2}", flush=True)
                                     break  # only replace the worst contender they beat
 
-                top4_file.write_text(json.dumps(top4, indent=2))
+                atomic_json_write(top4_file, top4, indent=2)
             except Exception as e:
                 print(f"[VALIDATOR] Top-4 leaderboard error (non-fatal): {e}", flush=True)
 
@@ -1890,8 +2003,7 @@ else:
 
             # ── Clear eval progress ──
             progress_path = state_path / "eval_progress.json"
-            with open(progress_path, "w") as f:
-                json.dump({"active": False}, f)
+            atomic_json_write(progress_path, {"active": False})
 
             # ── Clean HF model cache to prevent disk full ──
             # Keep only the teacher model; students re-download each eval anyway

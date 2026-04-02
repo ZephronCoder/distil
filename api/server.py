@@ -506,6 +506,44 @@ print(json.dumps(result))
         return {"error": str(e), "model": model_path}
 
 
+@app.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard with drift data",
+         description="Returns the top-4 leaderboard plus cumulative drift data from `state/cumulative_scores.json`.")
+def get_leaderboard():
+    top4 = _safe_json_load(os.path.join(STATE_DIR, "top4_leaderboard.json"), {}) or {}
+    cumulative = _safe_json_load(os.path.join(STATE_DIR, "cumulative_scores.json"), {}) or {}
+
+    leaderboard = {
+        "king": dict(top4.get("king") or {}) if top4.get("king") else None,
+        "contenders": [dict(c) for c in (top4.get("contenders") or [])],
+        "phase": top4.get("phase", "unknown"),
+        "initial_eval_complete": top4.get("initial_eval_complete", False),
+        "completed_at": top4.get("completed_at"),
+    }
+
+    if leaderboard["king"] is not None:
+        king_uid = str(leaderboard["king"].get("uid", ""))
+        king_drift = cumulative.get(king_uid, {}) if king_uid else {}
+        leaderboard["king"]["cumulative_score"] = king_drift.get("score")
+        leaderboard["king"]["cumulative_rounds"] = king_drift.get("rounds")
+        leaderboard["king"]["last_block"] = king_drift.get("last_block")
+
+    for contender in leaderboard["contenders"]:
+        uid_str = str(contender.get("uid", ""))
+        drift = cumulative.get(uid_str, {}) if uid_str else {}
+        contender["cumulative_score"] = drift.get("score")
+        contender["cumulative_rounds"] = drift.get("rounds")
+        contender["last_block"] = drift.get("last_block")
+
+    return JSONResponse(
+        content={
+            "leaderboard": leaderboard,
+            "cumulative_scores": cumulative,
+            "phase": leaderboard["phase"],
+        },
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
 @app.get("/api/announcement", tags=["Evaluation"], summary="Pending announcements",
          description="Returns pending announcements (e.g., new king crowned). Returns `{type: null}` if none pending.")
 def get_announcement():
@@ -684,24 +722,53 @@ def get_tmc_config():
     }
 
 
+
+
 @app.get("/api/history", tags=["Evaluation"], summary="Score history over time",
-         description="Returns historical KL scores for all miners over time. Supports `?limit=N` (default 50) to return only the latest N entries.")
+         description="Returns historical KL scores for all miners over time. Supports `?limit=N` (default 50) to return only the latest N entries. Response includes `full_eval_block` if a full eval round exists.")
 def get_history(limit: int = 50):
     limit = max(1, min(limit, 500))
     history_path = os.path.join(STATE_DIR, "score_history.json")
+    entries = []
     if os.path.exists(history_path):
         try:
             with open(history_path) as f:
                 data = json.load(f)
-            # Return latest N entries
             entries = data[-limit:] if len(data) > limit else data
-            return JSONResponse(
-                content=entries,
-                headers={"Cache-Control": "public, max-age=60, stale-while-revalidate=120"},
-            )
         except Exception:
-            return JSONResponse(content=[], headers={"Cache-Control": "public, max-age=60"})
-    return JSONResponse(content=[], headers={"Cache-Control": "public, max-age=60"})
+            pass
+
+    # Find full_eval block from h2h_history.
+    # Older state may have accidentally stored a timestamp in `block`, so when
+    # that happens we normalize to the nearest score_history entry by timestamp.
+    full_eval_block = None
+    h2h_path = os.path.join(STATE_DIR, "h2h_history.json")
+    if os.path.exists(h2h_path):
+        try:
+            with open(h2h_path) as f:
+                h2h_data = json.load(f)
+            full_eval_round = next((r for r in reversed(h2h_data) if r.get("type") == "full_eval"), None)
+            if full_eval_round:
+                raw_block = full_eval_round.get("block")
+                full_eval_ts = full_eval_round.get("timestamp")
+                if isinstance(raw_block, int) and raw_block < 100_000_000:
+                    full_eval_block = raw_block
+                elif full_eval_ts and entries:
+                    nearest = min(entries, key=lambda e: abs((e.get("timestamp") or 0) - full_eval_ts))
+                    full_eval_block = nearest.get("block")
+                elif full_eval_ts and os.path.exists(history_path):
+                    with open(history_path) as f:
+                        all_history = json.load(f)
+                    if all_history:
+                        nearest = min(all_history, key=lambda e: abs((e.get("timestamp") or 0) - full_eval_ts))
+                        full_eval_block = nearest.get("block")
+        except Exception:
+            pass
+
+    return JSONResponse(
+        content={"entries": entries, "full_eval_block": full_eval_block},
+        headers={"Cache-Control": "public, max-age=60, stale-while-revalidate=120"},
+    )
 
 
 @app.get("/api/health", tags=["Overview"], summary="Service health and quick status",
