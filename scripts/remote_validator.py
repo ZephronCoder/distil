@@ -111,11 +111,16 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
     except Exception:
         pass
 
+    # Role ping for important updates — distil・97 role
+    DISTIL_ROLE_ID = "1482026585358991571"
+    role_ping = f"<@&{DISTIL_ROLE_ID}>"
+
     announcement = {
         "type": "new_king",
         "timestamp": time.time(),
         "posted": False,
         "message": (
+            f"{role_ping}\n"
             f"## 🏆 New King of Distil SN97!\n\n"
             f"**UID {new_uid}** has dethroned **UID {old_uid}**\n\n"
             f"📊 **KL: {new_kl:.6f}** (previous king scored {old_kl:.6f} last eval)\n"
