@@ -1494,6 +1494,7 @@ else:
             model_to_uid = {m: uid for uid, m in uid_to_model.items()}
 
             king_h2h_kl = None  # King's score on THIS eval's prompts
+            this_round_uids = set()  # UIDs actually scored in THIS round (not persistent)
 
             for model_name, student_result in results.get("students", {}).items():
                 uid = model_to_uid.get(model_name)
@@ -1562,6 +1563,9 @@ else:
                 # overwrite their global score. Different prompt sets cause variance,
                 # and overwriting would let old challengers (scored on different prompts)
                 # appear to beat the king unfairly.
+                # Track UIDs scored in THIS round (not the persistent evaluated_uids set)
+                this_round_uids.add(uid)
+
                 if uid == king_uid:
                     king_h2h_kl = kl  # Store for epsilon comparison
                     # Update king's global score with H2H score so compute_winner_weights
@@ -1663,10 +1667,11 @@ else:
                 _cb = commitments.get(uid, {}).get("block")
                 if is_disqualified(uid, hotkey, dq_reasons, commit_block=_cb):
                     continue
-                # CRITICAL: Only include UIDs actually evaluated in THIS round.
-                # Using global scores would let stale scores from old prompt sets
-                # contaminate the H2H winner selection.
-                if uid_str in evaluated_uids and uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
+                # CRITICAL: Only include UIDs actually scored in THIS round.
+                # evaluated_uids is persistent (all-time) — using it would let stale
+                # scores from old prompt sets contaminate the H2H winner selection.
+                # this_round_uids tracks only models scored in the current eval.
+                if uid in this_round_uids and uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
                     h2h_candidates.append((uid, scores[uid_str]))
 
             if h2h_candidates:
