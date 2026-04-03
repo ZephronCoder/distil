@@ -523,9 +523,10 @@ def main():
             print(f"[eval] Logits extracted in {timings['teacher_logits_pass']:.1f}s", flush=True)
             del sequences_data
 
-            # Save cache
+            # Save cache (atomic: write to tmp then rename)
             cache_path = args.save_teacher_logits or os.path.join(
                 os.path.dirname(args.output), "teacher_cache.pt")
+            cache_tmp = cache_path + ".tmp"
             torch.save({
                 "full_sequences": [s.cpu() for s in full_sequences],
                 "teacher_logits": teacher_logits_list,
@@ -533,7 +534,8 @@ def main():
                 "block_seed": args.block_seed,
                 "prompts_hash": prompts_hash,
                 "generation_method": "vllm+hf",
-            }, cache_path)
+            }, cache_tmp)
+            os.replace(cache_tmp, cache_path)
             print(f"[eval] Cache saved to {cache_path}", flush=True)
 
             # Unload teacher — free ~67GB VRAM for students
