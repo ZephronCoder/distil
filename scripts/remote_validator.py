@@ -368,10 +368,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     try:
         print("[VALIDATOR] Ensuring pod dependencies...", flush=True)
         dep_result = lium.exec(pod, command=(
-            "pip install --break-system-packages 'transformers>=5.0' -q 2>&1 | tail -1 && "
-            "python3 -c 'import torch; import transformers; "
+            "pip install --break-system-packages 'transformers>=5.0' accelerate vllm -q 2>&1 | tail -1 && "
+            "python3 -c 'import torch; import transformers; import vllm; "
             "print(f\"torch={torch.__version__} transformers={transformers.__version__} "
-            "cuda={torch.cuda.is_available()}\")'"
+            "vllm={vllm.__version__} cuda={torch.cuda.is_available()}\")'"
         ))
         print(f"[VALIDATOR] Pod deps: {dep_result.get('stdout', '').strip()}", flush=True)
     except Exception as e:
@@ -1176,7 +1176,15 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             except Exception:
                 pass
 
-            if n_gpus >= 2 and len(ordered_uids) >= 2:
+            # Check RAM: parallel Step 2 loads teacher_cache.pt per process
+            # 60GB cache × 2 processes = 120GB RAM needed. Only parallelize if enough RAM.
+            try:
+                ram_check = lium.exec(pod, command="python3 -c \"import os; print(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') // (1024**3))\"")
+                total_ram_gb = int(ram_check.get('stdout', '0').strip())
+            except Exception:
+                total_ram_gb = 0
+            
+            if n_gpus >= 2 and len(ordered_uids) >= 2 and total_ram_gb >= 128:
                 # Parallel eval: teacher on GPU 0, then split students across GPUs
                 print(f"[VALIDATOR] Parallel eval: {n_gpus} GPUs, {len(models_to_eval)} models, {n_prompts} prompts", flush=True)
 
@@ -1193,12 +1201,12 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     f"--max-prompt-len {MAX_PROMPT_TOKENS} "
                     f"--max-new-tokens {MAX_NEW_TOKENS} "
                     f"--max-params-b {max_params_b} "
-                    f"--gpu 0 "
                     f"--teacher-logits /home/teacher_cache.pt "
                     f"--save-teacher-logits /home/teacher_cache.pt "
+                    f"--no-vllm "
                     f"--resume"
                 )
-                print("[VALIDATOR] Step 1: Teacher inference + first student on GPU 0...", flush=True)
+                print(f"[VALIDATOR] Step 1: Teacher inference + first student (all {n_gpus} GPUs, vllm-gpu-util=0.90)...", flush=True)
                 try:
                     result_teacher = lium.exec(pod, command=teacher_cmd)
                     print(f"[VALIDATOR] Teacher step exit: {result_teacher.get('exit_code')}", flush=True)

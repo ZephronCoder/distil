@@ -141,7 +141,9 @@ def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
 def load_model(name, device="cuda", dtype=torch.bfloat16):
     from transformers import AutoModelForCausalLM
     is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
-    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
+    # Use device_map="auto" for teacher on multi-GPU to spread weights
+    dm = "auto" if is_teacher and torch.cuda.device_count() > 1 else device
+    kwargs = dict(dtype=dtype, device_map=dm, trust_remote_code=is_teacher)
     try:
         m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
         print(f"  [model] Loaded with flash_attention_2", flush=True)
@@ -233,21 +235,30 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=409
         "--gpu-memory-utilization", str(gpu_memory_utilization),
         "--max-model-len", str(max_model_len),
         "--enable-prefix-caching",
+        "--enforce-eager",
         "--no-enable-log-requests",
     ]
 
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         n = torch.cuda.device_count()
-        cmd.extend(["--tensor-parallel-size", str(n)])
+        # TP size must be a power of 2 that divides model dims
+        tp = 1
+        for candidate in [8, 4, 2]:
+            if n >= candidate:
+                tp = candidate
+                break
+        cmd.extend(["--tensor-parallel-size", str(tp)])
         print(f"[vllm] Tensor parallelism: {n} GPUs", flush=True)
 
     log_f = open("/tmp/vllm_teacher.log", "w")
-    proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
+    env = os.environ.copy()
+    env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+    proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid, env=env)
     Path("/tmp/vllm_teacher.pid").write_text(str(proc.pid))
     print(f"[vllm] PID: {proc.pid}", flush=True)
 
     import requests
-    for elapsed in range(0, 300, 3):
+    for elapsed in range(0, 900, 5):
         try:
             if requests.get(f"{VLLM_URL}/health", timeout=3).status_code == 200:
                 print(f"[vllm] Ready in {elapsed}s", flush=True)
