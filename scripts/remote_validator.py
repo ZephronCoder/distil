@@ -1327,7 +1327,7 @@ else:
                     f"--max-new-tokens {MAX_NEW_TOKENS} "
                     f"--max-params-b {max_params_b} "
                     f"--teacher-logits /home/teacher_cache.pt "
-                    f"--save-teacher-logits /home/teacher_cache.pt "
+                    # Skip cache save — 45GB .pt fills 230GB pods
                     f"--resume"
                     f"{king_flag}"
                     f"{vllm_flag}"
