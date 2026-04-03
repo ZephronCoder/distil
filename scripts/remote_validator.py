@@ -836,12 +836,27 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if smart_challenger_added:
                     print(f"[VALIDATOR] Smart selection added {smart_challenger_added} challenger(s) to eval", flush=True)
 
-            # Sanity check: if too many challengers, something may be wrong with state
-            MAX_REASONABLE_CHALLENGERS = 50  # Higher during initial full eval
+            # Hard cap: if too many challengers, something is wrong with state.
+            # In maintenance mode, expect: new submissions + top-5 + maybe 1 stale = ~10 max.
+            # In initial_eval mode, allow more (up to 80 for full sweep).
+            top4_phase_check = "maintenance"
+            try:
+                _t4c = json.loads((state_path / "top4_leaderboard.json").read_text())
+                top4_phase_check = _t4c.get("phase", "maintenance")
+            except Exception:
+                pass
+            MAX_REASONABLE_CHALLENGERS = 80 if top4_phase_check == "initial_eval" else 15
             if len(challengers) > MAX_REASONABLE_CHALLENGERS:
-                print(f"[VALIDATOR] ⚠️ {len(challengers)} challengers detected — this seems high.", flush=True)
+                print(f"[VALIDATOR] ⛔ {len(challengers)} challengers exceeds cap of {MAX_REASONABLE_CHALLENGERS} "
+                      f"(phase={top4_phase_check}). Truncating to top {MAX_REASONABLE_CHALLENGERS} by global KL.", flush=True)
                 print(f"  evaluated_uids: {len(evaluated_uids)}, scores: {len(scores)}, valid_models: {len(valid_models)}", flush=True)
-                # Don't block — just log the warning. The eval will handle it.
+                # Keep king in challengers, sort rest by global KL, truncate
+                king_entry = challengers.pop(king_uid, None)
+                sorted_challengers = sorted(challengers.items(), key=lambda x: scores.get(str(x[0]), 999))
+                challengers = dict(sorted_challengers[:MAX_REASONABLE_CHALLENGERS - (1 if king_entry else 0)])
+                if king_entry:
+                    challengers[king_uid] = king_entry
+                print(f"[VALIDATOR] Truncated to {len(challengers)} challengers", flush=True)
 
             # ── Always include top-5 contenders in every round ──
             # In maintenance mode, the top 4 contenders (from leaderboard) are always
