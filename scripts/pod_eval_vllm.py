@@ -66,15 +66,51 @@ def free_gpu():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+# ── KL computation ──
+# Uses F.kl_div(log_target=True) which is mathematically identical to
+# sum(P * (log P - log Q)) but lets PyTorch fuse the kernel internally.
+# Chunked over positions to reduce peak memory (~4x less for 512-pos sequences).
+# Credit: caseus (github.com/winglian) for the optimization.
+KL_CHUNK_SIZE = 128
+
+
+def _kl_chunk_fn(t_log_p_chunk, s_log_p_chunk):
+    """KL per position for a chunk. Uses F.kl_div for better kernel fusion."""
+    return F.kl_div(s_log_p_chunk, t_log_p_chunk, log_target=True, reduction="none").sum(dim=-1)
+
+
+# Try to compile the inner kernel for ~2x speedup
+try:
+    _kl_chunk_compiled = torch.compile(_kl_chunk_fn, fullgraph=True)
+    _KL_USE_COMPILED = True
+except Exception:
+    _kl_chunk_compiled = _kl_chunk_fn
+    _KL_USE_COMPILED = False
+
+
 def compute_kl(teacher_logits, student_logits):
     """KL(teacher || student) per position. For one-off use."""
     t_log_p = F.log_softmax(teacher_logits.float(), dim=-1)
     s_log_p = F.log_softmax(student_logits.float(), dim=-1)
-    t_p = t_log_p.exp()
-    return (t_p * (t_log_p - s_log_p)).sum(dim=-1)
+    n_pos = t_log_p.shape[-2] if t_log_p.dim() >= 2 else t_log_p.shape[0]
+    kl_fn = _kl_chunk_compiled if _KL_USE_COMPILED else _kl_chunk_fn
+    kl_per_pos = torch.empty(t_log_p.shape[:-1], device=t_log_p.device)
+    for i in range(0, n_pos, KL_CHUNK_SIZE):
+        j = min(i + KL_CHUNK_SIZE, n_pos)
+        if t_log_p.dim() >= 3:
+            kl_per_pos[:, i:j] = kl_fn(t_log_p[:, i:j, :], s_log_p[:, i:j, :])
+        else:
+            kl_per_pos[i:j] = kl_fn(t_log_p[i:j, :], s_log_p[i:j, :])
+    return kl_per_pos
+
 
 def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
-    """KL using precomputed teacher log_softmax + probs. Saves ~50% compute."""
+    """KL using precomputed teacher log_softmax + probs. Saves ~50% compute.
+
+    Uses F.kl_div(log_target=True) + chunking for better memory and speed.
+    The t_p argument is kept for API compat but not used (F.kl_div computes
+    exp(t_log_p) internally when log_target=True).
+    """
     s_logits = student_logits.float()
     # Handle vocab size mismatch (student vs teacher)
     t_vocab = t_log_p.shape[-1]
@@ -87,7 +123,20 @@ def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
     elif s_vocab > t_vocab:
         s_logits = s_logits[..., :t_vocab]
     s_log_p = F.log_softmax(s_logits, dim=-1)
-    return (t_p * (t_log_p - s_log_p)).sum(dim=-1)
+    # Chunked KL over positions to reduce peak memory
+    n_pos = t_log_p.shape[1] if t_log_p.dim() >= 3 else t_log_p.shape[0]
+    kl_fn = _kl_chunk_compiled if _KL_USE_COMPILED else _kl_chunk_fn
+    if t_log_p.dim() >= 3:
+        kl_per_pos = torch.empty(t_log_p.shape[0], n_pos, device=t_log_p.device)
+        for i in range(0, n_pos, KL_CHUNK_SIZE):
+            j = min(i + KL_CHUNK_SIZE, n_pos)
+            kl_per_pos[:, i:j] = kl_fn(t_log_p[:, i:j, :], s_log_p[:, i:j, :])
+    else:
+        kl_per_pos = torch.empty(n_pos, device=t_log_p.device)
+        for i in range(0, n_pos, KL_CHUNK_SIZE):
+            j = min(i + KL_CHUNK_SIZE, n_pos)
+            kl_per_pos[i:j] = kl_fn(t_log_p[i:j, :], s_log_p[i:j, :])
+    return kl_per_pos
 
 def load_model(name, device="cuda", dtype=torch.bfloat16):
     from transformers import AutoModelForCausalLM
@@ -771,11 +820,38 @@ def main():
                     cont_s = s_logits[:, prompt_len - 1:-1, :]
                     min_len = min(cont_s.shape[1], t_log_p.shape[1])
                     # KL with precomputed teacher (skip teacher softmax)
+                    t_lp_slice = t_log_p[:, :min_len, :]
+                    t_p_slice = t_p[:, :min_len, :]
+                    s_cont_slice = cont_s[:, :min_len, :]
                     kl_per_pos = compute_kl_from_precomputed(
-                        t_log_p[:, :min_len, :], t_p[:, :min_len, :], cont_s[:, :min_len, :]
+                        t_lp_slice, t_p_slice, s_cont_slice
                     ).squeeze(0)
                     kl_mean = kl_per_pos.mean().item()
-                    del s_logits, cont_s, kl_per_pos
+
+                    # ── Shadow top-k KL metrics (logged but not used for scoring) ──
+                    topk_shadow = {}
+                    try:
+                        s_log_p_full = F.log_softmax(s_cont_slice.float(), dim=-1)
+                        for k_val in (100, 1000):
+                            # Get teacher's top-k token indices per position
+                            # t_p_slice: [1, min_len, vocab]
+                            _, topk_idx = t_p_slice.topk(k_val, dim=-1)  # [1, min_len, k]
+                            # Gather teacher and student log-probs at those indices
+                            t_topk = t_lp_slice.gather(-1, topk_idx)  # [1, min_len, k]
+                            s_topk = s_log_p_full.gather(-1, topk_idx)  # [1, min_len, k]
+                            # Renormalize (log_softmax over the k dimension)
+                            t_topk_norm = F.log_softmax(t_topk, dim=-1)
+                            s_topk_norm = F.log_softmax(s_topk, dim=-1)
+                            # KL on renormalized top-k
+                            topk_kl = F.kl_div(s_topk_norm, t_topk_norm,
+                                               log_target=True, reduction="none").sum(dim=-1).squeeze(0)
+                            topk_shadow[f"kl_top{k_val}"] = round(topk_kl.mean().item(), 6)
+                            del topk_idx, t_topk, s_topk, t_topk_norm, s_topk_norm, topk_kl
+                        del s_log_p_full
+                    except Exception:
+                        pass  # Shadow metrics are best-effort
+
+                    del s_logits, cont_s, kl_per_pos, t_lp_slice, t_p_slice, s_cont_slice
                     if teacher_log_probs is None:
                         # Chunked path: free per-prompt teacher tensors
                         del t_log_p, t_p
@@ -787,7 +863,10 @@ def main():
                         scoring_error = f"NaN/Inf KL at prompt {i}"
                         break
 
-                    kl_per_prompt.append({"mean": round(kl_mean, 6)})
+                    prompt_result = {"mean": round(kl_mean, 6)}
+                    if topk_shadow:
+                        prompt_result.update(topk_shadow)
+                    kl_per_prompt.append(prompt_result)
                     prompt_kl_means.append(kl_mean)
 
                     running_mean = sum(prompt_kl_means) / len(prompt_kl_means)
@@ -855,7 +934,14 @@ def main():
             n_scored = len(kl_per_prompt)
             status = "early_stopped" if early_stopped else ("partial" if scoring_error else "scored")
             print(f"  → KL={kl_avg:.6f} ({n_scored}/{len(prompts)} prompts, {status})", flush=True)
-            results["students"][student_name] = {
+            # Aggregate shadow top-k metrics
+            topk_aggs = {}
+            for k_label in ("kl_top100", "kl_top1000"):
+                vals = [d.get(k_label) for d in kl_per_prompt if d.get(k_label) is not None]
+                if vals:
+                    topk_aggs[k_label] = round(sum(vals) / len(vals), 6)
+
+            student_result = {
                 "status": status,
                 "kl_global_avg": round(kl_avg, 6),
                 "kl_per_prompt": [d["mean"] for d in kl_per_prompt],
@@ -864,6 +950,11 @@ def main():
                 "load_time": round(load_time, 1),
                 "early_stopped": early_stopped,
             }
+            # Shadow top-k KL (logged for analysis, not used in scoring)
+            if topk_aggs:
+                student_result["shadow_topk"] = topk_aggs
+                print(f"  → Shadow top-k: {topk_aggs}", flush=True)
+            results["students"][student_name] = student_result
             # Update early stopping baseline
             if kl_avg > 0.001 and not early_stopped and not scoring_error:
                 if best_kl_so_far is None or kl_avg < best_kl_so_far:

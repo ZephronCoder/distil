@@ -2055,45 +2055,76 @@ else:
                         print(f"[VALIDATOR] 📊 Initial eval progress: {len(tested_results)} tested, {untested_count} remaining", flush=True)
 
                 elif top4.get("phase") == "maintenance":
-                    # Maintenance mode: rebuild top-4 from actual scores.
+                    # Maintenance mode: rebuild top-5 from most recent H2H results.
                     # Uses winner_uid (already determined by paired t-test) as king.
-                    # Contenders are the next best scores, excluding DQ'd models.
+                    # Contenders are the next 4 best by their most recent H2H KL.
+                    #
+                    # IMPORTANT: We use per-model most-recent H2H scores, NOT global
+                    # scores.json. Global scores mix results from different prompt sets
+                    # and are just sample variance — not comparable across rounds.
                     actual_king = winner_uid if winner_uid is not None else king_uid
                     actual_king_str = str(actual_king)
 
-                    # Build sorted list of (uid_str, kl) from scores, excluding DQ'd
-                    valid_entries = []
-                    for uid_str, score in scores.items():
-                        if score <= 0 or score > MAX_KL_THRESHOLD:
-                            continue
-                        if int(uid_str) in disqualified:
-                            continue
-                        valid_entries.append((uid_str, score))
-                    valid_entries.sort(key=lambda x: x[1])  # best KL first
+                    # Build map: uid -> most recent H2H KL from h2h_history
+                    h2h_hist_path = state_path / "h2h_history.json"
+                    latest_h2h_kl = {}  # uid (int) -> {kl, model, block}
+                    if h2h_hist_path.exists():
+                        try:
+                            h2h_hist = json.loads(h2h_hist_path.read_text())
+                            for h_round in h2h_hist:
+                                for r in h_round.get("results", []):
+                                    r_uid = r.get("uid")
+                                    r_kl = r.get("kl", 999)
+                                    if r_uid is not None and 0 < r_kl <= MAX_KL_THRESHOLD:
+                                        latest_h2h_kl[int(r_uid)] = {
+                                            "kl": r_kl,
+                                            "model": r.get("model", ""),
+                                            "block": h_round.get("block", 0),
+                                        }
+                        except Exception as e:
+                            print(f"[VALIDATOR] Warning: failed to read h2h_history for leaderboard: {e}", flush=True)
+
+                    # Also include this round's results (they may not be in h2h_history yet)
+                    for uid in this_round_uids:
+                        uid_str = str(uid)
+                        if uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
+                            model_name = uid_to_model.get(uid, valid_models.get(uid, {}).get("model", ""))
+                            latest_h2h_kl[uid] = {
+                                "kl": scores[uid_str],
+                                "model": model_name,
+                                "block": current_block,
+                            }
+
+                    # Filter out DQ'd models
+                    valid_entries = [
+                        (uid, data) for uid, data in latest_h2h_kl.items()
+                        if uid not in disqualified
+                    ]
+                    valid_entries.sort(key=lambda x: x[1]["kl"])  # best KL first
 
                     # King is always the actual winner
-                    king_score = scores.get(actual_king_str, 999)
-                    king_model_name = uid_to_model.get(actual_king, valid_models.get(actual_king, {}).get("model", "unknown"))
+                    king_data = latest_h2h_kl.get(actual_king, {})
+                    king_kl_lb = king_data.get("kl", scores.get(actual_king_str, 999))
+                    king_model_name = king_data.get("model") or uid_to_model.get(actual_king, valid_models.get(actual_king, {}).get("model", "unknown"))
                     top4["king"] = {
                         "uid": actual_king,
                         "model": king_model_name,
-                        "h2h_kl": round(king_score, 6),
+                        "h2h_kl": round(king_kl_lb, 6),
                         "block": current_block,
                     }
 
-                    # Contenders are the next 3 best (excluding king)
+                    # Contenders are the next 4 best (excluding king)
                     contenders = []
-                    for uid_str, score in valid_entries:
-                        if int(uid_str) == actual_king:
+                    for uid, data in valid_entries:
+                        if uid == actual_king:
                             continue
-                        c_model = uid_to_model.get(int(uid_str), valid_models.get(int(uid_str), {}).get("model", ""))
                         contenders.append({
-                            "uid": int(uid_str),
-                            "model": c_model,
-                            "h2h_kl": round(score, 6),
-                            "block": current_block,
+                            "uid": uid,
+                            "model": data["model"],
+                            "h2h_kl": round(data["kl"], 6),
+                            "block": data["block"],
                         })
-                        if len(contenders) >= 3:
+                        if len(contenders) >= 4:
                             break
                     top4["contenders"] = contenders
 
