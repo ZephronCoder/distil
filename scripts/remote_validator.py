@@ -926,6 +926,58 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl,
 
 # ── Post-processing ───────────────────────────────────────────────────────
 
+# ── Chat server management ────────────────────────────────────────────────
+
+# Chat-king pod config (from lium)
+CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST", "91.224.44.81")
+CHAT_POD_SSH_PORT = os.environ.get("CHAT_POD_SSH_PORT", "20300")
+CHAT_POD_APP_PORT = 8100
+
+
+def _chat_ssh(cmd: str, timeout: int = 30) -> str:
+    """Run a command on the chat-king pod via SSH."""
+    import subprocess
+    ssh_cmd = [
+        "ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
+        "-p", CHAT_POD_SSH_PORT, f"root@{CHAT_POD_HOST}", cmd,
+    ]
+    try:
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+        return result.stdout
+    except Exception as e:
+        logger.warning(f"Chat pod SSH failed: {e}")
+        return ""
+
+
+def _restart_chat_server(model_name: str):
+    """Kill old chat server and start with new king model."""
+    logger.info(f"Restarting chat server with new king: {model_name}")
+    try:
+        _chat_ssh("pkill -f chat_server.py || true", timeout=10)
+        time.sleep(2)
+        _chat_ssh(
+            f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_APP_PORT} > /root/chat.log 2>&1 &",
+            timeout=10,
+        )
+        logger.info("Chat server restart initiated")
+    except Exception as e:
+        logger.warning(f"Failed to restart chat server: {e}")
+
+
+def _ensure_chat_server_running(model_name: str):
+    """Check if chat server is running; start it if not."""
+    try:
+        stdout = _chat_ssh("pgrep -f chat_server.py || echo not_running", timeout=10)
+        if "not_running" in stdout:
+            logger.info(f"Chat server not running, starting with {model_name}")
+            _chat_ssh(
+                f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_APP_PORT} > /root/chat.log 2>&1 &",
+                timeout=10,
+            )
+    except Exception as e:
+        logger.debug(f"Chat server check failed: {e}")
+
+
 def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                      king_h2h_kl, king_kl, king_per_prompt, current_block,
                      n_prompts, is_full_eval, uid_to_model, valid_models,
@@ -969,6 +1021,13 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
     state.h2h_history.append(h2h_round)
     state.h2h_history = state.h2h_history[-50:]
     state.save_h2h()
+
+    # Auto-restart chat server with new king model
+    if king_changed and effective_king_model:
+        _restart_chat_server(effective_king_model)
+    elif not king_changed:
+        # Even if king didn't change, ensure chat server is running with correct model
+        _ensure_chat_server_running(effective_king_model)
 
     # Update tested-against-king tracker
     if king_uid is not None:
