@@ -454,7 +454,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
             sys.exit(1)
 
         gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         check_info("GPU", f"{gpu_name} ({gpu_mem:.0f}GB)")
 
         from transformers import AutoModelForCausalLM, AutoTokenizer

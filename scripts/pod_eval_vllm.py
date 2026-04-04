@@ -57,7 +57,7 @@ def gpu_mem_str():
     """Return a human-readable string of current GPU memory usage."""
     if torch.cuda.is_available():
         alloc = torch.cuda.memory_allocated() / 1024**3
-        total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         return f"{alloc:.1f}/{total:.1f}GB"
     return "N/A"
 
