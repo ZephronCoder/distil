@@ -219,6 +219,28 @@ def is_vllm_running():
 def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=4096, persistent=False):
     """Start vLLM server via subprocess. Returns True on success.
     If persistent=True, reuses an already-running server."""
+    # Disk check before vLLM startup — model download can fail on full disk
+    try:
+        st = os.statvfs("/")
+        pct = int(100 * (1 - st.f_bavail / st.f_blocks))
+        free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
+        print(f"  [disk] Before vLLM start: {pct}% used, {free_gb:.1f}GB free", flush=True)
+        if pct > 85:
+            print(f"  [disk] >85% — cleaning before vLLM startup", flush=True)
+            disk_check_and_clean(model_name, threshold=80)
+            # Also clean stale /tmp files from failed vLLM downloads
+            import glob
+            for f in glob.glob("/tmp/vllm_*") + glob.glob("/tmp/tmp*"):
+                try:
+                    fsize = os.path.getsize(f)
+                    if fsize > 1024**3:  # >1GB
+                        os.remove(f)
+                        print(f"  [disk] Removed stale {f} ({fsize/1024**3:.1f}GB)", flush=True)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"  [disk] Pre-vLLM check failed: {e}", flush=True)
+
     if persistent and is_vllm_running():
         print(f"\n[vllm] Server already running — reusing (persistent mode)", flush=True)
         return True
@@ -460,6 +482,52 @@ def main():
             print(f"[eval] ✗ Cache failed: {e}", flush=True)
 
     if not teacher_cache_loaded and not args.no_vllm:
+        # ── Aggressive disk cleanup before teacher loading ──
+        # Teacher model is ~35GB; vLLM needs scratch space too.
+        # Run cleanup at lower threshold (70%) to ensure headroom.
+        try:
+            st = os.statvfs("/")
+            pct = int(100 * (1 - st.f_bavail / st.f_blocks))
+            free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
+            print(f"[disk] Before teacher load: {pct}% used, {free_gb:.1f}GB free", flush=True)
+        except Exception:
+            pct, free_gb = 0, 999
+        disk_check_and_clean(args.teacher, threshold=70)
+
+        # Clean stale teacher cache if hash doesn't match current prompts
+        if args.teacher_logits and os.path.exists(args.teacher_logits):
+            try:
+                import struct
+                cache = torch.load(args.teacher_logits, map_location="cpu", weights_only=False)
+                if cache.get("prompts_hash") != prompts_hash:
+                    cache_size = os.path.getsize(args.teacher_logits) / (1024**3)
+                    print(f"[disk] Stale teacher cache (hash mismatch) — removing ({cache_size:.1f}GB)", flush=True)
+                    os.remove(args.teacher_logits)
+                del cache
+            except Exception as e:
+                print(f"[disk] Could not check teacher cache staleness: {e}", flush=True)
+
+        # Clean /tmp of stale large files (failed downloads, old teacher files)
+        import glob
+        for pattern in ["/tmp/teacher_*", "/tmp/vllm_*", "/tmp/tmp*"]:
+            for f in glob.glob(pattern):
+                try:
+                    fsize = os.path.getsize(f)
+                    if fsize > 1024**3:  # >1GB
+                        os.remove(f)
+                        print(f"[disk] Removed stale {f} ({fsize/1024**3:.1f}GB)", flush=True)
+                except Exception:
+                    pass
+
+        # Log disk state after cleanup
+        try:
+            st = os.statvfs("/")
+            pct2 = int(100 * (1 - st.f_bavail / st.f_blocks))
+            free_gb2 = (st.f_bavail * st.f_frsize) / (1024**3)
+            print(f"[disk] After pre-teacher cleanup: {pct2}% used, {free_gb2:.1f}GB free", flush=True)
+        except Exception:
+            pass
+
         # ── vLLM generation ──
         print(f"\n{'='*60}", flush=True)
         print(f"PHASE 1a: vLLM teacher generation", flush=True)
@@ -553,7 +621,13 @@ def main():
             # Unload teacher — free ~67GB VRAM for students
             del teacher
             free_gpu()
-            print(f"[eval] Teacher unloaded. VRAM: {gpu_mem_str()}", flush=True)
+            try:
+                st = os.statvfs("/")
+                disk_pct = int(100 * (1 - st.f_bavail / st.f_blocks))
+                disk_free = (st.f_bavail * st.f_frsize) / (1024**3)
+                print(f"[eval] Teacher unloaded. VRAM: {gpu_mem_str()}, Disk: {disk_pct}% ({disk_free:.1f}GB free)", flush=True)
+            except Exception:
+                print(f"[eval] Teacher unloaded. VRAM: {gpu_mem_str()}", flush=True)
             teacher_cache_loaded = True
 
     if not teacher_cache_loaded:
@@ -561,6 +635,16 @@ def main():
         print(f"\n{'='*60}", flush=True)
         print(f"PHASE 1 FALLBACK: HF teacher generation", flush=True)
         print(f"{'='*60}", flush=True)
+
+        # Disk check before HF teacher download — needs ~35GB for model weights
+        try:
+            st = os.statvfs("/")
+            pct = int(100 * (1 - st.f_bavail / st.f_blocks))
+            free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
+            print(f"[disk] Before HF fallback load: {pct}% used, {free_gb:.1f}GB free", flush=True)
+        except Exception:
+            pass
+        disk_check_and_clean(args.teacher, threshold=70)
 
         t0 = time.time()
         teacher = load_model(args.teacher, device)
@@ -752,6 +836,14 @@ def main():
               (" (KING — stays in VRAM)" if student_name == king_name else ""), flush=True)
 
         model_start = time.time()
+        # Log disk state before each student
+        try:
+            st = os.statvfs("/")
+            disk_pct = int(100 * (1 - st.f_bavail / st.f_blocks))
+            disk_free = (st.f_bavail * st.f_frsize) / (1024**3)
+            print(f"[disk] Before student {student_idx+1}/{len(students)}: {disk_pct}% used, {disk_free:.1f}GB free", flush=True)
+        except Exception:
+            pass
         disk_check_and_clean(args.teacher)
 
         # ── Prefetch next student while we score this one ──

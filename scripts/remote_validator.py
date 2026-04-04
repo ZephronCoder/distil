@@ -1137,33 +1137,37 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     print("[VALIDATOR] Resuming round (keeping eval_results.json + teacher_cache.pt on pod)", flush=True)
                 else:
                     # New round: remove eval_results.json (scores from old prompts are invalid)
-                    # but KEEP teacher_cache.pt — pod_eval checks the prompts hash
-                    # and reuse it if prompts happen to match, or regenerate if they don't.
-                    lium.exec(pod, command="rm -f /home/eval_results.json")
-                    print("[VALIDATOR] New round (cleared eval_results.json, keeping teacher_cache.pt for hash check)", flush=True)
+                    # Also remove teacher_cache.pt to free ~45GB disk space.
+                    # pod_eval will regenerate teacher logits for the new prompt set anyway.
+                    lium.exec(pod, command="rm -f /home/eval_results.json /home/teacher_cache.pt")
+                    print("[VALIDATOR] New round (cleared eval_results.json + teacher_cache.pt to free disk)", flush=True)
             except Exception:
                 pass
 
-            # Pre-eval disk check — clean student cache if disk is >80% full
+            # Pre-eval disk cleanup — ALWAYS clean student caches + stale files
+            # (not just at >80% threshold — disk exhaustion was the #1 crash cause)
             try:
                 disk_check = lium.exec(pod, command="df --output=pcent / | tail -1 | tr -d ' %'")
                 disk_pct_str = disk_check.get('stdout', disk_check) if isinstance(disk_check, dict) else disk_check
                 disk_pct = int(str(disk_pct_str).strip())
-                if disk_pct > 80:
-                    print(f"[VALIDATOR] Disk {disk_pct}% full — cleaning student model cache", flush=True)
-                    clean_cmd = (
-                        "cd /root/.cache/huggingface/hub 2>/dev/null && "
-                        "for d in models--*; do "
-                        "  case \"$d\" in models--Qwen--Qwen3.5-35B-A3B) continue;; esac; "
-                        "  rm -rf \"$d\"; "
-                        "done; "
-                        "df -h / | tail -1"
-                    )
-                    clean_result = lium.exec(pod, command=clean_cmd)
-                    clean_info = clean_result.get('stdout', clean_result) if isinstance(clean_result, dict) else clean_result
-                    print(f"[VALIDATOR] Pre-eval cleanup done: {str(clean_info).strip()}", flush=True)
-                else:
-                    print(f"[VALIDATOR] Disk {disk_pct}% — OK", flush=True)
+                print(f"[VALIDATOR] Pre-eval disk: {disk_pct}% used", flush=True)
+
+                # ALWAYS clean non-teacher student model caches (they re-download anyway)
+                clean_cmd = (
+                    "cd /root/.cache/huggingface/hub 2>/dev/null && "
+                    "for d in models--*; do "
+                    "  case \"$d\" in models--Qwen--Qwen3.5-35B-A3B) continue;; esac; "
+                    "  rm -rf \"$d\"; "
+                    "done; "
+                    # Clean stale /tmp files >1GB (failed vLLM downloads, partial models)
+                    "find /tmp -maxdepth 1 -size +1G -mmin +30 -delete 2>/dev/null; "
+                    # Clean stale logit caches from previous blocks
+                    "rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json 2>/dev/null; "
+                    "df -h / | tail -1"
+                )
+                clean_result = lium.exec(pod, command=clean_cmd)
+                clean_info = clean_result.get('stdout', clean_result) if isinstance(clean_result, dict) else clean_result
+                print(f"[VALIDATOR] Pre-eval cleanup done: {str(clean_info).strip()}", flush=True)
             except Exception as e:
                 print(f"[VALIDATOR] Disk check failed (non-fatal): {e}", flush=True)
 
@@ -2157,7 +2161,7 @@ else:
             progress_path = state_path / "eval_progress.json"
             atomic_json_write(progress_path, {"active": False})
 
-            # ── Clean HF model cache to prevent disk full ──
+            # ── Clean HF model cache + stale files to prevent disk full ──
             # Keep only the teacher model; students re-download each eval anyway
             try:
                 clean_cmd = (
@@ -2166,13 +2170,16 @@ else:
                     "  case \"$d\" in models--Qwen--Qwen3.5-35B-A3B) continue;; esac; "
                     "  rm -rf \"$d\"; "
                     "done; "
+                    # Also clean stale teacher cache and /tmp large files
+                    "rm -f /home/teacher_cache.pt 2>/dev/null; "
+                    "find /tmp -maxdepth 1 -size +1G -mmin +30 -delete 2>/dev/null; "
                     "df -h / | tail -1"
                 )
                 result = lium.exec(pod, command=clean_cmd)
                 disk_info = result.get('stdout', result) if isinstance(result, dict) else result
-                print(f"[VALIDATOR] Cache cleanup: {str(disk_info).strip()}", flush=True)
+                print(f"[VALIDATOR] Post-eval cleanup: {str(disk_info).strip()}", flush=True)
             except Exception as e:
-                print(f"[VALIDATOR] Cache cleanup failed (non-fatal): {e}", flush=True)
+                print(f"[VALIDATOR] Post-eval cleanup failed (non-fatal): {e}", flush=True)
 
             # ── Restart any background tasks that were cleared for eval ──
             try:

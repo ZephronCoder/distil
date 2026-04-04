@@ -52,5 +52,6 @@
   "5H6kXPM3WNiRnpQKwEMqVB2rdv6FbFDRgEu4h8Lea8ejEAKh:7854471": "copy: identical weights to UID 97 (dasLOL/distilled-qwen35-4b-base), committed later",
   "7": "Model aidonuts/corpulent-quail-step1000-v0 is inaccessible (401). DQd.",
   "5CDsLvJkZbgHws65MfP6EfZtoRp1nsY4LesTnLMT6yxsoNba:7884961": "copy: identical weights to UID 40 (aidonuts/screaming-porcupine-s4000-a025-v9), committed later at block 7884961 vs 7884956",
-  "5GWLDWiuRR88XsMmmdRsfUHKXxA6dZpKfqjR92Z1cApT96oC:7885371": "FRAUD: student VRAM delta 24.5GB > 20.0GB"
+  "5GWLDWiuRR88XsMmmdRsfUHKXxA6dZpKfqjR92Z1cApT96oC:7885371": "FRAUD: student VRAM delta 24.5GB > 20.0GB",
+  "5FW4kBjSWLGiVQDRCpVtHNRJKKaz3UyHfMqBRC5gHuHT1D9F:7894718": "copy: identical weights to UID 63 (rlinprogress/sn97-distilled-V26), committed later at block 7894718 vs 7894687"
 }
