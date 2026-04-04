@@ -456,7 +456,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
     input_ids_list = []
     for p in prompts:
-        ids = tokenizer(p, return_tensors="pt", truncation=True, max_length=args.max_prompt_len).input_ids.to(device)
+        ids = tokenizer(p, return_tensors="pt", truncation=False).input_ids.to(device)
         input_ids_list.append(ids)
 
     # ═══════════════════════════════════════════════════════════════════

@@ -65,6 +65,39 @@ H2H_TESTED_KING_FILE = "h2h_tested_against_king.json"
 ANNOUNCEMENT_FILE = "announcement.json"
 MODEL_HASHES_FILE = "model_hashes.json"
 SCORE_HISTORY_FILE = "score_history.json"
+VALIDATOR_LOG_FILE = "validator_log.json"
+
+VALIDATOR_LOG_MAX_ENTRIES = 100
+
+
+def log_event(msg: str, level: str = "info", state_dir: str = "state"):
+    """Append a structured log entry to validator_log.json.
+
+    Keeps the last VALIDATOR_LOG_MAX_ENTRIES entries. Thread-safe via
+    atomic write. Each entry: {ts, level, msg}.
+    """
+    log_path = os.path.join(state_dir, VALIDATOR_LOG_FILE)
+    entries = []
+    if os.path.exists(log_path):
+        try:
+            with open(log_path) as f:
+                entries = json.load(f)
+            if not isinstance(entries, list):
+                entries = []
+        except (json.JSONDecodeError, OSError):
+            entries = []
+
+    entries.append({
+        "ts": time.time(),
+        "level": level,
+        "msg": str(msg),
+    })
+
+    # Trim to max entries
+    if len(entries) > VALIDATOR_LOG_MAX_ENTRIES:
+        entries = entries[-VALIDATOR_LOG_MAX_ENTRIES:]
+
+    atomic_json_write(log_path, entries)
 
 
 class ValidatorState:

@@ -945,6 +945,33 @@ def _sanitize_log_line(line: str) -> str | None:
     return cleaned
 
 
+@app.get("/api/validator-logs", tags=["Evaluation"], summary="Real-time validator activity logs",
+         description="""Returns structured validator log entries showing round progress, precheck results, eval outcomes, and errors.
+
+Query parameters:
+- `limit`: Number of entries to return (default 50, max 200)
+
+Each entry contains:
+- `ts`: Unix timestamp
+- `level`: Log level (info, warn, error)
+- `msg`: Human-readable log message
+
+Entries are returned most-recent-first.
+""")
+def get_validator_logs(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    log_path = os.path.join(STATE_DIR, "validator_log.json")
+    entries = _safe_json_load(log_path, [])
+    if not isinstance(entries, list):
+        entries = []
+    # Most recent first, limited
+    entries = list(reversed(entries))[:limit]
+    return JSONResponse(
+        content={"entries": entries, "count": len(entries)},
+        headers={"Cache-Control": "public, max-age=5, stale-while-revalidate=10"},
+    )
+
+
 @app.get("/api/gpu-logs", tags=["Evaluation"], summary="Recent GPU evaluation logs",
          description="""Returns sanitized recent logs from the GPU evaluation pod and validator process.
 

@@ -160,7 +160,7 @@ def sample_prompts_from_dataset(
     return prompts
 
 
-def format_prompt(text: str, max_chars: int = 512) -> str:
+def format_prompt(text: str, max_chars: int = 4000) -> str:
     """Format a raw pretraining text as a continuation prompt.
 
     Uses the first ~max_chars as context, model continues from there.

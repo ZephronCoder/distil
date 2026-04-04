@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("distillation.remote_validator")
 logger.setLevel(logging.DEBUG)
 
-from eval.state import ValidatorState, atomic_json_write
+from eval.state import ValidatorState, atomic_json_write, log_event
 from eval.pod import PodManager, sanitize_gpu_log
 from eval.chain import fetch_metagraph, parse_commitments, set_weights
 from eval.scoring import (
@@ -520,7 +520,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         pass
 
     # Disk cleanup + clear GPU
-    pod.disk_cleanup(TEACHER_MODEL)
+    try:
+        disk_pct = pod.disk_cleanup(TEACHER_MODEL)
+        if disk_pct is not None:
+            log_event(f"Pod disk: {disk_pct}% used after cleanup", state_dir=str(state.state_dir))
+    except Exception as e:
+        log_event(f"Pod disk cleanup failed: {str(e)[:100]}", level="warn", state_dir=str(state.state_dir))
     pod.clear_gpu()
 
     # Build eval command
@@ -610,6 +615,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     n_eval_models = len(models_to_eval)
     EVAL_TIMEOUT = (n_eval_models * 10 + 30) * 60
     logger.info(f"Running eval ({n_eval_models} models, {n_prompts} prompts, timeout={EVAL_TIMEOUT // 60}m)")
+    log_event(f"Running eval on pod: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
     eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
 
     try:
@@ -753,11 +759,18 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState,
             state.scores[str(uid)] = kl
             state.evaluated_uids.add(str(uid))
             logger.info(f"UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)")
+            log_event(f"UID {uid}: KL={kl:.6f} (king)", state_dir=str(state.state_dir))
         else:
             state.scores[str(uid)] = kl
             state.evaluated_uids.add(str(uid))
             reset_failures(uid, state.failures)
             logger.info(f"UID {uid} ({model_name}): KL={kl:.6f}")
+            # Compute vs-king info for log
+            _vs_info = ""
+            if king_h2h_kl is not None and king_h2h_kl > 0:
+                _pct = (king_h2h_kl - kl) / king_h2h_kl * 100
+                _vs_info = f", {_pct:+.2f}% vs king"
+            log_event(f"UID {uid}: KL={kl:.6f}{_vs_info}", state_dir=str(state.state_dir))
 
     # ── Paired t-test dethronement ──
     if king_uid is not None and king_h2h_kl is None:
@@ -1140,6 +1153,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             epoch_start = time.time()
             epoch_count += 1
             logger.info(f"\n=== EPOCH {epoch_count} ===")
+            log_event(f"Starting epoch {epoch_count}", state_dir=state_dir)
 
             # ── Clear stale eval progress ──
             if state.eval_progress.get("active"):
@@ -1157,6 +1171,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 logger.info(f"Block {current_block}, n={n_uids}, {len(revealed)} revealed")
             except Exception as chain_err:
                 logger.error(f"Chain unreachable: {chain_err}, sleeping 5min")
+                log_event(f"Chain unreachable: {str(chain_err)[:150]}, retrying in 5min", level="error", state_dir=state_dir)
                 time.sleep(300)
                 continue
 
@@ -1185,6 +1200,11 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             valid_models, disqualified = precheck_all_models(
                 commitments, uid_to_hotkey, uid_to_coldkey, state, max_params_b
             )
+
+            n_valid = len(valid_models)
+            n_dq = len(disqualified)
+            n_total = len(commitments)
+            log_event(f"Prechecked {n_total} models: {n_valid} valid, {n_dq} DQ, {n_total - n_valid - n_dq} error", state_dir=state_dir)
 
             if not valid_models:
                 logger.info("No valid models after pre-checks")
@@ -1254,6 +1274,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             n_prompts = EVAL_PROMPTS_FULL if is_full_eval else EVAL_PROMPTS_H2H
             logger.info(f"H2H: king=UID {king_uid} vs {n_challengers_in_eval} challengers ({n_prompts} prompts)")
+            challenger_uids_list = [uid for uid in models_to_eval if uid != king_uid]
+            log_event(f"Starting h2h round {epoch_count}, king=UID {king_uid}, challengers={challenger_uids_list}", state_dir=state_dir)
 
             # Model existence check
             removed = _check_models_exist(models_to_eval, uid_to_hotkey, state, commitments)
@@ -1388,8 +1410,12 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             state.save_progress({"active": False})
 
             # ── Pod cleanup ──
-            pod.post_eval_cleanup(TEACHER_MODEL)
-            pod.resume_background_tasks()
+            try:
+                pod.post_eval_cleanup(TEACHER_MODEL)
+                pod.resume_background_tasks()
+            except Exception as cleanup_err:
+                log_event(f"Pod cleanup error: {str(cleanup_err)[:100]}", level="warn", state_dir=state_dir)
+                logger.warning(f"Pod cleanup error: {cleanup_err}")
 
             # ── Announcement ──
             if winner_uid is not None and winner_uid != king_uid and king_uid is not None:
@@ -1405,6 +1431,15 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             elapsed = time.time() - epoch_start
             logger.info(f"Epoch complete in {elapsed:.0f}s")
 
+            # Log round completion
+            winner_model = uid_to_model.get(winner_uid, "unknown") if winner_uid else "none"
+            w_kl = state.scores.get(str(winner_uid), 0) if winner_uid else 0
+            king_changed = winner_uid is not None and winner_uid != king_uid and king_uid is not None
+            if king_changed:
+                log_event(f"Round complete. New king: UID {winner_uid} ({winner_model}), KL={w_kl:.6f}. Dethroned UID {king_uid}.", state_dir=state_dir)
+            else:
+                log_event(f"Round complete. Winner: UID {winner_uid}, KL={w_kl:.6f}. Weights set.", state_dir=state_dir)
+
             if once:
                 break
             logger.info("Checking for new challengers immediately...")
@@ -1415,6 +1450,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             break
         except Exception as e:
             logger.error(f"EPOCH ERROR: {e}")
+            log_event(f"Epoch error: {str(e)[:200]}", level="error", state_dir=state_dir)
             import traceback
             traceback.print_exc()
             state.save()
