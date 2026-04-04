@@ -26,6 +26,7 @@ KL_CHUNK_SIZE = 128
 try:
     @torch.compile(fullgraph=True)
     def _kl_chunk_compiled(t_chunk: torch.Tensor, s_chunk: torch.Tensor) -> torch.Tensor:
+        """Compiled KL kernel for a chunk of positions."""
         t_log_p = F.log_softmax(t_chunk, dim=-1)
         s_log_p = F.log_softmax(s_chunk, dim=-1)
         return F.kl_div(s_log_p, t_log_p, log_target=True, reduction="none").sum(dim=-1)
@@ -48,8 +49,7 @@ def compute_kl_from_logits(
     start_pos: int = 0,
     chunk_size: int = KL_CHUNK_SIZE,
 ) -> dict:
-    """
-    Exact KL(teacher || student) from full logit tensors.
+    """Exact KL(teacher || student) from full logit tensors.
 
     Uses chunked computation with torch.compile for ~2.4x speedup and ~10x
     memory reduction vs the naive full-sequence approach.
@@ -67,7 +67,6 @@ def compute_kl_from_logits(
         teacher_logits = teacher_logits.squeeze(0)
         student_logits = student_logits.squeeze(0)
 
-    # Slice to requested positions
     if start_pos > 0:
         teacher_logits = teacher_logits[start_pos:]
         student_logits = student_logits[start_pos:]
@@ -100,8 +99,7 @@ def generate_teacher_continuations(
     block_seed: Optional[int] = None,
     device: str = "cuda",
 ) -> list[dict]:
-    """
-    Pre-generate teacher continuations for all prompts in an epoch.
+    """Pre-generate teacher continuations for all prompts in an epoch.
 
     Called ONCE per epoch, results cached and reused for all student evaluations.
     This reduces teacher generation from O(students × prompts) to O(prompts).
@@ -125,7 +123,6 @@ def generate_teacher_continuations(
         input_ids = input_ids.to(device)
         prompt_len = input_ids.shape[1]
 
-        # Generate teacher continuation
         gen_kwargs = dict(max_new_tokens=max_new_tokens, use_cache=True)
         if block_seed is not None:
             torch.manual_seed(block_seed)
@@ -147,8 +144,7 @@ def generate_teacher_continuations(
             })
             continue
 
-        # Forward pass for teacher logits
-        full_ids = teacher_output  # [1, prompt_len + gen_len]
+        full_ids = teacher_output
         teacher_logits_full = teacher_model(full_ids).logits
 
         # Only keep continuation logits (memory efficient) — slice BEFORE .cpu()
@@ -156,8 +152,8 @@ def generate_teacher_continuations(
         teacher_cont_logits = teacher_logits_full[:, prompt_len - 1:-1, :].float().cpu()
 
         cache.append({
-            "full_ids": full_ids,  # keep on device for student forward pass
-            "teacher_logits": teacher_cont_logits,  # CPU to save GPU memory
+            "full_ids": full_ids,
+            "teacher_logits": teacher_cont_logits,
             "prompt_len": prompt_len,
             "gen_len": gen_len,
         })
@@ -175,8 +171,7 @@ def evaluate_student_kl(
     teacher_cache_entry: dict,
     device: str = "cuda",
 ) -> dict:
-    """
-    Evaluate a student model against cached teacher continuation data.
+    """Evaluate a student model against cached teacher continuation data.
 
     Uses pre-generated teacher continuations to avoid redundant teacher inference.
 
@@ -204,116 +199,11 @@ def evaluate_student_kl(
 
     full_ids = teacher_cache_entry["full_ids"].to(device)
 
-    # Student forward pass on the full sequence
     student_logits_full = student_model(full_ids).logits
-
-    # Only keep continuation logits — slice BEFORE moving to avoid full-seq on CPU
     student_cont_logits = student_logits_full[:, prompt_len - 1:-1, :].float()
-
-    # Move teacher logits to device for KL computation
     teacher_cont_logits = teacher_cache_entry["teacher_logits"].to(device)
 
-    # Compute KL on continuation positions
     result = compute_kl_from_logits(teacher_cont_logits, student_cont_logits)
     result["prompt_len"] = prompt_len
     result["gen_len"] = gen_len
     return result
-
-
-@torch.no_grad()
-def evaluate_kl_with_continuation(
-    teacher_model,
-    student_model,
-    input_ids: torch.Tensor,
-    max_new_tokens: int = 512,
-    device: str = "cuda",
-    block_seed: Optional[int] = None,
-) -> dict:
-    """
-    Legacy single-call KL evaluation with teacher continuation.
-    Kept for backward compatibility. For production, use
-    generate_teacher_continuations() + evaluate_student_kl() instead.
-
-    Steps:
-    1. Generate continuation from teacher (block-seeded sampling for anti-gaming)
-    2. Forward pass full sequence through both models
-    3. Compute KL on continuation positions only
-    """
-    input_ids = input_ids.to(device)
-    prompt_len = input_ids.shape[1]
-
-    # 1. Generate teacher continuation
-    gen_kwargs = dict(max_new_tokens=max_new_tokens, use_cache=True)
-    if block_seed is not None:
-        torch.manual_seed(block_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(block_seed)
-        gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9)
-    else:
-        gen_kwargs.update(do_sample=False)
-
-    teacher_output = teacher_model.generate(input_ids, **gen_kwargs)
-    gen_len = teacher_output.shape[1] - prompt_len
-
-    if gen_len == 0:
-        return {
-            "kl_mean": float("inf"),
-            "kl_std": 0.0,
-            "kl_max": float("inf"),
-            "kl_min": float("inf"),
-            "n_positions": 0,
-            "prompt_len": prompt_len,
-            "gen_len": 0,
-        }
-
-    # 2. Forward pass both models on full sequence (prompt + continuation)
-    full_ids = teacher_output
-    teacher_logits = teacher_model(full_ids).logits
-    student_logits = student_model(full_ids).logits
-
-    # 3. KL on continuation positions only — slice before .float() for memory
-    t_logits = teacher_logits[:, prompt_len - 1:-1, :].float()
-    s_logits = student_logits[:, prompt_len - 1:-1, :].float()
-
-    result = compute_kl_from_logits(t_logits, s_logits)
-    result["prompt_len"] = prompt_len
-    result["gen_len"] = gen_len
-    return result
-
-
-def compute_kl_divergence(
-    teacher_logprobs: list[dict[str, float]],
-    student_logprobs: list[dict[str, float]],
-    epsilon: float = 1e-10,
-) -> float:
-    """
-    Approximate KL(teacher || student) from top-k logprob dicts (CPU fallback).
-    Used only in simulation/testing. Production uses full-distribution GPU KL.
-    """
-    import math
-
-    n = min(len(teacher_logprobs), len(student_logprobs))
-    if n == 0:
-        return float("inf")
-
-    kl_sum = 0.0
-    for i in range(n):
-        t_lp = teacher_logprobs[i]
-        s_lp = student_logprobs[i]
-        all_tokens = set(t_lp.keys()) | set(s_lp.keys())
-
-        t_probs = {t: math.exp(t_lp.get(t, math.log(epsilon))) for t in all_tokens}
-        s_probs = {t: math.exp(s_lp.get(t, math.log(epsilon))) for t in all_tokens}
-
-        t_total = sum(t_probs.values())
-        s_total = sum(s_probs.values())
-
-        kl = 0.0
-        for t in all_tokens:
-            p = t_probs[t] / t_total
-            q = s_probs[t] / s_total
-            if p > 0 and q > 0:
-                kl += p * math.log(p / q)
-        kl_sum += max(kl, 0.0)
-
-    return kl_sum / n

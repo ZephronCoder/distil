@@ -33,56 +33,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("distillation.remote_validator")
 logger.setLevel(logging.DEBUG)
 
-import re as _re
+from eval.state import ValidatorState, atomic_json_write
+from eval.pod import PodManager, sanitize_gpu_log
+from eval.chain import fetch_metagraph, parse_commitments, set_weights
+from eval.scoring import (
+    load_scores, save_scores,
+    load_failures, save_failures, record_failure, reset_failures, is_stale,
+    load_disqualified, save_disqualified, disqualify, is_disqualified,
+    is_flagged, get_dq_reason, append_score_history,
+)
+from eval.model_checker import (
+    check_model_architecture, verify_model_integrity,
+    compute_model_hash, check_duplicate_hash, register_model_hash,
+)
+from eval.dataset import sample_prompts_from_dataset, format_prompt
 
-
-def _sanitize_for_json(obj):
-    """Replace inf/nan floats with None so JSON serialization never fails."""
-    import math
-    if isinstance(obj, float):
-        return None if (math.isinf(obj) or math.isnan(obj)) else obj
-    if isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
-    return obj
-
-
-def atomic_json_write(path, data, indent=None):
-    """Write JSON atomically: write to .tmp then os.replace (atomic on Linux)."""
-    path = str(path)
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(_sanitize_for_json(data), f, indent=indent)
-    os.replace(tmp, path)
-
-# Patterns for sanitizing GPU logs before public exposure
-_ANSI_RE = _re.compile(r'\x1b\[[0-9;]*m')
-_SECRET_PATTERNS = _re.compile(r'hf_[a-zA-Z0-9]{6,}|sk-[a-zA-Z0-9]{6,}|key-[a-zA-Z0-9]{6,}')
-_SENSITIVE_KEYWORDS = ("Authorization:", "Bearer ", "token=", "api_key=", "API_KEY=", "password", "secret")
-
-
-def _sanitize_gpu_log(raw: str) -> str:
-    """Strip ANSI codes, secrets, and SSH noise from GPU pod logs before writing to disk."""
-    lines = []
-    for line in raw.splitlines():
-        cleaned = _ANSI_RE.sub('', line).strip()
-        if not cleaned:
-            continue
-        # Drop lines with sensitive keywords
-        if any(kw in cleaned for kw in _SENSITIVE_KEYWORDS):
-            continue
-        # Drop SSH/SFTP noise
-        if any(noise in cleaned for noise in (
-            "sftp", "Authentication", "Connected (version", "chan ",
-            "Opened sftp", "sftp session closed",
-        )):
-            continue
-        # Redact any token/key patterns
-        cleaned = _SECRET_PATTERNS.sub('[REDACTED]', cleaned)
-        lines.append(cleaned)
-    return '\n'.join(lines)
-
+# ── Constants ─────────────────────────────────────────────────────────────
 
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
 NETUID = 97
@@ -90,33 +56,24 @@ MAX_KL_THRESHOLD = 2.0
 MAX_NEW_TOKENS = 512
 MAX_PROMPT_TOKENS = 1024
 
-# Prompts per head-to-head evaluation (king + challenger on same prompts)
-# Bumped from 60 → 120 to halve variance (per Arbos: "I could bump to 120+ without much pain")
-EVAL_PROMPTS_FULL = 60   # Full eval: many models, need speed
-EVAL_PROMPTS_H2H = 120   # Restored after eval stability confirmed
-# Epsilon: challenger must beat king by this relative margin to dethrone
-# e.g., 0.01 = challenger KL must be < king_kl * 0.99 (1% better)
-EPSILON = 0.01  # Legacy — kept as fallback if per-prompt data unavailable
-PAIRED_TEST_ALPHA = 0.05  # Significance level for paired t-test dethronement
-# Cumulative dethronement: REMOVED — replaced by paired t-test (2026-04-02).
-# The paired t-test determines significance in a single round, making multi-round
-# accumulation unnecessary. Kept as comments for historical reference.
-# LOSS_PENALTY_MULTIPLIER = 1.1
-# CUMULATIVE_DETHRONE_THRESHOLD = 0.005
+EVAL_PROMPTS_FULL = 60    # Full eval: many models, need speed
+EVAL_PROMPTS_H2H = 120    # Head-to-head: fewer models, need precision
+EPSILON = 0.01             # Legacy fallback if per-prompt data unavailable
+PAIRED_TEST_ALPHA = 0.05   # Significance level for paired t-test dethronement
+STALE_H2H_EPOCHS = 50      # Re-test if last H2H was >N epochs ago
+TOP_N_ALWAYS_INCLUDE = 5   # king + 4 contenders always in eval
 
-# Smart challenger selection: stale H2H re-test threshold
-STALE_H2H_EPOCHS = 50  # re-test if last H2H was >N epochs ago
+# Discord announcement role
+DISTIL_ROLE_ID = "1482026585358991571"
 
 
-def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, state_dir):
-    """Write a pending announcement to state/announcement.json for async Discord posting."""
-    # Note: "old_kl" is the PREVIOUS king's score from the LAST eval round.
-    # "new_kl" is the NEW king's score on THIS eval round's prompts.
-    # These are on DIFFERENT prompt sets, so direct comparison shows prompt variance, not real improvement.
-    # We still show both numbers for transparency but label them correctly.
+# ── Announcement ──────────────────────────────────────────────────────────
+
+def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, state: ValidatorState):
+    """Write a pending announcement to state for async Discord posting."""
     kl_diff_pct = ((old_kl - new_kl) / old_kl * 100) if old_kl > 0 else 0
 
-    # Fetch earnings data for the announcement
+    # Fetch earnings data
     earnings_line = ""
     try:
         import urllib.request
@@ -132,10 +89,7 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
     except Exception:
         pass
 
-    # Role ping for important updates — distil・97 role
-    DISTIL_ROLE_ID = "1482026585358991571"
     role_ping = f"<@&{DISTIL_ROLE_ID}>"
-
     announcement = {
         "type": "new_king",
         "timestamp": time.time(),
@@ -157,10 +111,985 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
             "old_uid": old_uid, "old_model": old_model, "old_kl": old_kl,
         },
     }
-    ann_path = Path(state_dir) / "announcement.json"
-    atomic_json_write(ann_path, announcement, indent=2)
-    print(f"[VALIDATOR] Announcement written: UID {new_uid} dethroned UID {old_uid}", flush=True)
+    state.save_announcement(announcement)
+    logger.info(f"Announcement written: UID {new_uid} dethroned UID {old_uid}")
 
+
+# ── DQ Migration ──────────────────────────────────────────────────────────
+
+def _migrate_dq_entries(state: ValidatorState, commitments: dict):
+    """Migrate bare-hotkey and stale bare-UID DQ entries to per-commit format."""
+    hotkey_to_block = {
+        com["hotkey"]: com["block"]
+        for com in commitments.values()
+        if "hotkey" in com and "block" in com
+    }
+
+    # Migrate bare hotkey → hotkey:block
+    migrated = 0
+    for key in list(state.dq_reasons.keys()):
+        if key.startswith("flag:") or key.isdigit() or ":" in key:
+            continue
+        if key in hotkey_to_block:
+            new_key = f"{key}:{hotkey_to_block[key]}"
+            state.dq_reasons[new_key] = state.dq_reasons.pop(key)
+            migrated += 1
+    if migrated:
+        logger.info(f"Migrated {migrated} DQ entries to per-commit format")
+
+    # Scrub stale bare-UID entries
+    scrubbed = 0
+    for key in list(state.dq_reasons.keys()):
+        if not key.isdigit():
+            continue
+        uid = int(key)
+        if uid not in commitments:
+            continue
+        com = commitments[uid]
+        hk = com.get("hotkey", "")
+        blk = com.get("block")
+        if blk and f"{hk}:{blk}" in state.dq_reasons:
+            del state.dq_reasons[key]
+            scrubbed += 1
+            continue
+        current_model = com.get("model", "")
+        dq_reason = state.dq_reasons[key]
+        if current_model and current_model not in dq_reason:
+            logger.info(f"Removing stale bare-UID DQ: UID {uid}")
+            del state.dq_reasons[key]
+            scrubbed += 1
+    if scrubbed:
+        logger.info(f"Scrubbed {scrubbed} stale bare-UID DQ entries")
+
+
+# ── Pre-check models ─────────────────────────────────────────────────────
+
+def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
+                        state: ValidatorState, max_params_b: float) -> tuple[dict, set]:
+    """Run architecture/hash/integrity checks on all committed models.
+
+    Returns (valid_models, disqualified_set) where valid_models is
+    {uid: {model, revision, params_b, hotkey, commit_block}}.
+    """
+    valid_models = {}
+    disqualified = set()
+
+    for uid, commit in commitments.items():
+        model_repo = commit["model"]
+        revision = commit.get("revision", "main")
+        hotkey = commit.get("hotkey", uid_to_hotkey.get(uid, ""))
+        this_commit_block = commit.get("block")
+
+        # Check DQ
+        if is_disqualified(uid, hotkey, state.dq_reasons, commit_block=this_commit_block):
+            reason = get_dq_reason(uid, hotkey, state.dq_reasons, commit_block=this_commit_block)
+            logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
+            disqualified.add(uid)
+            continue
+
+        # Already permanently DQ'd
+        if state.scores.get(str(uid), 0) > MAX_KL_THRESHOLD:
+            disqualified.add(uid)
+            continue
+
+        if is_stale(uid, state.failures):
+            logger.debug(f"UID {uid}: stale (too many failures), skipping")
+            disqualified.add(uid)
+            continue
+
+        # Skip expensive HF checks for already-evaluated UIDs with valid scores
+        uid_str = str(uid)
+        if (uid_str in state.evaluated_uids and uid_str in state.scores
+                and state.scores[uid_str] <= MAX_KL_THRESHOLD):
+            valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": None, "hotkey": hotkey}
+            continue
+
+        logger.info(f"Checking {model_repo}...")
+
+        # Flag check
+        hf_user = model_repo.split("/")[0] if "/" in model_repo else None
+        coldkey = uid_to_coldkey.get(uid)
+        flag_reason = is_flagged(coldkey=coldkey, hf_username=hf_user, dq=state.dq_reasons)
+        if flag_reason:
+            logger.warning(f"UID {uid} FLAGGED: {flag_reason}")
+
+        # Architecture check
+        check = check_model_architecture(model_repo, revision, max_params_b)
+        if check.get("transient"):
+            logger.info(f"UID {uid} ({model_repo}): TRANSIENT ERROR — {check['reason']}, will retry next epoch")
+            continue
+        if not check["pass"]:
+            logger.info(f"UID {uid} ({model_repo}): FAIL — {check['reason']}")
+            record_failure(uid, state.failures)
+            disqualify(hotkey, f"arch: {check['reason']}", state.dq_reasons,
+                       coldkey=coldkey, hf_username=hf_user, commit_block=this_commit_block)
+            disqualified.add(uid)
+            continue
+
+        # Duplicate hash check — earlier commitment wins
+        model_hash = compute_model_hash(model_repo, revision)
+        if model_hash:
+            original_uid = check_duplicate_hash(model_hash, uid, state.state_dir)
+            if original_uid is not None:
+                orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
+                this_block = commit.get("block", float("inf"))
+                if this_block >= orig_block:
+                    orig_model = commitments.get(original_uid, {}).get("model", "?")
+                    logger.info(f"UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}")
+                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(hotkey, f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}",
+                               state.dq_reasons, commit_block=this_commit_block)
+                    disqualified.add(uid)
+                    continue
+                else:
+                    logger.info(f"UID {original_uid} is duplicate of UID {uid} (committed earlier)")
+                    state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
+                    orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
+                    orig_commit_block = commitments.get(original_uid, {}).get("block")
+                    disqualify(orig_hotkey, f"copy: identical weights to UID {uid} ({model_repo}), committed later",
+                               state.dq_reasons, commit_block=orig_commit_block)
+                    valid_models.pop(original_uid, None)
+                    disqualified.add(original_uid)
+                    register_model_hash(model_hash, uid, state.state_dir)
+            else:
+                register_model_hash(model_hash, uid, state.state_dir)
+
+        # Integrity check
+        expected_hash = state.model_hashes.get(str(uid))
+        integrity = verify_model_integrity(model_repo, revision, expected_hash)
+        if integrity.get("transient"):
+            logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {integrity['reason']}, will retry")
+            continue
+        if not integrity["pass"]:
+            logger.info(f"UID {uid} DISQUALIFIED: {integrity['reason']}")
+            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+            disqualify(hotkey, f"integrity: {integrity['reason']}", state.dq_reasons,
+                       commit_block=this_commit_block)
+            disqualified.add(uid)
+            continue
+        if integrity["current_hash"]:
+            state.model_hashes[str(uid)] = integrity["current_hash"]
+            state.save_model_hashes()
+
+        valid_models[uid] = {
+            "model": model_repo, "revision": revision,
+            "params_b": check.get("params_b", 0),
+            "commit_block": commit.get("block", float("inf")),
+            "hotkey": hotkey,
+        }
+        logger.info(f"UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓")
+
+    return valid_models, disqualified
+
+
+# ── Challenger Selection ──────────────────────────────────────────────────
+
+def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
+                       epoch_count: int) -> dict:
+    """Select challengers for this round using priority-based selection.
+
+    Priority levels:
+      P1: Brand-new models (never scored)
+      P1b: Scored models untested vs new king (initial eval phase only)
+      P3: Stale re-tests (>STALE_H2H_EPOCHS since last H2H)
+
+    Returns dict of {uid: model_info} for challengers.
+    """
+    challengers = {}
+
+    # Base challengers: unevaluated valid models
+    for uid, info in valid_models.items():
+        uid_str = str(uid)
+        model_name = info["model"]
+        if uid_str in state.evaluated_uids and uid_str in state.scores:
+            continue
+        if model_name in state.permanently_bad_models:
+            state.evaluated_uids.add(uid_str)
+            continue
+        # Check model history — skip known-bad models
+        best_ever = state.model_score_history.get(model_name, {}).get("best_kl")
+        if best_ever is not None and king_kl < float("inf"):
+            skip_threshold = max(king_kl * 2.0, king_kl + 0.05)
+            if best_ever > skip_threshold:
+                state.evaluated_uids.add(uid_str)
+                continue
+        challengers[uid] = info
+
+    if king_uid is None:
+        return challengers
+
+    king_model_name = valid_models.get(king_uid, {}).get("model", "")
+
+    # P1: New models (never scored at all)
+    p1_new = []
+    for uid, info in valid_models.items():
+        if uid == king_uid or uid in challengers:
+            continue
+        if info["model"] in state.permanently_bad_models:
+            continue
+        uid_str = str(uid)
+        if state.scores.get(uid_str) is not None:
+            continue
+        if uid_str in state.evaluated_uids:
+            continue
+        p1_new.append(uid)
+
+    for uid in p1_new:
+        challengers[uid] = valid_models[uid]
+    if p1_new:
+        logger.info(f"🎯 SMART CHALLENGER: {len(p1_new)} new submission(s) — Priority 1: never evaluated")
+
+    # P1b: Initial eval phase — scored models untested vs new king
+    in_initial_eval = state.top4_leaderboard.get("phase") == "initial_eval"
+    if in_initial_eval:
+        FULL_EVAL_KL_CUTOFF = 0.12
+        p1b = []
+        for uid, info in valid_models.items():
+            if uid == king_uid or uid in challengers:
+                continue
+            if info["model"] in state.permanently_bad_models:
+                continue
+            uid_str = str(uid)
+            global_kl = state.scores.get(uid_str)
+            if global_kl is None or global_kl <= 0 or global_kl > FULL_EVAL_KL_CUTOFF:
+                continue
+            h2h_record = state.h2h_tested_against_king.get(uid_str, {})
+            if h2h_record.get("king_uid") == king_uid:
+                continue
+            p1b.append((uid, global_kl))
+        if p1b:
+            p1b.sort(key=lambda x: x[1])
+            for uid, _ in p1b:
+                challengers[uid] = valid_models[uid]
+            logger.info(f"🏆 FULL EVAL: {len(p1b)} scored models added (untested vs new king, KL<=0.12)")
+
+    # P3: Stale re-tests
+    if king_kl > 0 and king_kl < float("inf"):
+        stale_threshold = king_kl * 2.0
+        p3_candidates = []
+        for uid, info in valid_models.items():
+            if uid == king_uid or uid in challengers:
+                continue
+            if info["model"] in state.permanently_bad_models:
+                continue
+            uid_str = str(uid)
+            global_kl = state.scores.get(uid_str)
+            if global_kl is None or global_kl <= 0 or global_kl > stale_threshold:
+                continue
+            h2h_record = state.h2h_tested_against_king.get(uid_str, {})
+            if h2h_record.get("king_uid") != king_uid:
+                continue  # untested — handled by P1
+            epochs_since = epoch_count - h2h_record.get("epoch", 0)
+            if epochs_since > STALE_H2H_EPOCHS:
+                p3_candidates.append((uid, global_kl, epochs_since))
+        if p3_candidates:
+            p3_candidates.sort(key=lambda x: x[1])
+            uid, kl, age = p3_candidates[0]
+            challengers[uid] = valid_models[uid]
+            logger.info(f"🎯 SMART CHALLENGER: UID {uid} — P3: stale re-test ({age} epochs, KL={kl:.6f})")
+
+    return challengers
+
+
+def _add_top5_contenders(challengers, valid_models, state: ValidatorState, king_uid):
+    """Always include top-5 contenders from leaderboard in maintenance mode."""
+    if state.top4_leaderboard.get("phase") != "maintenance" or king_uid is None:
+        return
+    contenders_added = 0
+    for contender in (state.top4_leaderboard.get("contenders") or [])[:TOP_N_ALWAYS_INCLUDE - 1]:
+        c_uid = contender.get("uid")
+        if c_uid is not None and c_uid != king_uid and c_uid in valid_models and c_uid not in challengers:
+            challengers[c_uid] = valid_models[c_uid]
+            contenders_added += 1
+    if contenders_added:
+        logger.info(f"🏆 Added {contenders_added} top-{TOP_N_ALWAYS_INCLUDE} contender(s) to eval")
+
+
+def _cap_challengers(challengers, state: ValidatorState, king_uid):
+    """Hard cap challengers if too many (sanity check)."""
+    phase = state.top4_leaderboard.get("phase", "maintenance")
+    max_cap = 80 if phase == "initial_eval" else 15
+    if len(challengers) <= max_cap:
+        return
+    logger.warning(f"{len(challengers)} challengers exceeds cap of {max_cap} (phase={phase}). Truncating.")
+    king_entry = challengers.pop(king_uid, None)
+    sorted_chall = sorted(challengers.items(), key=lambda x: state.scores.get(str(x[0]), 999))
+    challengers.clear()
+    challengers.update(dict(sorted_chall[:max_cap - (1 if king_entry else 0)]))
+    if king_entry:
+        challengers[king_uid] = king_entry
+
+
+# ── Eval Execution ────────────────────────────────────────────────────────
+
+def _check_models_exist(models_to_eval, uid_to_hotkey, state: ValidatorState, commitments: dict) -> list:
+    """Pre-scoring HF HEAD check — remove deleted models."""
+    removed = []
+    for uid in list(models_to_eval.keys()):
+        mr = models_to_eval[uid]["model"]
+        try:
+            import urllib.request
+            req = urllib.request.Request(f"https://huggingface.co/api/models/{mr}", method="HEAD")
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower():
+                logger.warning(f"UID {uid} ({mr}): deleted from HF — DQ")
+                hk = models_to_eval[uid].get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+                cb = models_to_eval[uid].get("commit_block")
+                disqualify(hk, f"Model {mr} no longer exists on HuggingFace (404)",
+                           state.dq_reasons, commit_block=cb)
+                state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                state.evaluated_uids.add(str(uid))
+                removed.append(uid)
+    for uid in removed:
+        models_to_eval.pop(uid, None)
+    return removed
+
+
+def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int,
+                    prompt_texts: list, state: ValidatorState, max_params_b: float,
+                    is_full_eval: bool, use_vllm: bool, eval_script: str,
+                    eval_script_remote: str):
+    """Execute the GPU eval on the remote pod and return results.
+
+    Handles: prompt upload, eval script upload, progress polling,
+    result download, and timeout management.
+
+    Returns the parsed results dict or None on failure.
+    """
+    import threading
+    import concurrent.futures
+
+    # Sort challengers by commit block (earliest first)
+    ordered_uids = []
+    if king_uid is not None and king_uid in models_to_eval:
+        ordered_uids.append(king_uid)
+    challenger_uids_sorted = sorted(
+        [uid for uid in models_to_eval if uid != king_uid],
+        key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")),
+    )
+    ordered_uids.extend(challenger_uids_sorted)
+
+    # Write eval progress for dashboard
+    now = time.time()
+    est_teacher_s = 90
+    est_per_student_s = 5 * n_prompts
+    est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
+    eval_order = []
+    if king_uid is not None and king_uid in models_to_eval:
+        eval_order.append({"uid": king_uid, "model": models_to_eval[king_uid]["model"], "role": "king"})
+    for uid in challenger_uids_sorted:
+        eval_order.append({"uid": uid, "model": models_to_eval[uid]["model"], "role": "challenger"})
+    progress = {
+        "active": True, "phase": "teacher_loading",
+        "models": {str(uid): info["model"] for uid, info in models_to_eval.items()},
+        "eval_order": eval_order,
+        "students_total": len(models_to_eval), "students_done": 0,
+        "prompts_total": n_prompts, "prompts_done": 0,
+        "king_uid": king_uid,
+        "challenger_uids": [uid for uid in models_to_eval if uid != king_uid],
+        "started_at": now,
+        "estimated_duration_s": est_total_s,
+        "estimated_completion": now + est_total_s,
+    }
+    state.save_progress(progress)
+
+    # Upload prompts
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(prompt_texts, f)
+        f.flush()
+        os.fsync(f.fileno())
+        prompts_file = f.name
+    try:
+        pod.upload(prompts_file, "/home/prompts.json", max_attempts=3)
+    finally:
+        os.unlink(prompts_file)
+
+    # Re-upload eval script
+    pod.upload(eval_script, eval_script_remote, max_attempts=5)
+
+    # Clean stale artifacts; handle resume vs new round
+    try:
+        pod.exec("rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_progress.json")
+        if state.current_round.get("prompts"):
+            logger.info("Resuming round (keeping eval_results.json + teacher_cache.pt on pod)")
+        else:
+            pod.exec("rm -f /home/eval_results.json /home/teacher_cache.pt")
+            logger.info("New round (cleared eval_results.json + teacher_cache.pt)")
+    except Exception:
+        pass
+
+    # Disk cleanup + clear GPU
+    pod.disk_cleanup(TEACHER_MODEL)
+    pod.clear_gpu()
+
+    # Build eval command
+    student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
+    king_flag = ""
+    vllm_flag = " --no-vllm"
+    if use_vllm:
+        vllm_flag = " --vllm-gpu-util 0.45"
+        if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
+            king_flag = f" --king {models_to_eval[king_uid]['model']}"
+
+    eval_cmd = (
+        f"cd /home && python3 -u pod_eval.py "
+        f"--teacher {TEACHER_MODEL} "
+        f"--students {student_list} "
+        f"--prompts prompts.json "
+        f"--output eval_results.json "
+        f"--max-prompt-len {MAX_PROMPT_TOKENS} "
+        f"--max-new-tokens {MAX_NEW_TOKENS} "
+        f"--max-params-b {max_params_b} "
+        f"--teacher-logits /home/teacher_cache.pt "
+        f"--resume"
+        f"{king_flag}"
+        f"{vllm_flag}"
+        f" 2>&1 | tee /home/eval_output.log"
+    )
+
+    # Background progress polling
+    poll_stop = threading.Event()
+    progress_path = state.state_dir / "eval_progress.json"
+    gpu_log_path = state.state_dir / "gpu_eval.log"
+
+    def _poll_pod_progress():
+        """Poll live progress from pod every 15s for dashboard updates."""
+        while not poll_stop.is_set():
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+                    tmp_path = tmp.name
+                pod.download("/home/eval_progress.json", tmp_path)
+                with open(tmp_path) as f:
+                    pod_progress = json.load(f)
+                os.unlink(tmp_path)
+
+                pod_phase = pod_progress.get("phase", "scoring")
+                progress["phase"] = pod_phase
+                progress["pod"] = pod_progress
+
+                if pod_progress.get("current"):
+                    cur = pod_progress["current"]
+                    progress.update({
+                        "current_student": cur.get("student_name"),
+                        "current_prompt": cur.get("prompts_done", 0),
+                        "current_kl": cur.get("kl_running_mean"),
+                        "current_se": cur.get("kl_running_se"),
+                        "current_ci": cur.get("ci_95"),
+                        "current_best": cur.get("best_kl_so_far"),
+                    })
+                else:
+                    for k in ("current_student", "current_prompt", "current_kl"):
+                        progress.pop(k, None)
+
+                if pod_phase in ("teacher_generation", "teacher_logits", "teacher_loading",
+                                 "vllm_starting", "vllm_generating", "gpu_precompute", "loading_student"):
+                    progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
+
+                pod_completed = pod_progress.get("completed", [])
+                progress["completed"] = pod_completed
+                progress["students_done"] = len(pod_completed)
+                state.save_progress(progress)
+            except Exception:
+                pass
+
+            try:
+                log_result = pod.exec("tail -100 /home/eval_output.log 2>/dev/null || echo ''")
+                log_text = log_result.get("stdout", "")
+                if log_text.strip():
+                    gpu_log_path.write_text(sanitize_gpu_log(log_text))
+            except Exception:
+                pass
+
+            poll_stop.wait(15)
+
+    poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
+    poll_thread.start()
+
+    # Execute with timeout
+    n_eval_models = len(models_to_eval)
+    EVAL_TIMEOUT = (n_eval_models * 10 + 30) * 60
+    logger.info(f"Running eval ({n_eval_models} models, {n_prompts} prompts, timeout={EVAL_TIMEOUT // 60}m)")
+    eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(pod.exec, eval_cmd, env=eval_env)
+            try:
+                result = future.result(timeout=EVAL_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Eval timed out after {EVAL_TIMEOUT}s — killing")
+                try:
+                    pod.exec("pkill -9 -f pod_eval.py; echo killed")
+                except Exception:
+                    pass
+                result = {"stdout": "", "stderr": "timeout", "exit_code": -1, "success": False}
+    except Exception as e:
+        logger.error(f"lium.exec EXCEPTION: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    finally:
+        poll_stop.set()
+        poll_thread.join(timeout=5)
+
+    # Print last lines of output
+    stdout = result.get('stdout', '') or ''
+    stderr = result.get('stderr', '') or ''
+    if stdout.strip():
+        for line in stdout.strip().split('\n')[-30:]:
+            logger.info(f"  GPU: {line[:200]}")
+    if stderr.strip():
+        for line in stderr.strip().split('\n')[-10:]:
+            logger.warning(f"  GPU ERR: {line[:200]}")
+
+    # Download results
+    results_local = str(state.state_dir / "last_eval.json")
+    try:
+        pod.download("/home/eval_results.json", results_local)
+    except Exception:
+        logger.error("Failed to download results")
+        if not result.get('success', False):
+            state.save_progress({"active": False})
+            return None
+
+    # Check if results are usable
+    try:
+        with open(results_local) as f:
+            results = json.load(f)
+        n_students = len(results.get("students", {}))
+        if n_students == 0 and not result.get('success', False):
+            logger.error("Eval failed, no usable results")
+            state.save_progress({"active": False})
+            return None
+        if not result.get('success', False):
+            logger.warning(f"Eval failed but recovered {n_students} partial results")
+    except Exception:
+        logger.error("Results file corrupt")
+        state.save_progress({"active": False})
+        return None
+
+    return results
+
+
+# ── Result Processing ─────────────────────────────────────────────────────
+
+def process_results(results, models_to_eval, king_uid, state: ValidatorState,
+                    uid_to_hotkey, commitments, n_prompts, current_block, king_kl,
+                    epoch_count, is_full_eval):
+    """Process eval results: update scores, run paired t-test, crown winner.
+
+    Returns (winner_uid, winner_kl, h2h_results_list).
+    """
+    from scipy import stats as _scipy_stats
+
+    uid_to_model = {uid: m["model"] for uid, m in models_to_eval.items()}
+    model_to_uid = {m: uid for uid, m in uid_to_model.items()}
+
+    king_h2h_kl = None
+    this_round_uids = set()
+
+    # ── Score each model ──
+    for model_name, student_result in results.get("students", {}).items():
+        uid = model_to_uid.get(model_name)
+        if uid is None:
+            continue
+
+        if "error" in student_result:
+            logger.warning(f"UID {uid} ({model_name}): eval error — {student_result['error']}")
+            record_failure(uid, state.failures)
+            continue
+
+        # Functional copy detection
+        if student_result.get("functional_copy"):
+            copy_of = student_result.get("copy_of", "unknown")
+            copy_uid = next((u for u, i in models_to_eval.items() if i["model"] == copy_of), None)
+            reason = f"copy: functional copy of {copy_of}" + (f" (UID {copy_uid})" if copy_uid else "") + " — identical logit distribution"
+            logger.info(f"UID {uid} ({model_name}): FUNCTIONAL COPY — {reason}")
+            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+            hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+            cb = models_to_eval.get(uid, {}).get("commit_block")
+            disqualify(hk, reason, state.dq_reasons, commit_block=cb)
+            state.evaluated_uids.add(str(uid))
+            continue
+
+        # VRAM fraud check
+        if student_result.get("status") == "fraud_vram":
+            reason = student_result.get("reason", "VRAM fraud detected")
+            logger.info(f"UID {uid} ({model_name}): {reason}")
+            hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+            cb = models_to_eval.get(uid, {}).get("commit_block")
+            disqualify(hk, reason, state.dq_reasons, commit_block=cb)
+            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+            state.evaluated_uids.add(str(uid))
+            continue
+
+        speed_flag = student_result.get("speed_flag")
+        if speed_flag:
+            logger.warning(f"UID {uid} ({model_name}): ⚠️ {speed_flag}")
+
+        kl = student_result.get("kl_global_avg", float("inf"))
+
+        # KL=0 means model IS the teacher
+        if kl <= 1e-6:
+            reason = f"FRAUD: KL={kl:.10f} — model produces identical outputs to teacher"
+            logger.info(f"UID {uid} ({model_name}): {reason}")
+            hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+            cb = models_to_eval.get(uid, {}).get("commit_block")
+            disqualify(hk, reason, state.dq_reasons, commit_block=cb)
+            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+            state.evaluated_uids.add(str(uid))
+            continue
+
+        if kl == float("inf") or kl < 0:
+            logger.warning(f"UID {uid}: invalid KL={kl}")
+            record_failure(uid, state.failures)
+            continue
+
+        this_round_uids.add(uid)
+
+        if uid == king_uid:
+            king_h2h_kl = kl
+            state.scores[str(uid)] = kl
+            state.evaluated_uids.add(str(uid))
+            logger.info(f"UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)")
+        else:
+            state.scores[str(uid)] = kl
+            state.evaluated_uids.add(str(uid))
+            reset_failures(uid, state.failures)
+            logger.info(f"UID {uid} ({model_name}): KL={kl:.6f}")
+
+    # ── Paired t-test dethronement ──
+    if king_uid is not None and king_h2h_kl is None:
+        logger.warning(f"King UID {king_uid} did not produce a score — retaining crown by default")
+
+    king_new_kl = king_h2h_kl if king_h2h_kl is not None else state.scores.get(str(king_uid), king_kl) if king_uid else float("inf")
+    epsilon_threshold = king_new_kl * (1.0 - EPSILON) if king_uid else float("inf")
+    epsilon_dethroned_by = None
+
+    king_model_name = uid_to_model.get(king_uid)
+    king_per_prompt = None
+    if king_model_name and king_model_name in results.get("students", {}):
+        king_per_prompt = results["students"][king_model_name].get("kl_per_prompt")
+
+    challengers = {uid: info for uid, info in models_to_eval.items() if uid != king_uid}
+
+    if king_uid is not None and challengers:
+        for uid in challengers:
+            uid_str = str(uid)
+            if uid_str not in state.scores or state.scores[uid_str] <= 0 or state.scores[uid_str] > MAX_KL_THRESHOLD:
+                continue
+            challenger_kl = state.scores[uid_str]
+            challenger_model = uid_to_model.get(uid)
+            challenger_per_prompt = None
+            if challenger_model and challenger_model in results.get("students", {}):
+                challenger_per_prompt = results["students"][challenger_model].get("kl_per_prompt")
+
+            if (king_per_prompt and challenger_per_prompt
+                    and len(king_per_prompt) == len(challenger_per_prompt)
+                    and len(king_per_prompt) >= 20):
+                deltas = [k - c for k, c in zip(king_per_prompt, challenger_per_prompt)]
+                mean_delta = sum(deltas) / len(deltas)
+                t_stat, p_two = _scipy_stats.ttest_1samp(deltas, 0.0)
+                p_value = p_two / 2 if t_stat > 0 else 1.0 - p_two / 2
+                n_test = len(deltas)
+                pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
+
+                if p_value < PAIRED_TEST_ALPHA and mean_delta > 0:
+                    logger.info(f"UID {uid} DETHRONED king UID {king_uid}! "
+                                f"p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), t={t_stat:.3f}, n={n_test}")
+                    if epsilon_dethroned_by is None or challenger_kl < state.scores.get(str(epsilon_dethroned_by), float("inf")):
+                        epsilon_dethroned_by = uid
+                elif mean_delta > 0:
+                    logger.info(f"UID {uid}: better but not significant (p={p_value:.4f}, delta={mean_delta:.6f})")
+                else:
+                    logger.info(f"UID {uid}: worse than king (delta={mean_delta:.6f}, p={p_value:.4f})")
+            else:
+                # Legacy epsilon fallback
+                if challenger_kl < epsilon_threshold:
+                    logger.info(f"UID {uid} DETHRONED king UID {king_uid}! KL={challenger_kl:.6f} < {epsilon_threshold:.6f} [legacy epsilon]")
+                    if epsilon_dethroned_by is None or challenger_kl < state.scores.get(str(epsilon_dethroned_by), float("inf")):
+                        epsilon_dethroned_by = uid
+
+    # ── Determine winner ──
+    h2h_candidates = []
+    all_round_uids = set([king_uid] + list(challengers.keys())) if king_uid is not None else set(challengers.keys())
+    for uid in all_round_uids:
+        uid_str = str(uid)
+        hotkey = uid_to_hotkey.get(uid, "")
+        cb = commitments.get(uid, {}).get("block")
+        if is_disqualified(uid, hotkey, state.dq_reasons, commit_block=cb):
+            continue
+        if uid in this_round_uids and uid_str in state.scores and 0 < state.scores[uid_str] <= MAX_KL_THRESHOLD:
+            h2h_candidates.append((uid, state.scores[uid_str]))
+
+    winner_uid, winner_kl = None, float("inf")
+    if h2h_candidates:
+        h2h_candidates.sort(key=lambda x: x[1])
+        best_uid, best_kl = h2h_candidates[0]
+        if king_uid is not None and best_uid != king_uid and epsilon_dethroned_by is None:
+            winner_uid = king_uid
+            winner_kl = state.scores.get(str(king_uid), king_kl)
+            logger.info(f"King UID {king_uid} retains crown (no challenger passed epsilon)")
+        elif epsilon_dethroned_by is not None:
+            winner_uid = epsilon_dethroned_by
+            winner_kl = state.scores.get(str(epsilon_dethroned_by), best_kl)
+            logger.info(f"UID {winner_uid} is new king (paired t-test p<{PAIRED_TEST_ALPHA})")
+        else:
+            winner_uid, winner_kl = best_uid, best_kl
+
+    # ── Build H2H results for dashboard ──
+    h2h_results = _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl,
+                                     king_per_prompt, uid_to_model)
+
+    # ── Print leaderboard ──
+    logger.info(f"H2H ROUND RESULTS (block {current_block}):")
+    for rank, (uid, kl) in enumerate(h2h_candidates, 1):
+        marker = " ← WINNER" if uid == winner_uid else ""
+        is_king = " (king)" if uid == king_uid else ""
+        logger.info(f"  #{rank}  UID {uid}: KL={kl:.6f}{marker}{is_king}")
+
+    logger.info("GLOBAL LEADERBOARD:")
+    sorted_scores = sorted(state.scores.items(), key=lambda x: x[1])
+    for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
+        uid = int(uid_str)
+        hotkey = uid_to_hotkey.get(uid, "")
+        cb = commitments.get(uid, {}).get("block")
+        dq = " ⛔ DQ" if is_disqualified(uid, hotkey, state.dq_reasons, commit_block=cb) else ""
+        marker = " ← H2H WINNER" if uid == winner_uid else ""
+        in_round = " (in round)" if uid in all_round_uids else ""
+        logger.info(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{in_round}{dq}")
+
+    return winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, this_round_uids
+
+
+def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl,
+                       king_per_prompt, uid_to_model):
+    """Build H2H result entries for dashboard display."""
+    from scipy import stats as _scipy_stats
+
+    h2h_results = []
+    for uid, info in models_to_eval.items():
+        model_name = info["model"]
+        student_data = results.get("students", {}).get(model_name, {})
+        kl = student_data.get("kl_global_avg")
+        if kl is None or "error" in student_data:
+            continue
+        is_king = (uid == king_uid)
+        vs_king = ""
+        t_test_info = None
+        if king_h2h_kl is not None and not is_king and king_h2h_kl > 0:
+            pct = (king_h2h_kl - kl) / king_h2h_kl * 100
+            c_per_prompt = student_data.get("kl_per_prompt")
+            if (king_per_prompt and c_per_prompt
+                    and len(king_per_prompt) == len(c_per_prompt)
+                    and len(king_per_prompt) >= 20):
+                deltas = [k - c for k, c in zip(king_per_prompt, c_per_prompt)]
+                mean_d = sum(deltas) / len(deltas)
+                t_s, p2 = _scipy_stats.ttest_1samp(deltas, 0.0)
+                p_val = p2 / 2 if t_s > 0 else 1.0 - p2 / 2
+                t_test_info = {"p": round(p_val, 6), "t": round(t_s, 3), "n": len(deltas), "mean_delta": round(mean_d, 6)}
+                if p_val < PAIRED_TEST_ALPHA and mean_d > 0:
+                    vs_king = f"-{pct:.3f}% (p={p_val:.4f} DETHRONED)"
+                elif mean_d > 0:
+                    vs_king = f"-{pct:.3f}% (p={p_val:.4f}, not significant)"
+                else:
+                    vs_king = "worse"
+            else:
+                epsilon_threshold_h2h = king_h2h_kl * (1.0 - EPSILON)
+                if kl < epsilon_threshold_h2h:
+                    vs_king = f"-{pct:.3f}% (DETHRONED)"
+                elif kl < king_h2h_kl:
+                    vs_king = f"-{pct:.3f}% (not enough, need >{EPSILON * 100:.0f}%)"
+                else:
+                    vs_king = "worse"
+        entry = {"uid": uid, "model": model_name, "kl": round(kl, 6), "is_king": is_king, "vs_king": vs_king}
+        if t_test_info:
+            entry["t_test"] = t_test_info
+        h2h_results.append(entry)
+    h2h_results.sort(key=lambda x: x["kl"])
+    return h2h_results
+
+
+# ── Post-processing ───────────────────────────────────────────────────────
+
+def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
+                     king_h2h_kl, king_kl, king_per_prompt, current_block,
+                     n_prompts, is_full_eval, uid_to_model, valid_models,
+                     challengers, epoch_count, disqualified):
+    """Update H2H state files: latest, history, tested-against-king."""
+
+    n_challenger_results = sum(1 for r in h2h_results if not r.get("is_king"))
+    if n_challenger_results == 0:
+        logger.info("All challengers failed — skipping H2H round save")
+        return
+
+    king_changed = winner_uid != king_uid if king_uid is not None else False
+    effective_king_uid = winner_uid if winner_uid is not None else king_uid
+    effective_king_kl = king_h2h_kl
+    effective_king_model = uid_to_model.get(effective_king_uid, valid_models.get(effective_king_uid, {}).get("model", ""))
+    if king_changed and winner_uid is not None:
+        for r in h2h_results:
+            if r["uid"] == winner_uid:
+                effective_king_kl = r.get("kl", king_h2h_kl)
+                break
+
+    h2h_round = {
+        "block": current_block, "timestamp": time.time(),
+        "king_uid": effective_king_uid, "king_model": effective_king_model,
+        "prev_king_uid": king_uid,
+        "king_h2h_kl": round(effective_king_kl, 6) if effective_king_kl else None,
+        "king_global_kl": round(king_kl, 6),
+        "epsilon": EPSILON,
+        "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
+        "paired_test_alpha": PAIRED_TEST_ALPHA,
+        "dethrone_method": "paired_t_test" if king_per_prompt else "legacy_epsilon",
+        "n_prompts": n_prompts, "results": h2h_results,
+        "king_changed": king_changed,
+        "new_king_uid": winner_uid if king_changed else None,
+        "type": "full_eval" if is_full_eval else "h2h",
+    }
+
+    state.h2h_latest = h2h_round
+    # Replace preliminary entries
+    state.h2h_history = [h for h in state.h2h_history if not (h.get("block") == current_block and h.get("_preliminary"))]
+    state.h2h_history.append(h2h_round)
+    state.h2h_history = state.h2h_history[-50:]
+    state.save_h2h()
+
+    # Update tested-against-king tracker
+    if king_uid is not None:
+        for uid in challengers:
+            uid_str = str(uid)
+            if uid_str in state.scores and state.scores[uid_str] > 0:
+                state.h2h_tested_against_king[uid_str] = {
+                    "king_uid": king_uid, "epoch": epoch_count,
+                    "block": current_block, "kl": round(state.scores[uid_str], 6),
+                    "model": challengers[uid].get("model", ""), "timestamp": time.time(),
+                }
+        atomic_json_write(state._path("h2h_tested_against_king.json"),
+                          state.h2h_tested_against_king, indent=2)
+
+
+def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
+                          king_kl, disqualified):
+    """Update persistent model score history and permanently bad models."""
+    for uid, info in models_to_eval.items():
+        uid_str = str(uid)
+        model_name = info["model"]
+        if uid_str in state.scores and state.scores[uid_str] > 0:
+            kl = state.scores[uid_str]
+            prev = state.model_score_history.get(model_name, {})
+            if kl <= MAX_KL_THRESHOLD:
+                prev_best = prev.get("best_kl", float("inf"))
+                if kl < prev_best:
+                    state.model_score_history[model_name] = {
+                        **prev, "best_kl": round(kl, 6), "uid": uid,
+                        "block": current_block, "timestamp": time.time(),
+                    }
+            else:
+                prev_worst = prev.get("worst_kl", 0)
+                if kl > prev_worst:
+                    state.model_score_history[model_name] = {
+                        **prev, "worst_kl": round(kl, 6), "uid": uid,
+                        "block": current_block, "timestamp": time.time(),
+                    }
+                if "best_kl" not in state.model_score_history.get(model_name, {}):
+                    state.model_score_history.setdefault(model_name, {})["best_kl"] = round(kl, 6)
+
+    # Permanently bad models
+    if king_kl > 0 and king_kl < float("inf"):
+        perm_bad_threshold = king_kl * 10.0
+        newly_banned = []
+        for uid, info in models_to_eval.items():
+            uid_str = str(uid)
+            if uid_str in state.scores and state.scores[uid_str] > perm_bad_threshold:
+                model_name = info["model"]
+                if model_name not in state.permanently_bad_models:
+                    state.permanently_bad_models.add(model_name)
+                    newly_banned.append(f"{model_name} (UID {uid}, KL={state.scores[uid_str]:.4f})")
+        if newly_banned:
+            logger.info(f"🚫 Added {len(newly_banned)} models to permanently_bad_models")
+
+    state.save_model_tracking()
+
+
+def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl,
+                            h2h_results, uid_to_model, valid_models, current_block,
+                            epoch_count, disqualified):
+    """Update the top-4 leaderboard (initial eval → maintenance transition)."""
+    try:
+        if state.top4_leaderboard.get("phase") == "initial_eval":
+            # Check if all models tested
+            untested_count = 0
+            tested_results = []
+            for uid_str, score in state.scores.items():
+                if score <= 0 or score > MAX_KL_THRESHOLD:
+                    continue
+                if int(uid_str) in disqualified:
+                    continue
+                record = state.h2h_tested_against_king.get(uid_str, {})
+                if record.get("king_uid") == king_uid and record.get("kl"):
+                    tested_results.append((uid_str, record["kl"], record.get("model", "")))
+                else:
+                    untested_count += 1
+
+            if untested_count == 0 and len(tested_results) >= 4:
+                tested_results.sort(key=lambda x: x[1])
+                state.top4_leaderboard["king"] = {
+                    "uid": int(tested_results[0][0]), "model": tested_results[0][2],
+                    "h2h_kl": round(tested_results[0][1], 6), "block": current_block,
+                }
+                state.top4_leaderboard["contenders"] = [
+                    {"uid": int(tested_results[i][0]), "model": tested_results[i][2],
+                     "h2h_kl": round(tested_results[i][1], 6), "block": current_block}
+                    for i in range(1, min(4, len(tested_results)))
+                ]
+                state.top4_leaderboard["phase"] = "maintenance"
+                state.top4_leaderboard["initial_eval_complete"] = True
+                state.top4_leaderboard["completed_at"] = time.time()
+                state.top4_leaderboard["completed_block"] = current_block
+                logger.info(f"👑 TOP-4 INITIAL EVAL COMPLETE")
+            else:
+                logger.info(f"📊 Initial eval: {len(tested_results)} tested, {untested_count} remaining")
+
+        elif state.top4_leaderboard.get("phase") == "maintenance":
+            actual_king = winner_uid if winner_uid is not None else king_uid
+            king_model = uid_to_model.get(actual_king, valid_models.get(actual_king, {}).get("model", "unknown"))
+            king_kl_lb = next((r["kl"] for r in h2h_results if r["uid"] == actual_king), state.scores.get(str(actual_king), 999))
+
+            state.top4_leaderboard["king"] = {
+                "uid": actual_king, "model": king_model,
+                "h2h_kl": round(king_kl_lb, 6) if isinstance(king_kl_lb, float) else king_kl_lb,
+                "block": current_block,
+            }
+            contenders = []
+            for r in h2h_results:
+                if r["uid"] == actual_king:
+                    continue
+                if int(r["uid"]) in disqualified:
+                    continue
+                contenders.append({
+                    "uid": r["uid"], "model": r["model"],
+                    "h2h_kl": round(r["kl"], 6), "block": current_block,
+                })
+                if len(contenders) >= 4:
+                    break
+            state.top4_leaderboard["contenders"] = contenders
+
+        state.save_top4()
+        top4_str = ", ".join(
+            f"#{i+1} UID {e['uid']} (KL={e['h2h_kl']})"
+            for i, e in enumerate([state.top4_leaderboard.get('king', {})] + (state.top4_leaderboard.get('contenders') or []))
+            if e and e.get('uid') is not None
+        )
+        if top4_str:
+            logger.info(f"📊 TOP-4: {top4_str}")
+    except Exception as e:
+        logger.warning(f"Top-4 leaderboard error (non-fatal): {e}")
+
+
+# ── Main Loop ─────────────────────────────────────────────────────────────
 
 @click.command()
 @click.option("--network", default="finney")
@@ -175,2086 +1104,323 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
 @click.option("--tempo", type=int, default=360, help="Seconds between epochs")
 @click.option("--once", is_flag=True, help="Run one epoch and exit (for testing)")
 @click.option("--use-vllm", is_flag=True, default=False, envvar="USE_VLLM",
-              help="Use vLLM-accelerated pod_eval_vllm.py instead of HF pod_eval")
+              help="Use vLLM-accelerated evaluation")
 def main(network, netuid, wallet_name, hotkey_name, wallet_path,
          lium_api_key, lium_pod_name, state_dir, max_params_b, tempo, once, use_vllm):
     """Run the distillation validator with king-of-the-hill evaluation."""
     import bittensor as bt
     from lium import Lium, Config
-    from eval.scoring import (
-        load_scores, save_scores,
-        load_failures, save_failures, record_failure, reset_failures, is_stale,
-        load_disqualified, save_disqualified, disqualify, is_disqualified, is_flagged, get_dq_reason,
-        compute_winner_weights,
-        append_score_history,
-    )
-    from eval.model_checker import (
-        check_model_architecture, verify_model_integrity,
-        compute_model_hash, check_duplicate_hash, register_model_hash,
-    )
-    from eval.dataset import sample_prompts_from_dataset, format_prompt
 
-    state_path = Path(state_dir)
-    state_path.mkdir(parents=True, exist_ok=True)
+    # ── Init state ──
+    state = ValidatorState(state_dir)
+    state.load()
 
     # ── Init chain ──
     wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name, path=wallet_path)
     subtensor = bt.Subtensor(network=network)
 
-    # ── Init Lium ──
+    # ── Init pod ──
     cfg = Config(api_key=lium_api_key, ssh_key_path=Path.home() / ".ssh" / "id_ed25519")
     lium = Lium(config=cfg)
+    pod = PodManager(lium, pod_name=lium_pod_name)
+    pod.connect()
 
-    # Find pod
-    pods = lium.ps()
-    pod = None
-    for p in pods:
-        if lium_pod_name in p.name:
-            pod = p
-            break
-    if not pod:
-        logger.error(f"Lium pod '{lium_pod_name}' not found. Available: {[p.name for p in pods]}")
-        sys.exit(1)
-    logger.info(f"Using Lium pod: {pod.name} ({pod.id[:12]})")
-
-    # ── Load dataset ──
-    print(f"[VALIDATOR] Prompts sampled fresh from full dataset each epoch", flush=True)
-
-    # ── Load state ──
-    scores = load_scores(state_path)
-    failures = load_failures(state_path)
-    dq_reasons = load_disqualified(state_path)
-    epoch_count = 0
-
-    # ── Track which UIDs have been evaluated ──
-    evaluated_file = state_path / "evaluated_uids.json"
-    evaluated_uids = set()
-    if evaluated_file.exists():
-        try:
-            evaluated_uids = set(json.loads(evaluated_file.read_text()))
-        except Exception:
-            pass
-
-    def save_evaluated():
-        atomic_json_write(evaluated_file, list(evaluated_uids))
-
-    def validate_state_consistency(scores, evaluated_uids, uid_to_hotkey, commitments, dq_reasons):
-        """
-        Pre-flight state validation. Catches inconsistencies BEFORE they waste GPU time.
-        Returns (fixed_scores, fixed_evaluated, issues_found).
-
-        Checks:
-        1. Every scored UID must be in evaluated_uids (and vice versa)
-        2. Every scored UID must have a valid commitment on-chain
-        3. No DQ'd UIDs in scores
-        4. No recycled UIDs (hotkey changed since last scoring)
-        5. King must exist in scores and not be DQ'd
-        """
-        issues = []
-        fixed_scores = dict(scores)
-        fixed_evaluated = set(evaluated_uids)
-
-        # Load hotkey map for recycling detection
-        hotkey_map_file = state_path / "uid_hotkey_map.json"
-        prev_hotkey_map = {}
-        if hotkey_map_file.exists():
-            try:
-                prev_hotkey_map = json.loads(hotkey_map_file.read_text())
-            except Exception:
-                pass
-
-        # Check 1: Scored UIDs must be evaluated
-        scored_uids = set(fixed_scores.keys())
-        for uid_str in scored_uids - fixed_evaluated:
-            issues.append(f"UID {uid_str} has score but NOT in evaluated_uids — adding")
-            fixed_evaluated.add(uid_str)
-        for uid_str in fixed_evaluated - scored_uids:
-            # Evaluated but no score is OK (could have failed/DQ'd during eval)
-            pass
-
-        # Check 2: No DQ'd UIDs in scores
-        for uid_str in list(fixed_scores.keys()):
-            uid = int(uid_str)
-            hotkey = uid_to_hotkey.get(uid, uid_to_hotkey.get(uid_str, ""))
-            _cb = commitments.get(uid, {}).get("block")
-            if is_disqualified(uid, hotkey, dq_reasons, commit_block=_cb):
-                issues.append(f"UID {uid_str} is DQ'd but has score {fixed_scores[uid_str]:.6f} — removing")
-                fixed_scores.pop(uid_str)
-
-        # Check 3: Recycled UIDs (hotkey changed)
-        for uid_str in list(fixed_scores.keys()):
-            hotkey = str(uid_to_hotkey.get(int(uid_str), uid_to_hotkey.get(uid_str, "")))
-            prev = prev_hotkey_map.get(uid_str, "")
-            if prev and hotkey and prev != hotkey:
-                issues.append(f"UID {uid_str} hotkey changed ({prev[:8]}→{hotkey[:8]}) — clearing stale score")
-                fixed_scores.pop(uid_str)
-                fixed_evaluated.discard(uid_str)
-
-        # Check 4: Scored UIDs must have a commitment on-chain
-        # commitments is a dict keyed by UID (int)
-        commitment_uids = set()
-        for uid in commitments:
-            commitment_uids.add(str(uid))
-        for uid_str in list(fixed_scores.keys()):
-            if uid_str not in commitment_uids:
-                issues.append(f"UID {uid_str} has score but no on-chain commitment — removing")
-                fixed_scores.pop(uid_str)
-                fixed_evaluated.discard(uid_str)
-
-        # Check 5: Validate h2h_latest king
-        h2h_file = state_path / "h2h_latest.json"
-        if h2h_file.exists():
-            try:
-                h2h = json.loads(h2h_file.read_text())
-                h2h_king = h2h.get("king_uid")
-                new_king = h2h.get("new_king_uid")
-                king_changed = h2h.get("king_changed", False)
-                if new_king is not None and str(new_king) not in fixed_scores:
-                    issues.append(f"h2h_latest.new_king_uid={new_king} has no valid score — stale")
-                if h2h_king is not None and str(h2h_king) not in fixed_scores:
-                    issues.append(f"h2h_latest.king_uid={h2h_king} has no valid score — stale")
-                # If king_changed, king_uid should have been updated to new_king
-                if king_changed and new_king is not None and h2h_king != new_king:
-                    issues.append(f"h2h_latest: king_changed=true but king_uid={h2h_king} != new_king_uid={new_king} — fixing")
-                    h2h["king_uid"] = new_king
-                    atomic_json_write(h2h_file, h2h, indent=2)
-            except Exception:
-                pass
-
-        # Check 6: Remove garbage/sentinel scores (but keep UIDs in evaluated set)
-        import math
-        for uid_str in list(fixed_scores.keys()):
-            kl = fixed_scores[uid_str]
-            if not isinstance(kl, (int, float)) or math.isnan(kl) or math.isinf(kl) or kl < 0:
-                issues.append(f"UID {uid_str} has garbage score {kl} — removing from scores")
-                fixed_scores.pop(uid_str)
-                fixed_evaluated.discard(uid_str)
-            elif kl >= MAX_KL_THRESHOLD:
-                # High-KL models: cap the score as sentinel but DON'T remove from evaluated_uids.
-                # This prevents infinite re-evaluation of models that score terribly.
-                capped = MAX_KL_THRESHOLD + 1
-                issues.append(f"UID {uid_str} has high KL {kl:.4f} >= {MAX_KL_THRESHOLD} — capping to {capped} (stays evaluated)")
-                fixed_scores[uid_str] = capped
-                # Ensure it stays in evaluated set
-                fixed_evaluated.add(uid_str)
-
-        if issues:
-            print(f"[VALIDATOR] ⚠️ STATE VALIDATION found {len(issues)} issues:", flush=True)
-            for issue in issues:
-                print(f"  • {issue}", flush=True)
-        else:
-            print("[VALIDATOR] ✅ State validation passed", flush=True)
-
-        return fixed_scores, fixed_evaluated, issues
-
-    # ── Upload eval script (with retry — SFTP can be flaky on Lium pods) ──
+    # ── Upload eval script ──
     eval_script = "scripts/pod_eval_vllm.py"
-    eval_script_remote = "/home/pod_eval.py"  # same remote name either way
-    print(f"[VALIDATOR] Eval script: {eval_script} (vLLM w/ HF fallback)", flush=True)
-    for _upload_attempt in range(5):
-        try:
-            logger.info(f"Uploading eval script to pod (attempt {_upload_attempt + 1}/5)...")
-            lium.upload(pod, local=eval_script, remote=eval_script_remote)
-            logger.info("Upload successful")
-            break
-        except Exception as e:
-            logger.warning(f"Upload failed: {e}")
-            if _upload_attempt < 4:
-                time.sleep(10 * (_upload_attempt + 1))
-            else:
-                raise RuntimeError(f"Failed to upload eval script after 5 attempts: {e}")
+    eval_script_remote = "/home/pod_eval.py"
+    pod.upload(eval_script, eval_script_remote, max_attempts=5)
 
-    # ── Ensure pod has correct dependencies (transformers + torch) ──
-    try:
-        print("[VALIDATOR] Ensuring pod dependencies...", flush=True)
-        dep_result = lium.exec(pod, command=(
-            "pip install --break-system-packages 'vllm>=0.19' accelerate -q 2>&1 | tail -1 && "
-            "pip install --break-system-packages 'transformers>=5.0' -q 2>&1 | tail -1 && "
-            "python3 -c 'import torch; import transformers; import vllm; "
-            "print(f\"torch={torch.__version__} transformers={transformers.__version__} "
-            "vllm={vllm.__version__} cuda={torch.cuda.is_available()}\")'"
-        ))
-        print(f"[VALIDATOR] Pod deps: {dep_result.get('stdout', '').strip()}", flush=True)
-        # Patch grouped_mm for B200 sm_100 (torch._grouped_mm crashes)
-        lium.exec(pod, command=(
-            'python3 -c "import torch; cap=torch.cuda.get_device_capability(0); '
-            'print(f\"GPU compute capability: {cap}\")" && '
-            'grep -q PATCHED /usr/local/lib/python3.12/dist-packages/transformers/integrations/moe.py 2>/dev/null || '
-            'sed -i \'s/return hasattr(torch.nn.functional, "grouped_mm") or hasattr(torch, "_grouped_mm")/'
-            '# PATCHED: force fallback on sm_100 (B200)\n'
-            '    cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0,0)\n'
-            '    if cap[0] >= 10:\n'
-            '        return hasattr(torch.nn.functional, "grouped_mm")\n'
-            '    return hasattr(torch.nn.functional, "grouped_mm") or hasattr(torch, "_grouped_mm")/\' '
-            '/usr/local/lib/python3.12/dist-packages/transformers/integrations/moe.py'
-        ))
-        print("[VALIDATOR] Applied grouped_mm B200 patch", flush=True)
-    except Exception as e:
-        print(f"[VALIDATOR] Pod dep check failed (non-fatal): {e}", flush=True)
+    # ── Ensure pod deps ──
+    pod.ensure_dependencies(TEACHER_MODEL)
+
+    epoch_count = 0
 
     while True:
         try:
             epoch_start = time.time()
             epoch_count += 1
-            print(f"\n[VALIDATOR] === EPOCH {epoch_count} ===", flush=True)
+            logger.info(f"\n=== EPOCH {epoch_count} ===")
 
-            # ── Stale round detection ──
-            # If a round has been active >30 min, clear it to avoid stale dashboard data.
-            _stale_prog_path = state_path / "eval_progress.json"
-            if _stale_prog_path.exists():
-                try:
-                    _sp = json.loads(_stale_prog_path.read_text())
-                    if _sp.get("active"):
-                        _sp_age = (time.time() - _sp.get("started_at", 0)) / 60 if _sp.get("started_at") else 0
-                        if _sp_age > 30:
-                            _sp_done = len(_sp.get("completed", []))
-                            _sp_total = _sp.get("students_total", 0)
-                            print(f"[VALIDATOR] \u26a0\ufe0f STALE ROUND: active for {_sp_age:.0f}m, "
-                                  f"{_sp_done}/{_sp_total} students done", flush=True)
-                            atomic_json_write(_stale_prog_path, {"active": False, "stale_cleared": True, "stale_age_min": round(_sp_age, 1)})
-                            print("[VALIDATOR] Cleared stale eval progress", flush=True)
-                            _stale_rnd = state_path / "current_round.json"
-                            if _stale_rnd.exists():
-                                _stale_rnd.unlink()
-                                print("[VALIDATOR] Cleared stale current_round.json", flush=True)
-                except Exception as _se:
-                    print(f"[VALIDATOR] Stale check error (non-fatal): {_se}", flush=True)
+            # ── Clear stale eval progress ──
+            if state.eval_progress.get("active"):
+                age_min = (time.time() - state.eval_progress.get("started_at", 0)) / 60
+                if age_min > 30:
+                    logger.warning(f"STALE ROUND: active for {age_min:.0f}m — clearing")
+                    state.save_progress({"active": False, "stale_cleared": True, "stale_age_min": round(age_min, 1)})
+                    state.clear_round()
 
-            # ── Fetch chain state (with retry — Bittensor RPCs can be flaky) ──
-            for _chain_attempt in range(3):
-                try:
-                    print(f"[VALIDATOR] Fetching metagraph...", flush=True)
-                    metagraph = subtensor.metagraph(netuid)
-                    current_block = subtensor.block
-                    # Fetch the REAL on-chain block hash — unpredictable, derived from
-                    # actual chain state. Prevents miners from gaming prompt selection.
-                    try:
-                        current_block_hash = subtensor.substrate.get_block_hash(current_block)
-                        if current_block_hash:
-                            print(f"[VALIDATOR] Block {current_block}, hash={current_block_hash[:18]}...", flush=True)
-                        else:
-                            current_block_hash = None
-                            print(f"[VALIDATOR] Block {current_block}, hash=UNAVAILABLE (will fallback)", flush=True)
-                    except Exception as bh_err:
-                        current_block_hash = None
-                        print(f"[VALIDATOR] Block {current_block}, hash fetch failed: {bh_err}", flush=True)
-                    n_uids = int(metagraph.n)
-                    print(f"[VALIDATOR] n={n_uids}", flush=True)
+            # ── Fetch chain state ──
+            try:
+                metagraph, current_block, current_block_hash = fetch_metagraph(subtensor, netuid)
+                n_uids = int(metagraph.n)
+                revealed = subtensor.get_all_revealed_commitments(netuid)
+                logger.info(f"Block {current_block}, n={n_uids}, {len(revealed)} revealed")
+            except Exception as chain_err:
+                logger.error(f"Chain unreachable: {chain_err}, sleeping 5min")
+                time.sleep(300)
+                continue
 
-                    print(f"[VALIDATOR] Reading commitments...", flush=True)
-                    revealed = subtensor.get_all_revealed_commitments(netuid)
-                    print(f"[VALIDATOR] Got {len(revealed)} revealed entries", flush=True)
-                    break
-                except Exception as chain_err:
-                    print(f"[VALIDATOR] Chain RPC error (attempt {_chain_attempt + 1}/3): {chain_err}", flush=True)
-                    if _chain_attempt < 2:
-                        time.sleep(30)
-                    else:
-                        print("[VALIDATOR] Chain unreachable after 3 attempts, sleeping 5min", flush=True)
-                        time.sleep(300)
-                        continue
-            commitments = {}
-            uid_to_hotkey = {}
-            uid_to_coldkey = {}
-            for uid in range(n_uids):
-                hotkey = str(metagraph.hotkeys[uid])
-                uid_to_hotkey[uid] = hotkey
-                try:
-                    uid_to_coldkey[uid] = str(metagraph.coldkeys[uid])
-                except Exception:
-                    pass
-                if hotkey in revealed and len(revealed[hotkey]) > 0:
-                    block, data = revealed[hotkey][0]  # FIRST commitment — one per hotkey, permanent
-                    try:
-                        parsed = json.loads(data)
-                        if "model" in parsed:
-                            commitments[uid] = {"block": block, "hotkey": hotkey, **parsed}
-                    except Exception:
-                        continue
+            commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments(metagraph, revealed, n_uids)
+            logger.info(f"Found {len(commitments)} miner commitments")
 
-            print(f"[VALIDATOR] Found {len(commitments)} miner commitments", flush=True)
             if not commitments:
-                logger.info(f"No commitments, sleeping {tempo}s")
                 if once:
                     break
                 time.sleep(tempo)
                 continue
 
-            # ── Migrate bare-hotkey DQ entries to hotkey:block format ──
-            # Old DQ entries used bare hotkeys. New format is hotkey:block
-            # so miners can re-register with a new commit and not be permanently banned.
-            _migrated = 0
-            _hotkey_to_block = {com["hotkey"]: com["block"] for com in commitments.values() if "hotkey" in com and "block" in com}
-            for key in list(dq_reasons.keys()):
-                if key.startswith("flag:") or key.isdigit() or ":" in key:
-                    continue  # skip flags, UIDs, already-migrated
-                if key in _hotkey_to_block:
-                    new_key = f"{key}:{_hotkey_to_block[key]}"
-                    dq_reasons[new_key] = dq_reasons.pop(key)
-                    _migrated += 1
-            if _migrated:
-                save_disqualified(dq_reasons, state_path)
-                print(f"[VALIDATOR] Migrated {_migrated} DQ entries to per-commit format", flush=True)
+            # ── DQ migration ──
+            _migrate_dq_entries(state, commitments)
 
-            # ── Scrub stale bare-UID DQ entries ──
-            # When a UID gets a new occupant (different hotkey/commitment),
-            # legacy DQ entries keyed by bare UID must not carry over.
-            _scrubbed = 0
-            for key in list(dq_reasons.keys()):
-                if not key.isdigit():
-                    continue
-                _uid = int(key)
-                if _uid not in commitments:
-                    continue  # no current commitment — keep the entry
-                _com = commitments[_uid]
-                _hk = _com.get("hotkey", "")
-                _blk = _com.get("block")
-                # If there's a per-commit DQ for this hotkey:block, the bare UID is redundant
-                if _blk and f"{_hk}:{_blk}" in dq_reasons:
-                    del dq_reasons[key]
-                    _scrubbed += 1
-                    continue
-                # If the DQ reason references a model that's NOT the current commitment,
-                # it's from an old occupant — remove it
-                _current_model = _com.get("model", "")
-                _dq_reason = dq_reasons[key]
-                if _current_model and _current_model not in _dq_reason:
-                    print(f"[VALIDATOR] Removing stale bare-UID DQ: UID {_uid} (current model: {_current_model}, DQ reason references different model)", flush=True)
-                    del dq_reasons[key]
-                    _scrubbed += 1
-            if _scrubbed:
-                save_disqualified(dq_reasons, state_path)
-                print(f"[VALIDATOR] Scrubbed {_scrubbed} stale bare-UID DQ entries", flush=True)
+            # ── State validation ──
+            issues = state.validate_consistency(uid_to_hotkey, commitments, MAX_KL_THRESHOLD)
+            if issues:
+                state.save()
+                logger.info(f"State auto-repaired ({len(issues)} issues)")
 
-            # ══════════════════════════════════════════════════════════════
-            # STATE VALIDATION: Catch inconsistencies before they waste GPU
-            # ══════════════════════════════════════════════════════════════
-            scores, evaluated_uids, state_issues = validate_state_consistency(
-                scores, evaluated_uids, uid_to_hotkey, commitments, dq_reasons
+            # Update hotkey map
+            state.uid_hotkey_map = {str(k): v for k, v in uid_to_hotkey.items()}
+
+            # ── Phase 1: Pre-check all models ──
+            valid_models, disqualified = precheck_all_models(
+                commitments, uid_to_hotkey, uid_to_coldkey, state, max_params_b
             )
-            if state_issues:
-                save_scores(scores, state_path)
-                save_evaluated()
-                print(f"[VALIDATOR] State auto-repaired ({len(state_issues)} issues fixed)", flush=True)
-
-            # Save current hotkey map for next epoch (stale cleanup handled by validate_state_consistency above)
-            hotkey_map_file = state_path / "uid_hotkey_map.json"
-            atomic_json_write(hotkey_map_file, {str(k): v for k, v in uid_to_hotkey.items()})
-
-            # ══════════════════════════════════════════════════════════════
-            # PHASE 1: Pre-check ALL models (no GPU needed)
-            # ══════════════════════════════════════════════════════════════
-            valid_models = {}  # uid -> {model, revision, params_b}
-            disqualified = set()
-
-            for uid, commit in commitments.items():
-                model_repo = commit["model"]
-                revision = commit.get("revision", "main")
-                hotkey = commit.get("hotkey", uid_to_hotkey.get(uid, ""))
-
-                # Check DQ by hotkey:block (per-commitment DQ)
-                this_commit_block = commit.get("block")
-                if is_disqualified(uid, hotkey, dq_reasons, commit_block=this_commit_block):
-                    reason = get_dq_reason(uid, hotkey, dq_reasons, commit_block=this_commit_block)
-                    print(f"[VALIDATOR] UID {uid} ({model_repo}): DISQUALIFIED — {reason}", flush=True)
-                    disqualified.add(uid)
-                    continue
-
-                # Already permanently disqualified (duplicate hash)
-                if scores.get(str(uid), 0) > MAX_KL_THRESHOLD:
-                    disqualified.add(uid)
-                    continue
-
-                if is_stale(uid, failures):
-                    logger.debug(f"UID {uid}: stale (too many failures), skipping")
-                    disqualified.add(uid)
-                    continue
-
-                # Skip expensive HF checks for already-evaluated UIDs with valid scores.
-                # They'll be rechecked if their model/revision changes (new commitment).
-                uid_str = str(uid)
-                if uid_str in evaluated_uids and uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
-                    valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": None, "hotkey": hotkey}
-                    continue
-
-                print(f"[VALIDATOR] Checking {model_repo}...", flush=True)
-
-                # Check if this miner's coldkey or HF username is flagged
-                hf_user = model_repo.split("/")[0] if "/" in model_repo else None
-                coldkey = uid_to_coldkey.get(uid)
-                flag_reason = is_flagged(coldkey=coldkey, hf_username=hf_user, dq=dq_reasons)
-                if flag_reason:
-                    print(f"[VALIDATOR] ⚠️ UID {uid} FLAGGED: {flag_reason}", flush=True)
-
-                # Architecture check
-                check = check_model_architecture(model_repo, revision, max_params_b)
-                if check.get("transient"):
-                    # Transient error (rate limit, network) — skip this epoch, retry later
-                    print(f"[VALIDATOR] UID {uid} ({model_repo}): TRANSIENT ERROR — {check['reason']}, will retry next epoch", flush=True)
-                    continue
-                if not check["pass"]:
-                    print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
-                    record_failure(uid, failures)
-                    hf_user = model_repo.split("/")[0] if "/" in model_repo else None
-                    coldkey = uid_to_coldkey.get(uid)
-                    disqualify(hotkey, f"arch: {check['reason']}", dq_reasons,
-                               coldkey=coldkey, hf_username=hf_user,
-                               commit_block=this_commit_block)
-                    disqualified.add(uid)
-                    continue
-
-                # Duplicate hash check — earlier commitment wins
-                model_hash = compute_model_hash(model_repo, revision)
-                if model_hash:
-                    original_uid = check_duplicate_hash(model_hash, uid, state_path)
-                    if original_uid is not None:
-                        orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
-                        this_block = commit.get("block", float("inf"))
-                        if this_block >= orig_block:
-                            orig_model = commitments.get(original_uid, {}).get("model", "?")
-                            print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}", flush=True)
-                            scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                            disqualify(hotkey, f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}", dq_reasons,
-                                       commit_block=this_commit_block)
-                            disqualified.add(uid)
-                            continue
-                        else:
-                            print(f"[VALIDATOR] UID {original_uid} is duplicate of UID {uid} (committed earlier)", flush=True)
-                            scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
-                            orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
-                            orig_commit_block = commitments.get(original_uid, {}).get("block")
-                            disqualify(orig_hotkey, f"copy: identical weights to UID {uid} ({model_repo}), committed later", dq_reasons,
-                                       commit_block=orig_commit_block)
-                            valid_models.pop(original_uid, None)
-                            disqualified.add(original_uid)
-                            register_model_hash(model_hash, uid, state_path)
-                    else:
-                        register_model_hash(model_hash, uid, state_path)
-
-                # Integrity check — model still public + unchanged
-                hash_file = state_path / "model_hashes.json"
-                known_hashes = {}
-                if hash_file.exists():
-                    try:
-                        known_hashes = json.loads(hash_file.read_text())
-                    except Exception:
-                        pass
-                expected_hash = known_hashes.get(str(uid))
-                integrity = verify_model_integrity(model_repo, revision, expected_hash)
-                if integrity.get("transient"):
-                    print(f"[VALIDATOR] UID {uid} integrity check: TRANSIENT ERROR — {integrity['reason']}, will retry next epoch", flush=True)
-                    continue
-                if not integrity["pass"]:
-                    print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
-                    scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(hotkey, f"integrity: {integrity['reason']}", dq_reasons,
-                               commit_block=this_commit_block)
-                    disqualified.add(uid)
-                    continue
-                if integrity["current_hash"]:
-                    known_hashes[str(uid)] = integrity["current_hash"]
-                    atomic_json_write(hash_file, known_hashes, indent=2)
-
-                valid_models[uid] = {
-                    "model": model_repo,
-                    "revision": revision,
-                    "params_b": check.get("params_b", 0),
-                    "commit_block": commit.get("block", float("inf")),
-                    "hotkey": hotkey,
-                }
-                print(f"[VALIDATOR] UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓", flush=True)
 
             if not valid_models:
-                print("[VALIDATOR] No valid models after pre-checks", flush=True)
-                save_scores(scores, state_path)
-                save_failures(failures, state_path)
-                save_disqualified(dq_reasons, state_path)
+                logger.info("No valid models after pre-checks")
+                state.save()
                 if once:
                     break
                 time.sleep(tempo)
                 continue
 
-            # ══════════════════════════════════════════════════════════════
-            # PHASE 2: Identify king and challengers
-            # ══════════════════════════════════════════════════════════════
-            # Determine king from h2h_latest (authoritative) — NOT from global
-            # scores, because scores from different prompt sets aren't comparable.
+            # ── Phase 2: Identify king and challengers ──
             king_uid = None
             king_kl = float("inf")
-            h2h_file = state_path / "h2h_latest.json"
-            if h2h_file.exists():
-                try:
-                    h2h_data = json.loads(h2h_file.read_text())
-                    h2h_king = h2h_data.get("king_uid")
-                    if h2h_king is not None and h2h_king in valid_models:
-                        king_uid = h2h_king
-                        king_kl = scores.get(str(h2h_king), float("inf"))
-                        print(f"[VALIDATOR] King from h2h_latest: UID {king_uid} (KL={king_kl:.6f})", flush=True)
-                except Exception:
-                    pass
-            # Fallback: if h2h_latest doesn't exist or king isn't valid, use lowest score
+
+            # King from h2h_latest (authoritative)
+            if state.h2h_latest:
+                h2h_king = state.h2h_latest.get("king_uid")
+                if h2h_king is not None and h2h_king in valid_models:
+                    king_uid = h2h_king
+                    king_kl = state.scores.get(str(h2h_king), float("inf"))
+                    logger.info(f"King from h2h_latest: UID {king_uid} (KL={king_kl:.6f})")
+
+            # Fallback: lowest score
             if king_uid is None:
                 for uid in valid_models:
                     uid_str = str(uid)
-                    if uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
-                        if scores[uid_str] < king_kl:
-                            king_kl = scores[uid_str]
+                    if uid_str in state.scores and state.scores[uid_str] <= MAX_KL_THRESHOLD:
+                        if state.scores[uid_str] < king_kl:
+                            king_kl = state.scores[uid_str]
                             king_uid = uid
                 if king_uid is not None:
-                    print(f"[VALIDATOR] King from scores fallback: UID {king_uid} (KL={king_kl:.6f})", flush=True)
+                    logger.info(f"King from scores fallback: UID {king_uid} (KL={king_kl:.6f})")
 
-            # ── Load persistent model score history ──
-            # Tracks best-ever KL by model repo name (not UID — UIDs recycle).
-            # Models that scored terribly before don't need re-evaluation even
-            # on new prompt sets — they're clearly not competitive.
-            model_history_file = state_path / "model_score_history.json"
-            model_score_history = {}
-            if model_history_file.exists():
-                try:
-                    model_score_history = json.loads(model_history_file.read_text())
-                except Exception:
-                    pass
-
-            # ── Load permanently bad models list (belt-and-suspenders) ──
-            permanently_bad_file = state_path / "permanently_bad_models.json"
-            permanently_bad_models = set()
-            if permanently_bad_file.exists():
-                try:
-                    permanently_bad_models = set(json.loads(permanently_bad_file.read_text()))
-                except Exception:
-                    pass
-
-            # Challengers = valid models that haven't been successfully evaluated yet
-            challengers = {}
-            skipped_known_bad = 0
-            skipped_permanently_bad = 0
-            for uid, info in valid_models.items():
-                uid_str = str(uid)
-                model_name = info["model"]
-                # Already scored in THIS round's scoring context — skip
-                if uid_str in evaluated_uids and uid_str in scores:
-                    continue
-                # Check permanently bad list first (fastest check)
-                if model_name in permanently_bad_models:
-                    skipped_permanently_bad += 1
-                    evaluated_uids.add(uid_str)
-                    continue
-                # Check persistent model history — if this model scored > 2x king's KL
-                # on ANY previous evaluation, don't waste GPU time re-evaluating it.
-                # It's clearly not competitive regardless of prompt set variance.
-                best_ever = model_score_history.get(model_name, {}).get("best_kl")
-                if best_ever is not None and king_kl < float("inf"):
-                    skip_threshold = max(king_kl * 2.0, king_kl + 0.05)  # 2x king or king+0.05, whichever is larger
-                    if best_ever > skip_threshold:
-                        skipped_known_bad += 1
-                        evaluated_uids.add(uid_str)
-                        continue
-                challengers[uid] = info
-
-            if skipped_permanently_bad:
-                print(f"[VALIDATOR] Skipped {skipped_permanently_bad} permanently bad models (>10x king KL historically)", flush=True)
-            if skipped_known_bad:
-                print(f"[VALIDATOR] Skipped {skipped_known_bad} models with historically bad scores (>2x king KL)", flush=True)
-
-            # ── Smart challenger selection ──
-            # Instead of periodic re-challenge (wasteful), use priority-based selection:
-            #   P1: Best untested models (never H2H'd vs CURRENT king)
-            #   P2: New submissions (already in challengers from above)
-            #   P3: Stale re-tests (>50 epochs ago, within 2x king KL)
-            h2h_king_tracker_file = state_path / "h2h_tested_against_king.json"
-            h2h_tested_against_king = {}
-            if h2h_king_tracker_file.exists():
-                try:
-                    h2h_tested_against_king = json.loads(h2h_king_tracker_file.read_text())
-                except Exception:
-                    pass
-
-            if king_uid is not None:
-                king_model_name = valid_models.get(king_uid, {}).get("model", "")
-                smart_challenger_added = 0
-
-                                # Priority 1: Truly new models — never scored at all
-                # Brand-new submissions that need their first eval.
-                p1_new = []
-                for uid, info in valid_models.items():
-                    if uid == king_uid or uid in challengers:
-                        continue
-                    if info["model"] in permanently_bad_models:
-                        continue
-                    uid_str = str(uid)
-                    global_kl = scores.get(uid_str)
-                    if global_kl is not None:  # has a score = not new
-                        continue
-                    if uid_str in evaluated_uids:  # already evaluated, just missing score
-                        continue
-                    p1_new.append((uid, info["model"]))
-
-                # ALL new submissions in every round — no waiting
-                if p1_new:
-                    for p1_uid, p1_model in p1_new:
-                        challengers[p1_uid] = valid_models[p1_uid]
-                        smart_challenger_added += 1
-                    print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: {len(p1_new)} new submission(s) added "
-                          f"— Priority 1: never evaluated", flush=True)
-
-                # Priority 1b: Initial eval phase — all scored models untested vs new king
-                top4_file = state_path / "top4_leaderboard.json"
-                in_initial_eval = True
-                if top4_file.exists():
-                    try:
-                        t4 = json.loads(top4_file.read_text())
-                        in_initial_eval = t4.get("phase") == "initial_eval"
-                    except Exception:
-                        pass
-                if in_initial_eval:
-                    FULL_EVAL_KL_CUTOFF = 0.12
-                    p1b = []
-                    for uid, info in valid_models.items():
-                        if uid == king_uid or uid in challengers:
-                            continue
-                        if info["model"] in permanently_bad_models:
-                            continue
-                        uid_str = str(uid)
-                        global_kl = scores.get(uid_str)
-                        if global_kl is None or global_kl <= 0 or global_kl > FULL_EVAL_KL_CUTOFF:
-                            continue
-                        h2h_record = h2h_tested_against_king.get(uid_str, {})
-                        if h2h_record.get("king_uid") == king_uid:
-                            continue
-                        p1b.append((uid, global_kl, info["model"]))
-                    if p1b:
-                        p1b.sort(key=lambda x: x[1])
-                        for p1b_uid, p1b_kl, p1b_model in p1b:
-                            challengers[p1b_uid] = valid_models[p1b_uid]
-                            smart_challenger_added += 1
-                        print(f"[VALIDATOR] \U0001f3c6 FULL EVAL: {len(p1b)} scored models added "
-                              f"(untested vs new king, KL<=0.12)", flush=True)
-
-                # Priority 3: Stale re-tests — last H2H was >STALE_H2H_EPOCHS ago
-                # AND global score within 2x of king's KL (might have been unlucky)
-                if king_kl > 0 and king_kl < float("inf"):
-                    p3_candidates = []
-                    stale_threshold = king_kl * 2.0
-                    for uid, info in valid_models.items():
-                        if uid == king_uid or uid in challengers:
-                            continue
-                        model_name = info["model"]
-                        if model_name in permanently_bad_models:
-                            continue
-                        uid_str = str(uid)
-                        global_kl = scores.get(uid_str)
-                        if global_kl is None or global_kl <= 0 or global_kl > stale_threshold:
-                            continue
-                        # Must have been tested against current king (P1 handles untested)
-                        h2h_record = h2h_tested_against_king.get(uid_str, {})
-                        if h2h_record.get("king_uid") != king_uid:
-                            continue  # untested — handled by P1
-                        epochs_since = epoch_count - h2h_record.get("epoch", 0)
-                        if epochs_since > STALE_H2H_EPOCHS:
-                            p3_candidates.append((uid, global_kl, model_name, epochs_since))
-
-                    if p3_candidates:
-                        p3_candidates.sort(key=lambda x: x[1])  # best global KL first
-                        p3_uid, p3_kl, p3_model, p3_age = p3_candidates[0]
-                        challengers[p3_uid] = valid_models[p3_uid]
-                        smart_challenger_added += 1
-                        print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: UID {p3_uid} ({p3_model}) selected "
-                              f"— Priority 3: stale re-test ({p3_age} epochs since last H2H, "
-                              f"global KL={p3_kl:.6f})", flush=True)
-
-                if smart_challenger_added:
-                    print(f"[VALIDATOR] Smart selection added {smart_challenger_added} challenger(s) to eval", flush=True)
-
-            # Hard cap: if too many challengers, something is wrong with state.
-            # In maintenance mode, expect: new submissions + top-5 + maybe 1 stale = ~10 max.
-            # In initial_eval mode, allow more (up to 80 for full sweep).
-            top4_phase_check = "maintenance"
-            try:
-                _t4c = json.loads((state_path / "top4_leaderboard.json").read_text())
-                top4_phase_check = _t4c.get("phase", "maintenance")
-            except Exception:
-                pass
-            MAX_REASONABLE_CHALLENGERS = 80 if top4_phase_check == "initial_eval" else 15
-            if len(challengers) > MAX_REASONABLE_CHALLENGERS:
-                print(f"[VALIDATOR] ⛔ {len(challengers)} challengers exceeds cap of {MAX_REASONABLE_CHALLENGERS} "
-                      f"(phase={top4_phase_check}). Truncating to top {MAX_REASONABLE_CHALLENGERS} by global KL.", flush=True)
-                print(f"  evaluated_uids: {len(evaluated_uids)}, scores: {len(scores)}, valid_models: {len(valid_models)}", flush=True)
-                # Keep king in challengers, sort rest by global KL, truncate
-                king_entry = challengers.pop(king_uid, None)
-                sorted_challengers = sorted(challengers.items(), key=lambda x: scores.get(str(x[0]), 999))
-                challengers = dict(sorted_challengers[:MAX_REASONABLE_CHALLENGERS - (1 if king_entry else 0)])
-                if king_entry:
-                    challengers[king_uid] = king_entry
-                print(f"[VALIDATOR] Truncated to {len(challengers)} challengers", flush=True)
-
-            # Track challengers added BEFORE top-5 inclusion
-            # (these are the actual new/stale challengers that justify running an eval)
+            challengers = select_challengers(valid_models, state, king_uid, king_kl, epoch_count)
             challengers_before_top5 = set(challengers.keys())
+            _add_top5_contenders(challengers, valid_models, state, king_uid)
+            _cap_challengers(challengers, state, king_uid)
 
-            # ── Always include top-5 contenders in every round ──
-            # In maintenance mode, the top 4 contenders (from leaderboard) are always
-            # re-evaluated alongside any new challengers.
-            TOP_N_ALWAYS_INCLUDE = 5  # king + 4 contenders
-            top4_file_inc = state_path / "top4_leaderboard.json"
-            if top4_file_inc.exists() and king_uid is not None:
-                try:
-                    t4_inc = json.loads(top4_file_inc.read_text())
-                    if t4_inc.get("phase") == "maintenance":
-                        contenders_added = 0
-                        for contender in (t4_inc.get("contenders") or [])[:TOP_N_ALWAYS_INCLUDE - 1]:
-                            c_uid = contender.get("uid")
-                            if c_uid is not None and c_uid != king_uid and c_uid in valid_models and c_uid not in challengers:
-                                challengers[c_uid] = valid_models[c_uid]
-                                contenders_added += 1
-                        if contenders_added:
-                            print(f"[VALIDATOR] \U0001f3c6 Added {contenders_added} top-{TOP_N_ALWAYS_INCLUDE} contender(s) to eval", flush=True)
-                except Exception as e:
-                    print(f"[VALIDATOR] Warning: failed to load top4 for contender inclusion: {e}", flush=True)
-
-            # Only run eval if there are actual new challengers (not just top-5 re-runs)
             has_new_challengers = len(challengers_before_top5) > 0
             if not challengers or not has_new_challengers:
-                print(f"[VALIDATOR] No new challengers, king UID {king_uid} (KL={king_kl:.6f}) holds", flush=True)
-                # Still set weights periodically to keep tempo — use king directly
+                logger.info(f"No new challengers, king UID {king_uid} (KL={king_kl:.6f}) holds")
                 if king_uid is not None:
                     weights = [0.0] * max(n_uids, king_uid + 1)
                     weights[king_uid] = 1.0
-                    _set_weights(subtensor, wallet, netuid, n_uids, weights, king_uid)
-                save_scores(scores, state_path)
-                save_failures(failures, state_path)
-                save_disqualified(dq_reasons, state_path)
-                elapsed = time.time() - epoch_start
-                print(f"[VALIDATOR] Epoch complete in {elapsed:.0f}s (no eval needed)", flush=True)
-                if once:
-                    break
-                # Poll for new challengers every 60s instead of sleeping full tempo
-                poll_interval = 60
-                print(f"[VALIDATOR] Polling for new challengers every {poll_interval}s...", flush=True)
-                time.sleep(poll_interval)
-                continue
-
-            # ══════════════════════════════════════════════════════════════
-            # PHASE 3: GPU evaluation — king + challengers, same prompts
-            # ══════════════════════════════════════════════════════════════
-            # King is always included so both are scored on identical prompts.
-            # King's weights are permanent so its score is stable — but we need
-            # the head-to-head comparison on the SAME prompt set for a fair test.
-            models_to_eval = {}
-            # During initial full eval: no king privilege — all models are equal
-            # During maintenance: king is always included for fair H2H comparison
-            top4_check2 = state_path / "top4_leaderboard.json"
-            is_full_eval = True
-            if top4_check2.exists():
-                try:
-                    t4 = json.loads(top4_check2.read_text())
-                    is_full_eval = t4.get("phase") == "initial_eval"
-                except Exception:
-                    pass
-            if not is_full_eval and king_uid is not None and king_uid in valid_models:
-                models_to_eval[king_uid] = valid_models[king_uid]
-            for uid, info in challengers.items():
-                models_to_eval[uid] = info
-
-            # During full eval, king is in challengers already (or excluded if KL > cutoff)
-            if is_full_eval:
-                print(f"[VALIDATOR] \U0001f3c6 FULL EVAL MODE: {len(models_to_eval)} models, no king advantage", flush=True)
-
-            # Skip eval if no models to evaluate
-            n_challengers_in_eval = sum(1 for uid in models_to_eval if uid != king_uid)
-            if n_challengers_in_eval == 0:
-                print(f"[VALIDATOR] No challengers in eval batch — skipping (king UID {king_uid} holds)", flush=True)
-                save_scores(scores, state_path)
-                save_failures(failures, state_path)
-                save_disqualified(dq_reasons, state_path)
+                    set_weights(subtensor, wallet, netuid, n_uids, weights, king_uid)
+                state.save()
                 if once:
                     break
                 time.sleep(60)
                 continue
 
-            # Use fewer prompts during full eval (speed), more during maintenance (precision)
-            top4_check = state_path / "top4_leaderboard.json"
-            in_initial = True
-            if top4_check.exists():
-                try:
-                    t4 = json.loads(top4_check.read_text())
-                    in_initial = t4.get("phase") == "initial_eval"
-                except Exception:
-                    pass
-            n_prompts = EVAL_PROMPTS_FULL if in_initial else EVAL_PROMPTS_H2H
-            chall_str = ", ".join(f"UID {u}" for u in challengers)
-            king_str = f"UID {king_uid}" if king_uid else "none"
-            print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
+            # ── Phase 3: GPU evaluation ──
+            models_to_eval = {}
+            is_full_eval = state.top4_leaderboard.get("phase") == "initial_eval"
+            if not is_full_eval and king_uid is not None and king_uid in valid_models:
+                models_to_eval[king_uid] = valid_models[king_uid]
+            for uid, info in challengers.items():
+                models_to_eval[uid] = info
 
-            # ── Pre-scoring model existence check (lightweight HF HEAD request) ──
-            _removed_uids = []
-            for uid in list(models_to_eval.keys()):
-                _mr = models_to_eval[uid]["model"]
-                try:
-                    import urllib.request
-                    _hf_req = urllib.request.Request(f"https://huggingface.co/api/models/{_mr}", method="HEAD")
-                    urllib.request.urlopen(_hf_req, timeout=10)
-                except Exception as _hf_err:
-                    if "404" in str(_hf_err) or "not found" in str(_hf_err).lower():
-                        print(f"[VALIDATOR] \u26a0\ufe0f UID {uid} ({_mr}): deleted from HF — DQ", flush=True)
-                        _hk = models_to_eval[uid].get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                        _cb = models_to_eval[uid].get("commit_block")
-                        disqualify(_hk, f"Model {_mr} no longer exists on HuggingFace (404)", dq_reasons, commit_block=_cb)
-                        scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                        evaluated_uids.add(str(uid))
-                        _removed_uids.append(uid)
-            for _ru in _removed_uids:
-                models_to_eval.pop(_ru, None)
-                challengers.pop(_ru, None)
-            if _removed_uids:
-                print(f"[VALIDATOR] Removed {len(_removed_uids)} deleted models from eval", flush=True)
+            n_challengers_in_eval = sum(1 for uid in models_to_eval if uid != king_uid)
+            if n_challengers_in_eval == 0:
+                logger.info(f"No challengers in eval batch — king UID {king_uid} holds")
+                state.save()
+                if once:
+                    break
+                time.sleep(60)
+                continue
+
+            n_prompts = EVAL_PROMPTS_FULL if is_full_eval else EVAL_PROMPTS_H2H
+            logger.info(f"H2H: king=UID {king_uid} vs {n_challengers_in_eval} challengers ({n_prompts} prompts)")
+
+            # Model existence check
+            removed = _check_models_exist(models_to_eval, uid_to_hotkey, state, commitments)
+            if removed:
+                logger.info(f"Removed {len(removed)} deleted models")
                 if not models_to_eval:
-                    print("[VALIDATOR] No models left after existence check", flush=True)
-                    save_scores(scores, state_path)
-                    save_disqualified(dq_reasons, state_path)
+                    state.save()
                     if once:
                         break
                     time.sleep(60)
                     continue
 
-            # Sort challengers by commit block (earliest first) — used for both
-            # progress display and eval ordering
-            challenger_uids_sorted = sorted(
-                [uid for uid in models_to_eval if uid != king_uid],
-                key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")),
-            )
-
-            # ── Write eval progress (for dashboard live display) ──
-            # Realistic estimates: teacher gen ~90s, each student ~5s/prompt on Blackwell
-            est_teacher_s = 90
-            est_per_student_s = 5 * n_prompts  # ~5s per prompt per student (not 30s)
-            est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
-            progress_path = state_path / "eval_progress.json"
-            now = time.time()
-            eval_order = []
-            if king_uid is not None and king_uid in models_to_eval:
-                eval_order.append({"uid": king_uid, "model": models_to_eval[king_uid]["model"], "role": "king"})
-            for uid in challenger_uids_sorted:
-                eval_order.append({"uid": uid, "model": models_to_eval[uid]["model"], "role": "challenger"})
-            progress = {
-                "active": True,
-                "phase": "teacher_loading",
-                "models": {str(uid): info["model"] for uid, info in models_to_eval.items()},
-                "eval_order": eval_order,
-                "students_total": len(models_to_eval),
-                "students_done": 0,
-                "prompts_total": n_prompts,
-                "prompts_done": 0,
-                "king_uid": king_uid,
-                "challenger_uids": list(challengers.keys()),
-                "started_at": now,
-                "estimated_duration_s": est_total_s,
-                "estimated_completion": now + est_total_s,
-            }
-            atomic_json_write(progress_path, progress)
-
-            # ── Round resumption: reuse prompts from an incomplete round if available ──
-            round_file = state_path / "current_round.json"
+            # Round resumption
             resuming_round = False
-            if round_file.exists():
-                try:
-                    saved_round = json.loads(round_file.read_text())
-                    saved_models = set(saved_round.get("model_names", []))
-                    current_models = set(info["model"] for info in models_to_eval.values())
-                    saved_prompts = saved_round.get("prompts", [])
-                    # Resume if we have prompts AND models overlap significantly.
-                    # Exact match not required — new models can join an existing round.
-                    # pod_eval --resume will score them; already-scored models are skipped.
-                    if saved_prompts and (saved_models & current_models):
-                        prompt_texts = saved_prompts
-                        resuming_round = True
-                        new_models = current_models - saved_models
-                        dropped_models = saved_models - current_models
-                        if new_models:
-                            print(f"[VALIDATOR] RESUMING round + {len(new_models)} new models added", flush=True)
-                        if dropped_models:
-                            print(f"[VALIDATOR] RESUMING round, {len(dropped_models)} models dropped (DQ/stale)", flush=True)
-                        print(f"[VALIDATOR] RESUMING incomplete round ({len(prompt_texts)} prompts, {len(current_models)} models)", flush=True)
-                except Exception as e:
-                    print(f"[VALIDATOR] Could not load saved round: {e}", flush=True)
+            if state.current_round.get("prompts"):
+                saved_models = set(state.current_round.get("model_names", []))
+                current_models = set(info["model"] for info in models_to_eval.values())
+                if saved_models & current_models:
+                    prompt_texts = state.current_round["prompts"]
+                    resuming_round = True
+                    logger.info(f"RESUMING incomplete round ({len(prompt_texts)} prompts)")
 
             if not resuming_round:
-                # New round — sample fresh prompts
-                epoch_prompts = sample_prompts_from_dataset(
-                    n_prompts, current_block, block_hash=current_block_hash
-                )
+                epoch_prompts = sample_prompts_from_dataset(n_prompts, current_block, block_hash=current_block_hash)
                 prompt_texts = [format_prompt(p) for p in epoch_prompts]
 
-            # Save round state so we can resume after crash
-            round_state = {
-                "started_at": time.time(),
-                "block": current_block,
-                "block_hash": current_block_hash,
-                "king_uid": king_uid,
+            # Save round state for crash recovery
+            state.current_round = {
+                "started_at": time.time(), "block": current_block,
+                "block_hash": current_block_hash, "king_uid": king_uid,
                 "model_names": [info["model"] for info in models_to_eval.values()],
                 "prompts": prompt_texts,
             }
-            atomic_json_write(round_file, round_state)
+            state.save_round()
 
-            # Upload prompts
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-                json.dump(prompt_texts, f)
-                f.flush()
-                os.fsync(f.fileno())
-                prompts_file = f.name
-            fsize = os.path.getsize(prompts_file)
-            print(f"[VALIDATOR] Prompts file: {fsize} bytes, {len(prompt_texts)} prompts", flush=True)
-            for _up_att in range(3):
-                try:
-                    lium.upload(pod, local=prompts_file, remote="/home/prompts.json")
+            # Run eval on pod
+            results = run_eval_on_pod(
+                pod, models_to_eval, king_uid, n_prompts, prompt_texts,
+                state, max_params_b, is_full_eval, use_vllm,
+                eval_script, eval_script_remote,
+            )
+            if results is None:
+                if once:
                     break
-                except Exception as e:
-                    print(f"[VALIDATOR ERROR] Prompts upload failed (attempt {_up_att+1}/3): {e}", flush=True)
-                    if _up_att < 2:
-                        time.sleep(5)
-                    else:
-                        raise
-            os.unlink(prompts_file)
+                time.sleep(tempo)
+                continue
 
-            # Re-upload eval script (in case it changed)
-            for _up_att in range(5):
-                try:
-                    lium.upload(pod, local=eval_script, remote=eval_script_remote)
-                    break
-                except Exception as e:
-                    print(f"[VALIDATOR ERROR] Eval script upload failed (attempt {_up_att+1}/5): {e}", flush=True)
-                    if _up_att < 4:
-                        time.sleep(5)
-                    else:
-                        raise RuntimeError(f"Failed to upload eval script after 5 attempts: {e}")
-
-            # NEVER delete teacher_cache.pt or eval_results.json blindly.
-            # pod_eval checks the prompts hash inside teacher_cache.pt and
-            # --resume skips already-scored students. Let pod_eval handle
-            # cache validity — it's the only thing that knows if the hash matches.
+            # ── Persist raw results immediately (crash resilience) ──
+            uid_to_model = {uid: m["model"] for uid, m in models_to_eval.items()}
+            model_to_uid = {m: uid for uid, m in uid_to_model.items()}
             try:
-                lium.exec(pod, command="rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_progress.json")
-                if resuming_round:
-                    print("[VALIDATOR] Resuming round (keeping eval_results.json + teacher_cache.pt on pod)", flush=True)
-                else:
-                    # New round: remove eval_results.json (scores from old prompts are invalid)
-                    # Also remove teacher_cache.pt to free ~45GB disk space.
-                    # pod_eval will regenerate teacher logits for the new prompt set anyway.
-                    lium.exec(pod, command="rm -f /home/eval_results.json /home/teacher_cache.pt")
-                    print("[VALIDATOR] New round (cleared eval_results.json + teacher_cache.pt to free disk)", flush=True)
-            except Exception:
-                pass
-
-            # Pre-eval disk cleanup — ALWAYS clean student caches + stale files
-            # (not just at >80% threshold — disk exhaustion was the #1 crash cause)
-            try:
-                disk_check = lium.exec(pod, command="df --output=pcent / | tail -1 | tr -d ' %'")
-                disk_pct_str = disk_check.get('stdout', disk_check) if isinstance(disk_check, dict) else disk_check
-                disk_pct = int(str(disk_pct_str).strip())
-                print(f"[VALIDATOR] Pre-eval disk: {disk_pct}% used", flush=True)
-
-                # ALWAYS clean non-teacher student model caches (they re-download anyway)
-                clean_cmd = (
-                    "cd /root/.cache/huggingface/hub 2>/dev/null && "
-                    "for d in models--*; do "
-                    "  case \"$d\" in models--Qwen--Qwen3.5-35B-A3B) continue;; esac; "
-                    "  rm -rf \"$d\"; "
-                    "done; "
-                    # Clean stale /tmp files >1GB (failed vLLM downloads, partial models)
-                    "find /tmp -maxdepth 1 -size +1G -mmin +30 -delete 2>/dev/null; "
-                    # Clean stale logit caches from previous blocks
-                    "rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json 2>/dev/null; "
-                    "df -h / | tail -1"
-                )
-                clean_result = lium.exec(pod, command=clean_cmd)
-                clean_info = clean_result.get('stdout', clean_result) if isinstance(clean_result, dict) else clean_result
-                print(f"[VALIDATOR] Pre-eval cleanup done: {str(clean_info).strip()}", flush=True)
-            except Exception as e:
-                print(f"[VALIDATOR] Disk check failed (non-fatal): {e}", flush=True)
-
-            # Kill any background GPU processes to free VRAM for eval
-            try:
-                lium.exec(pod, command="for s in distil train; do tmux kill-session -t $s 2>/dev/null; done; sleep 2; echo 'GPU cleared'")
-                print("[VALIDATOR] Cleared GPU for eval", flush=True)
-            except Exception:
-                pass
-
-            # Run eval — king first, then challengers by commit block (earliest first).
-            # Earlier commits are more established → likely lower KL → sets best_kl_so_far
-            # early for better early-stopping on weaker newcomers.
-            ordered_uids = []
-            if king_uid is not None and king_uid in models_to_eval:
-                ordered_uids.append(king_uid)
-            ordered_uids.extend(challenger_uids_sorted)
-            student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
-
-            # Detect number of GPUs on pod for parallel eval
-            n_gpus = 1
-            try:
-                gpu_check = lium.exec(pod, command="python3 -c 'import torch; print(torch.cuda.device_count())'")
-                n_gpus = int(gpu_check.get("stdout", "1").strip())
-            except Exception:
-                pass
-
-            # Check RAM: parallel Step 2 loads teacher_cache.pt per process
-            # 60GB cache × 2 processes = 120GB RAM needed. Only parallelize if enough RAM.
-            try:
-                ram_check = lium.exec(pod, command="python3 -c \"import os; print(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') // (1024**3))\"")
-                total_ram_gb = int(ram_check.get('stdout', '0').strip())
-            except Exception:
-                total_ram_gb = 0
-            
-            if n_gpus >= 2 and len(ordered_uids) >= 2 and total_ram_gb >= 128:
-                # Parallel eval: teacher on GPU 0, then split students across GPUs
-                print(f"[VALIDATOR] Parallel eval: {n_gpus} GPUs, {len(models_to_eval)} models, {n_prompts} prompts", flush=True)
-
-                # Step 1: Teacher generates logits on GPU 0 and saves cache
-                # Always pass --teacher-logits + --resume so pod_eval reuses
-                # cached teacher logits (if prompts hash matches) and skips
-                # already-scored students.
-                teacher_cmd = (
-                    f"cd /home && python3 pod_eval.py "
-                    f"--teacher {TEACHER_MODEL} "
-                    f"--students {models_to_eval[ordered_uids[0]]['model']} "
-                    f"--prompts prompts.json "
-                    f"--output /home/eval_teacher_only.json "
-                    f"--max-prompt-len {MAX_PROMPT_TOKENS} "
-                    f"--max-new-tokens {MAX_NEW_TOKENS} "
-                    f"--max-params-b {max_params_b} "
-                    f"--teacher-logits /home/teacher_cache.pt "
-                    f"--save-teacher-logits /home/teacher_cache.pt "
-                    f"--no-vllm "
-                    f"--resume"
-                )
-                print(f"[VALIDATOR] Step 1: Teacher inference + first student (all {n_gpus} GPUs, vllm-gpu-util=0.90)...", flush=True)
-                try:
-                    result_teacher = lium.exec(pod, command=teacher_cmd)
-                    print(f"[VALIDATOR] Teacher step exit: {result_teacher.get('exit_code')}", flush=True)
-                except Exception as e:
-                    print(f"[VALIDATOR] Teacher step failed: {e}", flush=True)
-
-                # Step 2: Remaining students split across GPUs using cached teacher logits
-                remaining_uids = ordered_uids[1:]  # first student already done in step 1
-                if remaining_uids:
-                    mid = (len(remaining_uids) + 1) // 2
-                    group_0 = remaining_uids[:mid]
-                    group_1 = remaining_uids[mid:]
-
-                    def _build_student_cmd(uids, gpu_id, output_file):
-                        sl = ",".join(models_to_eval[u]["model"] for u in uids)
-                        return (
-                            f"cd /home && python3 pod_eval.py "
-                            f"--teacher {TEACHER_MODEL} "
-                            f"--students {sl} "
-                            f"--prompts prompts.json "
-                            f"--output {output_file} "
-                            f"--max-prompt-len {MAX_PROMPT_TOKENS} "
-                            f"--max-new-tokens {MAX_NEW_TOKENS} "
-                            f"--max-params-b {max_params_b} "
-                            f"--gpu {gpu_id} "
-                            f"--teacher-logits /home/teacher_cache.pt"
-                        )
-
-                    cmd_gpu0 = _build_student_cmd(group_0, 0, "/home/eval_gpu0.json") if group_0 else None
-                    cmd_gpu1 = _build_student_cmd(group_1, 1, "/home/eval_gpu1.json") if group_1 else None
-
-                    # Run both in parallel using background processes
-                    bg_cmds = []
-                    if cmd_gpu0 and cmd_gpu1:
-                        parallel_cmd = f"({cmd_gpu0}) & ({cmd_gpu1}) & wait"
-                        print(f"[VALIDATOR] Step 2: {len(group_0)} students GPU0 + {len(group_1)} students GPU1 in parallel", flush=True)
-                    elif cmd_gpu0:
-                        parallel_cmd = cmd_gpu0
-                        print(f"[VALIDATOR] Step 2: {len(group_0)} students on GPU0", flush=True)
-                    elif cmd_gpu1:
-                        parallel_cmd = cmd_gpu1
-                        print(f"[VALIDATOR] Step 2: {len(group_1)} students on GPU1", flush=True)
-                    else:
-                        parallel_cmd = None
-
-                    if parallel_cmd:
-                        try:
-                            result_parallel = lium.exec(pod, command=parallel_cmd)
-                            print(f"[VALIDATOR] Parallel step exit: {result_parallel.get('exit_code')}", flush=True)
-                        except Exception as e:
-                            print(f"[VALIDATOR] Parallel step failed: {e}", flush=True)
-
-                # Step 3: Merge all results into eval_results.json
-                merge_cmd = """python3 -c "
-import json, glob, os
-merged = None
-for f in ['/home/eval_teacher_only.json', '/home/eval_gpu0.json', '/home/eval_gpu1.json']:
-    if not os.path.exists(f): continue
-    with open(f) as fh:
-        data = json.load(fh)
-    if merged is None:
-        merged = data
-    else:
-        merged['students'].update(data.get('students', {}))
-if merged:
-    with open('/home/eval_results.json', 'w') as fh:
-        json.dump(merged, fh)
-    print(f'Merged {len(merged[\"students\"])} students')
-else:
-    print('ERROR: No results to merge')
-"
-"""
-                try:
-                    merge_result = lium.exec(pod, command=merge_cmd)
-                    print(f"[VALIDATOR] Merge: {merge_result.get('stdout', '').strip()}", flush=True)
-                except Exception as e:
-                    print(f"[VALIDATOR] Merge failed: {e}", flush=True)
-
-                # Fake result for downstream code — must include all keys accessed later
-                result = {"exit_code": 0, "stdout": "", "stderr": "", "success": True}
-            else:
-                # Single GPU: original sequential eval
-                # --resume + --teacher-logits: if a prior eval crashed mid-round,
-                # reuse teacher logits and skip already-scored students.
-                # Build eval command — use vLLM script if enabled
-                king_flag = ""
-                vllm_flag = ""
-                if use_vllm:
-                    vllm_flag = " --persistent-vllm --vllm-gpu-util 0.45"
-                    if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
-                        king_model_name = models_to_eval[king_uid]["model"]
-                        king_flag = f" --king {king_model_name}"
-                    # Full eval: no --king flag, all models treated equally
-                else:
-                    vllm_flag = " --no-vllm"
-                eval_cmd_core = (
-                    f"cd /home && python3 -u pod_eval.py "
-                    f"--teacher {TEACHER_MODEL} "
-                    f"--students {student_list} "
-                    f"--prompts prompts.json "
-                    f"--output eval_results.json "
-                    f"--max-prompt-len {MAX_PROMPT_TOKENS} "
-                    f"--max-new-tokens {MAX_NEW_TOKENS} "
-                    f"--max-params-b {max_params_b} "
-                    f"--teacher-logits /home/teacher_cache.pt "
-                    # Skip cache save — 45GB .pt fills 230GB pods
-                    f"--resume"
-                    f"{king_flag}"
-                    f"{vllm_flag}"
-                )
-                # Tee output to log file for live streaming to dashboard
-                cmd = f"{eval_cmd_core} 2>&1 | tee /home/eval_output.log"
-                print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
-
-                # Update progress: scoring phase (clear stale data from previous eval)
-                progress["phase"] = "scoring"
-                progress["completed"] = []
-                progress.pop("pod", None)
-                progress.pop("current_student", None)
-                progress.pop("current_prompt", None)
-                progress.pop("current_kl", None)
-                atomic_json_write(progress_path, progress)
-
-                # Background thread: poll live progress from pod every 10s
-                import threading
-                poll_stop = threading.Event()
-                progress_lock = threading.Lock()
-
-                # Log file path for pod output streaming
-                gpu_log_path = state_path / "gpu_eval.log"
-
-                def _poll_pod_progress():
-                    while not poll_stop.is_set():
-                        try:
-                            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-                                tmp_path = tmp.name
-                            lium.download(pod, remote="/home/eval_progress.json", local=tmp_path)
-                            with open(tmp_path) as f:
-                                pod_progress = json.load(f)
-                            os.unlink(tmp_path)
-                            with progress_lock:
-                                progress["pod"] = pod_progress
-                                pod_phase = pod_progress.get("phase", "scoring")
-                                progress["phase"] = pod_phase
-
-                                _student_keys = ("current_student", "current_prompt", "current_kl")
-
-                                # Teacher phases (generation, logit extraction, cache load)
-                                if pod_phase in ("teacher_generation", "teacher_logits",
-                                                 "teacher_loading", "vllm_starting",
-                                                 "vllm_generating", "gpu_precompute",
-                                                 "loading_student"):
-                                    progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
-                                    progress["prompts_total"] = pod_progress.get("prompts_total", n_prompts)
-                                    for k in _student_keys:
-                                        progress.pop(k, None)
-
-                                # Student scoring phase
-                                if pod_progress.get("current"):
-                                    cur = pod_progress["current"]
-                                    progress.update({
-                                        "current_student": cur.get("student_name"),
-                                        "current_prompt": cur.get("prompts_done", 0),
-                                        "current_kl": cur.get("kl_running_mean"),
-                                        "current_se": cur.get("kl_running_se"),
-                                        "current_ci": cur.get("ci_95"),
-                                        "current_best": cur.get("best_kl_so_far"),
-                                    })
-                                elif pod_phase == "scoring":
-                                    for k in _student_keys:
-                                        progress.pop(k, None)
-
-                                # Always update completed count
-                                pod_completed = pod_progress.get("completed", [])
-                                progress["completed"] = pod_completed
-                                progress["students_done"] = len(pod_completed)
-
-                                atomic_json_write(progress_path, progress)
-                        except Exception:
-                            pass
-
-                        # Fetch pod stdout log (last 100 lines) and sanitize before writing
-                        try:
-                            log_result = lium.exec(pod, command="tail -100 /home/eval_output.log 2>/dev/null || echo ''")
-                            log_text = log_result.get("stdout", "")
-                            if log_text.strip():
-                                gpu_log_path.write_text(_sanitize_gpu_log(log_text))
-                        except Exception:
-                            pass
-
-                        # Use longer poll interval (15s) during steady state to reduce
-                        # SFTP connection noise. The progress data is informational only.
-                        poll_stop.wait(15)
-
-                poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
-                poll_thread.start()
-
-                # Dynamic timeout: 10 min per model + 30 min buffer for teacher generation
-                # Per-model timeout (10 min) is enforced inside pod_eval; this is a safety net
-                n_eval_models = len(models_to_eval)
-                EVAL_TIMEOUT = (n_eval_models * 10 + 30) * 60
-                print(f"[VALIDATOR] Eval timeout: {EVAL_TIMEOUT//60}m ({n_eval_models} models × 10m + 30m buffer)", flush=True)
-                eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
-                try:
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        future = pool.submit(lium.exec, pod, command=cmd, env=eval_env)
-                        try:
-                            result = future.result(timeout=EVAL_TIMEOUT)
-                        except concurrent.futures.TimeoutError:
-                            print(f"[VALIDATOR] Eval timed out after {EVAL_TIMEOUT}s — killing pod process and recovering partial results", flush=True)
-                            try:
-                                lium.exec(pod, command="pkill -9 -f pod_eval.py; echo killed")
-                            except Exception:
-                                pass
-                            result = {"stdout": "", "stderr": "timeout", "exit_code": -1, "success": False}
-                    print(f"[VALIDATOR] Pod exit code: {result['exit_code']}", flush=True)
-                except Exception as exec_err:
-                    print(f"[VALIDATOR] lium.exec EXCEPTION: {exec_err}", flush=True)
-                    import traceback
-                    traceback.print_exc()
-                    poll_stop.set()
-                    poll_thread.join(timeout=5)
-                    if once:
-                        break
-                    time.sleep(tempo)
-                    continue
-                finally:
-                    poll_stop.set()
-                    poll_thread.join(timeout=5)
-
-            stdout = result.get('stdout', '') or ''
-            stderr = result.get('stderr', '') or ''
-            if stdout.strip():
-                for line in stdout.strip().split('\n')[-30:]:
-                    print(f"  GPU: {line[:200]}", flush=True)
-            if stderr.strip():
-                for line in stderr.strip().split('\n')[-10:]:
-                    print(f"  GPU ERR: {line[:200]}", flush=True)
-            # ── Download results (try even on failure — partial results may exist) ──
-            results_local = str(state_path / "last_eval.json")
-            download_ok = False
-            for _dl_attempt in range(3):
-                try:
-                    lium.download(pod, remote="/home/eval_results.json", local=results_local)
-                    download_ok = True
-                    break
-                except Exception as e:
-                    logger.warning(f"Download attempt {_dl_attempt+1}/3 failed: {e}")
-                    if _dl_attempt < 2:
-                        time.sleep(5)
-            if not download_ok:
-                logger.error("Failed to download results after 3 attempts")
-                if not result.get('success', False):
-                    print(f"[VALIDATOR] Eval failed and no results to recover, skipping", flush=True)
-                    atomic_json_write(progress_path, {"active": False})
-                    if once:
-                        break
-                    time.sleep(tempo)
-                    continue
-
-            if not result.get('success', False):
-                # Check if partial results are usable
-                try:
-                    with open(results_local) as f:
-                        partial = json.load(f)
-                    n_students = len(partial.get("students", {}))
-                    if n_students > 0:
-                        print(f"[VALIDATOR] Eval failed but recovered {n_students} partial results", flush=True)
-                    else:
-                        print(f"[VALIDATOR] Eval failed, no usable partial results", flush=True)
-                        atomic_json_write(progress_path, {"active": False})
-                        if once:
-                            break
-                        time.sleep(tempo)
+                imm_h2h = []
+                imm_king_kl = None
+                for mn, sr in results.get("students", {}).items():
+                    mu = model_to_uid.get(mn)
+                    if mu is None or "error" in sr:
                         continue
-                except Exception:
-                    print(f"[VALIDATOR] Eval failed, results file corrupt", flush=True)
-                    atomic_json_write(progress_path, {"active": False})
-                    if once:
-                        break
-                    time.sleep(tempo)
-                    continue
-
-            with open(results_local) as f:
-                results = json.load(f)
-
-            # ══════════════════════════════════════════════════════════════
-            # CRASH RESILIENCE: Persist raw results IMMEDIATELY before
-            # post-processing. If announcement/leaderboard logic crashes,
-            # the scored data is already safely on disk.
-            # ══════════════════════════════════════════════════════════════
-            try:
-                with open(results_local, "w") as _f:
-                    json.dump(results, _f, indent=2)
-                print(f"[VALIDATOR] ✅ Results persisted to {results_local}", flush=True)
-
-                _imm_h2h = []
-                _imm_u2m = {uid: m["model"] for uid, m in models_to_eval.items()}
-                _imm_m2u = {m: uid for uid, m in _imm_u2m.items()}
-                _imm_king_kl = None
-                for _mn, _sr in results.get("students", {}).items():
-                    _mu = _imm_m2u.get(_mn)
-                    if _mu is None or "error" in _sr:
+                    mkl = sr.get("kl_global_avg")
+                    if mkl is None:
                         continue
-                    _mkl = _sr.get("kl_global_avg")
-                    if _mkl is None:
-                        continue
-                    _ik = (_mu == king_uid)
-                    if _ik:
-                        _imm_king_kl = _mkl
-                    _imm_h2h.append({"uid": _mu, "model": _mn, "kl": round(_mkl, 6), "is_king": _ik, "vs_king": ""})
-                _imm_h2h.sort(key=lambda x: x["kl"])
-
-                if _imm_h2h:
-                    _imm_round = {
+                    ik = (mu == king_uid)
+                    if ik:
+                        imm_king_kl = mkl
+                    imm_h2h.append({"uid": mu, "model": mn, "kl": round(mkl, 6), "is_king": ik, "vs_king": ""})
+                imm_h2h.sort(key=lambda x: x["kl"])
+                if imm_h2h:
+                    imm_round = {
                         "block": current_block, "timestamp": time.time(),
                         "king_uid": king_uid, "prev_king_uid": king_uid,
-                        "king_h2h_kl": round(_imm_king_kl, 6) if _imm_king_kl else None,
+                        "king_h2h_kl": round(imm_king_kl, 6) if imm_king_kl else None,
                         "king_global_kl": round(king_kl, 6),
-                        "epsilon": EPSILON,
-                        "epsilon_threshold": round(_imm_king_kl * (1.0 - EPSILON), 6) if _imm_king_kl else None,
-                        "n_prompts": n_prompts, "results": _imm_h2h,
+                        "n_prompts": n_prompts, "results": imm_h2h,
                         "king_changed": False, "new_king_uid": None,
                         "type": "full_eval" if is_full_eval else "h2h",
                         "_preliminary": True,
                     }
-                    _hh_path = state_path / "h2h_history.json"
-                    _hh = []
-                    if _hh_path.exists():
-                        try:
-                            with open(_hh_path) as _hf:
-                                _hh = json.load(_hf)
-                        except Exception:
-                            _hh = []
-                    _hh.append(_imm_round)
-                    _hh = _hh[-50:]
-                    with open(_hh_path, "w") as _hf:
-                        json.dump(_hh, _hf, indent=2)
-                    print(f"[VALIDATOR] ✅ Preliminary H2H ({len(_imm_h2h)} results) persisted", flush=True)
-            except Exception as _persist_err:
-                print(f"[VALIDATOR] ⚠️ Failed to persist immediate results: {_persist_err}", flush=True)
+                    state.h2h_history.append(imm_round)
+                    state.h2h_history = state.h2h_history[-50:]
+                    atomic_json_write(state._path("h2h_history.json"), state.h2h_history, indent=2)
+                    logger.info(f"Preliminary H2H ({len(imm_h2h)} results) persisted")
+            except Exception as e:
+                logger.warning(f"Failed to persist immediate results: {e}")
 
-            # ══════════════════════════════════════════════════════════════
-            # PHASE 4: Process results — update scores, crown new king
-            # ══════════════════════════════════════════════════════════════
-            uid_to_model = {uid: m["model"] for uid, m in models_to_eval.items()}
-            model_to_uid = {m: uid for uid, m in uid_to_model.items()}
-
-            king_h2h_kl = None  # King's score on THIS eval's prompts
-            this_round_uids = set()  # UIDs actually scored in THIS round (not persistent)
-
-            for model_name, student_result in results.get("students", {}).items():
-                uid = model_to_uid.get(model_name)
-                if uid is None:
-                    continue
-
-                if "error" in student_result:
-                    logger.warning(f"UID {uid} ({model_name}): eval error — {student_result['error']}")
-                    record_failure(uid, failures)
-                    continue
-
-                # Check for functional copy detected by logit fingerprinting
-                if student_result.get("functional_copy"):
-                    copy_of_model = student_result.get("copy_of", "unknown")
-                    # Find the UID of the model it's a copy of
-                    copy_of_uid = None
-                    for other_uid, other_info in models_to_eval.items():
-                        if other_info["model"] == copy_of_model:
-                            copy_of_uid = other_uid
-                            break
-                    reason = f"copy: functional copy of {copy_of_model}" + (f" (UID {copy_of_uid})" if copy_of_uid else "") + " — identical logit distribution"
-                    print(f"[VALIDATOR] UID {uid} ({model_name}): FUNCTIONAL COPY — {reason}", flush=True)
-                    scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                    _cb = models_to_eval.get(uid, {}).get("commit_block")
-                    disqualify(_hk, reason, dq_reasons, commit_block=_cb)
-                    evaluated_uids.add(str(uid))
-                    continue
-
-                # ANTI-CHEAT: Check for fraud signals from pod_eval
-                fraud_status = student_result.get("status", "")
-                if fraud_status == "fraud_vram":
-                    reason = student_result.get("reason", "VRAM fraud detected")
-                    print(f"[VALIDATOR] UID {uid} ({model_name}): {reason}", flush=True)
-                    _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                    _cb = models_to_eval.get(uid, {}).get("commit_block")
-                    disqualify(_hk, reason, dq_reasons, commit_block=_cb)
-                    scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    evaluated_uids.add(str(uid))
-                    continue
-
-                speed_flag = student_result.get("speed_flag")
-                if speed_flag:
-                    print(f"[VALIDATOR] UID {uid} ({model_name}): ⚠️ {speed_flag}", flush=True)
-
-                kl = student_result.get("kl_global_avg", float("inf"))
-
-                # ANTI-CHEAT: KL=0 or near-zero means the model IS the teacher
-                if kl <= 1e-6:
-                    reason = f"FRAUD: KL={kl:.10f} — model produces identical outputs to teacher (likely teacher weights)"
-                    print(f"[VALIDATOR] UID {uid} ({model_name}): {reason}", flush=True)
-                    _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                    _cb = models_to_eval.get(uid, {}).get("commit_block")
-                    disqualify(_hk, reason, dq_reasons, commit_block=_cb)
-                    scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    evaluated_uids.add(str(uid))
-                    continue
-
-                if kl == float("inf") or kl < 0:
-                    logger.warning(f"UID {uid}: invalid KL={kl}")
-                    record_failure(uid, failures)
-                    continue
-
-                # For challengers, update their global score.
-                # For the king, only use H2H score for epsilon comparison — don't
-                # overwrite their global score. Different prompt sets cause variance,
-                # and overwriting would let old challengers (scored on different prompts)
-                # appear to beat the king unfairly.
-                # Track UIDs scored in THIS round (not the persistent evaluated_uids set)
-                this_round_uids.add(uid)
-
-                if uid == king_uid:
-                    king_h2h_kl = kl  # Store for epsilon comparison
-                    # Update king's global score with H2H score so compute_winner_weights
-                    # sees the real performance, not a stale score from an old prompt set
-                    scores[str(uid)] = kl
-                    evaluated_uids.add(str(uid))
-                    print(f"[VALIDATOR] UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)", flush=True)
-                else:
-                    scores[str(uid)] = kl
-                    evaluated_uids.add(str(uid))
-                    reset_failures(uid, failures)
-                    print(f"[VALIDATOR] UID {uid} ({model_name}): KL={kl:.6f}", flush=True)
-
-            # ── Paired t-test dethronement ──
-            # Instead of fixed epsilon, use per-prompt paired statistical test.
-            # For each prompt i, compute delta_i = king_kl_i - challenger_kl_i.
-            # If the mean delta is significantly > 0 (paired t-test, p < ALPHA),
-            # the challenger is genuinely better → dethrone.
-            # Falls back to legacy epsilon if per-prompt data unavailable.
-            from scipy import stats as _scipy_stats
-
-            if king_uid is not None and king_h2h_kl is None:
-                print(f"[VALIDATOR] ⚠️ King UID {king_uid} did not produce a score this round — retaining crown by default", flush=True)
-            king_new_kl = king_h2h_kl if king_h2h_kl is not None else scores.get(str(king_uid), king_kl) if king_uid else float("inf")
-            epsilon_threshold = king_new_kl * (1.0 - EPSILON) if king_uid else float("inf")
-            epsilon_dethroned_by = None  # Track which challenger dethroned king
-
-            # Extract per-prompt KL arrays from results
-            king_model_name = uid_to_model.get(king_uid)
-            king_per_prompt = None
-            if king_model_name and king_model_name in results.get("students", {}):
-                king_result = results["students"][king_model_name]
-                king_per_prompt = king_result.get("kl_per_prompt")
-
-            if king_uid is not None and challengers:
-                for uid in challengers:
-                    uid_str = str(uid)
-                    if uid_str not in scores or scores[uid_str] <= 0 or scores[uid_str] > MAX_KL_THRESHOLD:
-                        continue
-                    challenger_kl = scores[uid_str]
-                    challenger_model = uid_to_model.get(uid)
-                    challenger_per_prompt = None
-                    if challenger_model and challenger_model in results.get("students", {}):
-                        challenger_per_prompt = results["students"][challenger_model].get("kl_per_prompt")
-
-                    # Paired t-test if both have per-prompt data of same length
-                    if (king_per_prompt and challenger_per_prompt
-                            and len(king_per_prompt) == len(challenger_per_prompt)
-                            and len(king_per_prompt) >= 20):
-                        # delta_i = king_i - challenger_i; positive = challenger is better
-                        deltas = [k - c for k, c in zip(king_per_prompt, challenger_per_prompt)]
-                        mean_delta = sum(deltas) / len(deltas)
-                        # One-sided test: is mean_delta > 0? (challenger better)
-                        t_stat, p_two = _scipy_stats.ttest_1samp(deltas, 0.0)
-                        p_value = p_two / 2 if t_stat > 0 else 1.0 - p_two / 2  # one-sided
-                        n_prompts_test = len(deltas)
-                        pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
-
-                        if p_value < PAIRED_TEST_ALPHA and mean_delta > 0:
-                            print(f"[VALIDATOR] UID {uid} DETHRONED king UID {king_uid}! "
-                                  f"Paired t-test: p={p_value:.6f} < {PAIRED_TEST_ALPHA}, "
-                                  f"mean_delta={mean_delta:.6f} ({pct_better:.2f}% better), "
-                                  f"t={t_stat:.3f}, n={n_prompts_test}", flush=True)
-                            if epsilon_dethroned_by is None or challenger_kl < scores.get(str(epsilon_dethroned_by), float("inf")):
-                                epsilon_dethroned_by = uid
-                        elif mean_delta > 0:
-                            print(f"[VALIDATOR] UID {uid}: better than king but not significant "
-                                  f"(p={p_value:.4f}, need <{PAIRED_TEST_ALPHA}, "
-                                  f"delta={mean_delta:.6f}/{pct_better:.2f}%, t={t_stat:.3f}, n={n_prompts_test})", flush=True)
-                        else:
-                            print(f"[VALIDATOR] UID {uid}: worse than king "
-                                  f"(delta={mean_delta:.6f}, p={p_value:.4f}, t={t_stat:.3f})", flush=True)
-                    else:
-                        # Fallback: legacy epsilon check (no per-prompt data)
-                        if challenger_kl < epsilon_threshold:
-                            print(f"[VALIDATOR] UID {uid} DETHRONED king UID {king_uid}! "
-                                  f"KL={challenger_kl:.6f} < {epsilon_threshold:.6f} "
-                                  f"(king {king_new_kl:.6f} - {EPSILON*100:.0f}%) [legacy epsilon — no per-prompt data]", flush=True)
-                            if epsilon_dethroned_by is None or challenger_kl < scores.get(str(epsilon_dethroned_by), float("inf")):
-                                epsilon_dethroned_by = uid
-                        elif challenger_kl < king_new_kl:
-                            pct = ((king_new_kl - challenger_kl) / king_new_kl * 100) if king_new_kl > 0 else 0
-                            print(f"[VALIDATOR] UID {uid}: better than king but within epsilon "
-                                  f"(KL={challenger_kl:.6f}, needed <{epsilon_threshold:.6f}, only {pct:.1f}% better) [legacy]", flush=True)
-
-            # ── Cumulative dethronement: REMOVED (2026-04-02) ──
-            # Replaced by paired t-test. A genuinely better model now dethrones
-            # in a single round with statistical confidence (p < 0.05).
-
-            # ── Determine winner from H2H round results ONLY ──
-            # DO NOT use compute_winner_weights on global scores — scores from
-            # different prompt sets are not comparable. The H2H winner is whoever
-            # got the lowest KL in THIS round (same prompts for all models).
-            h2h_candidates = []
-            all_round_uids = set([king_uid] + list(challengers.keys())) if king_uid is not None else set(challengers.keys())
-            for uid in all_round_uids:
-                uid_str = str(uid)
-                hotkey = uid_to_hotkey.get(uid, "")
-                _cb = commitments.get(uid, {}).get("block")
-                if is_disqualified(uid, hotkey, dq_reasons, commit_block=_cb):
-                    continue
-                # CRITICAL: Only include UIDs actually scored in THIS round.
-                # evaluated_uids is persistent (all-time) — using it would let stale
-                # scores from old prompt sets contaminate the H2H winner selection.
-                # this_round_uids tracks only models scored in the current eval.
-                if uid in this_round_uids and uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
-                    h2h_candidates.append((uid, scores[uid_str]))
-
-            if h2h_candidates:
-                h2h_candidates.sort(key=lambda x: x[1])
-                best_uid, best_kl = h2h_candidates[0]
-                # Respect epsilon: if best is a challenger but didn't beat king by epsilon,
-                # king retains the crown even if their KL is slightly worse
-                if king_uid is not None and best_uid != king_uid and epsilon_dethroned_by is None:
-                    # No challenger passed epsilon — king wins
-                    winner_uid = king_uid
-                    winner_kl = scores.get(str(king_uid), king_kl)
-                    print(f"[VALIDATOR] King UID {king_uid} retains crown (no challenger passed epsilon)", flush=True)
-                elif epsilon_dethroned_by is not None:
-                    # A challenger passed the paired t-test — they're the winner
-                    winner_uid = epsilon_dethroned_by
-                    # Use the score from THIS round (already in scores dict from evaluated_uids)
-                    winner_kl = scores.get(str(epsilon_dethroned_by), best_kl)
-                    print(f"[VALIDATOR] UID {winner_uid} is new king (paired t-test p<{PAIRED_TEST_ALPHA})", flush=True)
-                else:
-                    winner_uid, winner_kl = best_uid, best_kl
-            else:
-                winner_uid, winner_kl = None, float("inf")
-
-            # Build weights array (winner-take-all)
-            weights = [0.0] * max(n_uids, (winner_uid or 0) + 1)
-            if winner_uid is not None:
-                weights[winner_uid] = 1.0
-
-            # Leaderboard (show H2H round results + full global scores)
-            print(f"\n[VALIDATOR] H2H ROUND RESULTS (block {current_block}):", flush=True)
-            for rank, (uid, kl) in enumerate(h2h_candidates, 1):
-                marker = " ← WINNER" if uid == winner_uid else ""
-                is_king = " (king)" if uid == king_uid else ""
-                print(f"  #{rank}  UID {uid}: KL={kl:.6f}{marker}{is_king}", flush=True)
-
-            print(f"\n[VALIDATOR] GLOBAL LEADERBOARD:", flush=True)
-            sorted_scores = sorted(
-                [(uid_str, kl) for uid_str, kl in scores.items()],
-                key=lambda x: x[1]
+            # ── Phase 4: Process results ──
+            (winner_uid, winner_kl, h2h_results,
+             king_h2h_kl, king_per_prompt, this_round_uids) = process_results(
+                results, models_to_eval, king_uid, state,
+                uid_to_hotkey, commitments, n_prompts, current_block, king_kl,
+                epoch_count, is_full_eval,
             )
-            for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
-                uid = int(uid_str)
-                hotkey = uid_to_hotkey.get(uid, "")
-                _cb = commitments.get(uid, {}).get("block")
-                dq = " ⛔ DQ" if (uid in disqualified or is_disqualified(uid, hotkey, dq_reasons, commit_block=_cb)) else ""
-                marker = " ← H2H WINNER" if uid == winner_uid else ""
-                in_round = " (in round)" if uid in all_round_uids else ""
-                print(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{in_round}{dq}", flush=True)
 
+            # Set weights
             if winner_uid is not None:
-                _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
+                weights = [0.0] * max(n_uids, winner_uid + 1)
+                weights[winner_uid] = 1.0
+                set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
             else:
-                print("[VALIDATOR] No valid miners — skipping weight setting", flush=True)
+                logger.info("No valid miners — skipping weight setting")
 
             # ── Persist state ──
-            save_scores(scores, state_path)
-            save_failures(failures, state_path)
-            save_disqualified(dq_reasons, state_path)
-            save_evaluated()
+            state.save()
 
-            # ── Update persistent model score history ──
-            # Track best-ever KL by model name so we never re-eval known-bad models.
-            model_history_file = state_path / "model_score_history.json"
-            model_score_history = {}
-            if model_history_file.exists():
-                try:
-                    model_score_history = json.loads(model_history_file.read_text())
-                except Exception:
-                    pass
-            for uid, info in models_to_eval.items():
-                uid_str = str(uid)
-                model_name = info["model"]
-                if uid_str in scores and scores[uid_str] > 0:
-                    kl = scores[uid_str]
-                    prev = model_score_history.get(model_name, {})
-                    if kl <= MAX_KL_THRESHOLD:
-                        # Good score: track best_kl as before
-                        prev_best = prev.get("best_kl", float("inf"))
-                        if kl < prev_best:
-                            model_score_history[model_name] = {
-                                **prev,
-                                "best_kl": round(kl, 6),
-                                "uid": uid,
-                                "block": current_block,
-                                "timestamp": time.time(),
-                            }
-                    else:
-                        # Bad score (above threshold): record as worst_kl so
-                        # challenger skip logic knows this model was evaluated
-                        prev_worst = prev.get("worst_kl", 0)
-                        if kl > prev_worst:
-                            model_score_history[model_name] = {
-                                **prev,
-                                "worst_kl": round(kl, 6),
-                                "uid": uid,
-                                "block": current_block,
-                                "timestamp": time.time(),
-                            }
-                        # Ensure best_kl exists for skip logic (use worst as floor)
-                        if "best_kl" not in model_score_history.get(model_name, {}):
-                            model_score_history.setdefault(model_name, {})["best_kl"] = round(kl, 6)
-            atomic_json_write(model_history_file, model_score_history, indent=2)
+            # ── Update H2H state ──
+            update_h2h_state(
+                state, h2h_results, king_uid, winner_uid, king_h2h_kl, king_kl,
+                king_per_prompt, current_block, n_prompts, is_full_eval,
+                uid_to_model, valid_models, challengers, epoch_count, disqualified,
+            )
 
-            # ── Update permanently bad models list ──
-            # Models scoring >10x king's KL are clearly broken/adversarial.
-            if king_kl > 0 and king_kl < float("inf"):
-                perm_bad_threshold = king_kl * 10.0
-                newly_banned = []
-                for uid, info in models_to_eval.items():
-                    uid_str = str(uid)
-                    if uid_str in scores and scores[uid_str] > perm_bad_threshold:
-                        model_name = info["model"]
-                        if model_name not in permanently_bad_models:
-                            permanently_bad_models.add(model_name)
-                            newly_banned.append(f"{model_name} (UID {uid}, KL={scores[uid_str]:.4f})")
-                if newly_banned:
-                    print(f"[VALIDATOR] 🚫 Added {len(newly_banned)} models to permanently_bad_models:", flush=True)
-                    for m in newly_banned:
-                        print(f"  • {m}", flush=True)
-                    atomic_json_write(permanently_bad_file, sorted(permanently_bad_models), indent=2)
+            # ── Update model tracking ──
+            update_model_tracking(state, models_to_eval, current_block, king_kl, disqualified)
 
-            # ── Append score history (non-DQ scores only) ──
+            # ── Score history ──
             valid_scores = {
-                uid_str: kl for uid_str, kl in scores.items()
-                if uid_str not in dq_reasons and 0 < kl <= MAX_KL_THRESHOLD
+                uid_str: kl for uid_str, kl in state.scores.items()
+                if uid_str not in state.dq_reasons and 0 < kl <= MAX_KL_THRESHOLD
             }
             if valid_scores:
                 append_score_history(
-                    block=current_block,
-                    timestamp=time.time(),
-                    scores=valid_scores,
-                    king_uid=winner_uid,
-                    state_dir=state_path,
+                    block=current_block, timestamp=time.time(),
+                    scores=valid_scores, king_uid=winner_uid, state_dir=state.state_dir,
                 )
 
-            # ── Save H2H round details for dashboard transparency ──
-            h2h_results = []
-            for uid, info in models_to_eval.items():
-                model_name = info["model"]
-                student_data = results.get("students", {}).get(model_name, {})
-                kl = student_data.get("kl_global_avg")
-                if kl is None or "error" in student_data:
-                    continue
-                is_king = (uid == king_uid)
-                vs_king = ""
-                t_test_info = None
-                if king_h2h_kl is not None and not is_king and king_h2h_kl > 0:
-                    pct = (king_h2h_kl - kl) / king_h2h_kl * 100
-                    # Compute paired t-test if per-prompt data available
-                    c_per_prompt = student_data.get("kl_per_prompt")
-                    if (king_per_prompt and c_per_prompt
-                            and len(king_per_prompt) == len(c_per_prompt)
-                            and len(king_per_prompt) >= 20):
-                        deltas = [k - c for k, c in zip(king_per_prompt, c_per_prompt)]
-                        mean_d = sum(deltas) / len(deltas)
-                        t_s, p2 = _scipy_stats.ttest_1samp(deltas, 0.0)
-                        p_val = p2 / 2 if t_s > 0 else 1.0 - p2 / 2
-                        t_test_info = {"p": round(p_val, 6), "t": round(t_s, 3), "n": len(deltas), "mean_delta": round(mean_d, 6)}
-                        if p_val < PAIRED_TEST_ALPHA and mean_d > 0:
-                            vs_king = f"-{pct:.3f}% (p={p_val:.4f} DETHRONED)"
-                        elif mean_d > 0:
-                            vs_king = f"-{pct:.3f}% (p={p_val:.4f}, not significant)"
-                        else:
-                            vs_king = "worse"
-                    else:
-                        # Legacy fallback
-                        epsilon_threshold_h2h = king_h2h_kl * (1.0 - EPSILON)
-                        if kl < epsilon_threshold_h2h:
-                            vs_king = f"-{pct:.3f}% (DETHRONED)"
-                        elif kl < king_h2h_kl:
-                            vs_king = f"-{pct:.3f}% (not enough, need >{EPSILON*100:.0f}%)"
-                        else:
-                            vs_king = "worse"
-                entry = {
-                    "uid": uid,
-                    "model": model_name,
-                    "kl": round(kl, 6),
-                    "is_king": is_king,
-                    "vs_king": vs_king,
-                }
-                if t_test_info:
-                    entry["t_test"] = t_test_info
-                h2h_results.append(entry)
-            h2h_results.sort(key=lambda x: x["kl"])
+            # ── Update top-4 leaderboard ──
+            update_top4_leaderboard(
+                state, winner_uid, king_uid, king_kl, h2h_results,
+                uid_to_model, valid_models, current_block, epoch_count, disqualified,
+            )
 
-            # Don't save king-only rounds — they clutter the dashboard and mean
-            # all challengers failed during eval (errors, timeouts, etc.)
-            n_challenger_results = sum(1 for r in h2h_results if not r.get("is_king"))
-            if n_challenger_results == 0:
-                print(f"[VALIDATOR] All challengers failed — skipping H2H round save (king-only)", flush=True)
+            # ── Round complete ──
+            state.clear_round()
+            state.save_progress({"active": False})
 
-            if n_challenger_results > 0:
-                king_changed = winner_uid != king_uid if king_uid is not None else False
-                # If king changed, use winner's H2H KL for the new king_h2h_kl
-                effective_king_uid = winner_uid if winner_uid is not None else king_uid
-                effective_king_kl = king_h2h_kl  # default to old king's H2H KL
-                effective_king_model = uid_to_model.get(effective_king_uid, valid_models.get(effective_king_uid, {}).get("model", ""))
-                if king_changed and winner_uid is not None:
-                    # Find winner's KL from H2H results
-                    for r in h2h_results:
-                        if r["uid"] == winner_uid:
-                            effective_king_kl = r.get("kl", king_h2h_kl)
-                            break
-                h2h_round = {
-                    "block": current_block,
-                    "timestamp": time.time(),
-                    # king_uid = the winner (for next round to pick up correctly)
-                    "king_uid": effective_king_uid,
-                    "king_model": effective_king_model,
-                    "prev_king_uid": king_uid,
-                    "king_h2h_kl": round(effective_king_kl, 6) if effective_king_kl else None,
-                    "king_global_kl": round(king_kl, 6),
-                    "epsilon": EPSILON,
-                    "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
-                    "paired_test_alpha": PAIRED_TEST_ALPHA,
-                    "dethrone_method": "paired_t_test" if king_per_prompt else "legacy_epsilon",
-                    "n_prompts": n_prompts,
-                    "results": h2h_results,
-                    "king_changed": king_changed,
-                    "new_king_uid": winner_uid if king_changed else None,
-                    "type": "full_eval" if is_full_eval else "h2h",
-                }
-                # Save latest round + replace preliminary entry in history
-                h2h_path = state_path / "h2h_latest.json"
-                atomic_json_write(h2h_path, h2h_round, indent=2)
-                h2h_history_path = state_path / "h2h_history.json"
-                history = []
-                if h2h_history_path.exists():
-                    try:
-                        with open(h2h_history_path) as f:
-                            history = json.load(f)
-                    except Exception:
-                        history = []
-                # Replace preliminary entry for this block
-                history = [h for h in history if not (h.get("block") == current_block and h.get("_preliminary"))]
-                history.append(h2h_round)
-                # Keep last 50 rounds
-                history = history[-50:]
-                atomic_json_write(h2h_history_path, history, indent=2)
+            # ── Pod cleanup ──
+            pod.post_eval_cleanup(TEACHER_MODEL)
+            pod.resume_background_tasks()
 
-            # ── Update h2h_tested_against_king tracker ──
-            # Record that each challenger in this round was H2H tested against the current king.
-            if king_uid is not None and challengers:
-                h2h_king_tracker_file = state_path / "h2h_tested_against_king.json"
-                h2h_tested_against_king = {}
-                if h2h_king_tracker_file.exists():
-                    try:
-                        h2h_tested_against_king = json.loads(h2h_king_tracker_file.read_text())
-                    except Exception:
-                        pass
-                for uid in challengers:
-                    uid_str = str(uid)
-                    if uid_str in scores and scores[uid_str] > 0:
-                        h2h_tested_against_king[uid_str] = {
-                            "king_uid": king_uid,
-                            "epoch": epoch_count,
-                            "block": current_block,
-                            "kl": round(scores[uid_str], 6),
-                            "model": challengers[uid].get("model", ""),
-                            "timestamp": time.time(),
-                        }
-                atomic_json_write(h2h_king_tracker_file, h2h_tested_against_king, indent=2)
-                print(f"[VALIDATOR] Updated h2h_tested_against_king: {len(challengers)} challengers tracked vs king UID {king_uid}", flush=True)
-
-            # ── Top-4 Leaderboard Management ──
-            # Phase 1 (initial_eval): smart challenger works through all models.
-            #   When all are tested, pick top 4 by H2H KL → switch to maintenance.
-            # Phase 2 (maintenance): new models must beat king by epsilon.
-            #   If they beat king → new king, old king → #2, #4 drops.
-            #   If they beat a contender → replace that contender.
-            try:
-                top4_file = state_path / "top4_leaderboard.json"
-                top4 = {"king": None, "contenders": [], "phase": "initial_eval", "initial_eval_complete": False}
-                if top4_file.exists():
-                    try:
-                        top4 = json.loads(top4_file.read_text())
-                    except Exception:
-                        pass
-
-                if top4.get("phase") == "initial_eval":
-                    # Check if all models have been H2H tested
-                    h2h_tracker = {}
-                    tracker_file = state_path / "h2h_tested_against_king.json"
-                    if tracker_file.exists():
-                        try:
-                            h2h_tracker = json.loads(tracker_file.read_text())
-                        except Exception:
-                            pass
-                    
-                    # Count untested models (with valid scores, not DQ'd, not permanently bad)
-                    untested_count = 0
-                    tested_results = []  # (uid, kl, model)
-                    for uid_str, score in scores.items():
-                        if score <= 0 or score > MAX_KL_THRESHOLD:
-                            continue
-                        if int(uid_str) in disqualified:
-                            continue
-                        record = h2h_tracker.get(uid_str, {})
-                        if record.get("king_uid") == king_uid and record.get("kl"):
-                            tested_results.append((uid_str, record["kl"], record.get("model", "")))
-                        else:
-                            untested_count += 1
-
-                    if untested_count == 0 and len(tested_results) >= 4:
-                        # All models tested! Build the top-4 leaderboard
-                        tested_results.sort(key=lambda x: x[1])  # best KL first
-                        top4["king"] = {
-                            "uid": int(tested_results[0][0]),
-                            "model": tested_results[0][2],
-                            "h2h_kl": round(tested_results[0][1], 6),
-                            "block": current_block,
-                        }
-                        top4["contenders"] = [
-                            {
-                                "uid": int(tested_results[i][0]),
-                                "model": tested_results[i][2],
-                                "h2h_kl": round(tested_results[i][1], 6),
-                                "block": current_block,
-                            }
-                            for i in range(1, min(4, len(tested_results)))
-                        ]
-                        top4["phase"] = "maintenance"
-                        top4["initial_eval_complete"] = True
-                        top4["completed_at"] = time.time()
-                        top4["completed_block"] = current_block
-
-                        # Actually set the new king
-                        new_king_uid = top4["king"]["uid"]
-                        if new_king_uid != king_uid:
-                            print(f"[VALIDATOR] 👑 TOP-4 INITIAL EVAL COMPLETE — NEW KING: UID {new_king_uid} (KL={top4['king']['h2h_kl']})", flush=True)
-                        else:
-                            print(f"[VALIDATOR] 👑 TOP-4 INITIAL EVAL COMPLETE — King UID {king_uid} confirmed", flush=True)
-
-                        top4_str = ", ".join(
-                            f"#{i+1} UID {e['uid']} (KL={e['h2h_kl']})"
-                            for i, e in enumerate([top4['king']] + top4['contenders'])
-                        )
-                        print(f"[VALIDATOR] 👑 TOP-4 LEADERBOARD: {top4_str}", flush=True)
-                    else:
-                        print(f"[VALIDATOR] 📊 Initial eval progress: {len(tested_results)} tested, {untested_count} remaining", flush=True)
-
-                elif top4.get("phase") == "maintenance":
-                    # Maintenance mode: top-5 = best 5 scores from the PREVIOUS h2h round.
-                    # All models in a single round are scored on the same prompts, so
-                    # their KLs are directly comparable. Mixing scores across rounds
-                    # (different prompt sets) is invalid.
-                    actual_king = winner_uid if winner_uid is not None else king_uid
-                    actual_king_str = str(actual_king)
-
-                    # Get this round's h2h results (already sorted by KL)
-                    this_round_results = []  # (uid, kl, model)
-                    for r in h2h_results:
-                        r_uid = r.get("uid")
-                        r_kl = r.get("kl")
-                        if r_uid is not None and r_kl is not None and 0 < r_kl <= MAX_KL_THRESHOLD:
-                            if int(r_uid) not in disqualified:
-                                this_round_results.append((
-                                    int(r_uid),
-                                    r_kl,
-                                    r.get("model", ""),
-                                ))
-
-                    # King is always the actual winner
-                    king_model_name = uid_to_model.get(actual_king, valid_models.get(actual_king, {}).get("model", "unknown"))
-                    king_kl_lb = next((kl for uid, kl, _ in this_round_results if uid == actual_king), scores.get(actual_king_str, 999))
-                    top4["king"] = {
-                        "uid": actual_king,
-                        "model": king_model_name,
-                        "h2h_kl": round(king_kl_lb, 6) if isinstance(king_kl_lb, float) else king_kl_lb,
-                        "block": current_block,
-                    }
-
-                    # Contenders are the next 4 best from this round (excluding king)
-                    contenders = []
-                    for uid, kl, model in this_round_results:
-                        if uid == actual_king:
-                            continue
-                        contenders.append({
-                            "uid": uid,
-                            "model": model,
-                            "h2h_kl": round(kl, 6),
-                            "block": current_block,
-                        })
-                        if len(contenders) >= 4:
-                            break
-                    top4["contenders"] = contenders
-
-                    top4_str = ", ".join(
-                        f"#{i+1} UID {e['uid']} (KL={e['h2h_kl']})"
-                        for i, e in enumerate([top4['king']] + top4['contenders'])
-                    )
-                    print(f"[VALIDATOR] 📊 TOP-4 LEADERBOARD: {top4_str}", flush=True)
-
-                atomic_json_write(top4_file, top4, indent=2)
-            except Exception as e:
-                print(f"[VALIDATOR] Top-4 leaderboard error (non-fatal): {e}", flush=True)
-
-            # ── Round complete — clear round state so next epoch starts fresh ──
-            round_file = state_path / "current_round.json"
-            if round_file.exists():
-                round_file.unlink()
-                print("[VALIDATOR] Cleared current_round.json (round complete)", flush=True)
-
-            # ── Clear eval progress ──
-            progress_path = state_path / "eval_progress.json"
-            atomic_json_write(progress_path, {"active": False})
-
-            # ── Clean HF model cache + stale files to prevent disk full ──
-            # Keep only the teacher model; students re-download each eval anyway
-            try:
-                clean_cmd = (
-                    "cd /root/.cache/huggingface/hub 2>/dev/null && "
-                    "for d in models--*; do "
-                    "  case \"$d\" in models--Qwen--Qwen3.5-35B-A3B) continue;; esac; "
-                    "  rm -rf \"$d\"; "
-                    "done; "
-                    # Also clean stale teacher cache and /tmp large files
-                    "rm -f /home/teacher_cache.pt 2>/dev/null; "
-                    "find /tmp -maxdepth 1 -size +1G -mmin +30 -delete 2>/dev/null; "
-                    "df -h / | tail -1"
-                )
-                result = lium.exec(pod, command=clean_cmd)
-                disk_info = result.get('stdout', result) if isinstance(result, dict) else result
-                print(f"[VALIDATOR] Post-eval cleanup: {str(disk_info).strip()}", flush=True)
-            except Exception as e:
-                print(f"[VALIDATOR] Post-eval cleanup failed (non-fatal): {e}", flush=True)
-
-            # ── Restart any background tasks that were cleared for eval ──
-            try:
-                lium.exec(pod, command="test -f /home/autostart.sh && bash /home/autostart.sh; echo 'Background tasks resumed'")
-                print("[VALIDATOR] Resumed background tasks on pod", flush=True)
-            except Exception:
-                pass
-
-            # ── Discord announcement if king changed ──
+            # ── Announcement ──
             if winner_uid is not None and winner_uid != king_uid and king_uid is not None:
-                new_king_model = (uid_to_model.get(winner_uid)
-                                  or valid_models.get(winner_uid, {}).get("model", "unknown"))
-                old_king_model = (uid_to_model.get(king_uid)
-                                  or valid_models.get(king_uid, {}).get("model", "unknown"))
-                # Use H2H KL (same prompt set) for accurate comparison in announcement
-                old_kl_for_announcement = king_h2h_kl if king_h2h_kl is not None else king_kl
+                new_king_model = uid_to_model.get(winner_uid, valid_models.get(winner_uid, {}).get("model", "unknown"))
+                old_king_model = uid_to_model.get(king_uid, valid_models.get(king_uid, {}).get("model", "unknown"))
+                old_kl = king_h2h_kl if king_h2h_kl is not None else king_kl
                 try:
-                    _announce_new_king(
-                        new_uid=winner_uid, new_model=new_king_model, new_kl=winner_kl,
-                        old_uid=king_uid, old_model=old_king_model, old_kl=old_kl_for_announcement,
-                        state_dir=state_path,
-                    )
+                    _announce_new_king(winner_uid, new_king_model, winner_kl,
+                                       king_uid, old_king_model, old_kl, state)
                 except Exception as ann_err:
-                    print(f"[VALIDATOR] Discord announcement failed: {ann_err}", flush=True)
+                    logger.warning(f"Announcement failed: {ann_err}")
 
             elapsed = time.time() - epoch_start
-            print(f"\n[VALIDATOR] Epoch complete in {elapsed:.0f}s", flush=True)
+            logger.info(f"Epoch complete in {elapsed:.0f}s")
 
             if once:
                 break
-            # After eval, check immediately for new challengers (may have arrived during eval)
-            print(f"[VALIDATOR] Checking for new challengers immediately...", flush=True)
+            logger.info("Checking for new challengers immediately...")
 
         except KeyboardInterrupt:
             logger.info("Shutting down")
-            save_scores(scores, state_path)
-            save_failures(failures, state_path)
-            save_disqualified(dq_reasons, state_path)
-            save_evaluated()
+            state.save()
             break
         except Exception as e:
-            print(f"[VALIDATOR ERROR] {e}", flush=True)
+            logger.error(f"EPOCH ERROR: {e}")
             import traceback
             traceback.print_exc()
-            save_scores(scores, state_path)
-            save_failures(failures, state_path)
-            save_disqualified(dq_reasons, state_path)
-            save_evaluated()
+            state.save()
             if once:
                 break
             time.sleep(60)
-
-
-def _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid):
-    """Set weights on-chain with retry."""
-    print(f"\n[VALIDATOR] Setting weights: UID {winner_uid} = 1.0", flush=True)
-    uids = list(range(n_uids))
-    for attempt in range(3):
-        try:
-            result = subtensor.set_weights(
-                wallet=wallet, netuid=netuid,
-                uids=uids, weights=weights,
-                wait_for_inclusion=True,
-                wait_for_finalization=True,
-            )
-            # set_weights returns (bool, str) tuple
-            ok = result[0] if isinstance(result, (tuple, list)) else bool(result)
-            if ok:
-                print("[VALIDATOR] ✓ Weights set on-chain!", flush=True)
-                return
-            err_msg = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else str(result)
-            logger.warning(f"Attempt {attempt + 1}: rejected — {err_msg}")
-        except Exception as e:
-            logger.error(f"Attempt {attempt + 1}: {e}")
-        time.sleep(30)
 
 
 if __name__ == "__main__":

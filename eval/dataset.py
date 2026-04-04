@@ -8,7 +8,6 @@ No streaming, no skip, instant random access across 400B tokens.
 Fallback: HuggingFaceFW/fineweb via streaming (slower but 15x more data).
 """
 import json
-import os
 import random
 import hashlib
 import logging
@@ -27,64 +26,6 @@ DEFAULT_SPLIT = "train"
 DEFAULT_TEXT_FIELD = "text"
 PROMPT_CACHE_DIR = Path("state/prompt_cache")
 
-# Legacy pool size for backward compat with load_prompts_from_hf
-DEFAULT_POOL_SIZE = 10_000
-
-
-def load_prompts_from_hf(
-    dataset_name: str = DEFAULT_DATASET,
-    split: str = DEFAULT_SPLIT,
-    text_field: str = DEFAULT_TEXT_FIELD,
-    n: int = DEFAULT_POOL_SIZE,
-    min_chars: int = 200,
-    max_chars: int = 4000,
-    cache_path: Path | None = None,
-) -> list[str]:
-    """
-    Stream n prompts from a HuggingFace dataset.
-
-    This is the legacy loader that builds a fixed pool. Prefer
-    sample_prompts_from_dataset() for production, which samples
-    directly from the full dataset each epoch.
-    """
-    if cache_path is None:
-        cache_path = PROMPT_CACHE_DIR / f"{dataset_name.replace('/', '_')}_{n}.json"
-
-    if cache_path.exists():
-        try:
-            cached = json.loads(cache_path.read_text())
-            if len(cached) >= n:
-                return cached[:n]
-        except Exception:
-            pass
-
-    from datasets import load_dataset
-
-    print(f"[dataset] Streaming {n} prompts from {dataset_name}...", flush=True)
-    ds = load_dataset(dataset_name, split=split, streaming=True, name="default")
-
-    prompts: list[str] = []
-    seen = 0
-    for item in ds:
-        seen += 1
-        text = item.get(text_field, "")
-        if not text or len(text) < min_chars:
-            continue
-        if len(text) > max_chars:
-            text = text[:max_chars]
-        prompts.append(text)
-        if len(prompts) >= n:
-            break
-        if seen > n * 20:
-            break
-
-    print(f"[dataset] Got {len(prompts)} prompts (scanned {seen} items)", flush=True)
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(prompts))
-
-    return prompts
-
 
 def sample_prompts_from_dataset(
     n: int,
@@ -97,8 +38,7 @@ def sample_prompts_from_dataset(
     max_chars: int = 4000,
     cache_dir: Path | None = None,
 ) -> list[str]:
-    """
-    Sample n prompts from karpathy/climbmix-400b-shuffle (6,542 shards).
+    """Sample n prompts from karpathy/climbmix-400b-shuffle (6,542 shards).
 
     Uses the actual on-chain block hash (from substrate) to pick a shard,
     ensuring miners cannot predict which shard will be selected before the
@@ -130,7 +70,6 @@ def sample_prompts_from_dataset(
 
     # Use real on-chain block hash if provided, otherwise fall back (insecure)
     if block_hash:
-        # Strip 0x prefix if present, use raw hex
         _hash_hex = block_hash.lstrip("0x") if block_hash.startswith("0x") else block_hash
         logger.info(f"Using on-chain block hash: {block_hash[:18]}...")
     else:
@@ -158,7 +97,6 @@ def sample_prompts_from_dataset(
         )
 
         # Shuffle deterministically with block hash seed (not block number)
-        # Using the hash ensures shuffle order is also unpredictable
         rng = random.Random(_hash_hex)
         indices = list(range(len(ds)))
         rng.shuffle(indices)
@@ -176,7 +114,6 @@ def sample_prompts_from_dataset(
 
         if len(prompts) >= n:
             print(f"[dataset] Got {len(prompts)} prompts from shard {shard_idx}", flush=True)
-            # Cache and return
             cache_dir.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(json.dumps(prompts))
             return prompts
@@ -217,37 +154,15 @@ def sample_prompts_from_dataset(
 
     print(f"[dataset] Got {len(prompts)} prompts (scanned {seen} items)", flush=True)
 
-    # Cache for this block
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(prompts))
 
     return prompts
 
 
-def sample_prompts_seeded(
-    prompts: list[str],
-    n: int,
-    block_number: int,
-) -> list[str]:
-    """
-    Sample n prompts from a pre-loaded pool, seeded by block_number.
-
-    Legacy function for use with load_prompts_from_hf(). For production,
-    prefer sample_prompts_from_dataset() which samples directly from the
-    full dataset without a fixed pool.
-    """
-    rng = random.Random(block_number)
-    return rng.sample(prompts, min(n, len(prompts)))
-
-
-def sample_prompts(prompts: list[str], n: int) -> list[str]:
-    """Random sample without block seeding (for testing/simulation)."""
-    return random.sample(prompts, min(n, len(prompts)))
-
-
 def format_prompt(text: str, max_chars: int = 512) -> str:
-    """
-    Format a raw pretraining text as a continuation prompt.
+    """Format a raw pretraining text as a continuation prompt.
+
     Uses the first ~max_chars as context, model continues from there.
 
     Includes sanitization to prevent malformed inputs from crashing

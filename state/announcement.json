@@ -1,14 +1,14 @@
 {
   "type": "new_king",
-  "timestamp": 1775305677.7432413,
+  "timestamp": 1775323424.3767214,
   "posted": false,
-  "message": "<@&1482026585358991571>\n## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 68** has dethroned **UID 54**\n\n\ud83d\udcca **KL: 0.084976** (previous king scored 0.085403 last eval)\n\ud83e\udd17 Model: [aidonuts/flatulent-flamingo-s550-a031](<https://huggingface.co/aidonuts/flatulent-flamingo-s550-a031>)\n\ud83d\udc51 Previous king: [yoiink/qwen35-4b-d1](<https://huggingface.co/yoiink/qwen35-4b-d1>)\n\nDethronement uses paired t-test (p<0.05) on 120 prompts. Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
+  "message": "<@&1482026585358991571>\n## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 75** has dethroned **UID 68**\n\n\ud83d\udcca **KL: 0.095577** (previous king scored 0.095756 last eval)\n\ud83e\udd17 Model: [aidonuts/floudering-domino-s7000-a040-a057](<https://huggingface.co/aidonuts/floudering-domino-s7000-a040-a057>)\n\ud83d\udc51 Previous king: [aidonuts/flatulent-flamingo-s550-a031](<https://huggingface.co/aidonuts/flatulent-flamingo-s550-a031>)\n\nDethronement uses paired t-test (p<0.05) on 120 prompts. Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
   "data": {
-    "new_uid": 68,
-    "new_model": "aidonuts/flatulent-flamingo-s550-a031",
-    "new_kl": 0.084976,
-    "old_uid": 54,
-    "old_model": "yoiink/qwen35-4b-d1",
-    "old_kl": 0.085403
+    "new_uid": 75,
+    "new_model": "aidonuts/floudering-domino-s7000-a040-a057",
+    "new_kl": 0.095577,
+    "old_uid": 68,
+    "old_model": "aidonuts/flatulent-flamingo-s550-a031",
+    "old_kl": 0.095756
   }
 }

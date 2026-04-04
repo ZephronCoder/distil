@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-vLLM-accelerated GPU evaluation script for SN97 validation (v2.0.0).
+vLLM-accelerated GPU evaluation script for SN97 validation (v3.0.0).
 
-Architecture & VRAM timeline (B200 = 192GB):
+Architecture & VRAM timeline (single B200 = 192GB):
   Phase 1 — Teacher generation via vLLM:
-    [vLLM teacher ~70GB] → generate 60 continuations → kill server
+    [vLLM teacher ~70GB] → generate continuations → kill server
     Time: ~3-5 min (vs 25 min with HF)
 
   Phase 2 — Teacher logit extraction via HF:
-    [HF teacher ~67GB] → 60 forward passes (no autoregressive) → cache logits → unload
+    [HF teacher ~67GB] → forward passes (no autoregressive) → cache logits → unload
     Time: ~8-10 min (forward-only, ~3x faster than generate)
 
   Phase 3 — Student scoring:
@@ -16,7 +16,7 @@ Architecture & VRAM timeline (B200 = 192GB):
     Total VRAM: ~18GB (king + challenger + overhead)
     Time: ~2-3 min per student
 
-Optimizations over pod_eval.py:
+Optimizations:
   1. vLLM teacher generation: 5-10x faster than HF generate()
   2. King stays in VRAM: no download/load/cleanup between rounds (~3-5 min saved)
   3. Prefetch next student: download while current student scores
@@ -54,17 +54,72 @@ from concurrent.futures import ThreadPoolExecutor
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def gpu_mem_str():
+    """Return a human-readable string of current GPU memory usage."""
     if torch.cuda.is_available():
         alloc = torch.cuda.memory_allocated() / 1024**3
-        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        total = torch.cuda.get_device_properties(0).total_mem / 1024**3
         return f"{alloc:.1f}/{total:.1f}GB"
     return "N/A"
 
 def free_gpu():
+    """Free GPU memory: garbage collect, empty cache, synchronize."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+def ensure_disk_space(teacher_name, threshold=85):
+    """Check disk usage, clean non-teacher caches and stale files if above threshold.
+
+    Called at every phase boundary (before vLLM start, before HF load, before each student)
+    to prevent disk exhaustion — the #1 crash cause historically.
+
+    Returns current disk usage percentage.
+    """
+    try:
+        st = os.statvfs("/")
+        pct = int(100 * (1 - st.f_bavail / st.f_blocks))
+        free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
+        print(f"  [disk] {pct}% used, {free_gb:.1f}GB free", flush=True)
+
+        if pct > threshold:
+            print(f"  [disk] >{threshold}% — cleaning non-teacher caches", flush=True)
+            teacher_cache = f"models--{teacher_name.replace('/', '--')}"
+            cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+            if cache_dir.exists():
+                for d in cache_dir.iterdir():
+                    if d.is_dir() and d.name.startswith("models--") and d.name != teacher_cache:
+                        shutil.rmtree(d)
+            # Clean stale /tmp files >1GB
+            import glob
+            for pattern in ["/tmp/vllm_*", "/tmp/tmp*", "/tmp/teacher_*"]:
+                for f in glob.glob(pattern):
+                    try:
+                        fsize = os.path.getsize(f)
+                        if fsize > 1024**3:
+                            os.remove(f)
+                            print(f"  [disk] Removed stale {f} ({fsize/1024**3:.1f}GB)", flush=True)
+                    except Exception:
+                        pass
+            # Clean stale teacher cache if hash doesn't match
+            teacher_logits_path = "/home/teacher_cache.pt"
+            if os.path.exists(teacher_logits_path):
+                cache_size = os.path.getsize(teacher_logits_path) / (1024**3)
+                if cache_size > 0 and pct > 90:
+                    os.remove(teacher_logits_path)
+                    print(f"  [disk] Removed stale teacher cache ({cache_size:.1f}GB)", flush=True)
+
+            st2 = os.statvfs("/")
+            pct2 = int(100 * (1 - st2.f_bavail / st2.f_blocks))
+            free_gb2 = (st2.f_bavail * st2.f_frsize) / (1024**3)
+            print(f"  [disk] After cleanup: {pct2}% used, {free_gb2:.1f}GB free", flush=True)
+            return pct2
+        return pct
+    except Exception as e:
+        print(f"  [disk] Check failed: {e}", flush=True)
+        return 0
+
 
 # ── KL computation ──
 # Uses F.kl_div(log_target=True) which is mathematically identical to
@@ -116,14 +171,13 @@ def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
     t_vocab = t_log_p.shape[-1]
     s_vocab = s_logits.shape[-1]
     if s_vocab < t_vocab:
-        # Pad student logits with -inf (zero probability)
         pad = torch.full((*s_logits.shape[:-1], t_vocab - s_vocab), -1e10,
                          device=s_logits.device, dtype=s_logits.dtype)
         s_logits = torch.cat([s_logits, pad], dim=-1)
     elif s_vocab > t_vocab:
         s_logits = s_logits[..., :t_vocab]
     s_log_p = F.log_softmax(s_logits, dim=-1)
-    # Chunked KL over positions to reduce peak memory
+    # Chunked KL over positions
     n_pos = t_log_p.shape[1] if t_log_p.dim() >= 3 else t_log_p.shape[0]
     kl_fn = _kl_chunk_compiled if _KL_USE_COMPILED else _kl_chunk_fn
     if t_log_p.dim() >= 3:
@@ -138,12 +192,16 @@ def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
             kl_per_pos[i:j] = kl_fn(t_log_p[i:j, :], s_log_p[i:j, :])
     return kl_per_pos
 
+
 def load_model(name, device="cuda", dtype=torch.bfloat16):
+    """Load a HuggingFace model for inference.
+
+    Uses flash_attention_2 when available, falls back to default attention.
+    Teacher models get trust_remote_code=True; students don't (security).
+    """
     from transformers import AutoModelForCausalLM
     is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
-    # Use device_map="auto" for teacher on multi-GPU to spread weights
-    dm = "auto" if is_teacher and torch.cuda.device_count() > 1 else device
-    kwargs = dict(dtype=dtype, device_map=dm, trust_remote_code=is_teacher)
+    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
     try:
         m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
         print(f"  [model] Loaded with flash_attention_2", flush=True)
@@ -152,6 +210,7 @@ def load_model(name, device="cuda", dtype=torch.bfloat16):
         m = AutoModelForCausalLM.from_pretrained(name, **kwargs)
         print(f"  [model] Loaded with default attention", flush=True)
         return m
+
 
 def prefetch_model(name):
     """Download model files to HF cache without loading to GPU. Runs in background."""
@@ -162,8 +221,9 @@ def prefetch_model(name):
     except Exception as e:
         print(f"  [prefetch] {name} failed: {e}", flush=True)
 
+
 def clean_model_cache(name, teacher_name=None):
-    """Remove HF cache for a model, preserving teacher cache."""
+    """Remove HF cache for a specific model, preserving teacher cache."""
     try:
         cache_name = f"models--{name.replace('/', '--')}"
         if teacher_name:
@@ -177,27 +237,6 @@ def clean_model_cache(name, teacher_name=None):
     except Exception:
         pass
 
-def disk_check_and_clean(teacher_name, threshold=85):
-    """Check disk usage, clean non-teacher caches if above threshold."""
-    try:
-        st = os.statvfs("/")
-        pct = int(100 * (1 - st.f_bavail / st.f_blocks))
-        if pct > threshold:
-            print(f"  [disk] {pct}% — cleaning non-teacher caches", flush=True)
-            teacher_cache = f"models--{teacher_name.replace('/', '--')}"
-            cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-            if cache_dir.exists():
-                for d in cache_dir.iterdir():
-                    if d.is_dir() and d.name.startswith("models--") and d.name != teacher_cache:
-                        shutil.rmtree(d)
-            st2 = os.statvfs("/")
-            pct2 = int(100 * (1 - st2.f_bavail / st2.f_blocks))
-            print(f"  [disk] After cleanup: {pct2}%", flush=True)
-        return pct
-    except Exception as e:
-        print(f"  [disk] Check failed: {e}", flush=True)
-        return 0
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # vLLM Server Management
@@ -205,9 +244,11 @@ def disk_check_and_clean(teacher_name, threshold=85):
 
 VLLM_PORT = 9100
 VLLM_URL = f"http://localhost:{VLLM_PORT}"
+VLLM_STARTUP_TIMEOUT = 900  # 15 min
+
 
 def is_vllm_running():
-    """Check if vLLM server is already running and healthy."""
+    """Check if vLLM server is running and healthy."""
     import requests
     try:
         r = requests.get(f"{VLLM_URL}/health", timeout=3)
@@ -216,34 +257,10 @@ def is_vllm_running():
         return False
 
 
-def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=4096, persistent=False):
-    """Start vLLM server via subprocess. Returns True on success.
-    If persistent=True, reuses an already-running server."""
-    # Disk check before vLLM startup — model download can fail on full disk
-    try:
-        st = os.statvfs("/")
-        pct = int(100 * (1 - st.f_bavail / st.f_blocks))
-        free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
-        print(f"  [disk] Before vLLM start: {pct}% used, {free_gb:.1f}GB free", flush=True)
-        if pct > 85:
-            print(f"  [disk] >85% — cleaning before vLLM startup", flush=True)
-            disk_check_and_clean(model_name, threshold=80)
-            # Also clean stale /tmp files from failed vLLM downloads
-            import glob
-            for f in glob.glob("/tmp/vllm_*") + glob.glob("/tmp/tmp*"):
-                try:
-                    fsize = os.path.getsize(f)
-                    if fsize > 1024**3:  # >1GB
-                        os.remove(f)
-                        print(f"  [disk] Removed stale {f} ({fsize/1024**3:.1f}GB)", flush=True)
-                except Exception:
-                    pass
-    except Exception as e:
-        print(f"  [disk] Pre-vLLM check failed: {e}", flush=True)
+def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=4096):
+    """Start vLLM server via subprocess. Returns True on success."""
+    ensure_disk_space(model_name, threshold=80)
 
-    if persistent and is_vllm_running():
-        print(f"\n[vllm] Server already running — reusing (persistent mode)", flush=True)
-        return True
     print(f"\n[vllm] Starting server for {model_name}...", flush=True)
     stop_vllm_server()
 
@@ -260,17 +277,6 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=409
         "--no-enable-log-requests",
     ]
 
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        n = torch.cuda.device_count()
-        # TP size must be a power of 2 that divides model dims
-        tp = 1
-        for candidate in [8, 4, 2]:
-            if n >= candidate:
-                tp = candidate
-                break
-        cmd.extend(["--tensor-parallel-size", str(tp)])
-        print(f"[vllm] Tensor parallelism: {n} GPUs", flush=True)
-
     log_f = open("/tmp/vllm_teacher.log", "w")
     env = os.environ.copy()
     env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
@@ -280,7 +286,6 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=409
 
     import requests
     start_time = time.time()
-    VLLM_STARTUP_TIMEOUT = 900  # 15 min — enough for fresh pod model download + load
     while time.time() - start_time < VLLM_STARTUP_TIMEOUT:
         elapsed = int(time.time() - start_time)
         try:
@@ -328,11 +333,8 @@ def stop_vllm_server():
         except Exception:
             pass
         pid_file.unlink(missing_ok=True)
-
-    # Belt and suspenders
     try:
-        subprocess.run(["fuser", "-k", f"{VLLM_PORT}/tcp"],
-                       capture_output=True, timeout=5)
+        subprocess.run(["fuser", "-k", f"{VLLM_PORT}/tcp"], capture_output=True, timeout=5)
     except Exception:
         pass
     free_gpu()
@@ -340,7 +342,10 @@ def stop_vllm_server():
 
 
 def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None):
-    """Generate teacher continuations via vLLM API. Returns list of dicts."""
+    """Generate teacher continuations via vLLM API.
+
+    Returns list of dicts with full_ids, prompt_len, gen_len.
+    """
     import requests
 
     results = []
@@ -381,11 +386,33 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Progress reporting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
+    """Write a phase update to the progress file for the dashboard."""
+    try:
+        data = {
+            "phase": phase,
+            "students": students,
+            "students_total": len(students),
+            "prompts_total": extra.get("prompts_total", 0),
+            "teacher_prompts_done": teacher_done,
+            "completed": extra.get("completed", []),
+            "current": extra.get("current", None),
+        }
+        with open(progress_path, "w") as pf:
+            json.dump(data, pf)
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="vLLM-accelerated SN97 evaluation v2")
+    parser = argparse.ArgumentParser(description="vLLM-accelerated SN97 evaluation v3")
     parser.add_argument("--teacher", default="Qwen/Qwen3.5-35B-A3B")
     parser.add_argument("--students", required=True, help="Comma-separated student models")
     parser.add_argument("--prompts", required=True, help="JSON file with prompt texts")
@@ -398,19 +425,16 @@ def main():
     parser.add_argument("--teacher-logits", default="/home/teacher_cache.pt")
     parser.add_argument("--save-teacher-logits", default=None)
     parser.add_argument("--king", default=None, help="King model name — stays in VRAM between rounds")
-    parser.add_argument("--gpu", type=int, default=None, help="GPU device index (for compatibility)")
-    parser.add_argument("--sequential", action="store_true", help="Ignored — for compatibility")
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
-    parser.add_argument("--persistent-vllm", action="store_true",
-                        help="Keep vLLM running between rounds — reuse if already up, don't kill after generation")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.45,
-                        help="vLLM GPU memory utilization (default 0.45 to leave room for students)")
+                        help="vLLM GPU memory utilization (default 0.45)")
     parser.add_argument("--vllm-max-model-len", type=int, default=4096)
+    # Backward-compatible args (ignored)
+    parser.add_argument("--gpu", type=int, default=None, help="Ignored — kept for backward compat")
+    parser.add_argument("--sequential", action="store_true", help="Ignored — kept for backward compat")
+    parser.add_argument("--persistent-vllm", action="store_true", help="Ignored — kept for backward compat")
     args = parser.parse_args()
 
-    # Set CUDA device if specified
-    if args.gpu is not None and torch.cuda.is_available():
-        torch.cuda.set_device(args.gpu)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     students = [s.strip() for s in args.students.split(",") if s.strip()]
     timings = {}
@@ -419,24 +443,8 @@ def main():
         prompts = json.load(f)
     prompts_hash = hashlib.md5(json.dumps(prompts).encode()).hexdigest()[:8]
 
-    # Progress file — written throughout for live dashboard updates
+    # Progress file path
     progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
-    def _write_phase(phase, teacher_done=None, **extra):
-        """Write a phase update to the progress file for the dashboard."""
-        try:
-            data = {
-                "phase": phase,
-                "students": students,
-                "students_total": len(students),
-                "prompts_total": len(prompts),
-                "teacher_prompts_done": teacher_done,
-                "completed": extra.get("completed", []),
-                "current": extra.get("current", None),
-            }
-            with open(progress_path, "w") as pf:
-                json.dump(data, pf)
-        except Exception:
-            pass
 
     print(f"[eval] {len(prompts)} prompts (hash={prompts_hash}), {len(students)} students", flush=True)
     print(f"[eval] Teacher: {args.teacher}", flush=True)
@@ -460,7 +468,7 @@ def main():
     prompt_lens = []
     teacher_cache_loaded = False
 
-    # Try cache
+    # Try loading from cache
     if args.teacher_logits and os.path.exists(args.teacher_logits):
         try:
             t0 = time.time()
@@ -482,66 +490,33 @@ def main():
             print(f"[eval] ✗ Cache failed: {e}", flush=True)
 
     if not teacher_cache_loaded and not args.no_vllm:
-        # ── Aggressive disk cleanup before teacher loading ──
-        # Teacher model is ~35GB; vLLM needs scratch space too.
-        # Run cleanup at lower threshold (70%) to ensure headroom.
-        try:
-            st = os.statvfs("/")
-            pct = int(100 * (1 - st.f_bavail / st.f_blocks))
-            free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
-            print(f"[disk] Before teacher load: {pct}% used, {free_gb:.1f}GB free", flush=True)
-        except Exception:
-            pct, free_gb = 0, 999
-        disk_check_and_clean(args.teacher, threshold=70)
+        # ── vLLM generation path ──
+        ensure_disk_space(args.teacher, threshold=70)
 
-        # Clean stale teacher cache if hash doesn't match current prompts
+        # Clean stale teacher cache if hash doesn't match
         if args.teacher_logits and os.path.exists(args.teacher_logits):
             try:
-                import struct
                 cache = torch.load(args.teacher_logits, map_location="cpu", weights_only=False)
                 if cache.get("prompts_hash") != prompts_hash:
                     cache_size = os.path.getsize(args.teacher_logits) / (1024**3)
-                    print(f"[disk] Stale teacher cache (hash mismatch) — removing ({cache_size:.1f}GB)", flush=True)
+                    print(f"[disk] Stale teacher cache — removing ({cache_size:.1f}GB)", flush=True)
                     os.remove(args.teacher_logits)
                 del cache
-            except Exception as e:
-                print(f"[disk] Could not check teacher cache staleness: {e}", flush=True)
+            except Exception:
+                pass
 
-        # Clean /tmp of stale large files (failed downloads, old teacher files)
-        import glob
-        for pattern in ["/tmp/teacher_*", "/tmp/vllm_*", "/tmp/tmp*"]:
-            for f in glob.glob(pattern):
-                try:
-                    fsize = os.path.getsize(f)
-                    if fsize > 1024**3:  # >1GB
-                        os.remove(f)
-                        print(f"[disk] Removed stale {f} ({fsize/1024**3:.1f}GB)", flush=True)
-                except Exception:
-                    pass
-
-        # Log disk state after cleanup
-        try:
-            st = os.statvfs("/")
-            pct2 = int(100 * (1 - st.f_bavail / st.f_blocks))
-            free_gb2 = (st.f_bavail * st.f_frsize) / (1024**3)
-            print(f"[disk] After pre-teacher cleanup: {pct2}% used, {free_gb2:.1f}GB free", flush=True)
-        except Exception:
-            pass
-
-        # ── vLLM generation ──
         print(f"\n{'='*60}", flush=True)
         print(f"PHASE 1a: vLLM teacher generation", flush=True)
         print(f"{'='*60}", flush=True)
 
-        _write_phase("vllm_starting")
+        _write_phase(progress_path, students, "vllm_starting", prompts_total=len(prompts))
         t0 = time.time()
-        vllm_ok = start_vllm_server(args.teacher, args.vllm_gpu_util, args.vllm_max_model_len,
-                                     persistent=args.persistent_vllm)
+        vllm_ok = start_vllm_server(args.teacher, args.vllm_gpu_util, args.vllm_max_model_len)
         timings["vllm_startup"] = time.time() - t0
 
         sequences_data = None
         if vllm_ok:
-            _write_phase("vllm_generating")
+            _write_phase(progress_path, students, "vllm_generating", prompts_total=len(prompts))
             t0 = time.time()
             try:
                 sequences_data = generate_via_vllm(prompts, tokenizer, args.max_new_tokens, args.block_seed)
@@ -549,34 +524,24 @@ def main():
                 print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
             except Exception as e:
                 print(f"[eval] vLLM generation failed: {e} — falling back to HF", flush=True)
-            if not args.persistent_vllm:
-                stop_vllm_server()
-            else:
-                print(f"[eval] vLLM kept alive (persistent mode)", flush=True)
+            stop_vllm_server()
         else:
             print(f"[eval] vLLM failed to start — falling back to HF", flush=True)
 
         if sequences_data:
-            # ── Free vLLM VRAM before loading HF teacher ──
-            if args.persistent_vllm:
-                print(f"[eval] Stopping vLLM to free VRAM for HF logit extraction...", flush=True)
-                stop_vllm_server()
-                import gc; gc.collect(); torch.cuda.empty_cache()
-                time.sleep(3)
-                print(f"[eval] VRAM after vLLM stop: {gpu_mem_str()}", flush=True)
-
             # ── HF forward pass for logits ──
             print(f"\n{'='*60}", flush=True)
             print(f"PHASE 1b: HF teacher logit extraction", flush=True)
             print(f"{'='*60}", flush=True)
 
+            ensure_disk_space(args.teacher, threshold=70)
             t0 = time.time()
             teacher = load_model(args.teacher, device)
             teacher.eval()
             timings["teacher_hf_load"] = time.time() - t0
             print(f"[eval] HF teacher loaded in {timings['teacher_hf_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
-            _write_phase("teacher_logits", teacher_done=0)
+            _write_phase(progress_path, students, "teacher_logits", teacher_done=0, prompts_total=len(prompts))
             t0 = time.time()
             with torch.no_grad():
                 for i, data in enumerate(sequences_data):
@@ -590,19 +555,18 @@ def main():
                     del logits, cont_logits
                     if (i + 1) % 10 == 0 or i == len(sequences_data) - 1:
                         print(f"  Logits [{i+1}/{len(sequences_data)}], VRAM: {gpu_mem_str()}", flush=True)
-                    _write_phase("teacher_logits", teacher_done=i + 1)
+                    _write_phase(progress_path, students, "teacher_logits", teacher_done=i + 1, prompts_total=len(prompts))
 
             timings["teacher_logits_pass"] = time.time() - t0
             print(f"[eval] Logits extracted in {timings['teacher_logits_pass']:.1f}s", flush=True)
             del sequences_data
 
-            # Save cache only if explicitly requested AND enough disk
+            # Save cache if requested and enough disk
             if args.save_teacher_logits:
-                cache_path = args.save_teacher_logits
-                st = os.statvfs(os.path.dirname(cache_path) or '/')
+                st = os.statvfs(os.path.dirname(args.save_teacher_logits) or '/')
                 free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
-                if free_gb > 50:  # need ~45GB for cache
-                    cache_tmp = cache_path + ".tmp"
+                if free_gb > 50:
+                    cache_tmp = args.save_teacher_logits + ".tmp"
                     torch.save({
                         "full_sequences": [s.cpu() for s in full_sequences],
                         "teacher_logits": teacher_logits_list,
@@ -611,23 +575,15 @@ def main():
                         "prompts_hash": prompts_hash,
                         "generation_method": "vllm+hf",
                     }, cache_tmp)
-                    os.replace(cache_tmp, cache_path)
-                    print(f"[eval] Cache saved to {cache_path}", flush=True)
+                    os.replace(cache_tmp, args.save_teacher_logits)
+                    print(f"[eval] Cache saved", flush=True)
                 else:
                     print(f"[eval] Skipped cache save ({free_gb:.0f}GB free, need 50GB)", flush=True)
-            else:
-                print(f"[eval] No cache save requested", flush=True)
 
-            # Unload teacher — free ~67GB VRAM for students
+            # Unload teacher
             del teacher
             free_gpu()
-            try:
-                st = os.statvfs("/")
-                disk_pct = int(100 * (1 - st.f_bavail / st.f_blocks))
-                disk_free = (st.f_bavail * st.f_frsize) / (1024**3)
-                print(f"[eval] Teacher unloaded. VRAM: {gpu_mem_str()}, Disk: {disk_pct}% ({disk_free:.1f}GB free)", flush=True)
-            except Exception:
-                print(f"[eval] Teacher unloaded. VRAM: {gpu_mem_str()}", flush=True)
+            print(f"[eval] Teacher unloaded. VRAM: {gpu_mem_str()}", flush=True)
             teacher_cache_loaded = True
 
     if not teacher_cache_loaded:
@@ -636,15 +592,7 @@ def main():
         print(f"PHASE 1 FALLBACK: HF teacher generation", flush=True)
         print(f"{'='*60}", flush=True)
 
-        # Disk check before HF teacher download — needs ~35GB for model weights
-        try:
-            st = os.statvfs("/")
-            pct = int(100 * (1 - st.f_bavail / st.f_blocks))
-            free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
-            print(f"[disk] Before HF fallback load: {pct}% used, {free_gb:.1f}GB free", flush=True)
-        except Exception:
-            pass
-        disk_check_and_clean(args.teacher, threshold=70)
+        ensure_disk_space(args.teacher, threshold=70)
 
         t0 = time.time()
         teacher = load_model(args.teacher, device)
@@ -652,7 +600,7 @@ def main():
         timings["teacher_hf_load"] = time.time() - t0
         print(f"[eval] Teacher loaded in {timings['teacher_hf_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
-        _write_phase("teacher_generation", teacher_done=0)
+        _write_phase(progress_path, students, "teacher_generation", teacher_done=0, prompts_total=len(prompts))
         t0 = time.time()
         with torch.no_grad():
             for i, ids in enumerate(input_ids_list):
@@ -674,11 +622,10 @@ def main():
                 del logits, cont_logits
                 gen_len = output_ids.shape[1] - prompt_len
                 print(f"  Prompt {i}: {prompt_len}+{gen_len} tokens, VRAM: {gpu_mem_str()}", flush=True)
-                _write_phase("teacher_generation", teacher_done=i + 1)
+                _write_phase(progress_path, students, "teacher_generation", teacher_done=i + 1, prompts_total=len(prompts))
 
         timings["teacher_generation"] = time.time() - t0
-        cache_path = args.save_teacher_logits or os.path.join(
-            os.path.dirname(args.output), "teacher_cache.pt")
+        cache_path = args.save_teacher_logits or os.path.join(os.path.dirname(args.output), "teacher_cache.pt")
         torch.save({
             "full_sequences": [s.cpu() for s in full_sequences],
             "teacher_logits": teacher_logits_list,
@@ -689,36 +636,20 @@ def main():
         }, cache_path)
         del teacher
         free_gpu()
-        print(f"[eval] HF generation done in {timings['teacher_generation']:.1f}s, teacher unloaded", flush=True)
+        print(f"[eval] HF generation done in {timings['teacher_generation']:.1f}s", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
-    # PHASE 1c: Move teacher logits to GPU + precompute softmax
+    # PHASE 1c: Chunked GPU processing setup
     # ═══════════════════════════════════════════════════════════════════
-    # Teacher logits are ~17GB for 60 prompts × 512 tokens × 152K vocab.
-    # B200 has 192GB — we use ~40GB total (king 8GB + challenger 8GB + logits 17GB).
-    # Keeping them on GPU eliminates ~93GB of PCIe transfers per round
-    # (18.7GB × 5 students). Precomputing log_softmax + probs saves ~50%
-    # of KL computation (teacher side computed once, not per-student).
-    _write_phase("gpu_precompute", teacher_done=len(prompts))
-    print(f"\n[eval] Keeping teacher logits on CPU, will process in chunks during scoring...", flush=True)
-    t0 = time.time()
-    # CHANGED: Don't precompute all teacher softmax on GPU at once.
-    # With 120 prompts, the full tensor is ~68GB which OOMs on B200 (178GB - 82GB teacher).
-    # Instead, keep raw logits on CPU and compute softmax per-chunk during student scoring.
-    # This trades ~10% speed for fitting in VRAM.
-    teacher_log_probs = None  # signal to use chunked processing
+    _write_phase(progress_path, students, "gpu_precompute", teacher_done=len(prompts), prompts_total=len(prompts))
+    print(f"\n[eval] Teacher logits: {len(teacher_logits_list)} prompts on CPU, chunked GPU processing enabled", flush=True)
+    # Keep teacher logits on CPU, compute softmax per-chunk during student scoring
+    teacher_log_probs = None
     teacher_probs = None
-    # Keep teacher_logits_list on CPU for chunked access
-    timings["teacher_gpu_precompute"] = time.time() - t0
-    print(f"[eval] Teacher logits: {len(teacher_logits_list)} prompts on CPU, chunked GPU processing enabled, VRAM: {gpu_mem_str()}", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1d: Filter short-completion prompts
     # ═══════════════════════════════════════════════════════════════════
-    # Prompts where the teacher generated <MIN_COMPLETION_TOKENS tokens are
-    # degenerate (teacher hit EOS early). KL on 1-23 tokens is pure noise
-    # and inflates variance. Remove for ALL models equally so paired
-    # comparisons remain valid.
     MIN_COMPLETION_TOKENS = 64
     completion_lens = [full_sequences[i].shape[1] - prompt_lens[i] for i in range(len(prompts))]
     keep_mask = [cl >= MIN_COMPLETION_TOKENS for cl in completion_lens]
@@ -726,16 +657,13 @@ def main():
     if n_filtered > 0:
         filtered_indices = [i for i, k in enumerate(keep_mask) if not k]
         print(f"[eval] Filtering {n_filtered} prompts with <{MIN_COMPLETION_TOKENS} completion tokens: {filtered_indices}", flush=True)
-        for idx in filtered_indices:
-            print(f"  prompt {idx}: {completion_lens[idx]} tokens", flush=True)
-        # Rebuild arrays keeping only valid prompts
         full_sequences = [full_sequences[i] for i in range(len(prompts)) if keep_mask[i]]
         teacher_logits_list = [teacher_logits_list[i] for i in range(len(prompts)) if keep_mask[i]]
         prompt_lens = [prompt_lens[i] for i in range(len(prompts)) if keep_mask[i]]
         prompts = [prompts[i] for i in range(len(prompts)) if keep_mask[i]]
-        print(f"[eval] {len(prompts)} prompts remaining after filter", flush=True)
+        print(f"[eval] {len(prompts)} prompts remaining", flush=True)
     else:
-        print(f"[eval] All {len(prompts)} prompts have >={MIN_COMPLETION_TOKENS} completion tokens — no filtering needed", flush=True)
+        print(f"[eval] All {len(prompts)} prompts have >={MIN_COMPLETION_TOKENS} completion tokens", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 2: Student scoring
@@ -773,17 +701,15 @@ def main():
         if data.get("status") != "load_failed" and data.get("kl_global_avg") is not None:
             results["students"][name] = data
 
-    # Progress (progress_path already defined at top of main)
+    # Live progress
     progress_lock = threading.Lock()
     live_progress = {
-        "phase": "scoring",
-        "students": students,
-        "students_total": len(students),
-        "prompts_total": len(prompts),
-        "completed": [],
-        "current": None,
+        "phase": "scoring", "students": students,
+        "students_total": len(students), "prompts_total": len(prompts),
+        "completed": [], "current": None,
     }
     def _write_progress():
+        """Write current live progress to disk for dashboard consumption."""
         try:
             with progress_lock:
                 with open(progress_path, "w") as pf:
@@ -792,24 +718,20 @@ def main():
             pass
     _write_progress()
 
-    # Early stopping
+    # Early stopping state
     best_kl_so_far = None
     best_kl_per_prompt_cumulative = None
     MIN_PROMPTS_EARLY_STOP = 7
     PER_MODEL_TIMEOUT = 600
 
-    # ── King stays in VRAM ──
-    # If --king is set, load it once and keep it loaded for all rounds.
-    # The king is scored first (sets best_kl_so_far for early stopping),
-    # then stays loaded while challengers rotate through.
+    # King stays in VRAM
     king_model = None
     king_name = args.king
 
-    # Prefetch executor for downloading next student while scoring current
+    # Prefetch executor
     prefetch_executor = ThreadPoolExecutor(max_workers=1)
     prefetch_future = None
 
-    # VRAM baseline (no student loaded yet)
     vram_before_students = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
 
     for student_idx, student_name in enumerate(students):
@@ -818,7 +740,6 @@ def main():
             prior = results["students"][student_name]
             kl = prior.get("kl_global_avg")
             print(f"\n[eval] {student_name}: SKIP (already scored, KL={kl})", flush=True)
-            # Update early stopping from resumed
             if kl and kl > 0.001 and kl < float('inf'):
                 if best_kl_so_far is None or kl < best_kl_so_far:
                     best_kl_so_far = kl
@@ -836,39 +757,25 @@ def main():
               (" (KING — stays in VRAM)" if student_name == king_name else ""), flush=True)
 
         model_start = time.time()
-        # Log disk state before each student
-        try:
-            st = os.statvfs("/")
-            disk_pct = int(100 * (1 - st.f_bavail / st.f_blocks))
-            disk_free = (st.f_bavail * st.f_frsize) / (1024**3)
-            print(f"[disk] Before student {student_idx+1}/{len(students)}: {disk_pct}% used, {disk_free:.1f}GB free", flush=True)
-        except Exception:
-            pass
-        disk_check_and_clean(args.teacher)
+        ensure_disk_space(args.teacher)
 
-        # ── Prefetch next student while we score this one ──
+        # Prefetch next student
         if student_idx + 1 < len(students):
             next_name = students[student_idx + 1]
             if next_name not in results["students"] and next_name != king_name:
                 prefetch_future = prefetch_executor.submit(prefetch_model, next_name)
 
-        # ── Load student (or reuse king) ──
+        # Load student (or reuse king)
         live_progress["phase"] = "loading_student"
-        live_progress["current"] = {
-            "student_name": student_name,
-            "student_idx": student_idx,
-            "prompts_done": 0,
-        }
+        live_progress["current"] = {"student_name": student_name, "student_idx": student_idx, "prompts_done": 0}
         _write_progress()
 
         is_king = (student_name == king_name)
         student = None
+        load_time = 0.0
 
         if is_king and king_model is not None:
-            # Reuse king already in VRAM
             student = king_model
-            load_time = 0.0
-            student_vram_gb = 0.0  # already accounted for
             print(f"[eval] King reused from VRAM", flush=True)
         else:
             try:
@@ -877,7 +784,7 @@ def main():
                 student.eval()
                 load_time = time.time() - t0
                 student_vram_gb = (torch.cuda.memory_allocated() - vram_before_students) / 1024**3
-                print(f"[eval] Loaded in {load_time:.1f}s, student VRAM: {student_vram_gb:.1f}GB, total: {gpu_mem_str()}", flush=True)
+                print(f"[eval] Loaded in {load_time:.1f}s, VRAM: {student_vram_gb:.1f}GB, total: {gpu_mem_str()}", flush=True)
             except Exception as e:
                 print(f"[eval] FAILED to load: {e}", flush=True)
                 results["students"][student_name] = {
@@ -894,7 +801,7 @@ def main():
                 clean_model_cache(student_name, args.teacher)
                 continue
 
-            # VRAM fraud check (only for non-king, since king was checked on prior load)
+            # VRAM fraud check
             MAX_STUDENT_VRAM_GB = 20.0
             if not is_king and student_vram_gb > MAX_STUDENT_VRAM_GB:
                 msg = f"FRAUD: student VRAM delta {student_vram_gb:.1f}GB > {MAX_STUDENT_VRAM_GB}GB"
@@ -907,15 +814,11 @@ def main():
                 clean_model_cache(student_name, args.teacher)
                 continue
 
-            # If this is king, keep reference
             if is_king:
                 king_model = student
-                print(f"[eval] King loaded — will stay in VRAM", flush=True)
+                print(f"[eval] King loaded — stays in VRAM", flush=True)
 
-        # ── Score: per-prompt with precomputed teacher, early stopping ──
-        # Teacher log_probs and probs are already on GPU (precomputed in Phase 1c).
-        # No CPU→GPU transfers needed. Student does forward pass, we compute KL
-        # using precomputed teacher side (saves ~50% of KL compute).
+        # ── Score: per-prompt with early stopping ──
         can_early_stop = (student_idx > 0) and (best_kl_so_far is not None)
         kl_per_prompt = []
         prompt_kl_means = []
@@ -929,21 +832,15 @@ def main():
                     full_seq = full_sequences[i]
                     prompt_len = prompt_lens[i]
                     # Teacher side: compute softmax on-the-fly per prompt (chunked to avoid OOM)
-                    if teacher_log_probs is not None:
-                        # Legacy path: precomputed (only if VRAM was sufficient)
-                        t_log_p = teacher_log_probs[i]
-                        t_p = teacher_probs[i]
-                    else:
-                        # Chunked path: move single prompt to GPU, compute, use, free
-                        tl = teacher_logits_list[i].to(device).float()
-                        t_log_p = F.log_softmax(tl, dim=-1)
-                        t_p = t_log_p.exp()
-                        del tl
+                    tl = teacher_logits_list[i].to(device).float()
+                    t_log_p = F.log_softmax(tl, dim=-1)
+                    t_p = t_log_p.exp()
+                    del tl
+
                     # Student forward pass
                     s_logits = student(full_seq).logits.float()
                     cont_s = s_logits[:, prompt_len - 1:-1, :]
                     min_len = min(cont_s.shape[1], t_log_p.shape[1])
-                    # KL with precomputed teacher (skip teacher softmax)
                     t_lp_slice = t_log_p[:, :min_len, :]
                     t_p_slice = t_p[:, :min_len, :]
                     s_cont_slice = cont_s[:, :min_len, :]
@@ -952,35 +849,28 @@ def main():
                     ).squeeze(0)
                     kl_mean = kl_per_pos.mean().item()
 
-                    # ── Shadow top-k KL metrics (logged but not used for scoring) ──
+                    # Shadow top-k KL metrics (logged but not used for scoring)
                     topk_shadow = {}
                     try:
                         s_log_p_full = F.log_softmax(s_cont_slice.float(), dim=-1)
                         for k_val in (100, 1000):
-                            # Get teacher's top-k token indices per position
-                            # t_p_slice: [1, min_len, vocab]
-                            _, topk_idx = t_p_slice.topk(k_val, dim=-1)  # [1, min_len, k]
-                            # Gather teacher and student log-probs at those indices
-                            t_topk = t_lp_slice.gather(-1, topk_idx)  # [1, min_len, k]
-                            s_topk = s_log_p_full.gather(-1, topk_idx)  # [1, min_len, k]
-                            # Renormalize (log_softmax over the k dimension)
+                            _, topk_idx = t_p_slice.topk(k_val, dim=-1)
+                            t_topk = t_lp_slice.gather(-1, topk_idx)
+                            s_topk = s_log_p_full.gather(-1, topk_idx)
                             t_topk_norm = F.log_softmax(t_topk, dim=-1)
                             s_topk_norm = F.log_softmax(s_topk, dim=-1)
-                            # KL on renormalized top-k
                             topk_kl = F.kl_div(s_topk_norm, t_topk_norm,
                                                log_target=True, reduction="none").sum(dim=-1).squeeze(0)
                             topk_shadow[f"kl_top{k_val}"] = round(topk_kl.mean().item(), 6)
                             del topk_idx, t_topk, s_topk, t_topk_norm, s_topk_norm, topk_kl
                         del s_log_p_full
                     except Exception:
-                        pass  # Shadow metrics are best-effort
+                        pass
 
                     del s_logits, cont_s, kl_per_pos, t_lp_slice, t_p_slice, s_cont_slice
-                    if teacher_log_probs is None:
-                        # Chunked path: free per-prompt teacher tensors
-                        del t_log_p, t_p
-                        if i % 20 == 0:
-                            torch.cuda.empty_cache()
+                    del t_log_p, t_p
+                    if i % 20 == 0:
+                        torch.cuda.empty_cache()
 
                     if math.isnan(kl_mean) or math.isinf(kl_mean):
                         print(f"  [prompt {i}] KL={kl_mean} — invalid, stopping", flush=True)
@@ -996,10 +886,8 @@ def main():
                     running_mean = sum(prompt_kl_means) / len(prompt_kl_means)
                     live_progress["phase"] = "scoring"
                     live_progress["current"] = {
-                        "student_name": student_name,
-                        "student_idx": student_idx,
-                        "prompts_done": i + 1,
-                        "prompts_total": len(prompts),
+                        "student_name": student_name, "student_idx": student_idx,
+                        "prompts_done": i + 1, "prompts_total": len(prompts),
                         "kl_running_mean": round(running_mean, 6),
                         "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far else None,
                     }
@@ -1010,10 +898,10 @@ def main():
 
                 except RuntimeError as e:
                     scoring_error = str(e)
-                    if "out of memory" not in str(e).lower():
-                        print(f"  [prompt {i}] RuntimeError: {e}", flush=True)
-                    else:
+                    if "out of memory" in str(e).lower():
                         print(f"  [prompt {i}] OOM", flush=True)
+                    else:
+                        print(f"  [prompt {i}] RuntimeError: {e}", flush=True)
                     free_gpu()
                     break
                 except Exception as e:
@@ -1058,7 +946,7 @@ def main():
             n_scored = len(kl_per_prompt)
             status = "early_stopped" if early_stopped else ("partial" if scoring_error else "scored")
             print(f"  → KL={kl_avg:.6f} ({n_scored}/{len(prompts)} prompts, {status})", flush=True)
-            # Aggregate shadow top-k metrics
+
             topk_aggs = {}
             for k_label in ("kl_top100", "kl_top1000"):
                 vals = [d.get(k_label) for d in kl_per_prompt if d.get(k_label) is not None]
@@ -1074,12 +962,11 @@ def main():
                 "load_time": round(load_time, 1),
                 "early_stopped": early_stopped,
             }
-            # Shadow top-k KL (logged for analysis, not used in scoring)
             if topk_aggs:
                 student_result["shadow_topk"] = topk_aggs
                 print(f"  → Shadow top-k: {topk_aggs}", flush=True)
             results["students"][student_name] = student_result
-            # Update early stopping baseline
+
             if kl_avg > 0.001 and not early_stopped and not scoring_error:
                 if best_kl_so_far is None or kl_avg < best_kl_so_far:
                     best_kl_so_far = kl_avg
@@ -1110,10 +997,9 @@ def main():
             free_gpu()
             clean_model_cache(student_name, args.teacher)
         else:
-            # King stays loaded — just clear KV cache
             torch.cuda.empty_cache()
 
-        # Wait for prefetch if needed
+        # Wait for prefetch
         if prefetch_future:
             try:
                 prefetch_future.result(timeout=1)

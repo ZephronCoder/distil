@@ -180,29 +180,6 @@ def register_model_hash(
     hash_file.write_text(json.dumps(hashes, indent=2))
 
 
-def verify_tokenizer(teacher_model: str, student_model: str) -> tuple[bool, str]:
-    """Verify student uses exact same tokenizer as teacher."""
-    from transformers import AutoTokenizer
-
-    t_tok = AutoTokenizer.from_pretrained(teacher_model, trust_remote_code=True)
-    s_tok = AutoTokenizer.from_pretrained(student_model, trust_remote_code=False)
-
-    if t_tok.vocab_size != s_tok.vocab_size:
-        return False, f"Vocab size mismatch: {s_tok.vocab_size} ≠ {t_tok.vocab_size} (teacher)"
-
-    test_strings = [
-        "def fibonacci(n):\n    if n <= 1: return n",
-        "The quick brown fox jumps over the lazy dog.",
-        "import torch\nclass Model(nn.Module):",
-        "class MyClass(BaseClass):\n    def __init__(self):\n        pass",
-    ]
-    for s in test_strings:
-        if t_tok.encode(s) != s_tok.encode(s):
-            return False, f"Tokenizer encoding mismatch on test string: '{s[:40]}...'"
-
-    return True, "ok"
-
-
 def verify_model_integrity(
     model_repo: str,
     revision: str = None,
