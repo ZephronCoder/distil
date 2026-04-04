@@ -1202,6 +1202,73 @@ def get_miner(uid: int):
     )
 
 
+@app.get("/api/miner/{uid}/rounds", tags=["Miners"], summary="H2H rounds for a specific miner",
+         description="""Returns all head-to-head rounds where a specific UID participated.
+
+Supports `?limit=N` (default 50, max 200) and `?page=N` (1-indexed). Newest rounds first.
+
+Each round entry includes:
+- `block`: Block number of the round
+- `timestamp`: Unix timestamp
+- `kl`: This miner's KL score in that round
+- `is_king`: Whether the miner was king during this round
+- `king_changed`: Whether the king was dethroned
+- `type`: Round type (h2h or full_eval)
+- `king_uid`: Who was king that round
+- `n_prompts`: Number of prompts used
+""")
+def get_miner_rounds(uid: int, limit: int = 50, page: int = 1):
+    limit = max(1, min(limit, 200))
+    page = max(1, page)
+    try:
+        h2h_history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
+        if not isinstance(h2h_history, list):
+            h2h_history = []
+
+        # Filter rounds where this UID participated
+        relevant = []
+        for rnd in reversed(h2h_history):
+            for r in rnd.get("results", []):
+                if r.get("uid") == uid:
+                    relevant.append({
+                        "block": rnd.get("block"),
+                        "timestamp": rnd.get("timestamp"),
+                        "kl": r.get("kl"),
+                        "model": r.get("model"),
+                        "is_king": r.get("is_king", False),
+                        "vs_king": r.get("vs_king"),
+                        "king_changed": rnd.get("king_changed", False),
+                        "king_uid": rnd.get("king_uid"),
+                        "new_king_uid": rnd.get("new_king_uid"),
+                        "type": rnd.get("type"),
+                        "n_prompts": rnd.get("n_prompts"),
+                        "p_value": rnd.get("p_value"),
+                    })
+                    break
+
+        total = len(relevant)
+        start = (page - 1) * limit
+        end = start + limit
+        page_data = relevant[start:end]
+
+        return JSONResponse(
+            content=_sanitize_floats({
+                "uid": uid,
+                "rounds": page_data,
+                "total": total,
+                "page": page,
+                "limit": limit,
+                "has_more": end < total,
+            }),
+            headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to fetch miner rounds: {str(e)}"},
+        )
+
+
 @app.get("/api/commitment/{hotkey}", tags=["Miners"], summary="Lookup commitment by hotkey",
          description="""Lookup a miner's on-chain model commitment by their hotkey (ss58 address).
 
