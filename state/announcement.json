@@ -1,14 +1,1 @@
-{
-  "type": "new_king",
-  "timestamp": 1775359468.913628,
-  "posted": false,
-  "message": "<@&1482026585358991571>\n## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 126** has dethroned **UID 46**\n\n\ud83d\udcca **KL: 0.101612** (previous king scored 0.101825 last eval)\n\ud83e\udd17 Model: [Troiaaa/m-nv8dcght](<https://huggingface.co/Troiaaa/m-nv8dcght>)\n\ud83d\udc51 Previous king: [QuiteLLM/sn97-test-ver14](<https://huggingface.co/QuiteLLM/sn97-test-ver14>)\n\nDethronement uses paired t-test (p<0.05) on 120 prompts. Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
-  "data": {
-    "new_uid": 126,
-    "new_model": "Troiaaa/m-nv8dcght",
-    "new_kl": 0.101612,
-    "old_uid": 46,
-    "old_model": "QuiteLLM/sn97-test-ver14",
-    "old_kl": 0.101825
-  }
-}
+{"type": "new_king", "timestamp": 1775399783.0952258, "posted": true, "message": "<@&1482026585358991571>\n## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 103** has dethroned **UID 126**\n\n\ud83d\udcca **KL: 0.094387** (previous king scored 0.095135 last eval)\n\ud83e\udd17 Model: [aidonuts/sunday-creek-s3500-a020-a099](<https://huggingface.co/aidonuts/sunday-creek-s3500-a020-a099>)\n\ud83d\udc51 Previous king: [Troiaaa/m-nv8dcght](<https://huggingface.co/Troiaaa/m-nv8dcght>)\n\nDethronement uses paired t-test (p<0.05) on 120 prompts. Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)", "data": {"new_uid": 103, "new_model": "aidonuts/sunday-creek-s3500-a020-a099", "new_kl": 0.094387, "old_uid": 126, "old_model": "Troiaaa/m-nv8dcght", "old_kl": 0.095135}, "suppressed": true, "suppressed_reason": "False dethronement based on stale eval data"}

@@ -468,7 +468,7 @@ def _check_models_exist(models_to_eval, uid_to_hotkey, state: ValidatorState, co
 def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int,
                     prompt_texts: list, state: ValidatorState, max_params_b: float,
                     is_full_eval: bool, use_vllm: bool, eval_script: str,
-                    eval_script_remote: str, resuming_round: bool = False):
+                    eval_script_remote: str):
     """Execute the GPU eval on the remote pod and return results.
 
     Handles: prompt upload, eval script upload, progress polling,
@@ -527,14 +527,10 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # Re-upload eval script
     pod.upload(eval_script, eval_script_remote, max_attempts=5)
 
-    # Clean stale artifacts; handle resume vs new round
+    # Clean ALL stale artifacts — every round starts fresh, no resume
     try:
-        pod.exec("rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_progress.json")
-        if resuming_round:
-            logger.info("Resuming round (keeping eval_results.json + teacher_cache.pt on pod)")
-        else:
-            pod.exec("rm -f /home/eval_results.json /home/teacher_cache.pt")
-            logger.info("New round (cleared eval_results.json + teacher_cache.pt)")
+        pod.exec("rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_progress.json /home/eval_results.json /home/teacher_cache.pt")
+        logger.info("Cleared all pod artifacts (eval_results, teacher_cache, progress)")
     except Exception:
         pass
 
@@ -565,8 +561,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"--max-prompt-len {MAX_PROMPT_TOKENS} "
         f"--max-new-tokens {MAX_NEW_TOKENS} "
         f"--max-params-b {max_params_b} "
-        f"--teacher-logits /home/teacher_cache.pt "
-        f"--resume"
+        f"--teacher-logits /home/teacher_cache.pt"
         f"{king_flag}"
         f"{vllm_flag}"
         f" 2>&1 | tee /home/eval_output.log"
@@ -1374,19 +1369,9 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     time.sleep(60)
                     continue
 
-            # Round resumption
-            resuming_round = False
-            if state.current_round.get("prompts"):
-                saved_models = set(state.current_round.get("model_names", []))
-                current_models = set(info["model"] for info in models_to_eval.values())
-                if saved_models & current_models:
-                    prompt_texts = state.current_round["prompts"]
-                    resuming_round = True
-                    logger.info(f"RESUMING incomplete round ({len(prompt_texts)} prompts)")
-
-            if not resuming_round:
-                epoch_prompts = sample_prompts_from_dataset(n_prompts, current_block, block_hash=current_block_hash)
-                prompt_texts = [format_prompt(p) for p in epoch_prompts]
+            # Fresh prompts every round — no resume
+            epoch_prompts = sample_prompts_from_dataset(n_prompts, current_block, block_hash=current_block_hash)
+            prompt_texts = [format_prompt(p) for p in epoch_prompts]
 
             # Save round state for crash recovery
             state.current_round = {
@@ -1402,7 +1387,6 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 pod, models_to_eval, king_uid, n_prompts, prompt_texts,
                 state, max_params_b, is_full_eval, use_vllm,
                 eval_script, eval_script_remote,
-                resuming_round=resuming_round,
             )
             if results is None:
                 if once:
