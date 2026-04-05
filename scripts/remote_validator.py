@@ -449,7 +449,7 @@ def _check_models_exist(models_to_eval, uid_to_hotkey, state: ValidatorState, co
 def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int,
                     prompt_texts: list, state: ValidatorState, max_params_b: float,
                     is_full_eval: bool, use_vllm: bool, eval_script: str,
-                    eval_script_remote: str):
+                    eval_script_remote: str, resuming_round: bool = False):
     """Execute the GPU eval on the remote pod and return results.
 
     Handles: prompt upload, eval script upload, progress polling,
@@ -511,7 +511,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # Clean stale artifacts; handle resume vs new round
     try:
         pod.exec("rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_progress.json")
-        if state.current_round.get("prompts"):
+        if resuming_round:
             logger.info("Resuming round (keeping eval_results.json + teacher_cache.pt on pod)")
         else:
             pod.exec("rm -f /home/eval_results.json /home/teacher_cache.pt")
@@ -1375,6 +1375,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 pod, models_to_eval, king_uid, n_prompts, prompt_texts,
                 state, max_params_b, is_full_eval, use_vllm,
                 eval_script, eval_script_remote,
+                resuming_round=resuming_round,
             )
             if results is None:
                 if once:

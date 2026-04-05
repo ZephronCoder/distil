@@ -1498,7 +1498,7 @@ _last_chat_restart = 0.0
 
 
 def _ensure_chat_server(king_model=None):
-    """Auto-start chat server if not running. Rate-limited to once per 2 min."""
+    """Auto-start chat server if not running or running wrong model. Rate-limited to once per 2 min."""
     global _last_chat_restart
     with _chat_restart_lock:
         if time.time() - _last_chat_restart < 120:
@@ -1507,10 +1507,16 @@ def _ensure_chat_server(king_model=None):
 
     model_name = king_model or "unknown"
     try:
-        stdout = _ssh_exec("pgrep -f chat_server.py || echo not_running")
+        stdout = _ssh_exec(f"curl -s http://localhost:{CHAT_POD_PORT}/health || echo not_running")
         if "not_running" in stdout:
             print(f"[chat] Auto-starting chat server for {model_name}", flush=True)
-            _ssh_exec(f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_PORT} > /tmp/chat_server.log 2>&1 &", timeout=10)
+            _ssh_exec(f"nohup /root/chat-env/bin/python /root/chat_server.py '{model_name}' {CHAT_POD_PORT} > /root/chat.log 2>&1 &", timeout=10)
+        elif model_name != "unknown" and model_name not in stdout:
+            # Server running but wrong model — restart
+            print(f"[chat] Chat server running wrong model, restarting for {model_name}", flush=True)
+            _ssh_exec("pkill -f chat_server.py || true", timeout=10)
+            import time as _t; _t.sleep(2)
+            _ssh_exec(f"nohup /root/chat-env/bin/python /root/chat_server.py '{model_name}' {CHAT_POD_PORT} > /root/chat.log 2>&1 &", timeout=10)
     except Exception as e:
         print(f"[chat] Auto-restart failed: {e}", flush=True)
 
