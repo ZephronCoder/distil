@@ -1233,6 +1233,14 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             logger.info(f"\n=== EPOCH {epoch_count} ===")
             log_event(f"Starting epoch {epoch_count}", state_dir=state_dir)
 
+            # ── Orphan cleanup: remove UIDs from evaluated_uids that have no score ──
+            orphans = [uid for uid in list(state.evaluated_uids) if uid not in state.scores]
+            if orphans:
+                for uid in orphans:
+                    state.evaluated_uids.discard(uid)
+                state.save_evaluated_uids()
+                logger.info(f"Cleaned {len(orphans)} orphaned UIDs from evaluated_uids")
+
             # ── Clear stale eval progress ──
             if state.eval_progress.get("active"):
                 age_min = (time.time() - state.eval_progress.get("started_at", 0)) / 60
