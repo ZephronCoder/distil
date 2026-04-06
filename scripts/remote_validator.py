@@ -309,9 +309,10 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
         hotkey = commit.get("hotkey", uid_to_hotkey.get(uid, ""))
         this_commit_block = commit.get("block")
 
-        # Check DQ
-        if is_disqualified(uid, hotkey, state.dq_reasons, commit_block=this_commit_block):
-            reason = get_dq_reason(uid, hotkey, state.dq_reasons, commit_block=this_commit_block)
+        # Check DQ (including coldkey hard bans)
+        coldkey = uid_to_coldkey.get(uid)
+        if is_disqualified(uid, hotkey, state.dq_reasons, commit_block=this_commit_block, coldkey=coldkey):
+            reason = get_dq_reason(uid, hotkey, state.dq_reasons, commit_block=this_commit_block, coldkey=coldkey)
             logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
             disqualified.add(uid)
             continue
