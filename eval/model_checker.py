@@ -272,6 +272,33 @@ TOKENIZER_TEST_STRINGS = [
 _teacher_tokenizer = None
 
 
+def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
+    """Soft check for whether a student repo is natively vLLM-compatible.
+
+    This does NOT gate evaluation yet. It is used to surface whether a model was
+    saved in the base Qwen3.5 wrapper format (`Qwen3_5ForConditionalGeneration`)
+    instead of the extracted text-only format (`Qwen3_5ForCausalLM`), which needs
+    serving-time reconstruction.
+    """
+    model_type = config.get("model_type")
+    archs = config.get("architectures") or []
+    preproc_present = False
+    if repo_info is not None:
+        try:
+            preproc_present = any(
+                getattr(s, "rfilename", "") == "preprocessor_config.json"
+                for s in (repo_info.siblings or [])
+            )
+        except Exception:
+            pass
+
+    if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs and preproc_present:
+        return True, "native_qwen3_5_wrapper"
+    if model_type == "qwen3_5_text" and "Qwen3_5ForCausalLM" in archs:
+        return False, "text_only_qwen3_5_checkpoint"
+    return False, f"unsupported_or_unknown:{model_type}:{','.join(archs) if archs else 'none'}"
+
+
 def _get_teacher_tokenizer():
     """Lazily load and cache the teacher tokenizer."""
     global _teacher_tokenizer
@@ -429,6 +456,9 @@ def check_model_architecture(
         config_total_b = moe_info["total_params"] / 1e9
         config_active_b = moe_info["active_params"] / 1e9
 
+        # Soft compatibility signal for future vLLM/sglang-native serving enforcement
+        vllm_compatible, vllm_reason = assess_vllm_compatibility(config, info)
+
         # Use safetensors count if available (most accurate), else config estimate
         total_params_b = safetensors_params_b if safetensors_params_b > 0 else config_total_b
 
@@ -582,6 +612,8 @@ def check_model_architecture(
             "active_params_b": config_active_b,
             "vocab_size": vocab_size,
             "is_moe": moe_info["is_moe"],
+            "vllm_compatible": vllm_compatible,
+            "vllm_reason": vllm_reason,
         }
 
     except Exception as e:

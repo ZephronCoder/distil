@@ -73,7 +73,7 @@ def parse_commitments(metagraph, revealed: dict, n_uids: int) -> tuple[dict, dic
         except Exception:
             pass
         if hotkey in revealed and len(revealed[hotkey]) > 0:
-            block, data = revealed[hotkey][0]  # FIRST commitment — one per hotkey, permanent
+            block, data = max(revealed[hotkey], key=lambda x: x[0])  # latest revealed commitment
             try:
                 parsed = json.loads(data)
                 if "model" in parsed:

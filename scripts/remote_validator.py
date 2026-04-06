@@ -73,6 +73,32 @@ ACTIVATION_COPY_THRESHOLD = 0.9999  # Cosine similarity above this = functional 
 DISTIL_ROLE_ID = "1482026585358991571"
 
 
+def write_api_commitments_cache(commitments: dict, state_dir: str):
+    """Write hotkey-keyed commitments cache for the prod API server.
+
+    The prod API host intentionally does not depend on bittensor, so it relies on
+    this synced cache instead of doing live chain RPC itself.
+    """
+    try:
+        cache_dir = Path(state_dir) / "api_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        hotkey_keyed = {}
+        for uid, data in commitments.items():
+            hotkey = data.get("hotkey")
+            if not hotkey:
+                continue
+            row = {k: v for k, v in data.items() if k != "hotkey"}
+            hotkey_keyed[str(hotkey)] = row
+        payload = {
+            "commitments": hotkey_keyed,
+            "count": len(hotkey_keyed),
+            "_ts": time.time(),
+        }
+        (cache_dir / "commitments.json").write_text(json.dumps(payload))
+    except Exception as e:
+        logger.warning(f"Failed to write API commitments cache: {e}")
+
+
 def _cosine_sim(a: list, b: list) -> float:
     """Cosine similarity between two float lists."""
     import math
@@ -406,7 +432,11 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             "params_b": check.get("params_b", 0),
             "commit_block": commit.get("block", float("inf")),
             "hotkey": hotkey,
+            "vllm_compatible": check.get("vllm_compatible"),
+            "vllm_reason": check.get("vllm_reason"),
         }
+        if check.get("vllm_compatible") is False:
+            logger.info(f"UID {uid}: {model_repo} is NOT natively vLLM-compatible ({check.get('vllm_reason')})")
         logger.info(f"UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓")
 
     return valid_models, disqualified
@@ -1400,6 +1430,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 continue
 
             commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments(metagraph, revealed, n_uids)
+            write_api_commitments_cache(commitments, state_dir)
             logger.info(f"Found {len(commitments)} miner commitments")
 
             if not commitments:
