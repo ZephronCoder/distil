@@ -266,8 +266,10 @@ for hotkey, entries in revealed.items():
     if not entries:
         continue
     try:
-        # Take the FIRST (original) entry — one commitment per hotkey, permanent
-        block, data_str = entries[0]
+        # Take the LATEST revealed commitment for this hotkey.
+        # Using the first/original entry leaves the dashboard permanently stale
+        # when a miner updates their model.
+        block, data_str = max(entries, key=lambda x: x[0])
     except (ValueError, TypeError) as e:
         print(f"[commitments] bad entry for {hotkey}: {e}", file=sys.stderr)
         continue
@@ -1507,16 +1509,16 @@ def _ensure_chat_server(king_model=None):
 
     model_name = king_model or "unknown"
     try:
-        stdout = _ssh_exec(f"curl -s http://localhost:{CHAT_POD_PORT}/health || echo not_running")
+        stdout = _ssh_exec(f"curl -fsS http://localhost:{CHAT_POD_PORT}/v1/models || echo not_running")
         if "not_running" in stdout:
             print(f"[chat] Auto-starting chat server for {model_name}", flush=True)
-            _ssh_exec(f"nohup /root/chat-env/bin/python /root/chat_server.py '{model_name}' {CHAT_POD_PORT} > /root/chat.log 2>&1 &", timeout=10)
+            _ssh_exec(f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_PORT} > /root/chat.log 2>&1 &", timeout=10)
         elif model_name != "unknown" and model_name not in stdout:
             # Server running but wrong model — restart
             print(f"[chat] Chat server running wrong model, restarting for {model_name}", flush=True)
-            _ssh_exec("pkill -f chat_server.py || true", timeout=10)
+            _ssh_exec("pkill -f 'vllm.entrypoints.openai.api_server|chat_server.py' || true", timeout=10)
             import time as _t; _t.sleep(2)
-            _ssh_exec(f"nohup /root/chat-env/bin/python /root/chat_server.py '{model_name}' {CHAT_POD_PORT} > /root/chat.log 2>&1 &", timeout=10)
+            _ssh_exec(f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_PORT} > /root/chat.log 2>&1 &", timeout=10)
     except Exception as e:
         print(f"[chat] Auto-restart failed: {e}", flush=True)
 
@@ -1531,8 +1533,8 @@ def chat_status():
     # Try health check on pod
     server_ok = False
     try:
-        stdout = _ssh_exec(f"curl -s http://localhost:{CHAT_POD_PORT}/health")
-        if '"status": "ok"' in stdout or '"status":"ok"' in stdout:
+        stdout = _ssh_exec(f"curl -fsS http://localhost:{CHAT_POD_PORT}/v1/models")
+        if stdout and (king_model is None or king_model in stdout):
             server_ok = True
         elif not eval_active:
             # Server not responding and no eval in progress — auto-restart

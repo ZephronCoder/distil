@@ -1100,7 +1100,7 @@ def _restart_chat_server(model_name: str):
     """Kill old chat server and start with new king model."""
     logger.info(f"Restarting chat server with new king: {model_name}")
     try:
-        _chat_ssh("pkill -f chat_server.py || true", timeout=10)
+        _chat_ssh("pkill -f 'vllm.entrypoints.openai.api_server|chat_server.py' || true", timeout=10)
         time.sleep(2)
         _chat_ssh(
             f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_APP_PORT} > /root/chat.log 2>&1 &",
@@ -1112,11 +1112,19 @@ def _restart_chat_server(model_name: str):
 
 
 def _ensure_chat_server_running(model_name: str):
-    """Check if chat server is running; start it if not."""
+    """Check if chat server is running with the right model; start/restart if needed."""
     try:
-        stdout = _chat_ssh("pgrep -f chat_server.py || echo not_running", timeout=10)
+        stdout = _chat_ssh(f"curl -fsS http://localhost:{CHAT_POD_APP_PORT}/v1/models || echo not_running", timeout=10)
         if "not_running" in stdout:
             logger.info(f"Chat server not running, starting with {model_name}")
+            _chat_ssh(
+                f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_APP_PORT} > /root/chat.log 2>&1 &",
+                timeout=10,
+            )
+        elif model_name not in stdout:
+            logger.info(f"Chat server running wrong model, restarting with {model_name}")
+            _chat_ssh("pkill -f 'vllm.entrypoints.openai.api_server|chat_server.py' || true", timeout=10)
+            time.sleep(2)
             _chat_ssh(
                 f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_APP_PORT} > /root/chat.log 2>&1 &",
                 timeout=10,
@@ -1146,11 +1154,13 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                 effective_king_kl = r.get("kl", king_h2h_kl)
                 break
 
+    _king_h2h_kl = round(effective_king_kl, 6) if effective_king_kl else None
     h2h_round = {
         "block": current_block, "block_hash": block_hash, "timestamp": time.time(),
         "king_uid": effective_king_uid, "king_model": effective_king_model,
         "prev_king_uid": king_uid,
-        "king_h2h_kl": round(effective_king_kl, 6) if effective_king_kl else None,
+        "king_kl": _king_h2h_kl,  # canonical field for API consumers
+        "king_h2h_kl": _king_h2h_kl,
         "king_global_kl": round(king_kl, 6),
         "epsilon": EPSILON,
         "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
