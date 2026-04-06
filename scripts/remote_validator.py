@@ -952,7 +952,28 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState,
 
     # ── Paired t-test dethronement ──
     if king_uid is not None and king_h2h_kl is None:
-        logger.warning(f"King UID {king_uid} did not produce a score — retaining crown by default")
+        # King MUST produce a fresh score every round. If it fails (deleted repo,
+        # download error, etc.), it loses the crown to the best challenger.
+        # Falling back to cached scores would let a 404'd king retain the crown forever.
+        logger.warning(f"King UID {king_uid} did not produce a score — will lose crown to best challenger")
+        best_challenger_uid = None
+        best_challenger_kl = float("inf")
+        for uid in (uid for uid in models_to_eval if uid != king_uid):
+            uid_str = str(uid)
+            if uid_str in state.scores and 0 < state.scores[uid_str] <= MAX_KL_THRESHOLD:
+                if state.scores[uid_str] < best_challenger_kl:
+                    best_challenger_kl = state.scores[uid_str]
+                    best_challenger_uid = uid
+        if best_challenger_uid is not None:
+            logger.info(f"King failed eval — promoting best challenger UID {best_challenger_uid} (KL={best_challenger_kl:.6f})")
+            log_event(f"King UID {king_uid} failed to produce score — promoting UID {best_challenger_uid}",
+                      level="warning", state_dir=str(state.state_dir))
+            return best_challenger_uid, best_challenger_kl, [], None, None, set(models_to_eval.keys())
+        else:
+            logger.error(f"King failed eval and no valid challengers — no king this round")
+            log_event(f"King UID {king_uid} failed and no valid challengers",
+                      level="error", state_dir=str(state.state_dir))
+            # Fall through with inf so any challenger can win
 
     king_new_kl = king_h2h_kl if king_h2h_kl is not None else state.scores.get(str(king_uid), king_kl) if king_uid else float("inf")
     epsilon_threshold = king_new_kl * (1.0 - EPSILON) if king_uid else float("inf")
