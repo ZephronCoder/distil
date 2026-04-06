@@ -1403,18 +1403,25 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     subtensor = bt.Subtensor(network=network)
 
     # ── Init pod ──
+    print(f"[validator] Initializing Lium client...", flush=True)
     cfg = Config(api_key=lium_api_key, ssh_key_path=Path.home() / ".ssh" / "id_ed25519")
     lium = Lium(config=cfg)
     pod = PodManager(lium, pod_name=lium_pod_name)
+    print(f"[validator] Connecting to pod '{lium_pod_name}'...", flush=True)
     pod.connect()
+    print(f"[validator] Connected to pod: {pod.pod.name if pod.pod else '?'}", flush=True)
 
     # ── Upload eval script ──
     eval_script = "scripts/pod_eval_vllm.py"
     eval_script_remote = "/home/pod_eval.py"
+    print("[validator] Uploading eval script...", flush=True)
     pod.upload(eval_script, eval_script_remote, max_attempts=5)
+    print("[validator] Eval script uploaded", flush=True)
 
     # ── Ensure pod deps ──
+    print("[validator] Ensuring pod dependencies...", flush=True)
     pod.ensure_dependencies(TEACHER_MODEL)
+    print("[validator] Pod dependencies ready", flush=True)
 
     epoch_count = 0
 
@@ -1422,7 +1429,11 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         try:
             epoch_start = time.time()
             epoch_count += 1
-            logger.info(f"\n=== EPOCH {epoch_count} ===")
+            # Re-force our logging level after bittensor clobbers it
+            logging.getLogger().setLevel(logging.INFO)
+            logger.setLevel(logging.DEBUG)
+            print(f"\n[validator] === EPOCH {epoch_count} ===", flush=True)
+            logger.info(f"=== EPOCH {epoch_count} ===")
             log_event(f"Starting epoch {epoch_count}", state_dir=state_dir)
 
             # ── Orphan cleanup: remove UIDs from evaluated_uids that have no score ──
@@ -1442,10 +1453,12 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     state.clear_round()
 
             # ── Fetch chain state ──
+            print("[validator] Fetching chain state...", flush=True)
             try:
                 metagraph, current_block, current_block_hash = fetch_metagraph(subtensor, netuid)
                 n_uids = int(metagraph.n)
                 revealed = subtensor.get_all_revealed_commitments(netuid)
+                print(f"[validator] Block {current_block}, n={n_uids}, {len(revealed)} revealed", flush=True)
                 logger.info(f"Block {current_block}, n={n_uids}, {len(revealed)} revealed")
             except Exception as chain_err:
                 logger.error(f"Chain unreachable: {chain_err}, sleeping 5min")
