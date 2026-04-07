@@ -608,9 +608,23 @@ def check_model_architecture(
                 f"total={total_params_b:.2f}B, active={config_active_b:.2f}B"
             )
 
-        # Architecture note: both Qwen3_5ForCausalLM and Qwen3_5ForConditionalGeneration
-        # are accepted. vLLM serving auto-patches at runtime via chat_server.py.
-        # vllm_compatible is surfaced as metadata only, not enforced.
+        # Enforce vLLM-native architecture
+        if not vllm_compatible:
+            return {
+                "pass": False,
+                "reason": (
+                    f"Model must use Qwen3_5ForConditionalGeneration architecture "
+                    f"(model_type=qwen3_5) to be vLLM-compatible. "
+                    f"Found: {','.join(config.get('architectures', []))} "
+                    f"(model_type={config.get('model_type', 'unknown')}). "
+                    f"Fix: edit config.json on HuggingFace — change architectures to "
+                    f"[\"Qwen3_5ForConditionalGeneration\"] and model_type to \"qwen3_5\". "
+                    f"No weight changes needed."
+                ),
+                "params_b": total_params_b,
+                "vllm_compatible": False,
+                "vllm_reason": vllm_reason,
+            }
 
         return {
             "pass": True,
