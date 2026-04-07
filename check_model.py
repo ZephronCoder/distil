@@ -296,6 +296,26 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         else:
             check_pass("No quantization")
 
+        # RULE: Must use Qwen3_5ForConditionalGeneration (vLLM-native architecture)
+        archs = config.get("architectures", [])
+        model_type = config.get("model_type", "")
+        has_preproc = any(
+            getattr(s, "rfilename", "") == "preprocessor_config.json"
+            for s in (info.siblings or [])
+        ) if info else False
+        if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs and has_preproc:
+            check_pass("Architecture", f"Qwen3_5ForConditionalGeneration (vLLM-native)")
+        elif model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs:
+            check_warn("Architecture",
+                       f"Qwen3_5ForConditionalGeneration found but missing preprocessor_config.json. "
+                       f"Copy it from Qwen/Qwen3.5-4B.")
+        else:
+            check_fail("Architecture",
+                       f"Must use Qwen3_5ForConditionalGeneration (model_type=qwen3_5). "
+                       f"Found: {','.join(archs)} (model_type={model_type}). "
+                       f"See Discord announcement for conversion instructions.")
+            failures.append(("architecture", f"{','.join(archs)} / {model_type}"))
+
         # RULE: Vocab size matches teacher
         vocab_size = config.get("vocab_size", 0)
         if not vocab_size:
