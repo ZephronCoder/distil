@@ -608,23 +608,9 @@ def check_model_architecture(
                 f"total={total_params_b:.2f}B, active={config_active_b:.2f}B"
             )
 
-        # Enforce vLLM-native architecture: models must use Qwen3_5ForConditionalGeneration
-        # (the base Qwen3.5-4B wrapper), not Qwen3_5ForCausalLM (text-only extraction).
-        # This ensures models work natively with vLLM without serving-time config patching.
-        if not vllm_compatible:
-            return {
-                "pass": False,
-                "reason": (
-                    f"Model must use Qwen3_5ForConditionalGeneration architecture "
-                    f"(model_type=qwen3_5) to be vLLM-compatible. "
-                    f"Found: {','.join(config.get('architectures', []))} "
-                    f"(model_type={config.get('model_type', 'unknown')}). "
-                    f"See docs for how to save your model in the correct format."
-                ),
-                "params_b": total_params_b,
-                "vllm_compatible": False,
-                "vllm_reason": vllm_reason,
-            }
+        # Architecture note: both Qwen3_5ForCausalLM and Qwen3_5ForConditionalGeneration
+        # are accepted. vLLM serving auto-patches at runtime via chat_server.py.
+        # vllm_compatible is surfaced as metadata only, not enforced.
 
         return {
             "pass": True,

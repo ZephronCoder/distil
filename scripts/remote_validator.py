@@ -326,31 +326,10 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             disqualified.add(uid)
             continue
 
-        # For already-evaluated UIDs with valid scores, still verify architecture
-        # (lightweight — only downloads config.json) but skip full re-check.
+        # Skip expensive HF checks for already-evaluated UIDs with valid scores
         uid_str = str(uid)
         if (uid_str in state.evaluated_uids and uid_str in state.scores
                 and state.scores[uid_str] <= MAX_KL_THRESHOLD):
-            # Quick arch check — ensure model still meets architecture requirements
-            try:
-                from huggingface_hub import hf_hub_download
-                cfg_path = hf_hub_download(model_repo, "config.json", revision=revision)
-                import json as _json
-                with open(cfg_path) as _f:
-                    cfg = _json.load(_f)
-                archs = cfg.get("architectures", [])
-                mtype = cfg.get("model_type", "")
-                if mtype != "qwen3_5" or "Qwen3_5ForConditionalGeneration" not in archs:
-                    logger.info(f"UID {uid} ({model_repo}): FAIL — wrong architecture ({mtype}/{','.join(archs)}), DQ")
-                    record_failure(uid, state.failures)
-                    disqualify(hotkey, f"arch: Model must use Qwen3_5ForConditionalGeneration (found {','.join(archs)}, model_type={mtype})",
-                               state.dq_reasons, commit_block=this_commit_block)
-                    disqualified.add(uid)
-                    state.scores.pop(uid_str, None)
-                    state.evaluated_uids.discard(uid_str)
-                    continue
-            except Exception:
-                pass  # Transient HF error — allow through, will catch next epoch
             valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": None, "hotkey": hotkey}
             continue
 
