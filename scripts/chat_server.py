@@ -84,6 +84,15 @@ def patch_config_and_tokenizer():
             json.dump(tok, f, indent=2)
         log("patched tokenizer_config.json")
 
+    # Copy base tokenizer files (miner tokenizer.json can be corrupt/incompatible)
+    for fn in ("tokenizer.json", "tokenizer_config.json"):
+        try:
+            src = hf_hub_download(BASE_MODEL, fn)
+            shutil.copy(src, MODEL_DIR / fn)
+            log(f"copied {fn} from base model")
+        except Exception as e:
+            log(f"warning: could not copy {fn}: {e}")
+
     # Copy base preprocessors expected by the wrapper.
     for fn in ("preprocessor_config.json", "video_preprocessor_config.json"):
         try:
