@@ -435,8 +435,6 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             "vllm_compatible": check.get("vllm_compatible"),
             "vllm_reason": check.get("vllm_reason"),
         }
-        if check.get("vllm_compatible") is False:
-            logger.info(f"UID {uid}: {model_repo} is NOT natively vLLM-compatible ({check.get('vllm_reason')})")
         logger.info(f"UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓")
 
     return valid_models, disqualified
