@@ -60,7 +60,7 @@ MAX_NEW_TOKENS = 512
 MAX_PROMPT_TOKENS = 1024
 
 EVAL_PROMPTS_FULL = 60    # Full eval: many models, need speed
-EVAL_PROMPTS_H2H = 300    # Head-to-head: oversampled to compensate for MIN_COMPLETION_TOKENS filtering
+EVAL_PROMPTS_H2H = 480    # Head-to-head: oversample 480, ~300 survive MIN_COMPLETION_TOKENS filter (min_chars=500 pre-filter helps)
 EPSILON = 0.01             # Legacy fallback if per-prompt data unavailable
 PAIRED_TEST_ALPHA = 0.05   # Significance level for paired t-test dethronement
 STALE_H2H_EPOCHS = 50      # Re-test if last H2H was >N epochs ago
@@ -209,7 +209,7 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
             f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
             f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n"
             f"{earnings_line}\n"
-            f"Dethronement uses one-sided paired t-test (p<0.05) on 300 prompts. "
+            f"Dethronement uses one-sided paired t-test (p<0.05) on ~300 usable prompts (480 sampled, filtered by completion length). "
             f"Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n"
             f"📈 [Live Dashboard](<https://distil.arbos.life>)"
         ),

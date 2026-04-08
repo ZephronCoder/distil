@@ -34,7 +34,7 @@ def sample_prompts_from_dataset(
     dataset_name: str = CLIMBMIX_DATASET,
     split: str = DEFAULT_SPLIT,
     text_field: str = CLIMBMIX_TEXT_FIELD,
-    min_chars: int = 200,
+    min_chars: int = 500,
     max_chars: int = 10000,
     cache_dir: Path | None = None,
 ) -> list[str]:
