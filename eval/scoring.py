@@ -96,11 +96,9 @@ def disqualify(hotkey: str, reason: str, dq: dict[str, str],
         flag_key = f"flag:coldkey:{coldkey}"
         if flag_key not in dq:
             dq[flag_key] = f"Associated with DQ'd hotkey {hotkey[:12]}... — {reason}"
-    # Flag HF username (prefix: "flag:hf:")
-    if hf_username:
-        flag_key = f"flag:hf:{hf_username}"
-        if flag_key not in dq:
-            dq[flag_key] = f"Associated with DQ'd hotkey {hotkey[:12]}... — {reason}"
+    # HF username flags removed — anyone can commit any HF account name,
+    # so flagging by HF username punishes innocent people. Only hotkey and
+    # coldkey are cryptographically tied to the committer.
 
 
 def is_disqualified(uid: int, hotkey: str, dq: dict[str, str],
@@ -134,8 +132,7 @@ def is_flagged(coldkey: str = None, hf_username: str = None,
         return None
     if coldkey and f"flag:coldkey:{coldkey}" in dq:
         return dq[f"flag:coldkey:{coldkey}"]
-    if hf_username and f"flag:hf:{hf_username}" in dq:
-        return dq[f"flag:hf:{hf_username}"]
+    # HF username flags removed — not cryptographically tied to committer
     return None
 
 
