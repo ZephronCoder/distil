@@ -225,7 +225,18 @@ class ValidatorState:
         atomic_json_write(self._path(TOP4_LEADERBOARD_FILE), self.top4_leaderboard, indent=2)
 
     def save_announcement(self, data: dict):
-        """Write a pending announcement for async Discord posting."""
+        """Write a pending announcement for async Discord posting.
+        
+        Skips write if an existing announcement for the same king change
+        is already present (whether posted or not), to prevent duplicates.
+        """
+        existing = _load_json(self._path(ANNOUNCEMENT_FILE), {})
+        if existing.get("type") == data.get("type"):
+            existing_data = existing.get("data", {})
+            new_data = data.get("data", {})
+            if (existing_data.get("new_uid") == new_data.get("new_uid") and
+                    existing_data.get("old_uid") == new_data.get("old_uid")):
+                return  # Same king change already recorded
         atomic_json_write(self._path(ANNOUNCEMENT_FILE), data, indent=2)
 
     def validate_consistency(
