@@ -13,10 +13,10 @@ LOCAL_STATE="/home/openclaw/distillation/state/"
 rsync -az --timeout=10 \
   --temp-dir=/tmp \
   --delay-updates \
+  --exclude='announcement.json' \
   --include='*.json' \
   --include='api_cache/' \
   --include='api_cache/*.json' \
-  --exclude='announcement.json' \
   --exclude='*.tmp' \
   --exclude='*' \
   "$LOCAL_STATE" "$REMOTE:$REMOTE_STATE" 2>/dev/null
