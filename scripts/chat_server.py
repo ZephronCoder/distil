@@ -161,7 +161,7 @@ def exec_vllm():
         "--dtype", "bfloat16",
         "--max-model-len", "32768",
         "--trust-remote-code",
-        "--served-model-name", MODEL_NAME,
+        "--served-model-name", "sn97-king",
         "--gpu-memory-utilization", "0.90",
         "--enforce-eager",
     ]
