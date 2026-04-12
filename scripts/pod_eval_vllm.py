@@ -376,7 +376,7 @@ def is_vllm_running():
         return False
 
 
-def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=4096):
+def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=16384):
     """Start vLLM server via subprocess. Returns True on success."""
     ensure_disk_space(model_name, threshold=80)
 
@@ -548,7 +548,7 @@ def main():
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                         help="vLLM GPU memory utilization (default 0.90)")
-    parser.add_argument("--vllm-max-model-len", type=int, default=4096)
+    parser.add_argument("--vllm-max-model-len", type=int, default=16384)
     # Backward-compatible args (ignored)
     parser.add_argument("--gpu", type=int, default=None, help="Ignored — kept for backward compat")
     parser.add_argument("--sequential", action="store_true", help="Ignored — kept for backward compat")
