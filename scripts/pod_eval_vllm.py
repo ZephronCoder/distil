@@ -1407,18 +1407,23 @@ def main():
                         t_indices = tl_entry["indices"]  # [1, seq_len, k]
                         t_values = tl_entry["values"]    # [1, seq_len, k]
                         min_len = min(cont_s.shape[1], t_indices.shape[1])
-                        s_cont_slice = cont_s[:, :min_len, :]
-                        # Detect if values are logprobs (from vLLM) or raw logits (from HF top-k)
-                        # vLLM logprobs are negative and typically < 0; raw logits can be positive
-                        # Heuristic: if max value > 0, they're logits; if all <= 0, they're logprobs
-                        max_val = t_values[:, :min_len, :].max().item()
-                        are_logprobs = (max_val <= 0.0)
-                        kl_per_pos = compute_kl_from_sparse(
-                            t_indices[:, :min_len, :], t_values[:, :min_len, :],
-                            s_cont_slice, values_are_logprobs=are_logprobs
-                        ).squeeze(0)
-                        kl_mean = kl_per_pos.mean().item()
-                        del t_indices, t_values, s_cont_slice, kl_per_pos
+                        if min_len == 0:
+                            # Empty continuation (0 generated tokens) — skip
+                            kl_mean = 0.0
+                            del t_indices, t_values
+                        else:
+                            s_cont_slice = cont_s[:, :min_len, :]
+                            # Detect if values are logprobs (from vLLM) or raw logits (from HF top-k)
+                            # vLLM logprobs are negative and typically < 0; raw logits can be positive
+                            # Heuristic: if max value > 0, they're logits; if all <= 0, they're logprobs
+                            max_val = t_values[:, :min_len, :].max().item()
+                            are_logprobs = (max_val <= 0.0)
+                            kl_per_pos = compute_kl_from_sparse(
+                                t_indices[:, :min_len, :], t_values[:, :min_len, :],
+                                s_cont_slice, values_are_logprobs=are_logprobs
+                            ).squeeze(0)
+                            kl_mean = kl_per_pos.mean().item()
+                            del t_indices, t_values, s_cont_slice, kl_per_pos
                     else:
                         # ── Dense teacher logits path (legacy / full-vocab) ──
                         tl = tl_entry.to(device).float()
