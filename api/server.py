@@ -736,13 +736,26 @@ def get_h2h_history(limit: int = 50, page: int = 1):
         try:
             with open(path) as f:
                 data = json.load(f)
-            # Annotate exploit rounds: king_changed but new_king not in results
+            # Annotate rounds with exploit info and extract t-test data to top level
             for entry in data:
                 if entry.get("king_changed") and entry.get("new_king_uid"):
                     result_uids = [r.get("uid") for r in entry.get("results", [])]
                     if entry["new_king_uid"] not in result_uids:
                         entry["_exploit"] = True
                         entry["_exploit_note"] = "King promoted from cached scores without evaluation this round (fixed in 579b17b)"
+                # Extract best challenger t-test info to top level for dashboard
+                if entry.get("t_stat") is None:
+                    best_tt = None
+                    for r in entry.get("results", []):
+                        tt = r.get("t_test")
+                        if tt and isinstance(tt, dict) and tt.get("p") is not None:
+                            if best_tt is None or tt["p"] < best_tt["p"]:
+                                best_tt = tt
+                    if best_tt:
+                        entry["t_stat"] = best_tt.get("t")
+                        entry["p_value"] = best_tt.get("p")
+                        entry["t_test_n"] = best_tt.get("n")
+                        entry["t_test_mean_delta"] = best_tt.get("mean_delta")
             total = len(data)
             # Reverse so newest first, then paginate
             data_rev = list(reversed(data))
