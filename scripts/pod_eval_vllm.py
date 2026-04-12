@@ -752,7 +752,7 @@ def stop_vllm_server():
 
 
 def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
-                      logprobs_k=128, token_to_id=None):
+                      logprobs_k=128, token_to_id=None, progress_cb=None):
     """Generate teacher continuations via vLLM API.
 
     When logprobs_k > 0, requests top-k logprobs from vLLM per generated token
@@ -808,6 +808,8 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
                     has_lp = "sparse_logprobs" in result
                     print(f"  [{idx+1}/{len(prompts)}] {prompt_ids.shape[1]}+{full_ids.shape[1]-prompt_ids.shape[1]} tokens"
                           f"{' (logprobs✓)' if has_lp else ''}", flush=True)
+                if progress_cb:
+                    progress_cb(idx + 1, len(prompts))
                 break
             except Exception as e:
                 if attempt < 2:
@@ -970,10 +972,14 @@ def main():
         if vllm_ok:
             _write_phase(progress_path, students, "vllm_generating", prompts_total=len(prompts))
             t0 = time.time()
+            def _vllm_progress(done, total):
+                _write_phase(progress_path, students, "vllm_generating",
+                             teacher_done=done, prompts_total=total)
             try:
                 sequences_data = generate_via_vllm(
                     prompts, tokenizer, args.max_new_tokens, args.block_seed,
                     logprobs_k=args.logprobs_k, token_to_id=token_to_id,
+                    progress_cb=_vllm_progress,
                 )
                 timings["vllm_generation"] = time.time() - t0
                 print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
