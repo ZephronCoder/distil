@@ -6,12 +6,14 @@ Checks:
 2. Active parameter count for MoE models (logged for transparency)
 3. Vocab size matches teacher (same tokenizer required)
 4. SHA256 hash of first safetensors shard (copy detection)
-5. Tokenizer encoding verification (spot-check)
+5. Tokenizer file integrity (byte-for-byte comparison with teacher)
+6. Tokenizer encoding verification (spot-check)
 """
 import json
 import hashlib
 import logging
 import os
+import requests as _requests
 from pathlib import Path
 from typing import Optional
 
@@ -357,6 +359,89 @@ def _get_teacher_tokenizer():
     return _teacher_tokenizer
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    """Check if an exception is a transient network error that should not DQ."""
+    err_str = str(exc).lower()
+    return any(k in err_str for k in [
+        "429", "rate limit", "too many requests",
+        "timeout", "timed out",
+        "connection", "connectionerror", "connecttimeout",
+    ])
+
+
+def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
+    """
+    Byte-for-byte verification of tokenizer files against the teacher model.
+
+    Checks:
+    1. tokenizer.json: SHA256 must exactly match the teacher's tokenizer.json.
+       This file contains the full vocabulary, merges, and added_tokens.
+    2. tokenizer_config.json: all fields except chat_template must match.
+       (chat_template is checked separately by the template hash check.)
+
+    Returns dict with:
+      match: bool
+      reason: str (if not matching)
+    """
+    # Download teacher tokenizer.json
+    teacher_tok_json_path = hf_hub_download(
+        repo_id=TEACHER_MODEL, filename="tokenizer.json"
+    )
+    with open(teacher_tok_json_path, "rb") as f:
+        teacher_tok_hash = hashlib.sha256(f.read()).hexdigest()
+
+    # Download student tokenizer.json
+    student_tok_json_path = hf_hub_download(
+        repo_id=model_repo, filename="tokenizer.json", revision=revision
+    )
+    with open(student_tok_json_path, "rb") as f:
+        student_tok_hash = hashlib.sha256(f.read()).hexdigest()
+
+    if student_tok_hash != teacher_tok_hash:
+        return {
+            "match": False,
+            "reason": (
+                f"tokenizer.json mismatch: student hash {student_tok_hash[:16]}... "
+                f"!= teacher hash {teacher_tok_hash[:16]}... "
+                f"(vocab/merges/added_tokens differ from {TEACHER_MODEL})"
+            ),
+        }
+
+    # Check tokenizer_config.json (excluding chat_template)
+    teacher_cfg_path = hf_hub_download(
+        repo_id=TEACHER_MODEL, filename="tokenizer_config.json"
+    )
+    student_cfg_path = hf_hub_download(
+        repo_id=model_repo, filename="tokenizer_config.json", revision=revision
+    )
+
+    with open(teacher_cfg_path) as f:
+        teacher_cfg = json.load(f)
+    with open(student_cfg_path) as f:
+        student_cfg = json.load(f)
+
+    # Remove chat_template from both (checked separately)
+    teacher_cfg.pop("chat_template", None)
+    student_cfg.pop("chat_template", None)
+
+    if teacher_cfg != student_cfg:
+        # Find the differing keys for a clear error message
+        diff_keys = []
+        all_keys = set(teacher_cfg.keys()) | set(student_cfg.keys())
+        for k in sorted(all_keys):
+            if teacher_cfg.get(k) != student_cfg.get(k):
+                diff_keys.append(k)
+        return {
+            "match": False,
+            "reason": (
+                f"tokenizer_config.json mismatch (excluding chat_template): "
+                f"differing fields: {', '.join(diff_keys[:10])}"
+            ),
+        }
+
+    return {"match": True}
+
+
 def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     """
     Verify that a model's tokenizer produces identical token IDs as the teacher.
@@ -580,19 +665,47 @@ def check_model_architecture(
                 "vocab_size": vocab_size,
             }
 
-        # 7. Verify tokenizer produces identical encodings as teacher
+        # 7a. Verify tokenizer files match teacher byte-for-byte
+        try:
+            tok_files_match = verify_tokenizer_files(model_repo, revision)
+            if not tok_files_match["match"]:
+                return {
+                    "pass": False,
+                    "reason": f"Tokenizer file mismatch: {tok_files_match['reason']}",
+                    "params_b": total_params_b,
+                    "vocab_size": vocab_size,
+                }
+        except Exception as tok_file_err:
+            if _is_transient_error(tok_file_err):
+                logger.warning(f"Tokenizer file check transient error for {model_repo}: {tok_file_err} (allowing)")
+            else:
+                return {
+                    "pass": False,
+                    "reason": f"Tokenizer file verification failed (fail-closed): {tok_file_err}",
+                    "params_b": total_params_b,
+                    "vocab_size": vocab_size,
+                }
+
+        # 7b. Verify tokenizer produces identical encodings as teacher
         try:
             tokenizer_match = verify_tokenizer_match(model_repo, revision)
             if not tokenizer_match["match"]:
                 return {
                     "pass": False,
-                    "reason": f"Tokenizer mismatch: {tokenizer_match['reason']}",
+                    "reason": f"Tokenizer encoding mismatch: {tokenizer_match['reason']}",
                     "params_b": total_params_b,
                     "vocab_size": vocab_size,
                 }
         except Exception as tok_err:
-            logger.warning(f"Tokenizer check failed for {model_repo}: {tok_err} (allowing)")
-            # Don't block on tokenizer download failure — vocab_size check is the primary gate
+            if _is_transient_error(tok_err):
+                logger.warning(f"Tokenizer encoding check transient error for {model_repo}: {tok_err} (allowing)")
+            else:
+                return {
+                    "pass": False,
+                    "reason": f"Tokenizer encoding verification failed (fail-closed): {tok_err}",
+                    "params_b": total_params_b,
+                    "vocab_size": vocab_size,
+                }
 
         # 8. Verify chat_template matches the official Qwen template
         # Prevents exploits via modified chat templates and blocks derivative models

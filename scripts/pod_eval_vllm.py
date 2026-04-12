@@ -33,6 +33,10 @@ Usage:
 """
 import math
 import torch
+
+# Chunk size for HF forward pass with KV cache on long sequences.
+# Sequences longer than this are processed in chunks to avoid truncation gaming.
+HF_CHUNK_SIZE = 4096
 import torch.nn.functional as F
 import json
 import time
@@ -549,11 +553,9 @@ def main():
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                         help="vLLM GPU memory utilization (default 0.90)")
     parser.add_argument("--vllm-max-model-len", type=int, default=16384)
-    parser.add_argument("--max-logit-len", type=int, default=2048,
-                        help="Max total sequence length for HF logit extraction. "
-                             "Longer sequences are truncated to prompt + this many completion tokens. "
-                             "Prevents Phase 1b hangs on 8192-token completions.")
     # Backward-compatible args (ignored)
+    parser.add_argument("--max-logit-len", type=int, default=None,
+                        help="DEPRECATED: ignored. Chunked forward pass replaces truncation.")
     parser.add_argument("--gpu", type=int, default=None, help="Ignored — kept for backward compat")
     parser.add_argument("--sequential", action="store_true", help="Ignored — kept for backward compat")
     parser.add_argument("--persistent-vllm", action="store_true", help="Ignored — kept for backward compat")
@@ -676,29 +678,50 @@ def main():
             print(f"[eval] HF teacher loaded in {timings['teacher_hf_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
             _write_phase(progress_path, students, "teacher_logits", teacher_done=0, prompts_total=len(prompts))
-            max_logit_len = getattr(args, 'max_logit_len', 2048)
-            n_truncated = 0
+            n_chunked = 0
             t0 = time.time()
             with torch.no_grad():
                 for i, data in enumerate(sequences_data):
                     full_ids = data["full_ids"].to(device)
                     prompt_len = data["prompt_len"]
-                    gen_len = full_ids.shape[1] - prompt_len
-                    # Truncate long completions to avoid HF forward pass hanging
-                    if gen_len > max_logit_len:
-                        full_ids = full_ids[:, :prompt_len + max_logit_len]
-                        n_truncated += 1
+                    seq_len = full_ids.shape[1]
                     prompt_lens.append(prompt_len)
                     full_sequences.append(full_ids)
-                    logits = teacher(full_ids).logits.float()
-                    cont_logits = logits[:, prompt_len - 1:-1, :]
-                    teacher_logits_list.append(cont_logits.cpu())
-                    del logits, cont_logits
+
+                    if seq_len <= HF_CHUNK_SIZE:
+                        # Short sequence — single forward pass
+                        logits = teacher(full_ids).logits.float()
+                        cont_logits = logits[:, prompt_len - 1:-1, :]
+                        teacher_logits_list.append(cont_logits.cpu())
+                        del logits, cont_logits
+                    else:
+                        # Long sequence — chunked forward pass with KV cache
+                        n_chunked += 1
+                        all_logit_chunks = []
+                        past_key_values = None
+                        for chunk_start in range(0, seq_len, HF_CHUNK_SIZE):
+                            chunk_end = min(chunk_start + HF_CHUNK_SIZE, seq_len)
+                            chunk_ids = full_ids[:, chunk_start:chunk_end]
+                            outputs = teacher(
+                                chunk_ids,
+                                past_key_values=past_key_values,
+                                use_cache=True,
+                            )
+                            all_logit_chunks.append(outputs.logits.float().cpu())
+                            past_key_values = outputs.past_key_values
+                            del outputs
+                        # Concatenate all logit chunks: shape [1, seq_len, vocab]
+                        all_logits = torch.cat(all_logit_chunks, dim=1)
+                        cont_logits = all_logits[:, prompt_len - 1:-1, :]
+                        teacher_logits_list.append(cont_logits)
+                        del all_logits, all_logit_chunks, past_key_values, cont_logits
+                        torch.cuda.empty_cache()
+
                     if (i + 1) % 10 == 0 or i == len(sequences_data) - 1:
                         print(f"  Logits [{i+1}/{len(sequences_data)}], VRAM: {gpu_mem_str()}", flush=True)
                     _write_phase(progress_path, students, "teacher_logits", teacher_done=i + 1, prompts_total=len(prompts))
-            if n_truncated:
-                print(f"[eval] Truncated {n_truncated}/{len(sequences_data)} sequences to {max_logit_len} completion tokens", flush=True)
+            if n_chunked:
+                print(f"[eval] Chunked forward pass used for {n_chunked}/{len(sequences_data)} sequences (chunk_size={HF_CHUNK_SIZE})", flush=True)
 
             timings["teacher_logits_pass"] = time.time() - t0
             print(f"[eval] Logits extracted in {timings['teacher_logits_pass']:.1f}s", flush=True)

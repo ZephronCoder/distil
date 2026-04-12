@@ -58,7 +58,6 @@ NETUID = 97
 MAX_KL_THRESHOLD = 2.0
 MAX_NEW_TOKENS = 8192
 MAX_PROMPT_TOKENS = 1024
-MAX_LOGIT_LEN = 2048      # Cap HF logit extraction to avoid Phase 1b timeout on long completions
 
 EVAL_PROMPTS_FULL = 60    # Full eval: many models, need speed
 EVAL_PROMPTS_H2H = 150    # Head-to-head: 100 prompts, pre-filtered, exact count
@@ -723,7 +722,6 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"--output eval_results.json "
         f"--max-prompt-len {MAX_PROMPT_TOKENS} "
         f"--max-new-tokens {MAX_NEW_TOKENS} "
-        f"--max-logit-len {MAX_LOGIT_LEN} "
         f"--max-params-b {max_params_b} "
         f"--teacher-logits /home/teacher_cache.pt"
         f"{king_flag}"
