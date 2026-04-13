@@ -5,8 +5,8 @@ import time
 
 import requests as req
 
-from ..config import NETUID, TMC_BASE, TMC_HEADERS
-from .cache import _get_stale
+from config import NETUID, TMC_BASE, TMC_HEADERS
+from helpers.cache import _get_stale
 
 
 def _fetch_metagraph():

@@ -2,7 +2,7 @@
 
 import subprocess
 
-from ..config import CHAT_POD_HOST, CHAT_POD_SSH_PORT, CHAT_POD_SSH_KEY
+from config import CHAT_POD_HOST, CHAT_POD_SSH_PORT, CHAT_POD_SSH_KEY
 
 
 def _ssh_exec(cmd: str, timeout: int = 30) -> str:

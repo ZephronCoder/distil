@@ -5,9 +5,9 @@ import traceback
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from ..config import NETUID, CACHE_TTL, TMC_BASE
-from ..helpers.cache import _get_cached, _get_stale, _set_cached, _bg_refresh
-from ..helpers.fetch import _fetch_metagraph, _fetch_price
+from config import NETUID, CACHE_TTL, TMC_BASE
+from helpers.cache import _get_cached, _get_stale, _set_cached, _bg_refresh
+from helpers.fetch import _fetch_metagraph, _fetch_price
 
 router = APIRouter()
 

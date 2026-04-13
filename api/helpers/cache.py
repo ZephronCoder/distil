@@ -5,8 +5,8 @@ import os
 import threading
 import time
 
-from ..config import DISK_CACHE_DIR
-from .sanitize import _safe_filename
+from config import DISK_CACHE_DIR
+from helpers.sanitize import _safe_filename
 
 
 # In-memory caches (fast path)

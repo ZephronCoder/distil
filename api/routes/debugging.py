@@ -5,8 +5,8 @@ import os
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from ..config import STATE_DIR
-from ..helpers.sanitize import _sanitize_log_line, _safe_json_load, _ANSI_RE, _ALLOWED_PREFIXES
+from config import STATE_DIR
+from helpers.sanitize import _sanitize_log_line, _safe_json_load, _ANSI_RE, _ALLOWED_PREFIXES
 
 router = APIRouter()
 

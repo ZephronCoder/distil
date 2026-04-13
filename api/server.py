@@ -5,18 +5,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .config import API_DESCRIPTION
-from .helpers.rate_limit import _rate_limiter
-from .helpers.cache import _bg_refresh
-from .helpers.fetch import _fetch_metagraph, _fetch_commitments, _fetch_price
+from config import API_DESCRIPTION
+from helpers.rate_limit import _rate_limiter
+from helpers.cache import _bg_refresh
+from helpers.fetch import _fetch_metagraph, _fetch_commitments, _fetch_price
 
 # Import routers
-from .routes.health import router as health_router
-from .routes.miners import router as miners_router
-from .routes.evaluation import router as evaluation_router
-from .routes.market import router as market_router
-from .routes.chat import router as chat_router
-from .routes.debugging import router as debugging_router
+from routes.health import router as health_router
+from routes.miners import router as miners_router
+from routes.evaluation import router as evaluation_router
+from routes.market import router as market_router
+from routes.chat import router as chat_router
+from routes.debugging import router as debugging_router
 
 
 app = FastAPI(

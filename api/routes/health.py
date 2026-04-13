@@ -6,8 +6,8 @@ import time as _time
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 
-from ..config import NETUID, STATE_DIR
-from ..helpers.sanitize import _safe_json_load
+from config import NETUID, STATE_DIR
+from helpers.sanitize import _safe_json_load
 
 router = APIRouter()
 
