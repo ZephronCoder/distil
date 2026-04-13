@@ -686,27 +686,53 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     if revision and revision != "main":
         kwargs["revision"] = revision
         print(f"  [model] Pinning to revision {revision[:12]}", flush=True)
-    try:
-        m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
-        print(f"  [model] Loaded with flash_attention_2", flush=True)
-        return m
-    except Exception:
-        m = AutoModelForCausalLM.from_pretrained(name, **kwargs)
-        print(f"  [model] Loaded with default attention", flush=True)
-        return m
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            try:
+                m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
+                print(f"  [model] Loaded with flash_attention_2", flush=True)
+                return m
+            except (ValueError, ImportError):
+                m = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+                print(f"  [model] Loaded with default attention", flush=True)
+                return m
+        except Exception as e:
+            err_str = str(e)
+            is_transient = any(s in err_str for s in ["429", "503", "rate limit", "Connection", "Timeout", "HTTPSConnection"])
+            if is_transient and attempt < max_retries - 1:
+                wait = (attempt + 1) * 30
+                print(f"  [model] Transient error loading {name} (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {err_str[:100]}", flush=True)
+                time.sleep(wait)
+            else:
+                raise
 
 
-def prefetch_model(name, revision=None):
-    """Download model files to HF cache without loading to GPU. Runs in background."""
-    try:
-        from huggingface_hub import snapshot_download
-        dl_kwargs = dict(ignore_patterns=["*.bin", "*.msgpack", "*.h5", "*.ot"])
-        if revision and revision != "main":
-            dl_kwargs["revision"] = revision
-        snapshot_download(name, **dl_kwargs)
-        print(f"  [prefetch] {name} cached (rev={revision or 'main'})", flush=True)
-    except Exception as e:
-        print(f"  [prefetch] {name} failed: {e}", flush=True)
+def prefetch_model(name, revision=None, max_retries=3):
+    """Download model files to HF cache without loading to GPU. Runs in background.
+    
+    Retries on transient HF errors (429, 503, connection errors).
+    """
+    from huggingface_hub import snapshot_download
+    dl_kwargs = dict(ignore_patterns=["*.bin", "*.msgpack", "*.h5", "*.ot"])
+    if revision and revision != "main":
+        dl_kwargs["revision"] = revision
+    for attempt in range(max_retries):
+        try:
+            snapshot_download(name, **dl_kwargs)
+            print(f"  [prefetch] {name} cached (rev={revision or 'main'})", flush=True)
+            return
+        except Exception as e:
+            err_str = str(e)
+            is_transient = any(s in err_str for s in ["429", "503", "rate limit", "Connection", "Timeout"])
+            if is_transient and attempt < max_retries - 1:
+                wait = (attempt + 1) * 30
+                print(f"  [prefetch] {name} transient error (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {err_str[:100]}", flush=True)
+                time.sleep(wait)
+            else:
+                print(f"  [prefetch] {name} failed: {e}", flush=True)
+                return
 
 
 def clean_model_cache(name, teacher_name=None):
