@@ -1,0 +1,139 @@
+"""Data fetchers for metagraph, commitments, and price."""
+
+import json
+import time
+
+import requests as req
+
+from ..config import NETUID, TMC_BASE, TMC_HEADERS
+from .cache import _get_stale
+
+
+def _fetch_metagraph():
+    """Fetch metagraph via subprocess to avoid loading bittensor/torch in the API process."""
+    import subprocess
+    script = """
+import bittensor as bt, json
+sub = bt.Subtensor(network="finney")
+meta = sub.metagraph(97)
+block = sub.block
+neurons = []
+for uid in range(meta.n):
+    neurons.append({
+        "uid": uid,
+        "hotkey": str(meta.hotkeys[uid]),
+        "coldkey": str(meta.coldkeys[uid]),
+        "stake": float(meta.S[uid]),
+        "trust": float(meta.T[uid]),
+        "consensus": float(meta.C[uid]),
+        "incentive": float(meta.I[uid]),
+        "emission": float(meta.E[uid]),
+        "dividends": float(meta.D[uid]),
+        "is_validator": float(meta.S[uid]) > 1000,
+    })
+print(json.dumps({"netuid": 97, "block": int(block), "n": int(meta.n), "neurons": neurons}))
+"""
+    result = subprocess.run(
+        ["python3", "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"metagraph fetch failed: {result.stderr[-500:]}")
+    data = json.loads(result.stdout)
+    data["timestamp"] = time.time()
+    return data
+
+
+def _fetch_commitments():
+    """Fetch commitments via subprocess to avoid loading bittensor/torch in the API process."""
+    import subprocess
+    script = """
+import bittensor as bt, json, sys
+sub = bt.Subtensor(network="finney")
+revealed = sub.get_all_revealed_commitments(97)
+commits = {}
+for hotkey, entries in revealed.items():
+    if not entries:
+        continue
+    try:
+        # Take the LATEST revealed commitment for this hotkey.
+        # Using the first/original entry leaves the dashboard permanently stale
+        # when a miner updates their model.
+        block, data_str = max(entries, key=lambda x: x[0])
+    except (ValueError, TypeError) as e:
+        print(f"[commitments] bad entry for {hotkey}: {e}", file=sys.stderr)
+        continue
+    # Robust parsing: try JSON first, then hex decode, then raw string
+    parsed = None
+    if isinstance(data_str, str):
+        # Try JSON directly
+        try:
+            parsed = json.loads(data_str)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # Try hex-encoded JSON
+        if parsed is None and data_str.startswith("0x"):
+            try:
+                decoded = bytes.fromhex(data_str[2:]).decode("utf-8")
+                parsed = json.loads(decoded)
+            except Exception:
+                pass
+        # Try hex without prefix
+        if parsed is None:
+            try:
+                decoded = bytes.fromhex(data_str).decode("utf-8")
+                parsed = json.loads(decoded)
+            except Exception:
+                pass
+    elif isinstance(data_str, dict):
+        parsed = data_str
+    if parsed and isinstance(parsed, dict):
+        commits[str(hotkey)] = {"block": block, **parsed}
+    else:
+        print(f"[commitments] unparseable for {hotkey}: {str(data_str)[:100]}", file=sys.stderr)
+        commits[str(hotkey)] = {"block": block, "raw": str(data_str)}
+print(json.dumps({"commitments": commits, "count": len(commits)}))
+"""
+    result = subprocess.run(
+        ["python3", "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"commitments fetch failed: {result.stderr[-500:]}")
+    data = json.loads(result.stdout)
+    return data
+
+
+def _fetch_price():
+    data = req.get(f"{TMC_BASE}/public/v1/subnets/table/", headers=TMC_HEADERS, timeout=10).json()
+    sn97 = next((item for item in data if item.get("subnet") == NETUID), None)
+    if not sn97:
+        raise ValueError("Subnet 97 not found")
+
+    alpha_price_tao = sn97.get("price", 0)
+    try:
+        r = req.get("https://api.coingecko.com/api/v3/simple/price?ids=bittensor&vs_currencies=usd", timeout=5)
+        tao_usd = r.json().get("bittensor", {}).get("usd", 0)
+    except Exception:
+        tao_usd = (_get_stale("price") or {}).get("tao_usd", 0)
+
+    miners_tao_per_day = sn97.get("miners_tao_per_day", 0) or 0
+
+    return {
+        "alpha_price_tao": round(alpha_price_tao, 6),
+        "alpha_price_usd": round(alpha_price_tao * tao_usd, 4),
+        "tao_usd": round(tao_usd, 2),
+        "alpha_in_pool": round(sn97.get("alpha_liquidity", 0) / 1e9, 2),
+        "tao_in_pool": round(sn97.get("tao_liquidity", 0) / 1e9, 2),
+        "marketcap_tao": round(sn97.get("marketcap", 0), 2),
+        "emission_pct": round(sn97.get("emission", 0), 4),
+        "volume_tao": round(sn97.get("volume", 0), 2),
+        "price_change_1h": round(sn97.get("price_difference_hour", 0), 2),
+        "price_change_24h": round(sn97.get("price_difference_day", 0), 2),
+        "price_change_7d": round(sn97.get("price_difference_week", 0), 2),
+        "miners_tao_per_day": round(miners_tao_per_day, 4),
+        "block_number": sn97.get("block_number", 0),
+        "name": sn97.get("name", ""),
+        "symbol": sn97.get("symbol", ""),
+        "timestamp": time.time(),
+    }
