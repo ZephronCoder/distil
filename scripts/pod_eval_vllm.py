@@ -30,37 +30,71 @@ Usage:
         --prompts prompts.json \\
         --output results.json \\
         --king user/king
+
+File layout (single-file — uploaded to remote GPU pod via SCP):
+  1. Imports & Constants
+  2. GPU & Disk Utilities
+  3. Model Utilities (load, prefetch, cache, fingerprint)
+  4. KL Computation (core, sparse, precomputed)
+  5. vLLM Server Management (start, stop, health)
+  6. vLLM Generation (teacher generation, logprobs parsing)
+  7. vLLM Student Scoring
+  8. HF Batched Forward Pass
+  9. Progress Reporting
+  10. Main
 """
-import math
-import torch
-
-# Chunk size for HF forward pass with KV cache on long sequences.
-# Sequences longer than this are processed in chunks to avoid truncation gaming.
-HF_CHUNK_SIZE = 4096
-
-# Minimum completion tokens for teacher generation.
-# Prompts producing fewer tokens are skipped to prevent near-empty
-# completions from polluting KL scores.
-MIN_COMPLETION_TOKENS = 10
-import torch.nn.functional as F
-import json
-import time
-import argparse
-import gc
-import hashlib
-import os
-import sys
-import shutil
-import subprocess
-import signal
-import hashlib
-import threading
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Shared utilities
+# §1  Imports
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import argparse
+import gc
+import glob
+import hashlib
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §2  Constants
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# -- HF forward pass --
+HF_CHUNK_SIZE = 4096        # Chunk size for KV-cached forward on long sequences
+MIN_COMPLETION_TOKENS = 10  # Skip prompts producing fewer continuation tokens
+
+# -- KL computation --
+# Uses F.kl_div(log_target=True) which is mathematically identical to
+# sum(P * (log P - log Q)) but lets PyTorch fuse the kernel internally.
+# Chunked over positions to reduce peak memory (~4x less for 512-pos sequences).
+# Credit: caseus (github.com/winglian) for the optimization.
+KL_CHUNK_SIZE = 128
+
+# -- Activation fingerprinting (functional copy detection) --
+ACTIVATION_FP_SEED = 42
+ACTIVATION_FP_N_INPUTS = 5
+ACTIVATION_FP_SEQ_LEN = 64
+ACTIVATION_FP_VOCAB_SIZE = 248320  # Qwen tokenizer vocab
+
+# -- vLLM server --
+VLLM_PORT = 9100
+VLLM_URL = f"http://localhost:{VLLM_PORT}"
+VLLM_STARTUP_TIMEOUT = 900  # 15 min
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §3  GPU & Disk Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def gpu_mem_str():
@@ -70,6 +104,7 @@ def gpu_mem_str():
         total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         return f"{alloc:.1f}/{total:.1f}GB"
     return "N/A"
+
 
 def free_gpu():
     """Free GPU memory: garbage collect, empty cache, synchronize."""
@@ -102,7 +137,6 @@ def ensure_disk_space(teacher_name, threshold=85):
                     if d.is_dir() and d.name.startswith("models--") and d.name != teacher_cache:
                         shutil.rmtree(d)
             # Clean stale /tmp files >1GB
-            import glob
             for pattern in ["/tmp/vllm_*", "/tmp/tmp*", "/tmp/teacher_*"]:
                 for f in glob.glob(pattern):
                     try:
@@ -131,33 +165,86 @@ def ensure_disk_space(teacher_name, threshold=85):
         return 0
 
 
-# ── KL computation ──
-# Uses F.kl_div(log_target=True) which is mathematically identical to
-# sum(P * (log P - log Q)) but lets PyTorch fuse the kernel internally.
-# Chunked over positions to reduce peak memory (~4x less for 512-pos sequences).
-# Credit: caseus (github.com/winglian) for the optimization.
-KL_CHUNK_SIZE = 128
+# ═══════════════════════════════════════════════════════════════════════════════
+# §4  Model Utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
+    """Load a HuggingFace model for inference.
+
+    Uses flash_attention_2 when available, falls back to default attention.
+    Teacher models get trust_remote_code=True; students don't (security).
+    When revision is set, pins to that exact HF commit hash.
+    """
+    from transformers import AutoModelForCausalLM
+    is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
+    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
+    if revision and revision != "main":
+        kwargs["revision"] = revision
+        print(f"  [model] Pinning to revision {revision[:12]}", flush=True)
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            try:
+                m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
+                print(f"  [model] Loaded with flash_attention_2", flush=True)
+                return m
+            except (ValueError, ImportError):
+                m = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+                print(f"  [model] Loaded with default attention", flush=True)
+                return m
+        except Exception as e:
+            err_str = str(e)
+            is_transient = any(s in err_str for s in ["429", "503", "rate limit", "Connection", "Timeout", "HTTPSConnection"])
+            if is_transient and attempt < max_retries - 1:
+                wait = (attempt + 1) * 30
+                print(f"  [model] Transient error loading {name} (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {err_str[:100]}", flush=True)
+                time.sleep(wait)
+            else:
+                raise
 
 
-def _kl_chunk_fn(t_log_p_chunk, s_log_p_chunk):
-    """KL per position for a chunk. Uses F.kl_div for better kernel fusion."""
-    return F.kl_div(s_log_p_chunk, t_log_p_chunk, log_target=True, reduction="none").sum(dim=-1)
+def prefetch_model(name, revision=None, max_retries=3):
+    """Download model files to HF cache without loading to GPU. Runs in background.
+
+    Retries on transient HF errors (429, 503, connection errors).
+    """
+    from huggingface_hub import snapshot_download
+    dl_kwargs = dict(ignore_patterns=["*.bin", "*.msgpack", "*.h5", "*.ot"])
+    if revision and revision != "main":
+        dl_kwargs["revision"] = revision
+    for attempt in range(max_retries):
+        try:
+            snapshot_download(name, **dl_kwargs)
+            print(f"  [prefetch] {name} cached (rev={revision or 'main'})", flush=True)
+            return
+        except Exception as e:
+            err_str = str(e)
+            is_transient = any(s in err_str for s in ["429", "503", "rate limit", "Connection", "Timeout"])
+            if is_transient and attempt < max_retries - 1:
+                wait = (attempt + 1) * 30
+                print(f"  [prefetch] {name} transient error (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {err_str[:100]}", flush=True)
+                time.sleep(wait)
+            else:
+                print(f"  [prefetch] {name} failed: {e}", flush=True)
+                return
 
 
-# Try to compile the inner kernel for ~2x speedup
-try:
-    _kl_chunk_compiled = torch.compile(_kl_chunk_fn, fullgraph=True)
-    _KL_USE_COMPILED = True
-except Exception:
-    _kl_chunk_compiled = _kl_chunk_fn
-    _KL_USE_COMPILED = False
-
-
-# ── Activation fingerprinting for functional copy detection ──
-ACTIVATION_FP_SEED = 42
-ACTIVATION_FP_N_INPUTS = 5
-ACTIVATION_FP_SEQ_LEN = 64
-ACTIVATION_FP_VOCAB_SIZE = 248320  # Qwen tokenizer vocab
+def clean_model_cache(name, teacher_name=None):
+    """Remove HF cache for a specific model, preserving teacher cache."""
+    try:
+        cache_name = f"models--{name.replace('/', '--')}"
+        if teacher_name:
+            teacher_cache = f"models--{teacher_name.replace('/', '--')}"
+            if cache_name == teacher_cache:
+                return
+        cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+            print(f"  [cleanup] Removed {cache_name}", flush=True)
+    except Exception:
+        pass
 
 
 def compute_activation_fingerprint(model, device="cuda"):
@@ -264,6 +351,24 @@ def compute_activation_fingerprint(model, device="cuda"):
         return None
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# §5  KL Computation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _kl_chunk_fn(t_log_p_chunk, s_log_p_chunk):
+    """KL per position for a chunk. Uses F.kl_div for better kernel fusion."""
+    return F.kl_div(s_log_p_chunk, t_log_p_chunk, log_target=True, reduction="none").sum(dim=-1)
+
+
+# Try to compile the inner kernel for ~2x speedup
+try:
+    _kl_chunk_compiled = torch.compile(_kl_chunk_fn, fullgraph=True)
+    _KL_USE_COMPILED = True
+except Exception:
+    _kl_chunk_compiled = _kl_chunk_fn
+    _KL_USE_COMPILED = False
+
+
 def compute_kl(teacher_logits, student_logits):
     """KL(teacher || student) per position. For one-off use."""
     t_log_p = F.log_softmax(teacher_logits.float(), dim=-1)
@@ -314,6 +419,8 @@ def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
     return kl_per_pos
 
 
+# ── Sparse KL helpers ──
+
 def _build_token_to_id_map(tokenizer):
     """Build mapping from token text to token ID for vLLM logprobs decoding."""
     vocab = tokenizer.get_vocab()  # {token_str: token_id}
@@ -326,6 +433,11 @@ def _build_token_to_id_map(tokenizer):
         if decoded not in text_to_id:
             text_to_id[decoded] = tok_id
     return text_to_id
+
+
+def _is_sparse_logits(entry):
+    """Check whether a teacher_logits_list entry is sparse (dict) or dense (tensor)."""
+    return isinstance(entry, dict) and "indices" in entry and "values" in entry
 
 
 def vllm_logprobs_to_sparse(top_logprobs_list, token_to_id, tokenizer, k=128):
@@ -377,11 +489,6 @@ def dense_to_sparse_topk(logits, k=128):
         logits = logits.unsqueeze(0)
     topk_values, topk_indices = logits.float().topk(k, dim=-1)
     return {"indices": topk_indices.cpu(), "values": topk_values.cpu()}
-
-
-def _is_sparse_logits(entry):
-    """Check whether a teacher_logits_list entry is sparse (dict) or dense (tensor)."""
-    return isinstance(entry, dict) and "indices" in entry and "values" in entry
 
 
 def compute_kl_from_sparse(teacher_indices, teacher_values, student_logits,
@@ -516,249 +623,9 @@ def compute_kl_sparse_vs_sparse(teacher_indices, teacher_values, student_indices
     return kl_per_pos
 
 
-def hf_batched_forward(teacher, sequences_data, device, batch_size=2, logprobs_k=128,
-                       progress_cb=None):
-    """Batched HF forward pass for teacher logit extraction.
-
-    Groups prompts by similar sequence length, pads within each batch,
-    runs the forward pass, then unpads and extracts continuation logits.
-
-    For sequences longer than HF_CHUNK_SIZE, falls back to per-sequence
-    chunked forward pass (batching long-context sequences is wasteful due
-    to extreme padding).
-
-    Args:
-        teacher: HF model (already on device, eval mode).
-        sequences_data: list of dicts with 'full_ids' [1, seq_len], 'prompt_len'.
-        device: torch device.
-        batch_size: number of sequences per batch.
-        logprobs_k: if >0, store only top-k logits (sparse). 0 = full vocab.
-        progress_cb: optional callback(i) called after each prompt is processed.
-
-    Returns:
-        (teacher_logits_list, prompt_lens, full_sequences, n_chunked)
-        teacher_logits_list: list of sparse dicts or dense tensors.
-    """
-    # Separate long sequences (chunked path) from short ones (batched path)
-    short_items = []  # (original_idx, data)
-    long_items = []   # (original_idx, data)
-    for idx, data in enumerate(sequences_data):
-        seq_len = data["full_ids"].shape[1]
-        if seq_len > HF_CHUNK_SIZE:
-            long_items.append((idx, data))
-        else:
-            short_items.append((idx, data))
-
-    # Sort short items by sequence length for efficient batching
-    short_items.sort(key=lambda x: x[1]["full_ids"].shape[1])
-
-    # Pre-allocate result arrays
-    n_total = len(sequences_data)
-    teacher_logits_list = [None] * n_total
-    prompt_lens = [0] * n_total
-    full_sequences = [None] * n_total
-    n_chunked = 0
-    processed = 0
-
-    with torch.no_grad():
-        # ── Batched path for short sequences ──
-        for batch_start in range(0, len(short_items), batch_size):
-            batch = short_items[batch_start:batch_start + batch_size]
-            if len(batch) == 1:
-                # Single item — no padding needed
-                orig_idx, data = batch[0]
-                full_ids = data["full_ids"].to(device)
-                prompt_len = data["prompt_len"]
-                prompt_lens[orig_idx] = prompt_len
-                full_sequences[orig_idx] = full_ids
-
-                logits = teacher(full_ids).logits.float()
-                cont_logits = logits[:, prompt_len - 1:-1, :]
-                if logprobs_k > 0:
-                    teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
-                else:
-                    teacher_logits_list[orig_idx] = cont_logits.cpu()
-                del logits, cont_logits
-                processed += 1
-                if progress_cb:
-                    progress_cb(processed)
-            else:
-                # Pad batch to max length
-                max_len = max(d["full_ids"].shape[1] for _, d in batch)
-                batch_ids = []
-                attention_masks = []
-                for _, data in batch:
-                    ids = data["full_ids"]  # [1, seq_len]
-                    seq_len = ids.shape[1]
-                    if seq_len < max_len:
-                        # Left-pad (standard for causal LMs)
-                        pad_len = max_len - seq_len
-                        pad = torch.zeros(1, pad_len, dtype=ids.dtype, device=ids.device)
-                        ids_padded = torch.cat([pad, ids], dim=1)
-                        mask = torch.cat([
-                            torch.zeros(1, pad_len, dtype=torch.long, device=ids.device),
-                            torch.ones(1, seq_len, dtype=torch.long, device=ids.device),
-                        ], dim=1)
-                    else:
-                        ids_padded = ids
-                        mask = torch.ones(1, seq_len, dtype=torch.long, device=ids.device)
-                    batch_ids.append(ids_padded)
-                    attention_masks.append(mask)
-
-                batch_tensor = torch.cat(batch_ids, dim=0).to(device)  # [B, max_len]
-                mask_tensor = torch.cat(attention_masks, dim=0).to(device)  # [B, max_len]
-
-                outputs = teacher(batch_tensor, attention_mask=mask_tensor)
-                batch_logits = outputs.logits.float()  # [B, max_len, vocab]
-                del outputs
-
-                # Unpad and extract continuation logits per item
-                for b_idx, (orig_idx, data) in enumerate(batch):
-                    full_ids = data["full_ids"].to(device)
-                    prompt_len = data["prompt_len"]
-                    seq_len = full_ids.shape[1]
-                    pad_len = max_len - seq_len
-                    prompt_lens[orig_idx] = prompt_len
-                    full_sequences[orig_idx] = full_ids
-
-                    # Extract this item's logits (remove padding offset)
-                    item_logits = batch_logits[b_idx:b_idx+1, pad_len:, :]  # [1, seq_len, vocab]
-                    cont_logits = item_logits[:, prompt_len - 1:-1, :]
-                    if logprobs_k > 0:
-                        teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
-                    else:
-                        teacher_logits_list[orig_idx] = cont_logits.cpu()
-                    del item_logits, cont_logits
-                    processed += 1
-                    if progress_cb:
-                        progress_cb(processed)
-
-                del batch_tensor, mask_tensor, batch_logits
-                torch.cuda.empty_cache()
-
-        # ── Chunked path for long sequences ──
-        for orig_idx, data in long_items:
-            n_chunked += 1
-            full_ids = data["full_ids"].to(device)
-            prompt_len = data["prompt_len"]
-            seq_len = full_ids.shape[1]
-            prompt_lens[orig_idx] = prompt_len
-            full_sequences[orig_idx] = full_ids
-
-            all_logit_chunks = []
-            past_key_values = None
-            for chunk_start in range(0, seq_len, HF_CHUNK_SIZE):
-                chunk_end = min(chunk_start + HF_CHUNK_SIZE, seq_len)
-                chunk_ids = full_ids[:, chunk_start:chunk_end]
-                outputs = teacher(
-                    chunk_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                all_logit_chunks.append(outputs.logits.float().cpu())
-                past_key_values = outputs.past_key_values
-                del outputs
-            all_logits = torch.cat(all_logit_chunks, dim=1)
-            cont_logits = all_logits[:, prompt_len - 1:-1, :]
-            if logprobs_k > 0:
-                teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
-            else:
-                teacher_logits_list[orig_idx] = cont_logits.cpu()
-            del all_logits, all_logit_chunks, past_key_values, cont_logits
-            torch.cuda.empty_cache()
-            processed += 1
-            if progress_cb:
-                progress_cb(processed)
-
-    return teacher_logits_list, prompt_lens, full_sequences, n_chunked
-
-
-def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
-    """Load a HuggingFace model for inference.
-
-    Uses flash_attention_2 when available, falls back to default attention.
-    Teacher models get trust_remote_code=True; students don't (security).
-    When revision is set, pins to that exact HF commit hash.
-    """
-    from transformers import AutoModelForCausalLM
-    is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
-    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
-    if revision and revision != "main":
-        kwargs["revision"] = revision
-        print(f"  [model] Pinning to revision {revision[:12]}", flush=True)
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            try:
-                m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
-                print(f"  [model] Loaded with flash_attention_2", flush=True)
-                return m
-            except (ValueError, ImportError):
-                m = AutoModelForCausalLM.from_pretrained(name, **kwargs)
-                print(f"  [model] Loaded with default attention", flush=True)
-                return m
-        except Exception as e:
-            err_str = str(e)
-            is_transient = any(s in err_str for s in ["429", "503", "rate limit", "Connection", "Timeout", "HTTPSConnection"])
-            if is_transient and attempt < max_retries - 1:
-                wait = (attempt + 1) * 30
-                print(f"  [model] Transient error loading {name} (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {err_str[:100]}", flush=True)
-                time.sleep(wait)
-            else:
-                raise
-
-
-def prefetch_model(name, revision=None, max_retries=3):
-    """Download model files to HF cache without loading to GPU. Runs in background.
-    
-    Retries on transient HF errors (429, 503, connection errors).
-    """
-    from huggingface_hub import snapshot_download
-    dl_kwargs = dict(ignore_patterns=["*.bin", "*.msgpack", "*.h5", "*.ot"])
-    if revision and revision != "main":
-        dl_kwargs["revision"] = revision
-    for attempt in range(max_retries):
-        try:
-            snapshot_download(name, **dl_kwargs)
-            print(f"  [prefetch] {name} cached (rev={revision or 'main'})", flush=True)
-            return
-        except Exception as e:
-            err_str = str(e)
-            is_transient = any(s in err_str for s in ["429", "503", "rate limit", "Connection", "Timeout"])
-            if is_transient and attempt < max_retries - 1:
-                wait = (attempt + 1) * 30
-                print(f"  [prefetch] {name} transient error (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {err_str[:100]}", flush=True)
-                time.sleep(wait)
-            else:
-                print(f"  [prefetch] {name} failed: {e}", flush=True)
-                return
-
-
-def clean_model_cache(name, teacher_name=None):
-    """Remove HF cache for a specific model, preserving teacher cache."""
-    try:
-        cache_name = f"models--{name.replace('/', '--')}"
-        if teacher_name:
-            teacher_cache = f"models--{teacher_name.replace('/', '--')}"
-            if cache_name == teacher_cache:
-                return
-        cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
-            print(f"  [cleanup] Removed {cache_name}", flush=True)
-    except Exception:
-        pass
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# vLLM Server Management
+# §6  vLLM Server Management
 # ═══════════════════════════════════════════════════════════════════════════════
-
-VLLM_PORT = 9100
-VLLM_URL = f"http://localhost:{VLLM_PORT}"
-VLLM_STARTUP_TIMEOUT = 900  # 15 min
-
 
 def is_vllm_running():
     """Check if vLLM server is running and healthy."""
@@ -858,6 +725,10 @@ def stop_vllm_server():
     time.sleep(2)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# §7  vLLM Generation (teacher continuations + logprobs)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
                             logprobs_k, tokenizer, token_to_id):
     """Generate a single prompt via vLLM. Used by both sequential and concurrent paths."""
@@ -927,8 +798,6 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
     Returns list of dicts with full_ids, prompt_len, gen_len, and optionally
     'sparse_logprobs' (dict with 'indices' and 'values' tensors).
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     if concurrency <= 1:
         # Sequential fallback
         results = []
@@ -1001,6 +870,10 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
 
     return result_slots
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §8  vLLM Student Scoring
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _parse_vllm_prompt_logprobs(prompt_logprobs_raw, token_to_id, tokenizer, k=128):
     """Parse vLLM prompt_logprobs response into sparse format.
@@ -1283,7 +1156,168 @@ def score_student_via_vllm(student_name, student_rev, full_sequences, prompt_len
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Progress reporting
+# §9  HF Batched Forward Pass
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def hf_batched_forward(teacher, sequences_data, device, batch_size=2, logprobs_k=128,
+                       progress_cb=None):
+    """Batched HF forward pass for teacher logit extraction.
+
+    Groups prompts by similar sequence length, pads within each batch,
+    runs the forward pass, then unpads and extracts continuation logits.
+
+    For sequences longer than HF_CHUNK_SIZE, falls back to per-sequence
+    chunked forward pass (batching long-context sequences is wasteful due
+    to extreme padding).
+
+    Args:
+        teacher: HF model (already on device, eval mode).
+        sequences_data: list of dicts with 'full_ids' [1, seq_len], 'prompt_len'.
+        device: torch device.
+        batch_size: number of sequences per batch.
+        logprobs_k: if >0, store only top-k logits (sparse). 0 = full vocab.
+        progress_cb: optional callback(i) called after each prompt is processed.
+
+    Returns:
+        (teacher_logits_list, prompt_lens, full_sequences, n_chunked)
+        teacher_logits_list: list of sparse dicts or dense tensors.
+    """
+    # Separate long sequences (chunked path) from short ones (batched path)
+    short_items = []  # (original_idx, data)
+    long_items = []   # (original_idx, data)
+    for idx, data in enumerate(sequences_data):
+        seq_len = data["full_ids"].shape[1]
+        if seq_len > HF_CHUNK_SIZE:
+            long_items.append((idx, data))
+        else:
+            short_items.append((idx, data))
+
+    # Sort short items by sequence length for efficient batching
+    short_items.sort(key=lambda x: x[1]["full_ids"].shape[1])
+
+    # Pre-allocate result arrays
+    n_total = len(sequences_data)
+    teacher_logits_list = [None] * n_total
+    prompt_lens = [0] * n_total
+    full_sequences = [None] * n_total
+    n_chunked = 0
+    processed = 0
+
+    with torch.no_grad():
+        # ── Batched path for short sequences ──
+        for batch_start in range(0, len(short_items), batch_size):
+            batch = short_items[batch_start:batch_start + batch_size]
+            if len(batch) == 1:
+                # Single item — no padding needed
+                orig_idx, data = batch[0]
+                full_ids = data["full_ids"].to(device)
+                prompt_len = data["prompt_len"]
+                prompt_lens[orig_idx] = prompt_len
+                full_sequences[orig_idx] = full_ids
+
+                logits = teacher(full_ids).logits.float()
+                cont_logits = logits[:, prompt_len - 1:-1, :]
+                if logprobs_k > 0:
+                    teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
+                else:
+                    teacher_logits_list[orig_idx] = cont_logits.cpu()
+                del logits, cont_logits
+                processed += 1
+                if progress_cb:
+                    progress_cb(processed)
+            else:
+                # Pad batch to max length
+                max_len = max(d["full_ids"].shape[1] for _, d in batch)
+                batch_ids = []
+                attention_masks = []
+                for _, data in batch:
+                    ids = data["full_ids"]  # [1, seq_len]
+                    seq_len = ids.shape[1]
+                    if seq_len < max_len:
+                        # Left-pad (standard for causal LMs)
+                        pad_len = max_len - seq_len
+                        pad = torch.zeros(1, pad_len, dtype=ids.dtype, device=ids.device)
+                        ids_padded = torch.cat([pad, ids], dim=1)
+                        mask = torch.cat([
+                            torch.zeros(1, pad_len, dtype=torch.long, device=ids.device),
+                            torch.ones(1, seq_len, dtype=torch.long, device=ids.device),
+                        ], dim=1)
+                    else:
+                        ids_padded = ids
+                        mask = torch.ones(1, seq_len, dtype=torch.long, device=ids.device)
+                    batch_ids.append(ids_padded)
+                    attention_masks.append(mask)
+
+                batch_tensor = torch.cat(batch_ids, dim=0).to(device)  # [B, max_len]
+                mask_tensor = torch.cat(attention_masks, dim=0).to(device)  # [B, max_len]
+
+                outputs = teacher(batch_tensor, attention_mask=mask_tensor)
+                batch_logits = outputs.logits.float()  # [B, max_len, vocab]
+                del outputs
+
+                # Unpad and extract continuation logits per item
+                for b_idx, (orig_idx, data) in enumerate(batch):
+                    full_ids = data["full_ids"].to(device)
+                    prompt_len = data["prompt_len"]
+                    seq_len = full_ids.shape[1]
+                    pad_len = max_len - seq_len
+                    prompt_lens[orig_idx] = prompt_len
+                    full_sequences[orig_idx] = full_ids
+
+                    # Extract this item's logits (remove padding offset)
+                    item_logits = batch_logits[b_idx:b_idx+1, pad_len:, :]  # [1, seq_len, vocab]
+                    cont_logits = item_logits[:, prompt_len - 1:-1, :]
+                    if logprobs_k > 0:
+                        teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
+                    else:
+                        teacher_logits_list[orig_idx] = cont_logits.cpu()
+                    del item_logits, cont_logits
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed)
+
+                del batch_tensor, mask_tensor, batch_logits
+                torch.cuda.empty_cache()
+
+        # ── Chunked path for long sequences ──
+        for orig_idx, data in long_items:
+            n_chunked += 1
+            full_ids = data["full_ids"].to(device)
+            prompt_len = data["prompt_len"]
+            seq_len = full_ids.shape[1]
+            prompt_lens[orig_idx] = prompt_len
+            full_sequences[orig_idx] = full_ids
+
+            all_logit_chunks = []
+            past_key_values = None
+            for chunk_start in range(0, seq_len, HF_CHUNK_SIZE):
+                chunk_end = min(chunk_start + HF_CHUNK_SIZE, seq_len)
+                chunk_ids = full_ids[:, chunk_start:chunk_end]
+                outputs = teacher(
+                    chunk_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                all_logit_chunks.append(outputs.logits.float().cpu())
+                past_key_values = outputs.past_key_values
+                del outputs
+            all_logits = torch.cat(all_logit_chunks, dim=1)
+            cont_logits = all_logits[:, prompt_len - 1:-1, :]
+            if logprobs_k > 0:
+                teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
+            else:
+                teacher_logits_list[orig_idx] = cont_logits.cpu()
+            del all_logits, all_logit_chunks, past_key_values, cont_logits
+            torch.cuda.empty_cache()
+            processed += 1
+            if progress_cb:
+                progress_cb(processed)
+
+    return teacher_logits_list, prompt_lens, full_sequences, n_chunked
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §10  Progress Reporting
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
@@ -1305,7 +1339,7 @@ def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main
+# §11  Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
