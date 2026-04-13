@@ -907,7 +907,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
 
 def process_results(results, models_to_eval, king_uid, state: ValidatorState,
                     uid_to_hotkey, commitments, n_prompts, current_block, king_kl,
-                    epoch_count, is_full_eval):
+                    epoch_count, is_full_eval, epoch_start_time=None):
     """Process eval results: update scores, run paired t-test, crown winner.
 
     Returns (winner_uid, winner_kl, h2h_results_list).
@@ -1420,6 +1420,8 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         "king_changed": king_changed,
         "new_king_uid": winner_uid if king_changed else None,
         "type": "full_eval" if is_full_eval else "h2h",
+        "elapsed_seconds": round(time.time() - epoch_start_time, 1) if epoch_start_time else None,
+        "n_students": len(h2h_results),
     }
 
     state.h2h_latest = h2h_round
@@ -1855,7 +1857,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
              king_h2h_kl, king_per_prompt, this_round_uids) = process_results(
                 results, models_to_eval, king_uid, state,
                 uid_to_hotkey, commitments, n_prompts, current_block, king_kl,
-                epoch_count, is_full_eval,
+                epoch_count, is_full_eval, epoch_start_time=epoch_start,
             )
 
             # Set weights

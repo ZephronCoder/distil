@@ -882,6 +882,61 @@ def get_tmc_config():
 
 
 
+@app.get("/api/eval-stats", tags=["Evaluation"], summary="Eval round statistics",
+         description="""Returns statistics about recent evaluation rounds including timing, model counts, and KL trends.
+
+Useful for monitoring eval pipeline health and performance over time.
+""")
+def get_eval_stats():
+    h2h_history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
+    if not h2h_history:
+        return JSONResponse(content={"rounds": 0}, headers={"Cache-Control": "public, max-age=30"})
+
+    recent = h2h_history[-20:]  # last 20 rounds
+    timings = [r.get("elapsed_seconds") for r in recent if r.get("elapsed_seconds")]
+    student_counts = [r.get("n_students") or len(r.get("results", [])) for r in recent]
+    king_kls = [r.get("king_kl") for r in recent if r.get("king_kl")]
+    dethronements = sum(1 for r in recent if r.get("king_changed"))
+
+    # Time between rounds
+    timestamps = [r.get("timestamp") for r in recent if r.get("timestamp")]
+    intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1) if timestamps[i+1] > timestamps[i]]
+
+    stats = {
+        "total_rounds": len(h2h_history),
+        "recent_rounds": len(recent),
+        "dethronements_recent": dethronements,
+        "timing": {
+            "avg_seconds": round(sum(timings) / len(timings), 1) if timings else None,
+            "min_seconds": round(min(timings), 1) if timings else None,
+            "max_seconds": round(max(timings), 1) if timings else None,
+            "rounds_with_timing": len(timings),
+        },
+        "models_per_round": {
+            "avg": round(sum(student_counts) / len(student_counts), 1) if student_counts else None,
+            "min": min(student_counts) if student_counts else None,
+            "max": max(student_counts) if student_counts else None,
+        },
+        "king_kl_trend": [round(kl, 6) for kl in king_kls],
+        "round_interval": {
+            "avg_minutes": round(sum(intervals) / len(intervals) / 60, 1) if intervals else None,
+            "min_minutes": round(min(intervals) / 60, 1) if intervals else None,
+            "max_minutes": round(max(intervals) / 60, 1) if intervals else None,
+        },
+        "last_round": {
+            "block": recent[-1].get("block"),
+            "timestamp": recent[-1].get("timestamp"),
+            "king_uid": recent[-1].get("king_uid"),
+            "elapsed_seconds": recent[-1].get("elapsed_seconds"),
+            "n_students": recent[-1].get("n_students") or len(recent[-1].get("results", [])),
+        },
+    }
+    return JSONResponse(
+        content=_sanitize_floats(stats),
+        headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"},
+    )
+
+
 @app.get("/api/history", tags=["Evaluation"], summary="Score history over time",
          description="Returns historical KL scores for all miners over time. Supports `?limit=N` (default 50) to return only the latest N entries. Response includes `full_eval_block` if a full eval round exists.")
 def get_history(limit: int = 50):
