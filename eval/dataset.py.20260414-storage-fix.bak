@@ -11,8 +11,6 @@ import json
 import random
 import hashlib
 import logging
-import os
-import tempfile
 from pathlib import Path
 
 logger = logging.getLogger("distillation.dataset")
@@ -27,32 +25,6 @@ DEFAULT_DATASET = "HuggingFaceFW/fineweb"
 DEFAULT_SPLIT = "train"
 DEFAULT_TEXT_FIELD = "text"
 PROMPT_CACHE_DIR = Path("state/prompt_cache")
-
-
-def _restore_hf_env(previous):
-    for key, value in previous.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
-
-
-def _load_dataset_in_temp_hf_cache(*args, **kwargs):
-    previous = {
-        key: os.environ.get(key)
-        for key in ("HF_HOME", "HF_HUB_CACHE", "HF_DATASETS_CACHE")
-    }
-    try:
-        with tempfile.TemporaryDirectory(prefix="distill-hf-") as tmpdir:
-            base = Path(tmpdir)
-            os.environ["HF_HOME"] = str(base / "home")
-            os.environ["HF_HUB_CACHE"] = str(base / "hub")
-            os.environ["HF_DATASETS_CACHE"] = str(base / "datasets")
-            kwargs.setdefault("cache_dir", str(base / "datasets"))
-            from datasets import load_dataset
-            return load_dataset(*args, **kwargs)
-    finally:
-        _restore_hf_env(previous)
 
 
 def sample_prompts_from_dataset(
@@ -94,6 +66,8 @@ def sample_prompts_from_dataset(
         except Exception:
             pass
 
+    from datasets import load_dataset
+
     # Use real on-chain block hash if provided, otherwise fall back (insecure)
     if block_hash:
         _hash_hex = block_hash.lstrip("0x") if block_hash.startswith("0x") else block_hash
@@ -116,7 +90,7 @@ def sample_prompts_from_dataset(
             flush=True,
         )
 
-        ds = _load_dataset_in_temp_hf_cache(
+        ds = load_dataset(
             CLIMBMIX_DATASET,
             data_files=shard_file,
             split="train",
@@ -161,7 +135,7 @@ def sample_prompts_from_dataset(
         flush=True,
     )
 
-    ds = _load_dataset_in_temp_hf_cache(DEFAULT_DATASET, split=DEFAULT_SPLIT, streaming=True, name="default")
+    ds = load_dataset(DEFAULT_DATASET, split=DEFAULT_SPLIT, streaming=True, name="default")
     ds_shuffled = ds.shuffle(seed=block_number, buffer_size=50_000)
     ds_skipped = ds_shuffled.skip(skip_offset)
 

@@ -196,72 +196,49 @@ def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optio
     """
     Compute a shard-invariant hash from safetensors tensor metadata.
 
-    Fetches only the safetensors headers over HTTP range requests instead of
-    downloading whole weight shards into the local Hugging Face cache.
+    Downloads only the header of each .safetensors file (not the weights),
+    extracts tensor names, shapes, and dtypes, sorts them, and SHA256s
+    the result. Two models with identical weights but different sharding
+    will produce the same hash because the tensor metadata is identical.
+
+    Returns hex digest or None on failure.
     """
     try:
-        from huggingface_hub import hf_hub_url
-        import struct
-
         info = model_info(model_repo, revision=revision, files_metadata=True)
         st_files = sorted(
-            [s.rfilename for s in (info.siblings or []) if s.rfilename.endswith('.safetensors')]
+            [s.rfilename for s in (info.siblings or []) if s.rfilename.endswith(".safetensors")]
         )
         if not st_files:
             logger.warning(f"No safetensors files in {model_repo}")
             return None
 
-        all_tensors = []
-        with _requests.Session() as session:
-            session.headers.update({'Accept-Encoding': 'identity'})
-            for fname in st_files:
-                url = hf_hub_url(repo_id=model_repo, filename=fname, revision=revision)
+        all_tensors = []  # list of (name, shape_tuple, dtype_str)
+        for fname in st_files:
+            header_path = hf_hub_download(
+                repo_id=model_repo, filename=fname, revision=revision,
+            )
+            # safetensors header: first 8 bytes = little-endian u64 header size,
+            # then header_size bytes of JSON with tensor metadata
+            import struct
+            with open(header_path, "rb") as f:
+                header_size = struct.unpack("<Q", f.read(8))[0]
+                header_json = json.loads(f.read(header_size))
+            for tensor_name, tensor_info in header_json.items():
+                if tensor_name == "__metadata__":
+                    continue
+                dtype = tensor_info.get("dtype", "")
+                shape = tuple(tensor_info.get("shape", []))
+                all_tensors.append((tensor_name, shape, dtype))
 
-                prefix_resp = session.get(
-                    url,
-                    headers={'Range': 'bytes=0-7'},
-                    timeout=30,
-                    stream=True,
-                    allow_redirects=True,
-                )
-                prefix_resp.raise_for_status()
-                prefix = prefix_resp.raw.read(8)
-                prefix_resp.close()
-                if len(prefix) != 8:
-                    raise ValueError(f"Incomplete safetensors header prefix for {fname}")
-
-                header_size = struct.unpack('<Q', prefix)[0]
-                if header_size <= 0 or header_size > 8_000_000:
-                    raise ValueError(f"Unexpected safetensors header size {header_size} for {fname}")
-
-                header_len = 8 + header_size
-                header_resp = session.get(
-                    url,
-                    headers={'Range': f'bytes=0-{header_len - 1}'},
-                    timeout=60,
-                    stream=True,
-                    allow_redirects=True,
-                )
-                header_resp.raise_for_status()
-                header_blob = header_resp.raw.read(header_len)
-                header_resp.close()
-                if len(header_blob) < header_len:
-                    raise ValueError(f"Incomplete safetensors header body for {fname}")
-
-                header_json = json.loads(header_blob[8:header_len].decode('utf-8'))
-                for tensor_name, tensor_info in header_json.items():
-                    if tensor_name == '__metadata__':
-                        continue
-                    dtype = tensor_info.get('dtype', '')
-                    shape = tuple(tensor_info.get('shape', []))
-                    all_tensors.append((tensor_name, shape, dtype))
-
+        # Sort by tensor name for deterministic ordering
         all_tensors.sort(key=lambda t: t[0])
-        canonical = json.dumps(all_tensors, separators=(',', ':'), sort_keys=False)
+        # Hash the canonical representation
+        canonical = json.dumps(all_tensors, separators=(",", ":"), sort_keys=False)
         return hashlib.sha256(canonical.encode()).hexdigest()
     except Exception as e:
         logger.warning(f"Tensor metadata hash failed for {model_repo}: {e}")
         return None
+
 
 def verify_model_integrity(
     model_repo: str,

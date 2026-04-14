@@ -744,7 +744,7 @@ def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
         "max_tokens": max_new_tokens,
         "temperature": 0.7 if block_seed is not None else 0.0,
         "top_p": 0.9 if block_seed is not None else 1.0,
-        "repetition_penalty": 1.1,  # Prevent degenerate repetition loops
+        # repetition_penalty removed — wrecks KL scores without stopping loops
     }
     if block_seed is not None:
         payload["seed"] = block_seed + idx
@@ -1621,9 +1621,9 @@ def main():
                     torch.manual_seed(args.block_seed + i)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed(args.block_seed + i)
-                    gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9, repetition_penalty=1.1)
+                    gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9)
                 else:
-                    gen_kwargs.update(do_sample=False, repetition_penalty=1.1)
+                    gen_kwargs.update(do_sample=False)
                 output_ids = teacher.generate(ids, **gen_kwargs)
                 gen_len = output_ids.shape[1] - prompt_len
                 hf_sequences_data.append({
