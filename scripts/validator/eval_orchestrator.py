@@ -242,29 +242,12 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             else:
                 register_model_hash(model_hash, uid, state.state_dir)
 
-        # Shard-invariant copy detection: compare against king to catch re-sharded copies
-        # before GPU eval (saves GPU time vs only checking at pre-dethronement)
-        king_uid_for_copy = state.h2h_latest.get("king_uid") if state.h2h_latest else None
-        king_model_for_copy = state.h2h_latest.get("king_model", "") if state.h2h_latest else ""
-        if king_uid_for_copy is not None and uid != king_uid_for_copy and king_model_for_copy:
-            try:
-                challenger_tmh = compute_tensor_metadata_hash(model_repo, revision)
-                king_tmh = compute_tensor_metadata_hash(king_model_for_copy)
-                if challenger_tmh and king_tmh and challenger_tmh == king_tmh:
-                    logger.warning(
-                        f"UID {uid} ({model_repo}): BLOCKED — shard-invariant hash identical to king "
-                        f"UID {king_uid_for_copy} ({king_model_for_copy}). Re-sharded copy detected in precheck."
-                    )
-                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        hotkey,
-                        f"copy: identical weights (shard-invariant hash) to king UID {king_uid_for_copy} ({king_model_for_copy})",
-                        state.dq_reasons, commit_block=this_commit_block,
-                    )
-                    disqualified.add(uid)
-                    continue
-            except Exception as e:
-                logger.warning(f"UID {uid}: shard-invariant precheck failed (non-blocking): {e}")
+        # Shard-invariant copy detection: DISABLED
+        # This check only compares tensor names/shapes/dtypes, not actual weight values.
+        # All Qwen3.5-4B models produce the same hash, causing 100% false positive DQs.
+        # Real copies are caught by the per-file hash (compute_model_hash) and
+        # activation fingerprinting during eval.
+        # See: https://github.com/... (shard-invariant hash false positives)
 
         # Integrity check — reset expected hash if miner re-committed or UID recycled
         expected_hash = state.model_hashes.get(str(uid))
@@ -1028,64 +1011,14 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState,
                     state.dq_reasons[str(epsilon_dethroned_by)] = f"Model went private after scoring"
                     epsilon_dethroned_by = None
                 else:
-                    # Shard-invariant hash check: block re-sharded copies of the king
-                    shard_blocked = False
-                    try:
-                        king_model_name = uid_to_model.get(king_uid, "")
-                        if king_model_name and challenger_model:
-                            challenger_shard_hash = compute_tensor_metadata_hash(challenger_model)
-                            king_shard_hash = compute_tensor_metadata_hash(king_model_name)
-                            if challenger_shard_hash and king_shard_hash:
-                                if challenger_shard_hash == king_shard_hash:
-                                    logger.warning(
-                                        f"BLOCKED dethronement: UID {epsilon_dethroned_by} ({challenger_model}) "
-                                        f"has identical tensor metadata hash as king UID {king_uid} ({king_model_name}) "
-                                        f"— re-sharded copy detected! hash={challenger_shard_hash[:16]}..."
-                                    )
-                                    winner_uid = king_uid
-                                    winner_kl = state.scores.get(str(king_uid), king_kl)
-                                    challenger_hotkey = uid_to_hotkey.get(epsilon_dethroned_by, str(epsilon_dethroned_by))
-                                    challenger_cb = commitments.get(epsilon_dethroned_by, {}).get("block")
-                                    disqualify(
-                                        challenger_hotkey,
-                                        f"copy: identical weights (shard-invariant hash) to king UID {king_uid} ({king_model_name})",
-                                        state.dq_reasons, commit_block=challenger_cb,
-                                    )
-                                    shard_blocked = True
-                                    epsilon_dethroned_by = None
-                                else:
-                                    logger.info(
-                                        f"Shard hash OK: challenger={challenger_shard_hash[:16]}... "
-                                        f"king={king_shard_hash[:16]}... (different weights confirmed)"
-                                    )
-                            else:
-                                logger.warning(f"Could not compute shard hash for comparison — allowing dethronement")
-                    except Exception as sh_err:
-                        logger.warning(f"Shard hash check failed (non-blocking): {sh_err}")
-
-                    # Store shard hash for future reference
-                    if not shard_blocked:
-                        try:
-                            import datetime
-                            shard_hashes_path = state.state_dir / "model_hashes_shards.json"
-                            shard_data = {}
-                            if shard_hashes_path.exists():
-                                shard_data = json.loads(shard_hashes_path.read_text())
-                            ch_hash = locals().get('challenger_shard_hash')
-                            if ch_hash:
-                                shard_data[str(epsilon_dethroned_by)] = {
-                                    "model_id": challenger_model,
-                                    "hash": ch_hash,
-                                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                                }
-                            shard_hashes_path.write_text(json.dumps(shard_data, indent=2))
-                        except Exception as e:
-                            logger.warning(f"Failed to store shard hash: {e}")
-
-                    if not shard_blocked:
-                        winner_uid = epsilon_dethroned_by
-                        winner_kl = state.scores.get(str(epsilon_dethroned_by), best_kl)
-                        logger.info(f"UID {winner_uid} is new king (paired t-test p<{PAIRED_TEST_ALPHA}), integrity + shard hash check passed")
+                    # Shard-invariant hash check: DISABLED
+                    # This check only compared tensor names/shapes/dtypes, not actual
+                    # weight values. All Qwen3.5-4B models produce the same hash,
+                    # making the king permanently undethronable. Real copies are caught
+                    # by the per-file hash and activation fingerprinting during eval.
+                    winner_uid = epsilon_dethroned_by
+                    winner_kl = state.scores.get(str(epsilon_dethroned_by), best_kl)
+                    logger.info(f"UID {winner_uid} is new king (paired t-test p<{PAIRED_TEST_ALPHA}), integrity check passed")
             except Exception as e:
                 logger.warning(f"BLOCKED dethronement: UID {epsilon_dethroned_by} model {challenger_model} integrity check failed: {e}")
                 winner_uid = king_uid
