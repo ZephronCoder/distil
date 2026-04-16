@@ -12,7 +12,7 @@ from scripts.validator.config import MAX_NEW_TOKENS, MAX_PROMPT_TOKENS, TEACHER_
 logger = logging.getLogger("distillation.remote_validator")
 
 
-def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, max_params_b: float, is_full_eval: bool, use_vllm: bool, eval_script: str, eval_script_remote: str):
+def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, max_params_b: float, is_full_eval: bool, use_vllm: bool, eval_script: str, eval_script_remote: str, block_seed: int | None = None):
     import shutil
     import threading
 
@@ -51,6 +51,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     remote_eval_script = f"{run_dir}/pod_eval.py"
     progress_remote = f"{run_dir}/eval_progress.json"
     results_remote = f"{run_dir}/eval_results.json"
+    done_marker_remote = f"{run_dir}/eval_done.marker"
     log_remote = f"{run_dir}/eval_output.log"
     eval_data_remote = f"{run_dir}/eval_data.json"
     teacher_cache_remote = f"{run_dir}/teacher_cache.pt"
@@ -83,7 +84,8 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     try:
         pod.exec(
             f"rm -f {shlex.quote(progress_remote)} {shlex.quote(results_remote)} {shlex.quote(log_remote)} "
-            f"{shlex.quote(eval_data_remote)} {shlex.quote(teacher_cache_remote)} {shlex.quote(pid_remote)}"
+            f"{shlex.quote(eval_data_remote)} {shlex.quote(teacher_cache_remote)} {shlex.quote(pid_remote)} "
+            f"{shlex.quote(done_marker_remote)}"
         )
         logger.info("Cleared all pod artifacts (eval_results, teacher_cache, progress)")
     except Exception:
@@ -125,6 +127,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"--teacher-logits {shlex.quote(teacher_cache_remote)}"
         f"{king_flag}"
         f"{vllm_flag}"
+        f"{f' --block-seed {block_seed}' if block_seed is not None else ''}"
     )
     inner_q = shlex.quote(inner_eval)
     start_cmd = (
@@ -133,7 +136,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"echo $! > {shlex.quote(pid_remote)} && echo DISTIL_PID:$(cat {shlex.quote(pid_remote)})"
     )
     status_inner = (
-        f"if [ -f {shlex.quote(results_remote)} ]; then echo DISTIL_STATUS:done; "
+        f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DISTIL_STATUS:done; "
         f"elif [ ! -f {shlex.quote(pid_remote)} ]; then echo DISTIL_STATUS:starting; "
         f"elif kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo DISTIL_STATUS:running; "
         "else echo DISTIL_STATUS:dead; fi"
