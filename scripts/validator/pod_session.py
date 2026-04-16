@@ -190,6 +190,8 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         logger.info("Detached GPU eval started: %s", (start_res.get("stdout") or "").strip()[:200])
         result = {"stdout": "", "stderr": "", "exit_code": -1, "success": False}
         dead_streak = 0
+        starting_streak = 0
+        MAX_STARTING_POLLS = 15  # ~5 min (20s sleep × 15) — if PID file never appears, eval script crashed on startup
         deadline = time.time() + eval_timeout
         while time.time() < deadline:
             status = pod.exec(status_cmd, timeout=90)
@@ -199,12 +201,21 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 break
             if "DISTIL_STATUS:dead" in out:
                 dead_streak += 1
+                starting_streak = 0
                 if dead_streak >= 3:
                     logger.error("Eval worker on pod exited before writing eval_results.json")
                     result = {"stdout": "", "stderr": "worker_dead", "exit_code": -1, "success": False}
                     break
+            elif "DISTIL_STATUS:starting" in out:
+                starting_streak += 1
+                dead_streak = 0
+                if starting_streak >= MAX_STARTING_POLLS:
+                    logger.error("Eval script never wrote PID file after %d polls — likely crashed on startup", starting_streak)
+                    result = {"stdout": "", "stderr": "startup_timeout", "exit_code": -1, "success": False}
+                    break
             else:
                 dead_streak = 0
+                starting_streak = 0
             time.sleep(20)
         else:
             logger.error(f"Eval timed out after {eval_timeout}s — killing")
