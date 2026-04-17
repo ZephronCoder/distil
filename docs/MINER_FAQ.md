@@ -49,6 +49,35 @@ Submit your HuggingFace model repo via the commitment mechanism on-chain.
 
 ---
 
+## Upcoming Mechanism Change — Multi-Axis Composite Score
+
+**What is changing.** KL divergence alone is insufficient: it can be over-optimized until the model produces gibberish under autoregressive sampling while still matching teacher logit shape on teacher-generated continuations. This has been demonstrated both in the literature (Tiapkin et al., 2025, "Teacher Hacking in Knowledge Distillation") and empirically on SN97.
+
+Starting in the validator commit cycle following the 14-day grace period, the validator will rank models by a **multi-axis composite score** rather than KL alone. The composite aggregates four independent axes using a **worst-case rule** — you win only if you're competitive on *every* axis.
+
+**The four axes.**
+
+1. **KL axis** (still present). Teacher-forced KL divergence on teacher continuations, as today. Normalized against the current king: a student matching king KL scores 1.0 on this axis.
+2. **Capability axis.** A small battery of verifiable prompts (arithmetic, yes/no, one-word factual) scored by exact-match extraction. The teacher is evaluated on the same prompts each round, and your score is normalized against teacher pass rate.
+3. **Length axis.** Your mean generation length on a held-out probe versus the teacher's mean generation length. Rambling or looping students are penalized; hard-stopping students are rewarded up to a cap.
+4. **Degeneracy axis.** The existing thinking-collapse probe (termination fraction, MAD-z-scored repetition versus the teacher, cross-rollout Self-BLEU).
+
+**Aggregation: worst-axis rule.** The composite is `min(axis_1, axis_2, axis_3, axis_4)`. Gaming any one axis at the expense of others brings your composite down. This is the Coste 2024 / Pan et al. 2025 min-form credit assignment rule.
+
+**Secondary: weighted mean.** We also log a weighted mean of the axes (KL and capability each 0.35, length and degeneracy each 0.15) as a softer aggregation used for display. The ranking key will be worst-axis.
+
+**Shadow mode (now).** Until the switchover, the composite is logged alongside KL in the H2H output and API. KL still decides the king. Watch your composite score — if it's low, you'll lose once the switch happens.
+
+**Why this is good for miners.** The on-chain commitment is permanent — it's in your interest that the thing the subnet rewards is actually correlated with model quality, because otherwise SN97 becomes a curiosity rather than a serious distillation program and alpha trends to zero. Under the new mechanism, a student that makes steady progress on real model quality *wins automatically*, whereas today it loses to a model that produces garbage but happens to match teacher logit shape.
+
+**What to train for.**
+
+- Reverse-KL under the student's own sampling (not forward-KL on teacher rollouts). See Thinking Machines, "On-Policy Distillation" (Nov 2025); GKD (Agarwal et al., 2024); MiniLLM (Gu et al., 2023).
+- Supervised fine-tuning on a capability mix (GSM8K, IFEval, basic QA) interleaved with the distillation objective.
+- Early termination behavior — don't emit `<think>` loops on trivial prompts.
+
+---
+
 ## Training Tips
 
 - **Base model:** Start from [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) or a compatible Qwen3.5 architecture

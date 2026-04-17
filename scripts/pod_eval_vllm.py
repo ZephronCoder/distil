@@ -437,6 +437,22 @@ THINK_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("THINK_PROBE_TERMINATE_TH
 THINK_PROBE_DEGEN_SIGMA = float(os.environ.get("THINK_PROBE_DEGEN_SIGMA", "4.0"))
 THINK_PROBE_GZIP_FLOOR = float(os.environ.get("THINK_PROBE_GZIP_FLOOR", "0.25"))
 THINK_PROBE_SELFBLEU_MAX = float(os.environ.get("THINK_PROBE_SELFBLEU_MAX", "0.85"))
+
+CAPABILITY_PROBE_PROMPTS = [
+    {"q": "What is 13 + 29? Answer with only the number.", "a": "42", "kind": "int"},
+    {"q": "What is 7 * 8? Answer with only the number.", "a": "56", "kind": "int"},
+    {"q": "What is 100 - 37? Answer with only the number.", "a": "63", "kind": "int"},
+    {"q": "What is 144 / 12? Answer with only the number.", "a": "12", "kind": "int"},
+    {"q": "Is 17 a prime number? Answer yes or no.", "a": "yes", "kind": "yesno"},
+    {"q": "Is 21 a prime number? Answer yes or no.", "a": "no", "kind": "yesno"},
+    {"q": "What is the capital of France? One word.", "a": "paris", "kind": "word"},
+    {"q": "What color do you get by mixing red and blue? One word.", "a": "purple", "kind": "word_alt", "alts": ["violet", "magenta"]},
+    {"q": "Which month has exactly 28 or 29 days? One word.", "a": "february", "kind": "word"},
+    {"q": "How many sides does a hexagon have? Answer with only the number.", "a": "6", "kind": "int"},
+]
+CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", "48"))
+LENGTH_PENALTY_RATIO = float(os.environ.get("LENGTH_PENALTY_RATIO", "2.0"))
+
 _CHAT_PROBE_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _CHAT_PROBE_THINK_TRAIL = re.compile(r"^.*?</think>\s*", re.DOTALL)
 _CHAT_PROBE_NARRATIVE = re.compile(r"^\s*Thinking Process:.*?(?=\n\n[A-Z0-9]|\Z)", re.DOTALL)
@@ -691,6 +707,247 @@ def _self_bleu_pairwise(texts: list[str], n: int = 4) -> float:
                 s += inter / union
                 pairs += 1
     return s / pairs if pairs else 0.0
+
+
+def _extract_capability_answer(text: str, kind: str) -> str:
+    """Pull the first answer token from a model generation.
+
+    We aim for extraction tolerance: students sometimes emit <think> blocks,
+    leading newlines, markdown, or verbose wrappers. Strip and search rather
+    than demand exact formatting. The prompt tells them how to answer; the
+    extractor is permissive so partial credit goes to models that *could*
+    answer but haven't been RLHF'd for format compliance.
+    """
+    t = _strip_thinking_probe(text or "").strip().lower()
+    if not t:
+        return ""
+    if kind == "int":
+        m = re.search(r"-?\d+", t)
+        return m.group(0) if m else ""
+    if kind == "yesno":
+        if re.search(r"\byes\b", t):
+            return "yes"
+        if re.search(r"\bno\b", t):
+            return "no"
+        return ""
+    m = re.search(r"[a-zA-Z]+", t)
+    return m.group(0) if m else ""
+
+
+def _capability_score_one(pred: str, item: dict) -> int:
+    if not pred:
+        return 0
+    if item["kind"] == "word_alt":
+        accepted = {item["a"].lower()} | {a.lower() for a in item.get("alts", [])}
+        return 1 if pred in accepted else 0
+    return 1 if pred == item["a"].lower() else 0
+
+
+def capability_probe(model, tokenizer, device="cuda"):
+    """Verifiable-rewards mini-battery.
+
+    Grounded answers (arithmetic, yes/no, one-word facts) cannot be gamed by
+    matching teacher logit shape — the answer is the answer. Zhou et al.
+    *IFEval* (arXiv:2311.07911) and the Tülu 3 RLVR line (Lambert et al.
+    arXiv:2411.15124) established this axis as the single most reward-hack-
+    resistant signal for small models.
+
+    Runs greedy generation at short max_new_tokens so cost is bounded: 10
+    prompts × ~32 tokens ≈ 1–3 GPU-seconds, negligible next to the KL pass.
+    Returns pass fraction and per-item breakdown for the UI.
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    try:
+        if tokenizer is None or model is None:
+            return out
+        if not getattr(tokenizer, "chat_template", None):
+            return out
+
+        eos_ids = []
+        for tok in ["<|im_end|>", "<|endoftext|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0:
+                eos_ids.append(tid)
+        if getattr(tokenizer, "eos_token_id", None) is not None:
+            eos_ids.append(int(tokenizer.eos_token_id))
+        eos_ids = list(set(eos_ids)) or None
+        pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for item in CAPABILITY_PROBE_PROMPTS:
+                msgs = [{"role": "user", "content": item["q"]}]
+                try:
+                    try:
+                        rendered = tokenizer.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                            enable_thinking=False,
+                        )
+                    except TypeError:
+                        rendered = tokenizer.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                        )
+                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                    gen = model.generate(
+                        ids, max_new_tokens=CAPABILITY_PROBE_MAX_TOKENS,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    pred = _extract_capability_answer(raw_text, item["kind"])
+                    ok = _capability_score_one(pred, item)
+                    out["items"].append({
+                        "q": item["q"], "expected": item["a"],
+                        "pred": pred, "ok": bool(ok),
+                        "tail": raw_text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"q": item["q"], "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def _render_chat_prompt(tokenizer, user_text: str, enable_thinking: bool = False):
+    msgs = [{"role": "user", "content": user_text}]
+    try:
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+        )
+
+
+def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda"):
+    """Run teacher on think-probe + capability-probe prompts while HF-loaded.
+
+    Populates the two globals the student-side probes read. Doing this once
+    per round amortizes teacher cost across all students and lets us run
+    statistical comparisons (teacher_self_bleu, per-prompt correctness
+    delta) that the single-student probe cannot do on its own.
+    """
+    think_samples = []
+    cap_answers = []
+    cap_gen_lens = []
+    if tokenizer is None or teacher is None:
+        return think_samples, cap_answers, cap_gen_lens
+    try:
+        eos_ids = []
+        for tok in ["<|im_end|>", "<|endoftext|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0:
+                eos_ids.append(tid)
+        if getattr(tokenizer, "eos_token_id", None) is not None:
+            eos_ids.append(int(tokenizer.eos_token_id))
+        eos_ids = list(set(eos_ids)) or None
+        pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+
+        was_training = teacher.training
+        teacher.eval()
+        with torch.no_grad():
+            for prompt in THINK_PROBE_PROMPTS:
+                try:
+                    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
+                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                    gen = teacher.generate(
+                        ids, max_new_tokens=THINK_PROBE_MAX_TOKENS,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    think_samples.append(tokenizer.decode(new_ids, skip_special_tokens=True))
+                except Exception as e:
+                    print(f"[eval] Teacher think-probe prompt failed: {e}", flush=True)
+            for item in CAPABILITY_PROBE_PROMPTS:
+                try:
+                    rendered = _render_chat_prompt(tokenizer, item["q"], enable_thinking=False)
+                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                    gen = teacher.generate(
+                        ids, max_new_tokens=CAPABILITY_PROBE_MAX_TOKENS,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    gen_len = int(new_ids.shape[0])
+                    raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    cap_answers.append(_extract_capability_answer(raw_text, item["kind"]))
+                    cap_gen_lens.append(gen_len)
+                except Exception as e:
+                    print(f"[eval] Teacher capability prompt failed: {e}", flush=True)
+                    cap_answers.append("")
+                    cap_gen_lens.append(0)
+        if was_training:
+            teacher.train()
+    except Exception as e:
+        print(f"[eval] prepare_teacher_probe_refs_hf error: {e}", flush=True)
+    return think_samples, cap_answers, cap_gen_lens
+
+
+def prepare_teacher_probe_refs_vllm(tokenizer):
+    """Same as the HF variant but using the live vLLM server. Greedy only."""
+    import requests
+    think_samples = []
+    cap_answers = []
+    cap_gen_lens = []
+    if tokenizer is None:
+        return think_samples, cap_answers, cap_gen_lens
+    try:
+        for prompt in THINK_PROBE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
+                resp = requests.post(
+                    f"{VLLM_URL}/v1/completions",
+                    json={
+                        "model": "teacher",
+                        "prompt": rendered,
+                        "max_tokens": THINK_PROBE_MAX_TOKENS,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                    },
+                    timeout=VLLM_REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                think_samples.append(resp.json()["choices"][0]["text"])
+            except Exception as e:
+                print(f"[eval] vLLM teacher think-probe failed: {e}", flush=True)
+        for item in CAPABILITY_PROBE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(tokenizer, item["q"], enable_thinking=False)
+                resp = requests.post(
+                    f"{VLLM_URL}/v1/completions",
+                    json={
+                        "model": "teacher",
+                        "prompt": rendered,
+                        "max_tokens": CAPABILITY_PROBE_MAX_TOKENS,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                    },
+                    timeout=VLLM_REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                txt = resp.json()["choices"][0]["text"]
+                cap_answers.append(_extract_capability_answer(txt, item["kind"]))
+                try:
+                    cap_gen_lens.append(len(tokenizer(txt, return_tensors="pt").input_ids[0]))
+                except Exception:
+                    cap_gen_lens.append(0)
+            except Exception as e:
+                print(f"[eval] vLLM teacher capability failed: {e}", flush=True)
+                cap_answers.append("")
+                cap_gen_lens.append(0)
+    except Exception as e:
+        print(f"[eval] prepare_teacher_probe_refs_vllm error: {e}", flush=True)
+    return think_samples, cap_answers, cap_gen_lens
 
 
 def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=None):
@@ -1736,11 +1993,16 @@ def main():
                 full_sequences = [s.to(device) for s in cache["full_sequences"]]
                 teacher_logits_list = cache["teacher_logits"]  # keep on CPU
                 prompt_lens = cache["prompt_lens"]
+                if cache.get("teacher_probe_samples"):
+                    globals()["_TEACHER_PROBE_SAMPLES"] = cache["teacher_probe_samples"]
+                if cache.get("teacher_capability_refs"):
+                    globals()["_TEACHER_CAPABILITY_REFS"] = cache["teacher_capability_refs"]
                 timings["teacher_cache_load"] = time.time() - t0
                 timings["teacher_generation"] = 0.0
                 timings["teacher_logits_pass"] = 0.0
                 print(f"[eval] ✓ Cached logits ({timings['teacher_cache_load']:.1f}s, "
-                      f"method={cache.get('generation_method', '?')})", flush=True)
+                      f"method={cache.get('generation_method', '?')}, "
+                      f"probe_refs={'yes' if cache.get('teacher_probe_samples') else 'no'})", flush=True)
                 teacher_cache_loaded = True
             else:
                 print(f"[eval] ✗ Cache stale — regenerating", flush=True)
@@ -1795,6 +2057,24 @@ def main():
                 print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
             except Exception as e:
                 print(f"[eval] vLLM generation failed: {e} — falling back to HF", flush=True)
+
+            # Probe-ref collection while vLLM is still hot (cheap: ~15 prompts).
+            # Populates _TEACHER_PROBE_SAMPLES so the MAD-z degeneracy branch
+            # activates, and _TEACHER_CAPABILITY_REFS so the shadow capability
+            # axis has a reference.
+            try:
+                _tpr_t0 = time.time()
+                think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_vllm(tokenizer)
+                globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
+                globals()["_TEACHER_CAPABILITY_REFS"] = {
+                    "answers": cap_answers, "gen_lens": cap_gen_lens,
+                }
+                timings["teacher_probe_refs"] = time.time() - _tpr_t0
+                print(f"[eval] Teacher probe refs via vLLM: "
+                      f"{len(think_refs)} think + {len(cap_answers)} cap "
+                      f"({timings['teacher_probe_refs']:.1f}s)", flush=True)
+            except Exception as e:
+                print(f"[eval] Teacher probe refs (vLLM) failed: {e}", flush=True)
             stop_vllm_server()
         else:
             print(f"[eval] vLLM failed to start — falling back to HF", flush=True)
@@ -1858,6 +2138,23 @@ def main():
                 timings["teacher_logits_pass"] = time.time() - t0
                 print(f"[eval] Logits extracted in {timings['teacher_logits_pass']:.1f}s", flush=True)
 
+                # Probe-ref collection while HF teacher is still loaded.
+                try:
+                    _tpr_t0 = time.time()
+                    think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_hf(
+                        teacher, tokenizer, device,
+                    )
+                    globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
+                    globals()["_TEACHER_CAPABILITY_REFS"] = {
+                        "answers": cap_answers, "gen_lens": cap_gen_lens,
+                    }
+                    timings["teacher_probe_refs"] = time.time() - _tpr_t0
+                    print(f"[eval] Teacher probe refs via HF: "
+                          f"{len(think_refs)} think + {len(cap_answers)} cap "
+                          f"({timings['teacher_probe_refs']:.1f}s)", flush=True)
+                except Exception as e:
+                    print(f"[eval] Teacher probe refs (HF in vLLM branch) failed: {e}", flush=True)
+
                 # Unload teacher
                 del teacher
                 free_gpu()
@@ -1883,6 +2180,8 @@ def main():
                         "generation_method": gen_method,
                         "logprobs_k": args.logprobs_k,
                         "sparse": any(_is_sparse_logits(tl) for tl in teacher_logits_list),
+                        "teacher_probe_samples": globals().get("_TEACHER_PROBE_SAMPLES", []),
+                        "teacher_capability_refs": globals().get("_TEACHER_CAPABILITY_REFS", {}),
                     }, cache_tmp)
                     os.replace(cache_tmp, args.save_teacher_logits)
                     cache_size = os.path.getsize(args.save_teacher_logits) / (1024**2)
@@ -1960,6 +2259,22 @@ def main():
             print(f"[eval] Chunked forward pass used for {n_chunked}/{len(hf_sequences_data)} sequences", flush=True)
         del hf_sequences_data
 
+        try:
+            _tpr_t0 = time.time()
+            think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_hf(
+                teacher, tokenizer, device,
+            )
+            globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
+            globals()["_TEACHER_CAPABILITY_REFS"] = {
+                "answers": cap_answers, "gen_lens": cap_gen_lens,
+            }
+            timings["teacher_probe_refs"] = time.time() - _tpr_t0
+            print(f"[eval] Teacher probe refs via HF: "
+                  f"{len(think_refs)} think + {len(cap_answers)} cap "
+                  f"({timings['teacher_probe_refs']:.1f}s)", flush=True)
+        except Exception as e:
+            print(f"[eval] Teacher probe refs (pure HF) failed: {e}", flush=True)
+
         cache_path = args.save_teacher_logits or os.path.join(os.path.dirname(args.output), "teacher_cache.pt")
         torch.save({
             "full_sequences": [s.cpu() for s in full_sequences],
@@ -1970,7 +2285,10 @@ def main():
             "generation_method": "hf",
             "logprobs_k": args.logprobs_k,
             "sparse": any(_is_sparse_logits(tl) for tl in teacher_logits_list),
+            "teacher_probe_samples": globals().get("_TEACHER_PROBE_SAMPLES", []),
+            "teacher_capability_refs": globals().get("_TEACHER_CAPABILITY_REFS", {}),
         }, cache_path)
+
         del teacher
         free_gpu()
         print(f"[eval] HF generation done in {timings['teacher_generation']:.1f}s, logits in {timings['teacher_logits_pass']:.1f}s", flush=True)
@@ -2366,6 +2684,47 @@ def main():
             except Exception as e:
                 print(f"[eval] Think probe error (non-fatal, allowing): {e}", flush=True)
 
+        # ── Capability probe (SHADOW axis, not gating) ─────────────────
+        # Verifiable-rewards micro-battery. Scored against teacher answers
+        # on the same prompts. Purpose: expose a capability axis that KL
+        # memorization cannot win, feeding the composite score preview.
+        cap_probe_this = (
+            student is not None
+            and os.environ.get("CAPABILITY_PROBE", "1") != "0"
+        )
+        if is_king and king_model is not None and student is king_model and load_time == 0.0:
+            cap_probe_this = False
+        if cap_probe_this:
+            try:
+                _cp_start = time.time()
+                cap = capability_probe(student, tokenizer, device)
+                _cp_dur = time.time() - _cp_start
+                refs = globals().get("_TEACHER_CAPABILITY_REFS") or {}
+                teacher_ans = refs.get("answers") or []
+                teacher_correct = 0
+                paired = 0
+                for item_idx, item in enumerate(CAPABILITY_PROBE_PROMPTS):
+                    if item_idx < len(teacher_ans):
+                        paired += 1
+                        if _capability_score_one(teacher_ans[item_idx], item):
+                            teacher_correct += 1
+                teacher_frac = teacher_correct / paired if paired else None
+                teach_str = f" teacher={teacher_frac*100:.0f}%" if teacher_frac is not None else ""
+                print(
+                    f"[eval] Capability probe: "
+                    f"{cap['correct']}/{cap['n']} ({cap['pass_frac']*100:.0f}%)"
+                    f"{teach_str} ({_cp_dur:.1f}s)",
+                    flush=True,
+                )
+                results["students"].setdefault(student_name, {})["capability"] = {
+                    "n": cap["n"], "correct": cap["correct"],
+                    "pass_frac": round(cap["pass_frac"], 3),
+                    "teacher_pass_frac": round(teacher_frac, 3) if teacher_frac is not None else None,
+                    "items": cap.get("items", []),
+                }
+            except Exception as e:
+                print(f"[eval] Capability probe error (non-fatal): {e}", flush=True)
+
         # ── Activation fingerprint (for functional copy detection) ──
         if student is not None:
             try:
@@ -2534,8 +2893,13 @@ def main():
 
         # Record results
         if scoring_error and not kl_per_prompt:
+            preserved = {
+                k: v for k, v in results["students"].get(student_name, {}).items()
+                if k in ("think_probe", "capability", "activation_fingerprint")
+            }
             results["students"][student_name] = {
-                "status": "scoring_error", "error": scoring_error[:500], "kl_global_avg": None}
+                "status": "scoring_error", "error": scoring_error[:500],
+                "kl_global_avg": None, **preserved}
         elif kl_per_prompt:
             kl_avg = sum(d["mean"] for d in kl_per_prompt) / len(kl_per_prompt)
             n_scored = len(kl_per_prompt)
@@ -2560,7 +2924,46 @@ def main():
             if topk_aggs:
                 student_result["shadow_topk"] = topk_aggs
                 print(f"  → Shadow top-k: {topk_aggs}", flush=True)
-            results["students"][student_name] = student_result
+
+            # Length penalty axis (shadow). Computes student-mean-gen vs
+            # teacher-mean-gen on the think probe prompts. Ratio > 1 means
+            # student rambles; 1.0 means matched; ~0 means student hard-stops.
+            think_prev = results["students"].get(student_name, {}).get("think_probe") or {}
+            stud_mean_gen = float(think_prev.get("mean_gen_tokens") or 0.0)
+            teacher_think_refs = globals().get("_TEACHER_PROBE_SAMPLES") or []
+            teach_mean_gen = 0.0
+            if teacher_think_refs and tokenizer is not None:
+                try:
+                    lens = []
+                    for txt in teacher_think_refs:
+                        if not txt:
+                            continue
+                        lens.append(len(tokenizer(txt, return_tensors="pt",
+                                                 truncation=False).input_ids[0]))
+                    if lens:
+                        teach_mean_gen = sum(lens) / len(lens)
+                except Exception:
+                    pass
+            if stud_mean_gen > 0 and teach_mean_gen > 0:
+                ratio = stud_mean_gen / teach_mean_gen
+                length_penalty = min(1.0, LENGTH_PENALTY_RATIO / max(ratio, 1e-6))
+                student_result["length_axis"] = {
+                    "student_mean_gen": round(stud_mean_gen, 1),
+                    "teacher_mean_gen": round(teach_mean_gen, 1),
+                    "ratio": round(ratio, 3),
+                    "penalty": round(length_penalty, 3),
+                }
+                print(f"  → Length axis: student={stud_mean_gen:.0f} "
+                      f"teacher={teach_mean_gen:.0f} ratio={ratio:.2f} "
+                      f"penalty={length_penalty:.2f}", flush=True)
+
+            # Preserve probes and fingerprint already written into this
+            # student's dict — overwriting it blanks them.
+            preserved = {
+                k: v for k, v in results["students"].get(student_name, {}).items()
+                if k in ("think_probe", "capability", "activation_fingerprint")
+            }
+            results["students"][student_name] = {**student_result, **preserved}
 
             if kl_avg > 0.001 and not early_stopped and not scoring_error:
                 if best_kl_so_far is None or kl_avg < best_kl_so_far:

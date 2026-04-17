@@ -47,10 +47,10 @@ next quarter; **P3** = spec only, implementation-deferred.
 
 | # | Axis | Primary attack prevented | Priority | Key ref |
 |---|---|---|---|---|
-| A1 | On-policy reverse-KL (student rollout + teacher NLL) | Teacher-forced hacking (Tiapkin) | P0 | Thinking Machines blog 10/2025 |
-| A2 | Autoregressive degeneracy gate (gzip + spectral) | CoT collapse | P0 *(shipped)* | Pimentel 2403.00553; Holtzman 1904.09751 |
-| A3 | Length penalty on rollouts | Infinite-loop emission-farming | P0 | Kimi k1.5 2501.12599 |
-| A4 | Verifiable outcome rewards (math/code/format) | "Miracle-step" overfitting | P1 | Tülu 3 2411.15124, Rubric Rewards 2510.07774 |
+| A1 | On-policy reverse-KL (student rollout + teacher NLL) | Teacher-forced hacking (Tiapkin) | P1 *(prototype)* | Thinking Machines blog 10/2025 |
+| A2 | Autoregressive degeneracy gate (gzip + spectral + Self-BLEU) | CoT collapse | P0 *(shipped)* | Pimentel 2403.00553; Holtzman 1904.09751 |
+| A3 | Length penalty on rollouts | Infinite-loop emission-farming | P0 *(shipped, shadow)* | Kimi k1.5 2501.12599 |
+| A4 | Verifiable outcome rewards (math/format/factoid) | "Miracle-step" overfitting | P0 *(mini, shipped shadow)* | Tülu 3 2411.15124, Rubric Rewards 2510.07774 |
 | A5 | Teacher ensemble worst-case (Qwen + DeepSeek + Llama) | Teacher-specific Goodhart | P1 | Coste 2406.01013 |
 | A6 | Weight-fingerprint dedup at registration | Copy-miner / fork-king | P1 | AWM 2510.06738, REEF, DuFFin |
 | A7 | Rotating prompt pool + reusable-holdout DP noise | Prompt memorization / reverse-engineering | P2 | LiveBench 2406.19314, Dwork 2015 |
@@ -391,13 +391,31 @@ format-constrained, refusal probes). Near zero maintenance.
 
 **Next tempo (P0, this commit cycle):**
 - [x] Shipped: teacher-anchored degeneracy probe (A2 subset).
-- [ ] A3 length penalty: implement in `pod_eval_vllm.py` scoring block.
-      4 lines.
-- [ ] A1 on-policy reverse-KL axis as an *additional* score term
-      alongside existing teacher-forced KL. Weight 0.5/0.5 initially.
+- [x] Shipped: teacher-probe reference collection while teacher is
+      loaded (populates the dormant `_TEACHER_PROBE_SAMPLES` so the
+      MAD-z branch actually activates; 15 prompts, ~10s extra per round).
+- [x] Shipped: A3 length penalty, computed as `min(1, 2·teacher_mean /
+      student_mean)` on the think-probe prompts. Stored as
+      `length_axis.penalty` per student.
+- [x] Shipped: A4-mini verifiable-rewards capability probe, 10
+      short prompts (arithmetic, yes/no, one-word facts) scored by
+      regex extraction, normalized against teacher pass rate. Runs
+      per-student in `pod_eval_vllm.py::capability_probe`.
+- [x] Shipped: `scripts/validator/composite.py` multi-axis score,
+      with both worst-axis (min-form, Coste 2024 / Pan 2025 PURE) and
+      weighted-mean aggregation. **Shadow mode** — logged and surfaced
+      in H2H/API but KL still decides the king. 14-day grace before
+      switchover.
+- [ ] A1 on-policy reverse-KL as a proper axis (requires holding the
+      teacher or reloading for a short forward pass over all-students'
+      rollouts). Deferred to next tempo — composite already anti-games
+      KL-farming via the other axes. Prototype exists at
+      `scripts/on_policy_rkl_probe.py`.
 
 **Next month (P1):**
-- [ ] A4 verifiable rewards (GSM8K-mini, HumanEval-mini, IFEval-mini)
+- [ ] Grace-period expiry: composite becomes the canonical ranking
+      key. Existing KL field preserved for transparency.
+- [ ] A4-full verifiable rewards (GSM8K-mini, HumanEval-mini, IFEval-mini)
       run in a sandbox on the eval pod.
 - [ ] A5 teacher ensemble (add DeepSeek-R1-Distill-Qwen-7B and
       Llama-3.1-8B-Instruct to eval pod; score as min across).
