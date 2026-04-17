@@ -25,12 +25,15 @@ const TASK_LABELS: Record<string, string> = {
   mmlu: "MMLU",
   mmlu_pro: "MMLU-Pro",
   gsm8k: "GSM8K",
+  bbh: "BBH",
   bbh_cot_fewshot: "BBH (CoT)",
   hellaswag: "HellaSwag",
   winogrande: "WinoGrande",
+  arc: "ARC-Challenge",
   arc_challenge: "ARC-Challenge",
   truthfulqa_mc2: "TruthfulQA MC2",
   ifeval: "IFEval",
+  humaneval: "HumanEval",
 };
 
 function formatScore(score: number | null | undefined): string {
@@ -123,7 +126,7 @@ export function BenchmarksTab() {
       <div>
         <h2 className="text-xl font-semibold tracking-tight text-foreground">Benchmarks</h2>
         <p className="text-xs text-muted-foreground mt-1">
-          Current king evaluated with lm-eval-harness against {baseline?.model ?? "a teacher-size baseline"}.
+          Current king evaluated with evalscope against the live chat vLLM{baseline ? ` · baseline ${baseline.model}` : ""}.
           {latest.fetched_at && (
             <span className="ml-1 text-muted-foreground/50">
               · refreshed {formatRelative(latest.fetched_at)}
@@ -135,7 +138,7 @@ export function BenchmarksTab() {
         </p>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      <div className={`grid grid-cols-1 gap-3 ${baseline ? "sm:grid-cols-3" : "sm:grid-cols-2"}`}>
         <div className="rounded-xl border border-border/20 bg-card/10 p-4">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">King</div>
           <div className="text-sm font-mono font-medium truncate" title={latest.model}>
@@ -147,20 +150,35 @@ export function BenchmarksTab() {
           </div>
         </div>
 
-        <div className="rounded-xl border border-border/20 bg-card/10 p-4">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">Baseline</div>
-          <div className="text-sm font-mono font-medium truncate">{baseline?.model ?? "—"}</div>
-          <div className="text-xs text-muted-foreground mt-0.5">Reference model</div>
-        </div>
+        {baseline && (
+          <div className="rounded-xl border border-border/20 bg-card/10 p-4">
+            <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">Baseline</div>
+            <div className="text-sm font-mono font-medium truncate">{baseline.model}</div>
+            <div className="text-xs text-muted-foreground mt-0.5">Reference model</div>
+          </div>
+        )}
 
         <div className="rounded-xl border border-border/20 bg-card/10 p-4">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">Result</div>
-          <div className="text-lg font-bold text-ok">
-            Wins {wins}/{comparable.length}
-          </div>
-          <div className="text-xs text-muted-foreground mt-0.5">
-            {taskKeys.length} tasks
-          </div>
+          {baseline ? (
+            <>
+              <div className="text-lg font-bold text-ok">
+                Wins {wins}/{comparable.length}
+              </div>
+              <div className="text-xs text-muted-foreground mt-0.5">
+                {taskKeys.length} tasks
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="text-lg font-bold text-foreground/80">
+                {taskKeys.length} tasks
+              </div>
+              <div className="text-xs text-muted-foreground mt-0.5">
+                Baseline pending
+              </div>
+            </>
+          )}
         </div>
       </div>
 
@@ -170,8 +188,13 @@ export function BenchmarksTab() {
             <tr className="border-b border-border/20">
               <th className="text-left px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Benchmark</th>
               <th className="text-right px-4 py-3 text-xs font-medium text-eval uppercase tracking-wider">King</th>
-              <th className="text-right px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Baseline</th>
-              <th className="text-right px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Delta</th>
+              {baseline && (
+                <>
+                  <th className="text-right px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Baseline</th>
+                  <th className="text-right px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Delta</th>
+                </>
+              )}
+              <th className="text-right px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">n</th>
             </tr>
           </thead>
           <tbody>
@@ -186,11 +209,18 @@ export function BenchmarksTab() {
                   <td className={`px-4 py-2.5 text-right font-mono tabular-nums ${win ? "text-ok font-semibold" : "text-foreground/70"}`}>
                     {formatScore(a)}
                   </td>
-                  <td className="px-4 py-2.5 text-right font-mono tabular-nums text-foreground/70">
-                    {formatScore(b)}
-                  </td>
-                  <td className={`px-4 py-2.5 text-right font-mono tabular-nums ${d.className}`}>
-                    {d.text}
+                  {baseline && (
+                    <>
+                      <td className="px-4 py-2.5 text-right font-mono tabular-nums text-foreground/70">
+                        {formatScore(b)}
+                      </td>
+                      <td className={`px-4 py-2.5 text-right font-mono tabular-nums ${d.className}`}>
+                        {d.text}
+                      </td>
+                    </>
+                  )}
+                  <td className="px-4 py-2.5 text-right font-mono tabular-nums text-muted-foreground/70">
+                    {latest.limit ?? "—"}
                   </td>
                 </tr>
               );
@@ -203,14 +233,14 @@ export function BenchmarksTab() {
         <p className="font-medium text-foreground/80">Methodology</p>
         <p>
           Run via{" "}
-          <a href="https://github.com/unarbos/distil/blob/main/benchmark.py" target="_blank" rel="noopener noreferrer" className="text-eval hover:underline">
-            benchmark.py
+          <a href="https://github.com/unarbos/distil/blob/main/scripts/run_king_benchmark.py" target="_blank" rel="noopener noreferrer" className="text-eval hover:underline">
+            run_king_benchmark.py
           </a>{" "}
           using{" "}
-          <a href="https://github.com/EleutherAI/lm-evaluation-harness" target="_blank" rel="noopener noreferrer" className="text-eval hover:underline">
-            lm-evaluation-harness
-          </a>
-          . Refreshes automatically when a new king is crowned.
+          <a href="https://github.com/modelscope/evalscope" target="_blank" rel="noopener noreferrer" className="text-eval hover:underline">
+            evalscope
+          </a>{" "}
+          against the live king vLLM (chat-king Lium pod). Refreshed nightly at 02:00 UTC and on every new king.
         </p>
       </div>
     </div>
