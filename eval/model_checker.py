@@ -190,6 +190,123 @@ def register_model_hash(
     hash_file.write_text(json.dumps(hashes, indent=2))
 
 
+def check_duplicate_content_hash(
+    content_hash: str, miner_uid: int, state_dir: Path = STATE_DIR,
+) -> Optional[int]:
+    """Find another UID with the same content (re-shard-invariant) hash."""
+    f = state_dir / "model_content_hashes.json"
+    if not f.exists():
+        return None
+    try:
+        hashes = json.loads(f.read_text())
+        for uid_str, stored_hash in hashes.items():
+            if stored_hash == content_hash and int(uid_str) != miner_uid:
+                return int(uid_str)
+    except Exception:
+        pass
+    return None
+
+
+def register_content_hash(
+    content_hash: str, miner_uid: int, state_dir: Path = STATE_DIR,
+):
+    """Register a content hash for a miner UID."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    f = state_dir / "model_content_hashes.json"
+    hashes = {}
+    if f.exists():
+        try:
+            hashes = json.loads(f.read_text())
+        except Exception:
+            pass
+    hashes[str(miner_uid)] = content_hash
+    f.write_text(json.dumps(hashes, indent=2))
+
+
+def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: int = 4) -> Optional[str]:
+    """
+    Shard-invariant content hash from the raw bytes of a few specific tensors.
+
+    Re-sharding a model (same weights, different file layout) produces
+    different SHA256s at the shard-file level but identical tensor bytes.
+    This hashes the bytes of a fixed set of named tensors, so it catches
+    re-sharded copies that slip past compute_model_hash.
+
+    Samples these tensors (present on every Qwen3.5 student):
+      - model.embed_tokens.weight
+      - model.layers.0.input_layernorm.weight
+      - model.layers.0.mlp.down_proj.weight
+      - model.norm.weight
+    Returns hex digest or None if unavailable.
+    """
+    import struct
+    try:
+        from huggingface_hub import hf_hub_url
+        info = model_info(model_repo, revision=revision, files_metadata=True)
+        st_files = sorted(
+            [s.rfilename for s in (info.siblings or []) if s.rfilename.endswith('.safetensors')]
+        )
+        if not st_files:
+            return None
+        targets = {
+            "model.embed_tokens.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.mlp.down_proj.weight",
+            "model.norm.weight",
+        }
+        tensor_hashes = []
+        with _requests.Session() as session:
+            session.headers.update({'Accept-Encoding': 'identity'})
+            for fname in st_files:
+                if not targets:
+                    break
+                url = hf_hub_url(repo_id=model_repo, filename=fname, revision=revision)
+                pr = session.get(url, headers={'Range': 'bytes=0-7'}, timeout=30,
+                                 stream=True, allow_redirects=True)
+                pr.raise_for_status()
+                prefix = pr.raw.read(8); pr.close()
+                if len(prefix) != 8:
+                    continue
+                header_size = struct.unpack('<Q', prefix)[0]
+                if header_size <= 0 or header_size > 8_000_000:
+                    continue
+                header_len = 8 + header_size
+                hr = session.get(url, headers={'Range': f'bytes=0-{header_len - 1}'},
+                                 timeout=60, stream=True, allow_redirects=True)
+                hr.raise_for_status()
+                blob = hr.raw.read(header_len); hr.close()
+                hj = json.loads(blob[8:header_len].decode('utf-8'))
+                for tname, tinfo in hj.items():
+                    if tname == '__metadata__' or tname not in targets:
+                        continue
+                    offs = tinfo.get('data_offsets') or [0, 0]
+                    if len(offs) != 2:
+                        continue
+                    abs_start = header_len + offs[0]
+                    abs_end = header_len + offs[1] - 1
+                    if abs_end < abs_start:
+                        continue
+                    size = abs_end - abs_start + 1
+                    if size <= 0 or size > 200_000_000:
+                        continue
+                    br = session.get(url, headers={'Range': f'bytes={abs_start}-{abs_end}'},
+                                     timeout=120, stream=True, allow_redirects=True)
+                    br.raise_for_status()
+                    data = br.raw.read(size); br.close()
+                    if len(data) != size:
+                        continue
+                    th = hashlib.sha256(data).hexdigest()
+                    tensor_hashes.append(f"{tname}:{th}")
+                    targets.discard(tname)
+        if not tensor_hashes:
+            return None
+        tensor_hashes.sort()
+        return hashlib.sha256("\n".join(tensor_hashes).encode()).hexdigest()
+    except Exception as e:
+        logger.warning(f"Content hash failed for {model_repo}: {e}")
+        return None
+
+
 def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optional[str]:
     """
     Compute a shard-invariant hash from safetensors tensor metadata.

@@ -4,9 +4,12 @@ import math
 import time
 
 from eval.model_checker import (
+    check_duplicate_content_hash,
     check_duplicate_hash,
     check_model_architecture,
+    compute_content_hash,
     compute_model_hash,
+    register_content_hash,
     register_model_hash,
     verify_model_integrity,
 )
@@ -199,6 +202,41 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                 register_model_hash(model_hash, uid, state.state_dir)
             else:
                 register_model_hash(model_hash, uid, state.state_dir)
+        # Shard-invariant content hash — catches re-sharded copies that slip
+        # past compute_model_hash (aizaysi's wind77/third ↔ pure-iron-6291 case).
+        content_hash = compute_content_hash(model_repo, revision)
+        if content_hash:
+            dup_uid = check_duplicate_content_hash(content_hash, uid, state.state_dir)
+            if dup_uid is not None:
+                orig_block = commitments.get(dup_uid, {}).get("block", float("inf"))
+                this_block = commit.get("block", float("inf"))
+                if this_block >= orig_block:
+                    orig_model = commitments.get(dup_uid, {}).get("model", "?")
+                    logger.info(f"UID {uid} ({model_repo}): CONTENT-DUPLICATE of UID {dup_uid}")
+                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(
+                        hotkey,
+                        f"copy: identical tensor content as UID {dup_uid} ({orig_model}) (re-sharded), committed later at block {this_block} vs {orig_block}",
+                        state.dq_reasons,
+                        commit_block=this_commit_block,
+                    )
+                    disqualified.add(uid)
+                    continue
+                orig_hotkey = uid_to_hotkey.get(dup_uid, str(dup_uid))
+                orig_commit_block = commitments.get(dup_uid, {}).get("block")
+                logger.info(f"UID {dup_uid} is content-duplicate of UID {uid} (committed earlier)")
+                state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
+                disqualify(
+                    orig_hotkey,
+                    f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), committed later",
+                    state.dq_reasons,
+                    commit_block=orig_commit_block,
+                )
+                valid_models.pop(dup_uid, None)
+                disqualified.add(dup_uid)
+                register_content_hash(content_hash, uid, state.state_dir)
+            else:
+                register_content_hash(content_hash, uid, state.state_dir)
         expected_hash = state.model_hashes.get(str(uid))
         stored_commit_block = state.model_hashes.get(f"{uid}_block")
         stored_hotkey = state.model_hashes.get(f"{uid}_hotkey")
