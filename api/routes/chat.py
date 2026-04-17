@@ -277,10 +277,11 @@ def chat_status():
     server_ok = False
     try:
         stdout = _ssh_exec(
-            f"curl -fsS http://localhost:{CHAT_POD_PORT}/v1/models",
+            f"curl -fsS http://localhost:{CHAT_POD_PORT}/v1/models >/dev/null && cat /root/model_name.txt 2>/dev/null",
             check=False,
         )
-        if stdout and (king_model is None or king_model in stdout):
+        served = (stdout or "").strip()
+        if served and (king_model is None or served == king_model):
             server_ok = True
         elif not eval_active:
             _ensure_chat_server(king_model)
