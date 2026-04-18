@@ -1,6 +1,7 @@
 import logging
 import math
 
+from eval.private_pool import dp_noise_for
 from eval.scoring import disqualify, is_disqualified, record_failure, reset_failures
 from eval.state import ValidatorState, log_event
 from scripts.validator.composite import annotate_h2h_with_composite, compute_composite
@@ -10,6 +11,29 @@ from scripts.validator.precheck import check_activation_fingerprint
 logger = logging.getLogger("distillation.remote_validator")
 
 MIN_PROMPTS_DETHRONE = 100
+
+
+def _apply_dp_noise_to_per_prompt(per_prompt, prompt_texts, private_start_idx):
+    """Axis A7: inject DP-Laplace noise into per-prompt KL values for prompts
+    drawn from the private (reusable-holdout) subset. Public prompt scores are
+    untouched.
+
+    per_prompt is a list of floats aligned with prompt_texts. Returns a noised
+    copy without mutating the input.
+    """
+    if not per_prompt or not prompt_texts or private_start_idx is None:
+        return per_prompt
+    n = min(len(per_prompt), len(prompt_texts))
+    if private_start_idx >= n:
+        return per_prompt
+    out = list(per_prompt)
+    for i in range(private_start_idx, n):
+        try:
+            noise = dp_noise_for(prompt_texts[i])
+        except Exception:
+            noise = 0.0
+        out[i] = max(0.0, float(out[i]) + noise)
+    return out
 
 
 def _paired_t_stats(deltas: list[float]):
@@ -69,19 +93,38 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             continue
         fingerprint = student_result.get("activation_fingerprint")
         if fingerprint and fingerprint.get("layer_fingerprints"):
-            is_copy, orig_uid, orig_model, sim = check_activation_fingerprint(model_name, uid, fingerprint, state.state_dir)
+            uid_to_commit_block = {
+                u: info.get("commit_block")
+                for u, info in models_to_eval.items()
+                if info.get("commit_block") is not None
+            }
+            this_commit_block = models_to_eval.get(uid, {}).get("commit_block")
+            is_copy, copy_uid, copy_model, orig_uid, orig_model, sim = check_activation_fingerprint(
+                model_name, uid, fingerprint, state.state_dir,
+                commit_block=this_commit_block,
+                uid_to_commit_block=uid_to_commit_block,
+            )
             if is_copy:
-                reason = f"copy: activation-space duplicate of UID {orig_uid} ({orig_model}) — cosine similarity {sim:.6f} > {ACTIVATION_COPY_THRESHOLD}"
-                logger.info(f"UID {uid} ({model_name}): ACTIVATION COPY — {reason}")
-                log_event(f"Activation copy detected: UID {uid} is copy of UID {orig_uid} (sim={sim:.6f})", level="warning", state_dir=str(state.state_dir))
-                state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                hotkey = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                commit_block = models_to_eval.get(uid, {}).get("commit_block")
-                disqualify(hotkey, reason, state.dq_reasons, commit_block=commit_block)
-                state.evaluated_uids.add(str(uid))
-                continue
-            if sim > 0.99:
-                logger.info(f"UID {uid}: high similarity to UID {orig_uid} (sim={sim:.6f}) — below threshold, monitoring")
+                if copy_uid == uid:
+                    reason = (
+                        f"copy: activation-space duplicate of UID {orig_uid} ({orig_model}) — "
+                        f"cosine similarity {sim:.6f} > {ACTIVATION_COPY_THRESHOLD}, committed later"
+                    )
+                    logger.info(f"UID {uid} ({model_name}): ACTIVATION COPY — {reason}")
+                    log_event(
+                        f"Activation copy detected: UID {uid} is later-committed copy of UID {orig_uid} (sim={sim:.6f})",
+                        level="warning", state_dir=str(state.state_dir),
+                    )
+                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    hotkey = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+                    disqualify(hotkey, reason, state.dq_reasons, commit_block=this_commit_block)
+                    state.evaluated_uids.add(str(uid))
+                    continue
+                logger.info(
+                    f"UID {uid} ({model_name}): activation match with UID {copy_uid} ({copy_model}) "
+                    f"(sim={sim:.6f}) — UID {uid} committed first, NOT disqualifying. UID {copy_uid} "
+                    f"will be flagged as the copy when its turn is processed."
+                )
         if student_result.get("status") == "fraud_vram":
             reason = student_result.get("reason", "VRAM fraud detected")
             logger.info(f"UID {uid} ({model_name}): {reason}")
@@ -191,6 +234,13 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     epsilon_dethroned_by = None
     king_model_name = uid_to_model.get(king_uid)
     king_per_prompt = results["students"][king_model_name].get("kl_per_prompt") if king_model_name and king_model_name in results.get("students", {}) else None
+
+    round_info = getattr(state, "current_round", {}) or {}
+    prompt_texts_for_dp = round_info.get("prompts") or []
+    n_private = int(((round_info.get("private_pool") or {}).get("n") or 0))
+    private_start = (len(prompt_texts_for_dp) - n_private) if n_private > 0 else None
+    if king_per_prompt is not None and private_start is not None:
+        king_per_prompt = _apply_dp_noise_to_per_prompt(king_per_prompt, prompt_texts_for_dp, private_start)
     challengers = {uid: info for uid, info in models_to_eval.items() if uid != king_uid}
     if king_uid is not None and challengers:
         for uid in challengers:
@@ -200,6 +250,8 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             challenger_kl = state.scores[uid_str]
             challenger_model = uid_to_model.get(uid)
             challenger_per_prompt = results["students"][challenger_model].get("kl_per_prompt") if challenger_model and challenger_model in results.get("students", {}) else None
+            if challenger_per_prompt is not None and private_start is not None:
+                challenger_per_prompt = _apply_dp_noise_to_per_prompt(challenger_per_prompt, prompt_texts_for_dp, private_start)
             if king_per_prompt and challenger_per_prompt:
                 n_paired = min(len(king_per_prompt), len(challenger_per_prompt))
                 if n_paired >= MIN_PROMPTS_DETHRONE:
