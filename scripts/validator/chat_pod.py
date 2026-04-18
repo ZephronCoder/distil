@@ -14,7 +14,7 @@ def chat_ssh(cmd: str, timeout: int = 30) -> str:
     import subprocess
     ssh_cmd = [
         "ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-        "-p", CHAT_POD_SSH_PORT, f"root@{CHAT_POD_HOST}", cmd,
+        "-p", str(CHAT_POD_SSH_PORT), f"root@{CHAT_POD_HOST}", cmd,
     ]
     try:
         result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
