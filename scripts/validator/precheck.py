@@ -243,7 +243,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                 "revision": revision,
                 "params_b": None,
                 "hotkey": hotkey,
-                "commit_block": this_commit_block,
+                "commit_block": this_commit_block if this_commit_block is not None else float("inf"),
             }
             continue
         logger.info(f"Checking {model_repo}...")
