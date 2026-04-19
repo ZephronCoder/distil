@@ -136,11 +136,26 @@ def cap_challengers(challengers, state: ValidatorState, king_uid):
         return
     logger.warning(f"{len(challengers)} challengers exceeds cap of {max_cap} (phase={phase}). Truncating.")
     king_entry = challengers.pop(king_uid, None)
-    sorted_chall = sorted(challengers.items(), key=lambda x: state.scores.get(str(x[0]), 999))
+    # Preserve H2H leaderboard contenders (Topaz/sebastian 2026-04-19): when
+    # many unscored challengers tie on the `scores.get(uid, 999)` sort key,
+    # dict-insertion-order tiebreaking silently dropped top-4 contenders
+    # (they're added last in add_top5_contenders). Pin them before the cap.
+    protected_uids = {
+        entry.get("uid")
+        for entry in (state.top4_leaderboard.get("contenders") or [])
+        if entry.get("uid") is not None and entry.get("uid") != king_uid
+    }
+    protected = {uid: info for uid, info in challengers.items() if uid in protected_uids}
+    remaining = {uid: info for uid, info in challengers.items() if uid not in protected_uids}
+    sorted_remaining = sorted(remaining.items(), key=lambda x: state.scores.get(str(x[0]), 999))
+    slots_for_remaining = max(0, max_cap - len(protected) - (1 if king_entry else 0))
     challengers.clear()
-    challengers.update(dict(sorted_chall[:max_cap - (1 if king_entry else 0)]))
+    challengers.update(protected)
+    challengers.update(dict(sorted_remaining[:slots_for_remaining]))
     if king_entry:
         challengers[king_uid] = king_entry
+    if protected:
+        logger.info(f"cap_challengers: protected {len(protected)} top-contender(s) from truncation: {sorted(protected)}")
 
 
 def assert_top_contenders_present(challengers, valid_models, state: ValidatorState, king_uid):
