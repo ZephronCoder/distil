@@ -3175,7 +3175,24 @@ def main():
             except Exception as e:
                 print(f"[eval] Chat probe error (non-fatal, allowing): {e}", flush=True)
 
-        think_probe_this = student is not None and os.environ.get("THINK_COLLAPSE_PROBE", "1") != "0"
+        # Thinking-collapse probe DISABLED as of 2026-04-19. See reports/
+        # 2026-04-19-think-probe-disabled.md — the teacher-anchored Wilson
+        # variant of the probe (commit 8eec9a2) DQ'd every student including
+        # the teacher itself and the reigning king for three consecutive
+        # rounds (blocks 7999728 / 8000338 / 8001xxx). Miners confirmed
+        # the breakage empirically; the probe's termination threshold is
+        # fundamentally miscalibrated for Qwen3.5 reasoning models that
+        # legitimately emit long chain-of-thought before EOS.
+        #
+        # The entire probe pipeline (generation, Wilson bounds, per-student
+        # storage) is retained but gated behind an opt-in env var so we can
+        # re-enable it offline once it is properly calibrated against a
+        # real teacher baseline. Default is OFF: the probe does NOT run,
+        # does NOT consume GPU time, and CANNOT DQ a model.
+        think_probe_this = (
+            student is not None
+            and os.environ.get("THINK_COLLAPSE_PROBE", "0") == "1"
+        )
         if is_king and king_model is not None and student is king_model and load_time == 0.0:
             think_probe_this = False
         if think_probe_this:
@@ -3209,25 +3226,15 @@ def main():
                     "samples": tprobe.get("samples", []),
                 }
                 if not tprobe["pass"]:
-                    results["students"][student_name].update({
-                        "status": "thinking_collapse",
-                        "reason": f"thinking_collapse:{tprobe['reason']}",
-                        "kl_global_avg": float("inf"),
-                    })
-                    with open(args.output, "w") as f:
-                        json.dump(results, f, indent=2)
-                    live_progress["completed"].append({"student_name": student_name, "status": "thinking_collapse"})
-                    live_progress["current"] = None
-                    _write_progress()
-                    if is_king:
-                        king_model = None
-                    try:
-                        del student
-                    except Exception:
-                        pass
-                    free_gpu()
-                    clean_model_cache(student_name, args.teacher)
-                    continue
+                    # Telemetry-only: record the failure on the student's
+                    # result entry but DO NOT DQ. See disable rationale in
+                    # the opt-in env var gate above.
+                    results["students"][student_name]["think_probe"]["would_have_dq"] = True
+                    print(
+                        f"[eval] Think probe FAILED (telemetry-only, not DQ'ing): "
+                        f"{tprobe['reason']}",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"[eval] Think probe error (non-fatal, allowing): {e}", flush=True)
 
