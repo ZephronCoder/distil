@@ -14,11 +14,16 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
   if (accept) headers.set("accept", accept);
   if (contentType) headers.set("content-type", contentType);
 
+  // IMPORTANT: forward the client's AbortSignal so that when the browser
+  // disconnects, we tear down the upstream fetch too. Without this, long-lived
+  // streams (e.g. /api/eval-stream SSE) leak tasks on the Python API until it
+  // hits --limit-concurrency and starts returning 503 to everyone.
   const response = await fetch(upstream, {
     method: request.method,
     headers,
     body: request.method === "GET" || request.method === "HEAD" ? undefined : await request.text(),
     cache: "no-store",
+    signal: request.signal,
   });
 
   const outHeaders = new Headers();

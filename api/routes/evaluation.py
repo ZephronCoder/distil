@@ -726,13 +726,28 @@ async def eval_stream(request: Request):
     progress_path = os.path.join(STATE_DIR, "eval_progress.json")
     latest_path = os.path.join(STATE_DIR, "h2h_latest.json")
 
+    # Bound lifetime so a single stuck stream can never squat a task slot forever.
+    # 15 minutes is way more than any real dashboard session needs; the browser's
+    # EventSource transparently reconnects on close, so users see no interruption.
+    MAX_STREAM_SECONDS = 15 * 60
+    # Keepalive on idle: some intermediaries silently drop sockets when the app
+    # is quiet (e.g. between rounds). Emitting a comment line every ~20s keeps
+    # the TCP path warm AND, crucially, lets us notice a broken pipe so we can
+    # exit the generator (freeing the task) instead of spinning forever.
+    KEEPALIVE_SECONDS = 20.0
+
     async def gen():
+        started = time.monotonic()
+        last_keepalive = started
         last_prog_mtime = 0.0
         last_latest_mtime = 0.0
         last_payload: str | None = None
         yield "event: hello\ndata: {\"v\": 1}\n\n"
         while True:
             if await request.is_disconnected():
+                break
+            if time.monotonic() - started > MAX_STREAM_SECONDS:
+                # Client can reconnect; this bounds the slot held by any one stream.
                 break
             try:
                 prog_mtime = os.path.getmtime(progress_path) if os.path.exists(progress_path) else 0.0
@@ -748,12 +763,28 @@ async def eval_stream(request: Request):
                     if payload != last_payload:
                         yield f"data: {payload}\n\n"
                         last_payload = payload
+                        last_keepalive = time.monotonic()
                     last_prog_mtime = prog_mtime
                     last_latest_mtime = latest_mtime
+                # SSE comment keepalive — harmless to clients, but if the socket
+                # is half-closed this yield raises and we fall out of the loop.
+                if time.monotonic() - last_keepalive >= KEEPALIVE_SECONDS:
+                    yield ": keepalive\n\n"
+                    last_keepalive = time.monotonic()
+            except (asyncio.CancelledError, GeneratorExit):
+                raise
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                break
             except Exception:
-                yield 'event: error\ndata: {"error": "stream glitch"}\n\n'
+                try:
+                    yield 'event: error\ndata: {"error": "stream glitch"}\n\n'
+                except Exception:
+                    break
             await asyncio.sleep(1.0)
-        yield "event: bye\ndata: {}\n\n"
+        try:
+            yield "event: bye\ndata: {}\n\n"
+        except Exception:
+            pass
 
     return StreamingResponse(
         gen(),
