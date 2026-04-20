@@ -2432,12 +2432,27 @@ def _atomic_json_write(path, data):
             _os.unlink(tmp)
         except OSError:
             pass
-        marker = f"_atomic_json_write_err_{path}"
-        if not globals().get(marker):
-            globals()[marker] = True
+        # Key on (path, exception type, str(exception)) so distinct failure
+        # modes all get reported once, but we don't spam the log at 1Hz.
+        err_key = f"_atomic_json_write_err_{path}_{type(exc).__name__}_{str(exc)[:80]}"
+        if not globals().get(err_key):
+            globals()[err_key] = True
             try:
+                import traceback as _tb
                 print(f"[progress] {path} write failed: "
                       f"{type(exc).__name__}: {exc}", file=_sys.stderr, flush=True)
+                try:
+                    print(f"[progress]   data keys: {list(data.keys()) if hasattr(data, 'keys') else type(data).__name__}",
+                          file=_sys.stderr, flush=True)
+                    print(f"[progress]   data repr: {repr(data)[:400]}",
+                          file=_sys.stderr, flush=True)
+                except Exception:
+                    pass
+                print("[progress] traceback (most recent call last):",
+                      file=_sys.stderr, flush=True)
+                for frame_line in _tb.format_exception(type(exc), exc, exc.__traceback__)[-6:]:
+                    for ln in frame_line.rstrip().splitlines():
+                        print(f"[progress]   {ln}", file=_sys.stderr, flush=True)
             except Exception:
                 pass
 
