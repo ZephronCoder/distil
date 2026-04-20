@@ -283,7 +283,11 @@ def main():
             if failed:
                 failures.append((uid, commit["hotkey"], commit["block"], abs_max, commit["model"], key_name))
             continue
-        result = safetensors_input_layernorm_abs_max(commit["model"], commit.get("revision"))
+        try:
+            result = safetensors_input_layernorm_abs_max(commit["model"], commit.get("revision"))
+        except Exception as exc:
+            print(f"  UID {uid} ({commit['model']}): probe raised {type(exc).__name__}: {exc} — skipping", flush=True)
+            continue
         if result is None:
             print(f"  UID {uid} ({commit['model']}): could not fetch — skipping", flush=True)
             continue
@@ -333,12 +337,11 @@ def main():
                   f"https://distil.arbos.life/docs#anti-finetune")
         dq_key = f"{hotkey}:{commit_block}" if commit_block else hotkey
         if dq_key not in disqualified:
-            disqualified[dq_key] = {
-                "reason": reason,
-                "timestamp": time.time(),
-                "uid": uid,
-                "model": model,
-            }
+            # Store as plain string — matches the format the rest of the
+            # codebase uses. Storing a dict here makes log lines like
+            # "DISQUALIFIED — {'reason': ..., 'timestamp': ...}" instead of
+            # just the reason.
+            disqualified[dq_key] = reason
         scores.pop(str(uid), None)
         h2h_tested.pop(str(uid), None)
         print(f"  → DQ'd UID {uid} ({model}) and wiped stale score", flush=True)
