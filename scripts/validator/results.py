@@ -458,8 +458,9 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                     mean_delta = sum(deltas) / len(deltas)
                     t_stat, p_value, _ = _paired_t_stats(deltas)
                     pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
-                    if p_value < PAIRED_TEST_ALPHA and mean_delta > 0:
-                        logger.info(f"UID {uid} DETHRONED king UID {king_uid}! p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), t={t_stat:.3f}, n={len(deltas)}")
+                    passes_epsilon = challenger_kl < epsilon_threshold
+                    if p_value < PAIRED_TEST_ALPHA and mean_delta > 0 and passes_epsilon:
+                        logger.info(f"UID {uid} DETHRONED king UID {king_uid}! p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), t={t_stat:.3f}, n={len(deltas)}, KL={challenger_kl:.6f} < eps={epsilon_threshold:.6f}")
                         dethroners.append({
                             "uid": uid,
                             "kl": challenger_kl,
@@ -469,6 +470,8 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                             "p_vs_king": p_value,
                             "n_paired_vs_king": n_paired,
                         })
+                    elif p_value < PAIRED_TEST_ALPHA and mean_delta > 0 and not passes_epsilon:
+                        logger.info(f"UID {uid}: significant but fails epsilon (p={p_value:.4f}, KL={challenger_kl:.6f} >= eps={epsilon_threshold:.6f}, delta={mean_delta:.6f})")
                     elif mean_delta > 0:
                         logger.info(f"UID {uid}: better but not significant (p={p_value:.4f}, delta={mean_delta:.6f}, n={len(deltas)})")
                     else:
