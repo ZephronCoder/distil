@@ -300,6 +300,8 @@ def _compact_round(h2h, last_eval):
             "mbpp_bench": _compact_bench(s.get("mbpp_bench")),
             "tool_use_bench": _compact_bench(s.get("tool_use_bench")),
             "self_consistency_bench": _compact_bench(s.get("self_consistency_bench")),
+            # Session 3.1 (2026-04-25, SHADOW) — commonsense science MC.
+            "arc_bench": _compact_bench(s.get("arc_bench")),
         })
     return {
         "block": h2h.get("block"),

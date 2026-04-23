@@ -1867,6 +1867,10 @@ BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PE
 BENCH_SELF_CONSISTENCY_SAMPLES = int(os.environ.get("BENCH_SELF_CONSISTENCY_SAMPLES", "5"))
 BENCH_SELF_CONSISTENCY_TEMP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TEMP", "0.7"))
 BENCH_SELF_CONSISTENCY_TOPP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TOPP", "0.9"))
+# Session 3.1 (added 2026-04-25): ARC-Challenge commonsense science reasoning.
+# 1172-item pool; independent of MMLU so miners can't climb `knowledge_bench`
+# by memorizing one taxonomy.
+BENCH_ARC_PER_ROUND = int(os.environ.get("BENCH_ARC_PER_ROUND", "6"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
@@ -1879,6 +1883,7 @@ BENCH_MBPP_MAX_TOKENS = int(os.environ.get("BENCH_MBPP_MAX_TOKENS", "512"))
 BENCH_TOOL_USE_MAX_TOKENS = int(os.environ.get("BENCH_TOOL_USE_MAX_TOKENS", "320"))
 BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_MAX_TOKENS", "512"))
 BENCH_TOOL_USE_SANDBOX_TIMEOUT_S = float(os.environ.get("BENCH_TOOL_USE_SANDBOX_TIMEOUT_S", "4.0"))
+BENCH_ARC_MAX_TOKENS = int(os.environ.get("BENCH_ARC_MAX_TOKENS", "48"))
 
 # Per-bench RNG stream offsets so the axes draw from independent
 # substreams even when given the same block_seed. Hex constants are
@@ -1894,16 +1899,19 @@ _BENCH_STREAM = {
     "mbpp": 0x00B00B88,          # Session 3
     "tool_use": 0x700101C0,      # Session 3
     "self_consistency": 0x5CC001, # Session 3
+    "arc": 0xAC0DE317,            # Session 3.1
 }
 
 _BENCH_BLOCK_SEED = None
 _BENCH_POOLS: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
+    "arc": [],
 }
 _BENCH_SAMPLES: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
+    "arc": [],
 }
 
 
@@ -2164,6 +2172,60 @@ def _bench_load_pools(verbose: bool = True):
                     "gold": g,
                 })
 
+    # ── arc_bench: AI2 ARC-Challenge (Session 3.1) ──────────────────
+    # 1172 grade-school/high-school science MC questions graded for
+    # "Challenge" difficulty by AI2. Disjoint from MMLU (different
+    # curriculum + different authoring pipeline), so climbing this
+    # independently measures commonsense-science reasoning that
+    # ``knowledge_bench`` and ``reasoning_bench`` don't already cover.
+    # Letter answers A/B/C/D (sometimes 1/2/3/4 in the raw data —
+    # normalized below). Load path tolerates absence so an unknown
+    # pod HF cache layout never blocks a round.
+    try:
+        arc = None
+        for _cfg in ("ARC-Challenge", "arc_challenge"):
+            try:
+                arc = load_dataset("allenai/ai2_arc", _cfg, split="test")
+                break
+            except Exception:
+                continue
+        if arc is not None:
+            for item in arc:
+                q = item.get("question")
+                choices = item.get("choices") or {}
+                labels = list(choices.get("label") or [])
+                texts = list(choices.get("text") or [])
+                ans = str(item.get("answerKey") or "").strip()
+                if not (q and labels and texts and ans and len(labels) == len(texts)):
+                    continue
+                # ARC sometimes encodes answers as '1'/'2'/'3'/'4';
+                # normalize to letters matching the choice labels.
+                if ans in labels:
+                    gold_letter = ans
+                else:
+                    try:
+                        gold_letter = labels[int(ans) - 1]
+                    except (ValueError, IndexError):
+                        continue
+                # Upper-case for case-insensitive extraction.
+                gold_letter = gold_letter.strip().upper()[:1]
+                if gold_letter not in "ABCDEFGHIJ":
+                    continue
+                # Convert labels to uppercase A/B/C/D for a consistent prompt.
+                upper_labels = [lab.strip().upper()[:1] for lab in labels]
+                if gold_letter not in upper_labels:
+                    continue
+                _BENCH_POOLS["arc"].append({
+                    "src": "arc-challenge",
+                    "question": str(q),
+                    "labels": upper_labels,
+                    "texts": [str(t) for t in texts],
+                    "gold_letter": gold_letter,
+                })
+    except Exception as e:
+        if verbose:
+            print(f"[bench] arc-challenge load error: {e}", flush=True)
+
     if verbose:
         print(
             f"[bench] pools loaded: "
@@ -2175,7 +2237,8 @@ def _bench_load_pools(verbose: bool = True):
             f"aime={len(_BENCH_POOLS['aime'])}, "
             f"mbpp={len(_BENCH_POOLS['mbpp'])}, "
             f"tool_use={len(_BENCH_POOLS['tool_use'])}, "
-            f"self_consistency={len(_BENCH_POOLS['self_consistency'])}",
+            f"self_consistency={len(_BENCH_POOLS['self_consistency'])}, "
+            f"arc={len(_BENCH_POOLS['arc'])}",
             flush=True,
         )
 
@@ -2257,6 +2320,7 @@ def set_bench_block_seed(block_seed):
     _BENCH_SAMPLES["self_consistency"] = _pick_bench_items(
         "self_consistency", block_seed, BENCH_SELF_CONSISTENCY_PER_ROUND,
     )
+    _BENCH_SAMPLES["arc"] = _pick_bench_items("arc", block_seed, BENCH_ARC_PER_ROUND)
     print(
         f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
         f"code={len(_BENCH_SAMPLES['code'])}, "
@@ -2266,7 +2330,8 @@ def set_bench_block_seed(block_seed):
         f"aime={len(_BENCH_SAMPLES['aime'])}, "
         f"mbpp={len(_BENCH_SAMPLES['mbpp'])}, "
         f"tool_use={len(_BENCH_SAMPLES['tool_use'])}, "
-        f"self_consistency={len(_BENCH_SAMPLES['self_consistency'])}",
+        f"self_consistency={len(_BENCH_SAMPLES['self_consistency'])}, "
+        f"arc={len(_BENCH_SAMPLES['arc'])}",
         flush=True,
     )
 
@@ -3117,6 +3182,57 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
     return out
 
 
+# ── arc_bench (Session 3.1 — commonsense science MC) ─────────────────
+
+def _format_arc_prompt(item: dict) -> str:
+    lines = [f"({lab}) {txt}" for lab, txt in zip(item["labels"], item["texts"])]
+    opts = "\n".join(lines)
+    return (
+        f"{item['question']}\n\n"
+        f"Options:\n{opts}\n\n"
+        "Respond with only the letter of the correct answer."
+    )
+
+
+def arc_bench_probe(model, tokenizer, device="cuda"):
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("arc") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_arc_prompt(it)
+                    text, _ = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_ARC_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    m = _MMLU_LETTER_RE.search(cleaned)
+                    pred = m.group(1).upper() if m else ""
+                    ok = 1 if pred and pred == it["gold_letter"] else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "pred": pred,
+                        "gold": it["gold_letter"],
+                        "ok": bool(ok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
 def run_bench_battery(model, tokenizer, device="cuda"):
     """Run all bench probes for one student. Returns a dict keyed by axis
     name (``math_bench`` / ``code_bench`` / ... / ``aime_bench`` / etc.).
@@ -3145,6 +3261,8 @@ def run_bench_battery(model, tokenizer, device="cuda"):
         ("mbpp_bench", mbpp_bench_probe),
         ("tool_use_bench", tool_use_bench_probe),
         ("self_consistency_bench", self_consistency_bench_probe),
+        # Session 3.1 — shadow, commonsense science.
+        ("arc_bench", arc_bench_probe),
     )
     for name, fn in _probes:
         st = time.time()

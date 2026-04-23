@@ -182,12 +182,31 @@ class TestSession3Shadow(unittest.TestCase):
             "mbpp_bench": 0.55,
             "tool_use_bench": 0.4,
             "self_consistency_bench": 0.6,
+            "arc_bench": 0.72,
         })
         axes = compute_axes(student, king_kl=0.3, king_rkl=0.1)
         self.assertEqual(axes["aime_bench"], 0.25)
         self.assertEqual(axes["mbpp_bench"], 0.55)
         self.assertEqual(axes["tool_use_bench"], 0.4)
         self.assertEqual(axes["self_consistency_bench"], 0.6)
+        self.assertEqual(axes["arc_bench"], 0.72)
+
+    def test_arc_bench_is_v3_shadow(self):
+        """arc_bench is in ARENA_V3_AXIS_WEIGHTS but not in composite when shadow."""
+        import scripts.validator.composite as _c
+        self.assertIn("arc_bench", _c.ARENA_V3_AXIS_WEIGHTS)
+        self.assertIn("arc_bench", _c.BENCH_MIN_VALID)
+        # default: shadow
+        self.assertFalse(_c.ARENA_V3_AXES_IN_COMPOSITE)
+        student = _make_student(bench={
+            "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
+            "knowledge_bench": 0.8, "ifeval_bench": 0.8,
+            "arc_bench": 0.05,  # would destroy worst if included
+        })
+        comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
+        self.assertGreater(comp["worst"], 0.10,
+                           "arc_bench=0.05 must NOT pull worst down in shadow mode")
+        self.assertEqual(comp["axes"]["arc_bench"], 0.05)
 
 
 class TestParetoDominance(unittest.TestCase):

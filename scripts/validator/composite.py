@@ -132,6 +132,11 @@ ARENA_V3_AXIS_WEIGHTS = {
     "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.06")),
     "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.04")),
     "self_consistency_bench":   float(os.environ.get("BENCH_SC_WEIGHT", "0.04")),
+    # Session 3.1 — ARC-Challenge commonsense science (added 2026-04-25).
+    # Small weight because it overlaps somewhat with ``reasoning_bench``
+    # and ``knowledge_bench`` conceptually, but the dataset is completely
+    # disjoint so it adds real coverage.
+    "arc_bench":                float(os.environ.get("BENCH_ARC_WEIGHT", "0.04")),
 }
 
 ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "0") != "0"
@@ -151,6 +156,9 @@ BENCH_MIN_VALID = {
     "mbpp_bench": 2,
     "tool_use_bench": 2,
     "self_consistency_bench": 2,
+    # Session 3.1 — ARC larger budget (6 per round), keep floor at 4
+    # so one parse failure doesn't drop the axis.
+    "arc_bench": 4,
 }
 
 COMPOSITE_SHADOW_VERSION = 5  # bumped for Arena v3
@@ -361,6 +369,10 @@ def _axis_self_consistency_bench(student: dict) -> float | None:
     return _axis_bench_pass_frac(student, "self_consistency_bench")
 
 
+def _axis_arc_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "arc_bench")
+
+
 def _axis_on_policy_rkl(student: dict, king_rkl: float | None) -> float:
     """Normalize on-policy reverse KL to [0, 1] higher-is-better.
 
@@ -424,6 +436,7 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "mbpp_bench": _axis_mbpp_bench(student),
         "tool_use_bench": _axis_tool_use_bench(student),
         "self_consistency_bench": _axis_self_consistency_bench(student),
+        "arc_bench": _axis_arc_bench(student),
     }
 
 

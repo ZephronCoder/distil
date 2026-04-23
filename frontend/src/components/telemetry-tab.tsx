@@ -38,6 +38,8 @@ interface CompositeAxes {
   mbpp_bench?: number;
   tool_use_bench?: number;
   self_consistency_bench?: number;
+  // Arena v3 Session 3.1 (SHADOW) — commonsense science MC (ARC-Challenge).
+  arc_bench?: number;
 }
 
 interface ParetoSummary {
@@ -131,6 +133,8 @@ interface RoundResult {
   mbpp_bench?: BenchBlock | null;
   tool_use_bench?: BenchBlock | null;
   self_consistency_bench?: BenchBlock | null;
+  // Arena v3 Session 3.1 (SHADOW) — commonsense science MC.
+  arc_bench?: BenchBlock | null;
 }
 
 interface RoundDetail {
@@ -552,6 +556,7 @@ export function TelemetryTab() {
                     ax.mbpp_bench,
                     ax.tool_use_bench,
                     ax.self_consistency_bench,
+                    ax.arc_bench,
                   ].filter((v): v is number => v != null);
                   const v3Worst = v3AxisValues.length > 0 ? Math.min(...v3AxisValues) : undefined;
                   const pareto = r.composite?.pareto;
@@ -677,18 +682,19 @@ export function TelemetryTab() {
                               </div>
                             )}
                             {/* Arena v3 Session 3 — shadow axes */}
-                            {(r.aime_bench || r.mbpp_bench || r.tool_use_bench || r.self_consistency_bench) && (
+                            {(r.aime_bench || r.mbpp_bench || r.tool_use_bench || r.self_consistency_bench || r.arc_bench) && (
                               <div className="mt-1 border-t border-border/10 pt-2">
                                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground/40 mb-1">
                                   Arena v3 — capability extension <span className={r.composite?.arena_v3_in_composite ? "text-emerald-400" : "text-amber-400/80"}>
                                     {r.composite?.arena_v3_in_composite ? "(live)" : "(shadow, promote +48h)"}
                                   </span>
                                 </div>
-                                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px]">
+                                <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-[10px]">
                                   <BenchCell label="aime" b={r.aime_bench} />
                                   <BenchCell label="mbpp" b={r.mbpp_bench} />
                                   <BenchCell label="tool_use" b={r.tool_use_bench} />
                                   <BenchCell label="self_consistency" b={r.self_consistency_bench} />
+                                  <BenchCell label="arc" b={r.arc_bench} />
                                 </div>
                               </div>
                             )}
