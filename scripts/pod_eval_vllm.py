@@ -1240,22 +1240,32 @@ def _render_chat_prompt(tokenizer, user_text: str, enable_thinking: bool = False
 
 
 def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=None):
-    """Run teacher on think-probe + capability-probe prompts while HF-loaded.
+    """Run teacher on think-probe + capability-probe + chat-probe prompts while HF-loaded.
 
-    Populates the two globals the student-side probes read. Doing this once
-    per round amortizes teacher cost across all students and lets us run
+    Populates the globals the student-side probes read. Doing this once per
+    round amortizes teacher cost across all students and lets us run
     statistical comparisons (teacher_self_bleu, per-prompt correctness
-    delta) that the single-student probe cannot do on its own.
+    delta, length-ratio) that the single-student probe cannot do on its own.
 
     ``block_seed`` rotates the think-probe prompts so the teacher references
     match the student-side probe set for this round (see
     ``_pick_think_probe_prompts`` for the rationale).
+
+    The chat-probe teacher pass is new (2026-04-22): the composite ``length``
+    axis needs a teacher-side length anchor to normalize student rambling
+    against. Previously it relied on ``_TEACHER_PROBE_SAMPLES`` (think
+    probe), which is empty when ``THINK_COLLAPSE_PROBE=0`` (the default
+    after the 2026-04-19 miscalibration outage). Running the teacher on
+    the four trivial CHAT_PROBE_PROMPTS gives us an always-available
+    anchor — ``enable_thinking=False`` + 48 tokens each ≈ 200 tokens total
+    teacher work, negligible next to the ~300-prompt scoring pass.
     """
     think_samples = []
     cap_answers = []
     cap_gen_lens = []
+    chat_gen_lens = []
     if tokenizer is None or teacher is None:
-        return think_samples, cap_answers, cap_gen_lens
+        return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
     think_prompts = _pick_think_probe_prompts(block_seed)
     try:
         eos_ids = []
@@ -1302,21 +1312,48 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
                     print(f"[eval] Teacher capability prompt failed: {e}", flush=True)
                     cap_answers.append("")
                     cap_gen_lens.append(0)
+            # Chat-probe teacher anchor for the length axis. We run with the
+            # same enable_thinking=False / greedy config as the student-side
+            # ``chat_response_probe`` so the length ratio is apples-to-apples.
+            # CHAT_PROBE_MAX_TOKENS (default 768) is enough headroom for a
+            # well-behaved teacher to terminate trivial prompts; if the
+            # teacher itself rambles we want to know about that too.
+            for prompt in CHAT_PROBE_PROMPTS:
+                try:
+                    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                    gen = teacher.generate(
+                        ids, max_new_tokens=CHAT_PROBE_MAX_TOKENS,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    chat_gen_lens.append(int(new_ids.shape[0]))
+                except Exception as e:
+                    print(f"[eval] Teacher chat-probe prompt failed: {e}", flush=True)
         if was_training:
             teacher.train()
     except Exception as e:
         print(f"[eval] prepare_teacher_probe_refs_hf error: {e}", flush=True)
-    return think_samples, cap_answers, cap_gen_lens
+    return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
 
 
 def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None):
-    """Same as the HF variant but using the live vLLM server. Greedy only."""
+    """Same as the HF variant but using the live vLLM server. Greedy only.
+
+    Returns ``(think_samples, cap_answers, cap_gen_lens, chat_gen_lens)``.
+    ``chat_gen_lens`` (new 2026-04-22) is the per-prompt token count for the
+    teacher's greedy ``enable_thinking=False`` response on each
+    CHAT_PROBE_PROMPTS entry; the composite length axis uses its mean as a
+    stable anchor so the axis stays defined even with THINK_COLLAPSE_PROBE=0.
+    """
     import requests
     think_samples = []
     cap_answers = []
     cap_gen_lens = []
+    chat_gen_lens = []
     if tokenizer is None:
-        return think_samples, cap_answers, cap_gen_lens
+        return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
     think_prompts = _pick_think_probe_prompts(block_seed)
     try:
         for prompt in think_prompts:
@@ -1362,9 +1399,34 @@ def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None):
                 print(f"[eval] vLLM teacher capability failed: {e}", flush=True)
                 cap_answers.append("")
                 cap_gen_lens.append(0)
+        # Chat-probe teacher anchor for the length axis — see matching
+        # comment in the HF variant for rationale.
+        for prompt in CHAT_PROBE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+                resp = requests.post(
+                    f"{VLLM_URL}/v1/completions",
+                    json={
+                        "model": "teacher",
+                        "prompt": rendered,
+                        "max_tokens": CHAT_PROBE_MAX_TOKENS,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                    },
+                    timeout=VLLM_REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                txt = resp.json()["choices"][0]["text"]
+                try:
+                    chat_gen_lens.append(len(tokenizer(txt, return_tensors="pt",
+                                                       truncation=False).input_ids[0]))
+                except Exception:
+                    chat_gen_lens.append(0)
+            except Exception as e:
+                print(f"[eval] vLLM teacher chat-probe failed: {e}", flush=True)
     except Exception as e:
         print(f"[eval] prepare_teacher_probe_refs_vllm error: {e}", flush=True)
-    return think_samples, cap_answers, cap_gen_lens
+    return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
 
 
 def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=None,
@@ -2851,6 +2913,12 @@ def main():
                 elif cached_refs:
                     print(f"[eval] Capability refs cache stale "
                           f"(seed {cached_seed} != {args.block_seed}); will regenerate", flush=True)
+                # Chat-probe teacher length anchor. Prompts are fixed
+                # (CHAT_PROBE_PROMPTS), not seeded — so we can always reuse
+                # a cached value here without the block_seed guard that
+                # applies to the capability refs.
+                if cache.get("teacher_chat_probe_gen_lens"):
+                    globals()["_TEACHER_CHAT_PROBE_GEN_LENS"] = cache["teacher_chat_probe_gen_lens"]
                 timings["teacher_cache_load"] = time.time() - t0
                 timings["teacher_generation"] = 0.0
                 timings["teacher_logits_pass"] = 0.0
@@ -2918,16 +2986,20 @@ def main():
             # axis has a reference.
             try:
                 _tpr_t0 = time.time()
-                think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_vllm(
+                think_refs, cap_answers, cap_gen_lens, chat_gen_lens = prepare_teacher_probe_refs_vllm(
                     tokenizer, block_seed=args.block_seed,
                 )
                 globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
                 globals()["_TEACHER_CAPABILITY_REFS"] = {
                     "answers": cap_answers, "gen_lens": cap_gen_lens,
                 }
+                if chat_gen_lens:
+                    globals()["_TEACHER_CHAT_PROBE_GEN_LENS"] = chat_gen_lens
                 timings["teacher_probe_refs"] = time.time() - _tpr_t0
+                teach_chat_mean = (sum(chat_gen_lens) / len(chat_gen_lens)) if chat_gen_lens else 0.0
                 print(f"[eval] Teacher probe refs via vLLM: "
-                      f"{len(think_refs)} think + {len(cap_answers)} cap "
+                      f"{len(think_refs)} think + {len(cap_answers)} cap + "
+                      f"{len(chat_gen_lens)} chat(mean={teach_chat_mean:.0f}) "
                       f"({timings['teacher_probe_refs']:.1f}s)", flush=True)
             except Exception as e:
                 print(f"[eval] Teacher probe refs (vLLM) failed: {e}", flush=True)
@@ -2997,16 +3069,20 @@ def main():
                 # Probe-ref collection while HF teacher is still loaded.
                 try:
                     _tpr_t0 = time.time()
-                    think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_hf(
+                    think_refs, cap_answers, cap_gen_lens, chat_gen_lens = prepare_teacher_probe_refs_hf(
                         teacher, tokenizer, device, block_seed=args.block_seed,
                     )
                     globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
                     globals()["_TEACHER_CAPABILITY_REFS"] = {
                         "answers": cap_answers, "gen_lens": cap_gen_lens,
                     }
+                    if chat_gen_lens:
+                        globals()["_TEACHER_CHAT_PROBE_GEN_LENS"] = chat_gen_lens
                     timings["teacher_probe_refs"] = time.time() - _tpr_t0
+                    teach_chat_mean = (sum(chat_gen_lens) / len(chat_gen_lens)) if chat_gen_lens else 0.0
                     print(f"[eval] Teacher probe refs via HF: "
-                          f"{len(think_refs)} think + {len(cap_answers)} cap "
+                          f"{len(think_refs)} think + {len(cap_answers)} cap + "
+                          f"{len(chat_gen_lens)} chat(mean={teach_chat_mean:.0f}) "
                           f"({timings['teacher_probe_refs']:.1f}s)", flush=True)
                 except Exception as e:
                     print(f"[eval] Teacher probe refs (HF in vLLM branch) failed: {e}", flush=True)
@@ -3039,6 +3115,7 @@ def main():
                         "teacher_probe_samples": globals().get("_TEACHER_PROBE_SAMPLES", []),
                         "teacher_capability_refs": globals().get("_TEACHER_CAPABILITY_REFS", {}),
                         "teacher_capability_block_seed": args.block_seed,
+                        "teacher_chat_probe_gen_lens": globals().get("_TEACHER_CHAT_PROBE_GEN_LENS", []),
                     }, cache_tmp)
                     os.replace(cache_tmp, args.save_teacher_logits)
                     cache_size = os.path.getsize(args.save_teacher_logits) / (1024**2)
@@ -3118,16 +3195,20 @@ def main():
 
         try:
             _tpr_t0 = time.time()
-            think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_hf(
+            think_refs, cap_answers, cap_gen_lens, chat_gen_lens = prepare_teacher_probe_refs_hf(
                 teacher, tokenizer, device, block_seed=args.block_seed,
             )
             globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
             globals()["_TEACHER_CAPABILITY_REFS"] = {
                 "answers": cap_answers, "gen_lens": cap_gen_lens,
             }
+            if chat_gen_lens:
+                globals()["_TEACHER_CHAT_PROBE_GEN_LENS"] = chat_gen_lens
             timings["teacher_probe_refs"] = time.time() - _tpr_t0
+            teach_chat_mean = (sum(chat_gen_lens) / len(chat_gen_lens)) if chat_gen_lens else 0.0
             print(f"[eval] Teacher probe refs via HF: "
-                  f"{len(think_refs)} think + {len(cap_answers)} cap "
+                  f"{len(think_refs)} think + {len(cap_answers)} cap + "
+                  f"{len(chat_gen_lens)} chat(mean={teach_chat_mean:.0f}) "
                   f"({timings['teacher_probe_refs']:.1f}s)", flush=True)
         except Exception as e:
             print(f"[eval] Teacher probe refs (pure HF) failed: {e}", flush=True)
@@ -3145,6 +3226,7 @@ def main():
             "teacher_probe_samples": globals().get("_TEACHER_PROBE_SAMPLES", []),
             "teacher_capability_refs": globals().get("_TEACHER_CAPABILITY_REFS", {}),
             "teacher_capability_block_seed": args.block_seed,
+            "teacher_chat_probe_gen_lens": globals().get("_TEACHER_CHAT_PROBE_GEN_LENS", []),
         }, cache_path)
 
         del teacher
@@ -3798,26 +3880,62 @@ def main():
                 student_result["shadow_topk"] = topk_aggs
                 print(f"  → Shadow top-k: {topk_aggs}", flush=True)
 
-            # Length penalty axis (shadow). Computes student-mean-gen vs
-            # teacher-mean-gen on the think probe prompts. Ratio > 1 means
-            # student rambles; 1.0 means matched; ~0 means student hard-stops.
-            think_prev = results["students"].get(student_name, {}).get("think_probe") or {}
-            stud_mean_gen = float(think_prev.get("mean_gen_tokens") or 0.0)
-            teacher_think_refs = globals().get("_TEACHER_PROBE_SAMPLES") or []
+            # Length penalty axis (production, 2026-04-22). Ratio of
+            # student mean generation length to teacher mean. Ratio > 1
+            # means student rambles; 1.0 means matched; small ratios mean
+            # student hard-stops. Two data sources, ordered by quality:
+            #
+            #   1. think_probe (enable_thinking=True, 32 prompts) — the
+            #      ideal signal because it catches the exact pathology of
+            #      "model rambles on simple reasoning questions". Only
+            #      available when THINK_COLLAPSE_PROBE=1. Anchored on the
+            #      teacher's own think-probe length (_TEACHER_PROBE_SAMPLES).
+            #
+            #   2. chat_probe (enable_thinking=False, 4 trivial prompts) —
+            #      always-on fallback. Anchored on the teacher's chat
+            #      probe length (_TEACHER_CHAT_PROBE_GEN_LENS, new in this
+            #      commit). Weaker signal because enable_thinking=False
+            #      suppresses the visible ramble, but still catches
+            #      degraded students that emit 400+ tokens of "Thinking
+            #      Process:..." on "hi".
+            #
+            # Before this commit only the think_probe path existed, so
+            # with the probe disabled the length axis was always None and
+            # dropped out of the composite — leaving KL as the only
+            # defense against the length pathology the user explicitly
+            # flagged. Falling back to chat_probe keeps the axis live and
+            # the composite honest while the think probe remains
+            # opt-in.
+            length_source = None
+            stud_mean_gen = 0.0
             teach_mean_gen = 0.0
-            if teacher_think_refs and tokenizer is not None:
-                try:
-                    lens = []
-                    for txt in teacher_think_refs:
-                        if not txt:
-                            continue
-                        lens.append(len(tokenizer(txt, return_tensors="pt",
-                                                 truncation=False).input_ids[0]))
-                    if lens:
-                        teach_mean_gen = sum(lens) / len(lens)
-                except Exception:
-                    pass
-            if stud_mean_gen > 0 and teach_mean_gen > 0:
+            think_prev = results["students"].get(student_name, {}).get("think_probe") or {}
+            chat_prev = results["students"].get(student_name, {}).get("chat_probe") or {}
+            if think_prev.get("mean_gen_tokens"):
+                stud_mean_gen = float(think_prev["mean_gen_tokens"])
+                teacher_think_refs = globals().get("_TEACHER_PROBE_SAMPLES") or []
+                if teacher_think_refs and tokenizer is not None:
+                    try:
+                        lens = []
+                        for txt in teacher_think_refs:
+                            if not txt:
+                                continue
+                            lens.append(len(tokenizer(txt, return_tensors="pt",
+                                                     truncation=False).input_ids[0]))
+                        if lens:
+                            teach_mean_gen = sum(lens) / len(lens)
+                    except Exception:
+                        pass
+                if stud_mean_gen > 0 and teach_mean_gen > 0:
+                    length_source = "think_probe"
+            if length_source is None and chat_prev.get("mean_gen_tokens"):
+                teach_chat_lens = globals().get("_TEACHER_CHAT_PROBE_GEN_LENS") or []
+                if teach_chat_lens:
+                    stud_mean_gen = float(chat_prev["mean_gen_tokens"])
+                    teach_mean_gen = sum(teach_chat_lens) / len(teach_chat_lens)
+                    if stud_mean_gen > 0 and teach_mean_gen > 0:
+                        length_source = "chat_probe"
+            if length_source is not None:
                 ratio = stud_mean_gen / teach_mean_gen
                 length_penalty = min(1.0, LENGTH_PENALTY_RATIO / max(ratio, 1e-6))
                 student_result["length_axis"] = {
@@ -3825,10 +3943,11 @@ def main():
                     "teacher_mean_gen": round(teach_mean_gen, 1),
                     "ratio": round(ratio, 3),
                     "penalty": round(length_penalty, 3),
+                    "source": length_source,
                 }
-                print(f"  → Length axis: student={stud_mean_gen:.0f} "
-                      f"teacher={teach_mean_gen:.0f} ratio={ratio:.2f} "
-                      f"penalty={length_penalty:.2f}", flush=True)
+                print(f"  → Length axis ({length_source}): "
+                      f"student={stud_mean_gen:.0f} teacher={teach_mean_gen:.0f} "
+                      f"ratio={ratio:.2f} penalty={length_penalty:.2f}", flush=True)
 
             # ── On-policy RKL rollouts (Phase A) ─────────────────────────
             # Sample rollouts from the student's own policy while it is

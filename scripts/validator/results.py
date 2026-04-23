@@ -19,6 +19,32 @@ logger = logging.getLogger("distillation.remote_validator")
 
 MIN_PROMPTS_DETHRONE = 100
 
+# ── Composite-axis dethronement floor (2026-04-22) ──────────────────────
+# A challenger that passes the KL paired t-test (p<0.05) AND the 3% epsilon
+# margin is still blocked from taking the crown if its worst composite axis
+# is below this floor. Motivation: the 2026-04-22 king (tom9491/distil-32)
+# passes KL handsomely but rambles 3–10x longer than the teacher on trivial
+# "hi"/"2+2=" prompts. Under raw KL that pathology is invisible — on-policy
+# RKL, length ratio, and the think-probe degeneracy axes all see it
+# directly. Without this veto a KL-specialized model can win even as its
+# generations become unusable.
+#
+# Floor choice: 0.20 is the "catastrophic failure" threshold for any axis
+# we care about. Concrete interpretation per axis:
+#
+#   * length   (penalty < 0.20 ⇒ student > 5x teacher tokens; clear ramble)
+#   * on_policy_rkl (score < 0.20 ⇒ on-policy RKL > 5x king; diverged)
+#   * capability (score < 0.20 ⇒ < 20% of teacher pass rate on verifiables)
+#   * degeneracy (score < 0.20 ⇒ half-plus of think prompts degenerate)
+#   * kl       (not applicable to dethroners: by construction their kl
+#              axis is ~1.0 since they beat the king on KL)
+#
+# If the composite isn't populated on enough axes (e.g. chat_probe and
+# think_probe both errored) the gate fails open — we don't want an
+# eval-side outage to freeze the crown.
+COMPOSITE_DETHRONE_FLOOR = 0.20
+COMPOSITE_DETHRONE_MIN_AXES = 3
+
 
 def _log_finetune_probe_telemetry(
     state_dir, uid, model_name, student_result, current_block, is_king,
@@ -101,6 +127,66 @@ def _pairwise_two_sided_p(a_per_prompt: list[float], b_per_prompt: list[float]) 
     mean_delta = sum(deltas) / n
     _t, _p_one, p_two = _paired_t_stats(deltas)
     return mean_delta, p_two, n
+
+
+def _composite_dethrone_veto(
+    challenger_model: str | None,
+    students_data: dict,
+    king_kl: float | None,
+    king_rkl: float | None,
+) -> dict | None:
+    """Return a veto dict iff the challenger's composite is catastrophic.
+
+    A "veto" means the challenger passed the KL gate (paired t-test + 3%
+    epsilon) but has at least one composite axis below
+    ``COMPOSITE_DETHRONE_FLOOR``. The most common cause in practice
+    (2026-04-22) is the ``length`` axis: KL-hacked students emit 3–10x
+    more tokens than the teacher on trivial prompts, which doesn't hurt
+    per-token KL but makes them unusable in chat.
+    Fail-open policy: the veto only triggers when we have ≥
+    ``COMPOSITE_DETHRONE_MIN_AXES`` populated axes AND the worst is below
+    the floor. If the composite couldn't be computed (missing data,
+    probe errored, exception), we return None and the dethrone proceeds
+    through the existing KL gate. That way a broken pod_eval_vllm probe
+    doesn't freeze the king indefinitely.
+
+    Returns:
+      None if the challenger should be allowed through, OR
+      ``{"reason": str, "worst_axis": str, "worst_value": float, "composite": dict}``
+      if the dethronement should be blocked.
+    """
+    if not challenger_model:
+        return None
+    data = students_data.get(challenger_model) or {}
+    if not data:
+        return None
+    try:
+        comp = compute_composite(data, king_kl, king_rkl)
+    except Exception as exc:
+        logger.warning(f"[composite-veto] compute failed for {challenger_model}: {exc}")
+        return None
+    present_count = comp.get("present_count") or 0
+    if present_count < COMPOSITE_DETHRONE_MIN_AXES:
+        return None
+    worst = comp.get("worst")
+    if worst is None or worst >= COMPOSITE_DETHRONE_FLOOR:
+        return None
+    axes = comp.get("axes") or {}
+    worst_axis = min(
+        ((k, v) for k, v in axes.items() if v is not None),
+        key=lambda kv: kv[1],
+        default=(None, None),
+    )
+    axis_name, axis_value = worst_axis
+    return {
+        "reason": (
+            f"composite worst axis '{axis_name}'={axis_value:.3f} < "
+            f"floor {COMPOSITE_DETHRONE_FLOOR} (n_axes={present_count})"
+        ),
+        "worst_axis": axis_name or "unknown",
+        "worst_value": float(axis_value) if axis_value is not None else 0.0,
+        "composite": comp,
+    }
 
 
 def _resolve_dethrone_winner(dethroners: list[dict]) -> int:
@@ -445,6 +531,18 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     king_model_name = uid_to_model.get(king_uid)
     king_per_prompt = results["students"][king_model_name].get("kl_per_prompt") if king_model_name and king_model_name in results.get("students", {}) else None
 
+    # Resolve the RKL anchor now so the dethronement loop below can apply
+    # the composite-floor veto (COMPOSITE_DETHRONE_FLOOR) with the same
+    # normalization that ``annotate_h2h_with_composite`` will use later.
+    # Kept best-effort: missing / errored RKL data just means the composite
+    # veto falls through for that axis without blocking legit dethroners.
+    students_data_early = results.get("students", {}) or {}
+    try:
+        _early_h2h_stub = [{"uid": king_uid, "model": uid_to_model.get(king_uid), "is_king": True}] if king_uid else []
+        king_rkl_ref_early = _resolve_king_rkl(king_h2h_kl, students_data_early, _early_h2h_stub)
+    except Exception:
+        king_rkl_ref_early = None
+
     round_info = getattr(state, "current_round", {}) or {}
     prompt_texts_for_dp = round_info.get("prompts") or []
     n_private = int(((round_info.get("private_pool") or {}).get("n") or 0))
@@ -481,6 +579,22 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                     pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
                     passes_epsilon = challenger_kl < epsilon_threshold
                     if p_value < PAIRED_TEST_ALPHA and mean_delta > 0 and passes_epsilon:
+                        comp_veto = _composite_dethrone_veto(
+                            challenger_model, students_data_early, king_h2h_kl, king_rkl_ref_early,
+                        )
+                        if comp_veto is not None:
+                            logger.info(
+                                f"UID {uid}: BLOCKED DETHRONE by composite floor — "
+                                f"{comp_veto['reason']} (KL passed: p={p_value:.4f}, "
+                                f"delta={mean_delta:.6f}, KL={challenger_kl:.6f})"
+                            )
+                            log_event(
+                                f"Composite floor blocked dethrone: UID {uid} "
+                                f"axis {comp_veto['worst_axis']}={comp_veto['worst_value']:.3f} "
+                                f"< {COMPOSITE_DETHRONE_FLOOR}",
+                                level="warning", state_dir=str(state.state_dir),
+                            )
+                            continue
                         logger.info(f"UID {uid} DETHRONED king UID {king_uid}! p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), t={t_stat:.3f}, n={len(deltas)}, KL={challenger_kl:.6f} < eps={epsilon_threshold:.6f}")
                         dethroners.append({
                             "uid": uid,
@@ -504,6 +618,21 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 if challenger_n < MIN_PROMPTS_DETHRONE:
                     logger.info(f"UID {uid}: insufficient prompts for legacy epsilon ({challenger_n} < {MIN_PROMPTS_DETHRONE}), KL={challenger_kl:.6f}")
                 elif challenger_kl < epsilon_threshold:
+                    comp_veto = _composite_dethrone_veto(
+                        challenger_model, students_data_early, king_h2h_kl, king_rkl_ref_early,
+                    )
+                    if comp_veto is not None:
+                        logger.info(
+                            f"UID {uid}: BLOCKED DETHRONE by composite floor — "
+                            f"{comp_veto['reason']} [legacy epsilon path, KL={challenger_kl:.6f}]"
+                        )
+                        log_event(
+                            f"Composite floor blocked dethrone: UID {uid} "
+                            f"axis {comp_veto['worst_axis']}={comp_veto['worst_value']:.3f} "
+                            f"< {COMPOSITE_DETHRONE_FLOOR} [legacy path]",
+                            level="warning", state_dir=str(state.state_dir),
+                        )
+                        continue
                     logger.info(f"UID {uid} DETHRONED king UID {king_uid}! KL={challenger_kl:.6f} < {epsilon_threshold:.6f} [legacy epsilon, n={challenger_n}]")
                     legacy_dethroners.append({
                         "uid": uid,
@@ -696,6 +825,42 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     h2h_results = _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt, uid_to_model, state.dq_reasons, uid_to_hotkey, commitments)
     try:
         annotate_h2h_with_composite(h2h_results, king_h2h_kl, students_data)
+        # Backfill the vs_king string for entries that would have passed
+        # the KL gate (``... dethroned``) but were blocked by the
+        # composite-floor veto. Without this the dashboard would say
+        # "dethroned" for a challenger that never actually took the
+        # crown, which is exactly the kind of false-positive signal the
+        # Discord has been asking us to surface clearly.
+        for row in h2h_results:
+            if row.get("is_king") or row.get("disqualified"):
+                continue
+            vs = row.get("vs_king") or ""
+            if " dethroned" not in vs:
+                continue
+            comp = row.get("composite") or {}
+            worst = comp.get("worst")
+            present = comp.get("present_count") or 0
+            if worst is None or present < COMPOSITE_DETHRONE_MIN_AXES:
+                continue
+            if worst >= COMPOSITE_DETHRONE_FLOOR:
+                continue
+            axes = comp.get("axes") or {}
+            bad = min(
+                ((k, v) for k, v in axes.items() if v is not None),
+                key=lambda kv: kv[1],
+                default=(None, None),
+            )
+            ax_name, ax_val = bad
+            row["vs_king"] = (
+                vs.replace(" dethroned", f" blocked: {ax_name}={ax_val:.2f}")
+                if ax_name is not None
+                else vs.replace(" dethroned", " blocked by composite")
+            )
+            row["composite_veto"] = {
+                "worst_axis": ax_name,
+                "worst_value": round(float(ax_val), 4) if ax_val is not None else None,
+                "floor": COMPOSITE_DETHRONE_FLOOR,
+            }
         # Re-sort h2h_results by composite.worst (desc) so the leaderboard
         # endpoint and h2h_latest display rank order matches the ranking
         # key used for crown decisions. KL stays as an informational field

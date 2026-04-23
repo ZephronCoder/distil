@@ -1,23 +1,37 @@
-"""Multi-axis composite score computation — production ranking key.
+"""Multi-axis composite score computation — production ranking + dethrone gate.
 
 Core idea: a single scalar like KL can be over-optimized until the model is
 useless under autoregressive sampling (the Tiapkin 2025 "Teacher Hacking"
-pathology, empirically visible on the current SN97 king). The fix is to
-score each student on several independent axes and combine them with a
-worst-case rule, so that gaming any single axis penalizes overall rank.
+pathology, empirically visible on the 2026-04-22 SN97 king, which rambles
+3–10x longer than the teacher on trivial prompts while passing KL). The
+fix is to score each student on several independent axes and combine them
+with a worst-case rule, so that gaming any single axis penalizes overall
+rank.
 
 This module is intentionally pure-Python, no ML deps, safe to import from
 the validator service. It consumes the JSON that ``pod_eval_vllm.py``
 writes per student and emits a ``composite`` score and per-axis breakdown.
 
-Status: PRODUCTION (promoted from shadow 2026-04-19, commit 8eec9a2).
-``composite.worst`` is the primary ranking key used by
-``scripts/validator/results.py`` to order the leaderboard and select the
-canonical challenger. Crown transitions still additionally require the
-paired t-test on KL + 3% epsilon (``epsilon_dethroned_by``) so a single
-bad round cannot dethrone the king on axis noise. Axes that are missing
-for a given round (e.g. ``degeneracy`` while ``THINK_COLLAPSE_PROBE=0``)
-drop out and the weighted mean renormalizes over the surviving axes.
+Status: PRODUCTION — ranking + dethrone veto.
+  * 2026-04-19 (commit 8eec9a2): promoted from shadow to production
+    ranking key. ``composite.worst`` orders the leaderboard and selects
+    the canonical challenger for display.
+  * 2026-04-22 (this commit): ``composite.worst`` is now ALSO a dethrone
+    gate. A challenger that passes the KL paired t-test + 3% epsilon is
+    still blocked from taking the crown if its worst composite axis is
+    below ``COMPOSITE_DETHRONE_FLOOR`` (currently 0.20). See
+    ``scripts/validator/results.py::_composite_dethrone_veto``.
+  * Same commit: the ``length`` axis is now always populated even when
+    ``THINK_COLLAPSE_PROBE=0``. It falls back to the always-on
+    ``chat_probe`` length vs a teacher anchor captured in
+    ``prepare_teacher_probe_refs_*``. This closes the gap that let a
+    KL-specialized-but-rambling model keep the crown unopposed.
+
+Axes that are missing for a given round (e.g. ``degeneracy`` while
+``THINK_COLLAPSE_PROBE=0``) drop out and the weighted mean renormalizes
+over the surviving axes. The veto fails open if fewer than
+``COMPOSITE_DETHRONE_MIN_AXES`` axes are populated — we don't want a pod
+probe outage to freeze the crown.
 """
 from __future__ import annotations
 
