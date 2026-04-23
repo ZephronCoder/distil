@@ -172,8 +172,25 @@ def _composite_dethrone_veto(
     if worst is None or worst >= COMPOSITE_DETHRONE_FLOOR:
         return None
     axes = comp.get("axes") or {}
+    # Only report axes that are actually in the active composite —
+    # shadow axes (bench/judge, pre-promotion) may score lower than
+    # the triggering axis but should not be surfaced as the reason.
+    broken_axes = set(comp.get("broken_axes") or [])
+    from scripts.validator.composite import (
+        AXIS_WEIGHTS as _AX,
+        BENCH_AXIS_WEIGHTS as _BX,
+        JUDGE_AXIS_IN_COMPOSITE as _JIC,
+        BENCH_AXES_IN_COMPOSITE as _BIC,
+    )
+    active = set(_AX.keys())
+    if _JIC:
+        active.add("judge_probe")
+    if _BIC:
+        active.update(_BX.keys())
+    active.difference_update(broken_axes)
+    active_axes = {k: v for k, v in axes.items() if v is not None and k in active}
     worst_axis = min(
-        ((k, v) for k, v in axes.items() if v is not None),
+        active_axes.items(),
         key=lambda kv: kv[1],
         default=(None, None),
     )
@@ -855,8 +872,21 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             if worst >= COMPOSITE_DETHRONE_FLOOR:
                 continue
             axes = comp.get("axes") or {}
+            broken_axes = set(comp.get("broken_axes") or [])
+            from scripts.validator.composite import (
+                AXIS_WEIGHTS as _AX,
+                BENCH_AXIS_WEIGHTS as _BX,
+                JUDGE_AXIS_IN_COMPOSITE as _JIC,
+                BENCH_AXES_IN_COMPOSITE as _BIC,
+            )
+            _active = set(_AX.keys())
+            if _JIC:
+                _active.add("judge_probe")
+            if _BIC:
+                _active.update(_BX.keys())
+            _active.difference_update(broken_axes)
             bad = min(
-                ((k, v) for k, v in axes.items() if v is not None),
+                ((k, v) for k, v in axes.items() if v is not None and k in _active),
                 key=lambda kv: kv[1],
                 default=(None, None),
             )

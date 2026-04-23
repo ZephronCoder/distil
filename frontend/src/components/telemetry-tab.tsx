@@ -27,6 +27,12 @@ interface CompositeAxes {
   adversarial?: number;
   on_policy_rkl?: number;
   judge_probe?: number;
+  // Pareto holistic eval v2 (2026-04-24) — absolute-correctness axes.
+  math_bench?: number;
+  code_bench?: number;
+  reasoning_bench?: number;
+  knowledge_bench?: number;
+  ifeval_bench?: number;
 }
 
 interface Composite {
@@ -37,6 +43,25 @@ interface Composite {
   present_count?: number;
   broken_axes?: string[];
   judge_in_composite?: boolean;
+  bench_in_composite?: boolean;
+}
+
+interface BenchItem {
+  src?: string;
+  ok?: boolean;
+  reason?: string | null;
+  pred?: string | null;
+  gold?: string | null;
+  task_id?: string | null;
+}
+
+interface BenchBlock {
+  n?: number;
+  correct?: number;
+  pass_frac?: number;
+  wall_s?: number;
+  error?: string;
+  items?: BenchItem[];
 }
 
 interface RoundResult {
@@ -65,6 +90,12 @@ interface RoundResult {
   judge_normalized?: number;
   judge_n_valid?: number;
   judge_n?: number;
+  // Pareto holistic eval v2 bench axes (shadow until BENCH_AXES_IN_COMPOSITE=1)
+  math_bench?: BenchBlock | null;
+  code_bench?: BenchBlock | null;
+  reasoning_bench?: BenchBlock | null;
+  knowledge_bench?: BenchBlock | null;
+  ifeval_bench?: BenchBlock | null;
 }
 
 interface RoundDetail {
@@ -458,6 +489,7 @@ export function TelemetryTab() {
                   <th className="pr-2">Len</th>
                   <th className="pr-2">Deg</th>
                   <th className="pr-2" title="Teacher-as-judge score (shadow). Normalized from 1-5 rubric on 16 rotated prompts per round.">Judge*</th>
+                  <th className="pr-2" title="Pareto holistic eval v2 (2026-04-24) — worst of math/code/reason/know/ifeval absolute-correctness axes. Shadow until BENCH_AXES_IN_COMPOSITE=1.">Bench*</th>
                   <th className="pr-2">Worst</th>
                   <th className="pr-2">vs King</th>
                 </tr>
@@ -468,6 +500,15 @@ export function TelemetryTab() {
                   const worst = r.composite?.worst;
                   const isDq = r.disqualified === true;
                   const isExpanded = expandedUid === r.uid;
+                  // Worst of the five bench axes (null-aware)
+                  const benchAxisValues = [
+                    ax.math_bench,
+                    ax.code_bench,
+                    ax.reasoning_bench,
+                    ax.knowledge_bench,
+                    ax.ifeval_bench,
+                  ].filter((v): v is number => v != null);
+                  const benchWorst = benchAxisValues.length > 0 ? Math.min(...benchAxisValues) : undefined;
                   return (
                     <>
                       <tr
@@ -494,6 +535,16 @@ export function TelemetryTab() {
                         >
                           {ax.judge_probe == null ? "—" : ax.judge_probe.toFixed(2)}
                         </td>
+                        <td
+                          className={`pr-2 tabular-nums ${axisColor(benchWorst)} ${r.composite?.bench_in_composite ? "" : "opacity-70"}`}
+                          title={
+                            r.composite?.bench_in_composite
+                              ? "Pareto holistic eval v2 — worst of math/code/reason/know/ifeval (live)"
+                              : "Pareto holistic eval v2 — worst of math/code/reason/know/ifeval (SHADOW — not in ranking yet)"
+                          }
+                        >
+                          {benchWorst == null ? "—" : benchWorst.toFixed(2)}
+                        </td>
                         <td className={`pr-2 tabular-nums font-semibold ${axisColor(worst)}`}>
                           {worst == null ? "—" : worst.toFixed(2)}
                         </td>
@@ -503,7 +554,7 @@ export function TelemetryTab() {
                       </tr>
                       {isExpanded && (
                         <tr>
-                          <td colSpan={10} className="pb-2 pl-4 text-muted-foreground/60 bg-card/5">
+                          <td colSpan={11} className="pb-2 pl-4 text-muted-foreground/60 bg-card/5">
                             <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] py-2">
                               <div>prompts: {r.prompts_scored}/{r.prompts_total}</div>
                               <div>paired: {r.paired_prompts}</div>
@@ -541,6 +592,23 @@ export function TelemetryTab() {
                                 </div>
                               )}
                             </div>
+                            {/* Pareto holistic eval v2 — per-axis breakdown */}
+                            {(r.math_bench || r.code_bench || r.reasoning_bench || r.knowledge_bench || r.ifeval_bench) && (
+                              <div className="mt-1 border-t border-border/10 pt-2">
+                                <div className="text-[10px] uppercase tracking-wider text-muted-foreground/40 mb-1">
+                                  Pareto holistic eval v2 <span className={r.composite?.bench_in_composite ? "text-emerald-400" : "text-amber-400/80"}>
+                                    {r.composite?.bench_in_composite ? "(live)" : "(shadow)"}
+                                  </span>
+                                </div>
+                                <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-[10px]">
+                                  <BenchCell label="math" b={r.math_bench} />
+                                  <BenchCell label="code" b={r.code_bench} />
+                                  <BenchCell label="reason" b={r.reasoning_bench} />
+                                  <BenchCell label="know" b={r.knowledge_bench} />
+                                  <BenchCell label="ifeval" b={r.ifeval_bench} />
+                                </div>
+                              </div>
+                            )}
                           </td>
                         </tr>
                       )}
@@ -550,9 +618,15 @@ export function TelemetryTab() {
               </tbody>
             </table>
           </div>
-          <div className="text-[10px] text-muted-foreground/40 font-mono">
-            Composite axes (0–1): worst-of-axis drives reward. Axes = KL (fidelity), RKL (on-policy KL), capability (absolute correctness + teacher-relative), length (≈ teacher length), degeneracy (coherence).
-            <span className="ml-1">Judge* = teacher-as-judge rubric score (1–5 normalized). <span className="text-amber-400">SHADOW</span> — visible here but not yet in ranking (48h telemetry before promotion).</span>
+          <div className="text-[10px] text-muted-foreground/40 font-mono space-y-1">
+            <div>
+              Composite axes (0–1): worst-of-axis drives reward. Axes = KL (fidelity), RKL (on-policy KL), capability (absolute correctness + teacher-relative), length (≈ teacher length), degeneracy (coherence).
+              <span className="ml-1">Judge* = teacher-as-judge rubric score (1–5 normalized).</span>
+            </div>
+            <div>
+              <span className="text-amber-400">Bench*</span> = Pareto holistic eval v2 (2026-04-24): absolute pass-frac on a small rotated sample of GSM8K+MATH-500 (math), HumanEval (code, sandboxed), BBH (reasoning), MMLU-Pro (knowledge), IFEval (instruction-following). Scored against ground truth; click any row to see the per-axis breakdown.
+              <span className="ml-1 text-amber-400">SHADOW</span> for 48h of telemetry, then flips live. Overfitting these axes produces a SOTA model — that&apos;s the point.
+            </div>
           </div>
         </div>
       )}
@@ -647,6 +721,40 @@ export function TelemetryTab() {
           )}
         </ul>
       </div>
+    </div>
+  );
+}
+
+function BenchCell({ label, b }: { label: string; b?: BenchBlock | null }) {
+  if (!b) {
+    return (
+      <div className="flex items-center gap-1">
+        <span className="text-muted-foreground/50 w-12">{label}</span>
+        <span className="text-muted-foreground/30 tabular-nums">—</span>
+      </div>
+    );
+  }
+  if (b.error) {
+    return (
+      <div className="flex items-center gap-1" title={b.error}>
+        <span className="text-muted-foreground/50 w-12">{label}</span>
+        <span className="text-red-400/70 tabular-nums">err</span>
+      </div>
+    );
+  }
+  const pct = b.pass_frac;
+  return (
+    <div
+      className="flex items-center gap-1"
+      title={`${b.correct}/${b.n} correct${b.wall_s != null ? ` · ${b.wall_s.toFixed(1)}s` : ""}`}
+    >
+      <span className="text-muted-foreground/50 w-12">{label}</span>
+      <span className={`tabular-nums ${axisColor(pct)}`}>
+        {pct == null ? "—" : (pct * 100).toFixed(0) + "%"}
+      </span>
+      <span className="text-muted-foreground/30 tabular-nums">
+        ({b.correct ?? 0}/{b.n ?? 0})
+      </span>
     </div>
   );
 }

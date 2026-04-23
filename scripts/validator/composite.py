@@ -32,6 +32,18 @@ Status: PRODUCTION — ranking + dethrone veto.
     per round but excluded from ``worst`` / ``weighted`` aggregation
     until the ``JUDGE_AXIS_IN_COMPOSITE`` gate flips (Session 2). See
     ``reports/2026-04-23-goodhart-immune-eval.md``.
+  * 2026-04-24: **Pareto holistic eval v2** — five new absolute-
+    correctness axes from public held-out benchmarks
+    (``math_bench``, ``code_bench``, ``reasoning_bench``,
+    ``knowledge_bench``, ``ifeval_bench``) added in SHADOW mode. See
+    ``reports/2026-04-24-pareto-holistic-eval-v2.md``. These break the
+    last Goodhart hole — the old six axes all scored *relative* to the
+    teacher, which means a perfectly-distilled model of a non-SOTA
+    teacher still ranked #1 but couldn't actually do grade-school math.
+    The new axes score against ground truth (GSM8K / HumanEval /
+    BBH / MMLU-Pro / IFEval), so overfitting them ⇒ SOTA small model.
+    Promoted to composite ranking when ``BENCH_AXES_IN_COMPOSITE=1``
+    (2026-04-26 by default).
 
 Axes that are missing for a given round (e.g. ``degeneracy`` while
 ``THINK_COLLAPSE_PROBE=0``) drop out and the weighted mean renormalizes
@@ -55,6 +67,10 @@ from typing import Any
 # model must be competitive on reasoning, length discipline, and
 # non-degenerate generation — not just logit-matching.
 AXIS_WEIGHTS = {
+    # Tier 1: relative (teacher-referenced) axes. Production since
+    # 2026-04-19. Kept at the same relative weighting; the weights
+    # below are only used by the ``weighted`` aggregation, which is
+    # auxiliary — the production ranking key is ``worst``.
     "on_policy_rkl": 0.35,
     "kl": 0.15,
     "capability": 0.25,
@@ -76,7 +92,36 @@ JUDGE_AXIS_WEIGHT = float(os.environ.get("JUDGE_AXIS_WEIGHT", "0.20"))
 # Flip to ``1`` during Session 2 rollout after 48h of telemetry.
 JUDGE_AXIS_IN_COMPOSITE = os.environ.get("JUDGE_AXIS_IN_COMPOSITE", "0") != "0"
 
-COMPOSITE_SHADOW_VERSION = 3
+# ── 2026-04-24 — Pareto holistic eval v2 ──────────────────────────────
+# Five absolute-correctness axes drawn from public held-out benchmarks.
+# Each normalized to [0, 1] by raw ``pass_frac``. Starts in shadow mode
+# (visible + logged but not ranking) and flips to production when
+# ``BENCH_AXES_IN_COMPOSITE=1``. See
+# ``reports/2026-04-24-pareto-holistic-eval-v2.md`` section 5 for the
+# staged weight proposal.
+BENCH_AXIS_WEIGHTS = {
+    "math_bench":      float(os.environ.get("BENCH_MATH_WEIGHT", "0.15")),
+    "code_bench":      float(os.environ.get("BENCH_CODE_WEIGHT", "0.15")),
+    "reasoning_bench": float(os.environ.get("BENCH_REASONING_WEIGHT", "0.10")),
+    "knowledge_bench": float(os.environ.get("BENCH_KNOWLEDGE_WEIGHT", "0.10")),
+    "ifeval_bench":    float(os.environ.get("BENCH_IFEVAL_WEIGHT", "0.05")),
+}
+
+BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "0") != "0"
+
+# Per-axis minimum valid-item count below which the axis drops as
+# "insufficient sample". Small pools (code_bench samples only 4 items
+# per round by design) get a lower floor so rounding noise doesn't
+# exclude them unnecessarily.
+BENCH_MIN_VALID = {
+    "math_bench": 4,
+    "code_bench": 2,
+    "reasoning_bench": 4,
+    "knowledge_bench": 4,
+    "ifeval_bench": 4,
+}
+
+COMPOSITE_SHADOW_VERSION = 4
 
 # ── Teacher sanity gate (2026-04-23) ──────────────────────────────────────
 # For each ranking axis we can optionally compute the axis value for the
@@ -213,6 +258,50 @@ def _axis_judge_probe(student: dict) -> float | None:
     return max(0.0, min(1.0, float(norm)))
 
 
+def _axis_bench_pass_frac(student: dict, axis_name: str) -> float | None:
+    """Generic [0, 1] pass-fraction extractor for Pareto holistic eval v2.
+
+    Each ``*_bench`` key in the student result has the same schema:
+    ``{"n": int, "correct": int, "pass_frac": float, "items": [...]}``.
+    Returns the raw ``pass_frac`` if there are at least ``BENCH_MIN_VALID``
+    items; otherwise ``None`` so the axis drops out for the round.
+    Errored probes are also mapped to None (fail-open).
+    """
+    payload = student.get(axis_name) or {}
+    if not payload or payload.get("error"):
+        return None
+    n = int(payload.get("n") or 0)
+    if n < BENCH_MIN_VALID.get(axis_name, 4):
+        return None
+    frac = payload.get("pass_frac")
+    if frac is None:
+        return None
+    try:
+        return max(0.0, min(1.0, float(frac)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _axis_math_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "math_bench")
+
+
+def _axis_code_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "code_bench")
+
+
+def _axis_reasoning_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "reasoning_bench")
+
+
+def _axis_knowledge_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "knowledge_bench")
+
+
+def _axis_ifeval_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "ifeval_bench")
+
+
 def _axis_on_policy_rkl(student: dict, king_rkl: float | None) -> float:
     """Normalize on-policy reverse KL to [0, 1] higher-is-better.
 
@@ -265,6 +354,11 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "length": _axis_length(student),
         "degeneracy": _axis_degeneracy(student),
         "judge_probe": _axis_judge_probe(student),
+        "math_bench": _axis_math_bench(student),
+        "code_bench": _axis_code_bench(student),
+        "reasoning_bench": _axis_reasoning_bench(student),
+        "knowledge_bench": _axis_knowledge_bench(student),
+        "ifeval_bench": _axis_ifeval_bench(student),
     }
 
 
@@ -284,8 +378,16 @@ def resolve_teacher_broken_axes(teacher_student_row: dict | None,
     if not teacher_student_row:
         return broken
     teacher_axes = compute_axes(teacher_student_row, king_kl, king_rkl)
+    # Build the set of axes the teacher is actually being scored on this
+    # round. AXIS_WEIGHTS + (judge if promoted) + (bench if promoted).
+    applicable = set(AXIS_WEIGHTS.keys())
+    if JUDGE_AXIS_IN_COMPOSITE:
+        applicable.add("judge_probe")
+    if BENCH_AXES_IN_COMPOSITE:
+        for k in BENCH_AXIS_WEIGHTS:
+            applicable.add(k)
     for axis, val in teacher_axes.items():
-        if axis not in AXIS_WEIGHTS:
+        if axis not in applicable:
             continue
         if val is None:
             continue
@@ -318,12 +420,18 @@ def compute_composite(student: dict, king_kl: float | None = None,
     anchors).
     """
     axes = compute_axes(student, king_kl, king_rkl)
-    # Build effective weights: judge axis is shadow-only unless the
-    # promote gate is on. Keeping this local to compute_composite so a
-    # single env flip flows to every caller without touching AXIS_WEIGHTS.
+    # Build effective weights: both the judge axis and the five bench
+    # axes are shadow-only until their respective gates flip
+    # (``JUDGE_AXIS_IN_COMPOSITE`` / ``BENCH_AXES_IN_COMPOSITE``).
+    # Keeping this local to compute_composite so a single env flip
+    # flows to every caller without touching AXIS_WEIGHTS.
     effective_weights = dict(AXIS_WEIGHTS)
     if JUDGE_AXIS_IN_COMPOSITE:
         effective_weights["judge_probe"] = JUDGE_AXIS_WEIGHT
+    if BENCH_AXES_IN_COMPOSITE:
+        for k, w in BENCH_AXIS_WEIGHTS.items():
+            if w > 0:
+                effective_weights[k] = w
     ranked = {
         k: v for k, v in axes.items()
         if v is not None
@@ -346,6 +454,7 @@ def compute_composite(student: dict, king_kl: float | None = None,
         "present_count": len(ranked),
         "broken_axes": sorted(broken_axes) if broken_axes else [],
         "judge_in_composite": JUDGE_AXIS_IN_COMPOSITE,
+        "bench_in_composite": BENCH_AXES_IN_COMPOSITE,
     }
 
 

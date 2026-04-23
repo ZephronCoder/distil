@@ -190,6 +190,31 @@ def _compact_think(tp):
     }
 
 
+def _compact_bench(payload):
+    """Compact representation of a *_bench probe payload for the dashboard."""
+    if not payload:
+        return None
+    items = payload.get("items") or []
+    compact = []
+    for it in items[:12]:
+        compact.append({
+            "src": (it.get("src") or "")[:40],
+            "ok": it.get("ok"),
+            "reason": (it.get("reason") or "")[:80] if it.get("reason") else None,
+            "pred": (str(it.get("pred") or "")[:80]) if it.get("pred") is not None else None,
+            "gold": (str(it.get("gold") or "")[:40]) if it.get("gold") is not None else None,
+            "task_id": it.get("task_id"),
+        })
+    return {
+        "n": payload.get("n"),
+        "correct": payload.get("correct"),
+        "pass_frac": payload.get("pass_frac"),
+        "wall_s": payload.get("wall_s"),
+        "error": payload.get("error"),
+        "items": compact,
+    }
+
+
 def _compact_round(h2h, last_eval):
     if not h2h:
         return None
@@ -234,6 +259,13 @@ def _compact_round(h2h, last_eval):
             "judge_normalized": jp.get("normalized"),
             "judge_n_valid": jp.get("n_valid"),
             "judge_n": jp.get("n"),
+            # Pareto holistic eval v2 (2026-04-24) — five absolute-
+            # correctness bench axes (shadow until BENCH_AXES_IN_COMPOSITE=1).
+            "math_bench": _compact_bench(s.get("math_bench")),
+            "code_bench": _compact_bench(s.get("code_bench")),
+            "reasoning_bench": _compact_bench(s.get("reasoning_bench")),
+            "knowledge_bench": _compact_bench(s.get("knowledge_bench")),
+            "ifeval_bench": _compact_bench(s.get("ifeval_bench")),
         })
     return {
         "block": h2h.get("block"),

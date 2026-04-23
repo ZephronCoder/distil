@@ -1816,6 +1816,729 @@ def _render_chat_prompt(tokenizer, user_text: str, enable_thinking: bool = False
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# § Pareto holistic bench battery — 2026-04-24, shadow mode
+# ═══════════════════════════════════════════════════════════════════════
+# Five axes drawn from public, held-out benchmarks cached on the eval
+# pod:
+#   math_bench      — GSM8K test (1319) + MATH-500 test (500), exact answer
+#   code_bench      — HumanEval test (164), subprocess-sandboxed unit tests
+#   reasoning_bench — BBH (~5250) across 21 objective subtasks, exact-match
+#   knowledge_bench — MMLU-Pro test (12032), MC letter
+#   ifeval_bench    — IFEval train (541 filtered → ~240), instruction-follow
+#
+# Each probe samples 4-8 items per round via ``_pick_bench_items`` seeded
+# by the on-chain ``block_seed``, so every validator computes the same
+# items but the items rotate round-to-round. Scoring is absolute
+# (ground-truth anchored, no teacher dependency), which is what makes
+# these axes "Goodhart-immune": overfit ⇒ SOTA model.
+#
+# See ``reports/2026-04-24-pareto-holistic-eval-v2.md`` for the full
+# architecture + Affine-Cortex inspiration.
+
+BENCH_BATTERY_ENABLED = os.environ.get("BENCH_BATTERY_ENABLED", "1") != "0"
+
+BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "8"))
+BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "4"))
+BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "8"))
+BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "8"))
+BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
+
+BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
+BENCH_CODE_MAX_TOKENS = int(os.environ.get("BENCH_CODE_MAX_TOKENS", "512"))
+BENCH_REASONING_MAX_TOKENS = int(os.environ.get("BENCH_REASONING_MAX_TOKENS", "128"))
+BENCH_KNOWLEDGE_MAX_TOKENS = int(os.environ.get("BENCH_KNOWLEDGE_MAX_TOKENS", "48"))
+BENCH_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_IFEVAL_MAX_TOKENS", "512"))
+
+# Per-bench RNG stream offsets so the five axes draw from independent
+# substreams even when given the same block_seed. Hex constants are
+# arbitrary high-entropy values (NOT the same as the think/rkl/judge
+# offsets).
+_BENCH_STREAM = {
+    "math": 0xA13AC001,
+    "code": 0xC0DEBABE,
+    "reasoning": 0xBBBBB117,
+    "knowledge": 0x4A11A7E4,
+    "ifeval": 0x1FEAF001,
+}
+
+_BENCH_BLOCK_SEED = None
+_BENCH_POOLS: dict[str, list[dict]] = {
+    "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
+}
+_BENCH_SAMPLES: dict[str, list[dict]] = {
+    "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
+}
+
+
+def _bench_load_pools(verbose: bool = True):
+    """Populate ``_BENCH_POOLS`` from HF cache. Idempotent.
+
+    Runs once at the top of ``main()`` via ``set_bench_block_seed``.
+    Failures for individual datasets are logged but do not abort — a
+    missing axis just drops out of the composite, which is correct
+    behavior. All datasets are expected to be cached at
+    ``~/.cache/huggingface/datasets`` (pre-staged by ``evalscope``).
+    """
+    if all(_BENCH_POOLS[k] for k in _BENCH_POOLS):
+        return
+    try:
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+        from datasets import load_dataset  # type: ignore
+    except Exception as e:
+        if verbose:
+            print(f"[bench] datasets import failed: {e}", flush=True)
+        return
+
+    # ── math_bench: GSM8K + MATH-500 ────────────────────────────────
+    try:
+        gsm = load_dataset("openai/gsm8k", "main", split="test")
+        for item in gsm:
+            ans = str(item["answer"])
+            m = re.search(r"####\s*(-?\d[\d,]*(?:\.\d+)?)", ans)
+            if not m:
+                continue
+            gold = m.group(1).replace(",", "")
+            _BENCH_POOLS["math"].append({
+                "src": "gsm8k",
+                "question": item["question"],
+                "gold": gold,
+            })
+    except Exception as e:
+        if verbose:
+            print(f"[bench] gsm8k load error: {e}", flush=True)
+    try:
+        math500 = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        for item in math500:
+            gold = str(item["answer"]).strip()
+            if not gold:
+                continue
+            _BENCH_POOLS["math"].append({
+                "src": "math500",
+                "question": item["problem"],
+                "gold": gold,
+            })
+    except Exception as e:
+        if verbose:
+            print(f"[bench] math500 load error: {e}", flush=True)
+
+    # ── code_bench: HumanEval ────────────────────────────────────────
+    try:
+        he = load_dataset("openai/openai_humaneval", split="test")
+        for item in he:
+            _BENCH_POOLS["code"].append({
+                "src": "humaneval",
+                "task_id": item["task_id"],
+                "prompt": item["prompt"],
+                "test": item["test"],
+                "entry_point": item["entry_point"],
+            })
+    except Exception as e:
+        if verbose:
+            print(f"[bench] humaneval load error: {e}", flush=True)
+
+    # ── reasoning_bench: BBH (21 objective subtasks) ────────────────
+    bbh_subtasks = [
+        "boolean_expressions", "causal_judgement", "date_understanding",
+        "disambiguation_qa", "formal_fallacies", "geometric_shapes",
+        "hyperbaton", "logical_deduction_five_objects",
+        "logical_deduction_seven_objects", "logical_deduction_three_objects",
+        "movie_recommendation", "navigate", "object_counting",
+        "penguins_in_a_table", "reasoning_about_colored_objects",
+        "ruin_names", "snarks", "sports_understanding",
+        "temporal_sequences", "tracking_shuffled_objects_five_objects",
+        "web_of_lies",
+    ]
+    for sub in bbh_subtasks:
+        try:
+            bbh = load_dataset("lukaemon/bbh", sub, split="test")
+            for item in bbh:
+                _BENCH_POOLS["reasoning"].append({
+                    "src": f"bbh/{sub}",
+                    "question": item["input"],
+                    "gold": str(item["target"]).strip(),
+                })
+        except Exception as e:
+            if verbose:
+                print(f"[bench] bbh/{sub} load error: {e}", flush=True)
+
+    # ── knowledge_bench: MMLU-Pro ───────────────────────────────────
+    try:
+        mmlu = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
+        for item in mmlu:
+            opts = list(item["options"])
+            if not opts:
+                continue
+            _BENCH_POOLS["knowledge"].append({
+                "src": "mmlu-pro",
+                "question": item["question"],
+                "options": opts,
+                "gold_letter": str(item["answer"]).strip()[:1].upper(),
+                "category": item.get("category", ""),
+            })
+    except Exception as e:
+        if verbose:
+            print(f"[bench] mmlu-pro load error: {e}", flush=True)
+
+    # ── ifeval_bench: Google IFEval (train, filtered) ───────────────
+    try:
+        import ifeval_vendor as _ifev  # type: ignore
+        ife = load_dataset("google/IFEval", split="train")
+        for item in ife:
+            ids = list(item["instruction_id_list"])
+            if not _ifev.item_is_supported(ids):
+                continue
+            kwargs = list(item["kwargs"])
+            _BENCH_POOLS["ifeval"].append({
+                "src": "ifeval",
+                "prompt": item["prompt"],
+                "instruction_ids": ids,
+                "kwargs": kwargs,
+            })
+    except ImportError:
+        if verbose:
+            print("[bench] ifeval_vendor not importable — ifeval_bench skipped", flush=True)
+    except Exception as e:
+        if verbose:
+            print(f"[bench] ifeval load error: {e}", flush=True)
+
+    if verbose:
+        print(
+            f"[bench] pools loaded: "
+            f"math={len(_BENCH_POOLS['math'])}, "
+            f"code={len(_BENCH_POOLS['code'])}, "
+            f"reasoning={len(_BENCH_POOLS['reasoning'])}, "
+            f"knowledge={len(_BENCH_POOLS['knowledge'])}, "
+            f"ifeval={len(_BENCH_POOLS['ifeval'])}",
+            flush=True,
+        )
+
+
+def _coerce_block_seed(block_seed) -> int | None:
+    """Normalize block_seed (int or hex str) to an int for random.Random."""
+    if block_seed is None:
+        return None
+    try:
+        return int(block_seed)
+    except (TypeError, ValueError):
+        try:
+            return int(str(block_seed), 16)
+        except (TypeError, ValueError):
+            return None
+
+
+def _pick_bench_items(bench_key: str, block_seed, k: int) -> list[dict]:
+    """Deterministic per-round sample from ``_BENCH_POOLS[bench_key]``.
+
+    Sampling is without replacement within a round (so per-round items
+    are distinct), but without any cross-round state (so different
+    rounds can sample the same item — miners cannot infer "we already
+    saw this one").
+
+    For the reasoning axis we do stratified sampling: at most one item
+    per BBH subtask per round to force breadth.
+    """
+    import random
+    pool = _BENCH_POOLS.get(bench_key) or []
+    if not pool:
+        return []
+    seed = _coerce_block_seed(block_seed)
+    if seed is None:
+        return list(pool[:k])
+    rng = random.Random(seed ^ _BENCH_STREAM.get(bench_key, 0))
+    if bench_key == "reasoning":
+        buckets: dict[str, list[dict]] = {}
+        for it in pool:
+            buckets.setdefault(it.get("src", "bbh/unknown"), []).append(it)
+        subs = list(buckets.keys())
+        rng.shuffle(subs)
+        picks: list[dict] = []
+        for sub in subs:
+            items = list(buckets[sub])
+            rng.shuffle(items)
+            if items:
+                picks.append(items[0])
+            if len(picks) >= k:
+                break
+        return picks[:k]
+    idxs = list(range(len(pool)))
+    rng.shuffle(idxs)
+    return [pool[i] for i in idxs[:min(k, len(pool))]]
+
+
+def set_bench_block_seed(block_seed):
+    """Regenerate per-round bench samples from the current block_seed.
+
+    Idempotent: no-op if already seeded with the same value. Loads the
+    pools on first call. Called once per round from ``main()`` right
+    after the other per-round setters.
+    """
+    global _BENCH_BLOCK_SEED
+    if not BENCH_BATTERY_ENABLED:
+        return
+    _bench_load_pools(verbose=(_BENCH_BLOCK_SEED != block_seed))
+    if block_seed == _BENCH_BLOCK_SEED and all(_BENCH_SAMPLES[k] for k in _BENCH_SAMPLES):
+        return
+    _BENCH_BLOCK_SEED = block_seed
+    _BENCH_SAMPLES["math"] = _pick_bench_items("math", block_seed, BENCH_MATH_PER_ROUND)
+    _BENCH_SAMPLES["code"] = _pick_bench_items("code", block_seed, BENCH_CODE_PER_ROUND)
+    _BENCH_SAMPLES["reasoning"] = _pick_bench_items("reasoning", block_seed, BENCH_REASONING_PER_ROUND)
+    _BENCH_SAMPLES["knowledge"] = _pick_bench_items("knowledge", block_seed, BENCH_KNOWLEDGE_PER_ROUND)
+    _BENCH_SAMPLES["ifeval"] = _pick_bench_items("ifeval", block_seed, BENCH_IFEVAL_PER_ROUND)
+    print(
+        f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
+        f"code={len(_BENCH_SAMPLES['code'])}, "
+        f"reasoning={len(_BENCH_SAMPLES['reasoning'])}, "
+        f"knowledge={len(_BENCH_SAMPLES['knowledge'])}, "
+        f"ifeval={len(_BENCH_SAMPLES['ifeval'])}",
+        flush=True,
+    )
+
+
+# ── bench generation helper (reuses chat template + eos/pad setup) ────
+
+def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
+                    device: str, enable_thinking: bool = False) -> tuple[str, int]:
+    """Greedy generation for a single bench prompt. Returns (text, gen_tokens).
+
+    Uses the same eos/pad setup as the existing probes so behavior is
+    identical to capability_probe / chat_response_probe.
+    """
+    eos_ids = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+    gen = model.generate(
+        ids, max_new_tokens=max_new_tokens,
+        do_sample=False, temperature=1.0, top_p=1.0,
+        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+    )
+    new_ids = gen[0, ids.shape[1]:]
+    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+    return text, int(new_ids.shape[0])
+
+
+# ── math_bench ─────────────────────────────────────────────────────────
+
+# Handles comma-separated thousands ("1,234,567") and decimals.
+_MATH_NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+_MATH_BOXED_START_RE = re.compile(r"\\boxed\s*\{")
+_MATH_ANSWER_PHRASE_RE = re.compile(
+    r"(?:the\s+)?answer\s*(?:is|=|:)\s*\$?([^\s\n\.]+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_boxed(text: str) -> str | None:
+    """Extract the contents of the last ``\\boxed{...}`` in ``text``,
+    supporting nested braces one level deep (e.g. ``\\boxed{\\frac{3}{4}}``).
+    """
+    last = None
+    for m in _MATH_BOXED_START_RE.finditer(text):
+        i = m.end()
+        depth = 1
+        j = i
+        while j < len(text) and depth > 0:
+            c = text[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    last = text[i:j].strip()
+                    break
+            j += 1
+    return last
+
+
+def _math_format_prompt(question: str, src: str) -> str:
+    """Nudge the model toward a deterministic final-answer format so
+    extraction is robust. Works for both GSM8K and MATH-500."""
+    if src == "math500":
+        return (
+            f"{question}\n\n"
+            "Solve the problem and end your response with "
+            "'\\boxed{ANSWER}' where ANSWER is the final simplified result."
+        )
+    return (
+        f"{question}\n\n"
+        "Solve step by step and end with '#### N' where N is the final numeric answer."
+    )
+
+
+def _math_extract_answer(text: str, src: str) -> str:
+    """Pull the numeric/boxed answer from a generation."""
+    cleaned = _strip_thinking_probe(text or "")
+    if not cleaned:
+        return ""
+    if src == "math500":
+        boxed = _extract_boxed(cleaned)
+        if boxed:
+            return boxed.rstrip(".")
+    if "####" in cleaned:
+        m = re.search(r"####\s*([^\n]+)", cleaned)
+        if m:
+            tail = m.group(1).strip().rstrip(".")
+            tm = _MATH_NUMBER_RE.search(tail)
+            if tm:
+                return tm.group(0)
+            return tail
+    # Try "The answer is X" / "answer = X" / "answer: X" patterns.
+    m = _MATH_ANSWER_PHRASE_RE.search(cleaned)
+    if m:
+        frag = m.group(1).strip().rstrip(".,")
+        tm = _MATH_NUMBER_RE.search(frag)
+        if tm:
+            return tm.group(0)
+        if frag:
+            return frag
+    nums = _MATH_NUMBER_RE.findall(cleaned)
+    if nums:
+        return nums[-1]
+    return cleaned.strip().splitlines()[-1].strip() if cleaned else ""
+
+
+def _math_score_one(pred: str, gold: str) -> int:
+    if not pred:
+        return 0
+    p = pred.replace(",", "").replace("$", "").strip().rstrip(".")
+    g = gold.replace(",", "").replace("$", "").strip().rstrip(".")
+    if p == g:
+        return 1
+    try:
+        return 1 if abs(float(p) - float(g)) < 1e-6 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def math_bench_probe(model, tokenizer, device="cuda"):
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("math") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _math_format_prompt(it["question"], it.get("src", ""))
+                    text, _ = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_MATH_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    pred = _math_extract_answer(text, it.get("src", ""))
+                    ok = _math_score_one(pred, it["gold"])
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "pred": pred[:80],
+                        "gold": it["gold"][:40],
+                        "ok": bool(ok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── code_bench ─────────────────────────────────────────────────────────
+
+def code_bench_probe(model, tokenizer, device="cuda"):
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("code") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    try:
+        generations: list[tuple[str, dict]] = []
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Complete the following Python function. "
+                        "Output only the function body (no extra explanation, no markdown fences).\n\n"
+                        f"{it['prompt']}"
+                    )
+                    gen, _ = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_CODE_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    generations.append((gen, it))
+                except Exception as e:
+                    generations.append(("", {**it, "gen_error": str(e)[:120]}))
+        if was_training:
+            model.train()
+        sandbox_input = [
+            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            for gen, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        idx = 0
+        for gen, it in generations:
+            if "gen_error" in it:
+                out["items"].append({
+                    "task_id": it.get("task_id"), "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            ok = bool(r and r.passed)
+            out["items"].append({
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": ok,
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(ok)
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── reasoning_bench (BBH) ──────────────────────────────────────────────
+
+_BBH_PAREN_RE = re.compile(r"\(?([A-Z])\)?")
+
+
+def _reasoning_format_prompt(question: str, gold: str) -> str:
+    """Light prompt wrapper for BBH — ask for concise final answer in
+    the same format the ``target`` field uses ("(A)", "True", "No", etc.)."""
+    g = (gold or "").strip()
+    if g.startswith("(") and g.endswith(")") and len(g) == 3:
+        hint = "Respond with only the letter in parentheses, e.g. (A)."
+    elif g in ("True", "False"):
+        hint = "Respond with only 'True' or 'False'."
+    elif g in ("Yes", "No"):
+        hint = "Respond with only 'Yes' or 'No'."
+    elif g in ("valid", "invalid"):
+        hint = "Respond with only 'valid' or 'invalid'."
+    else:
+        hint = "Respond with only the final answer, no explanation."
+    return f"{question}\n\n{hint}"
+
+
+def _reasoning_extract_answer(text: str, gold: str) -> str:
+    cleaned = _strip_thinking_probe(text or "").strip()
+    if not cleaned:
+        return ""
+    tail = cleaned.splitlines()[-1].strip() if cleaned.splitlines() else cleaned.strip()
+    gold_norm = gold.strip()
+    if gold_norm.startswith("(") and gold_norm.endswith(")") and len(gold_norm) == 3:
+        m = _BBH_PAREN_RE.search(tail)
+        if m:
+            return f"({m.group(1)})"
+    if gold_norm in ("True", "False", "Yes", "No", "valid", "invalid"):
+        low = cleaned.lower()
+        for candidate in (gold_norm.lower(), gold_norm):
+            if re.search(r"\b" + re.escape(candidate) + r"\b", low):
+                return gold_norm
+        return tail[:40]
+    return tail[:80]
+
+
+def _reasoning_score_one(pred: str, gold: str) -> int:
+    if not pred:
+        return 0
+    p = pred.strip().rstrip(".").lower()
+    g = gold.strip().rstrip(".").lower()
+    if p == g:
+        return 1
+    # allow "(A)" vs "a" kind of slack
+    if p.replace("(", "").replace(")", "") == g.replace("(", "").replace(")", ""):
+        return 1
+    return 0
+
+
+def reasoning_bench_probe(model, tokenizer, device="cuda"):
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("reasoning") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _reasoning_format_prompt(it["question"], it["gold"])
+                    text, _ = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_REASONING_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    pred = _reasoning_extract_answer(text, it["gold"])
+                    ok = _reasoning_score_one(pred, it["gold"])
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "pred": pred[:80],
+                        "gold": it["gold"][:40],
+                        "ok": bool(ok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── knowledge_bench (MMLU-Pro) ─────────────────────────────────────────
+
+_MMLU_LETTER_RE = re.compile(r"\b([A-J])\b")
+
+
+def _format_mmlu_prompt(item: dict) -> str:
+    letters = "ABCDEFGHIJ"
+    opts = "\n".join(f"({letters[i]}) {opt}" for i, opt in enumerate(item["options"]))
+    return (
+        f"{item['question']}\n\n"
+        f"Options:\n{opts}\n\n"
+        "Respond with only the letter of the correct answer."
+    )
+
+
+def knowledge_bench_probe(model, tokenizer, device="cuda"):
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("knowledge") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_mmlu_prompt(it)
+                    text, _ = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_KNOWLEDGE_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    m = _MMLU_LETTER_RE.search(cleaned)
+                    pred = m.group(1) if m else ""
+                    ok = 1 if pred and pred.upper() == it["gold_letter"] else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "category": it.get("category", ""),
+                        "pred": pred,
+                        "gold": it["gold_letter"],
+                        "ok": bool(ok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── ifeval_bench ───────────────────────────────────────────────────────
+
+def ifeval_bench_probe(model, tokenizer, device="cuda"):
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("ifeval") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import ifeval_vendor as _ifev  # type: ignore
+    except ImportError:
+        out["error"] = "ifeval_vendor not importable on pod"
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    text, _ = _bench_generate(
+                        model, tokenizer, it["prompt"],
+                        BENCH_IFEVAL_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "")
+                    all_pass, per = _ifev.evaluate_item(
+                        cleaned, it["instruction_ids"], it.get("kwargs") or [],
+                    )
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "instruction_ids": it["instruction_ids"],
+                        "per_instruction": per,
+                        "ok": bool(all_pass),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += int(all_pass)
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def run_bench_battery(model, tokenizer, device="cuda"):
+    """Run all five bench probes for one student. Returns a dict keyed
+    by axis name (``math_bench`` / ``code_bench`` / ...). Each value is
+    a dict with ``n``, ``correct``, ``pass_frac``, ``items``, and
+    optional ``error``. Caller stores these under the student's
+    results entry — see the main() student loop.
+    """
+    if not BENCH_BATTERY_ENABLED:
+        return {}
+    t0 = time.time()
+    out: dict[str, dict] = {}
+    _probes = (
+        ("math_bench", math_bench_probe),
+        ("code_bench", code_bench_probe),
+        ("reasoning_bench", reasoning_bench_probe),
+        ("knowledge_bench", knowledge_bench_probe),
+        ("ifeval_bench", ifeval_bench_probe),
+    )
+    for name, fn in _probes:
+        st = time.time()
+        try:
+            res = fn(model, tokenizer, device)
+        except Exception as e:
+            res = {"error": str(e)[:200], "n": 0, "correct": 0, "pass_frac": 0.0}
+        res["wall_s"] = round(time.time() - st, 1)
+        out[name] = res
+    out["_total_wall_s"] = round(time.time() - t0, 1)
+    return out
+
+
 def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=None):
     """Run teacher on think-probe + capability-probe + chat-probe prompts while HF-loaded.
 
@@ -3411,6 +4134,7 @@ def main():
     set_capability_block_seed(args.block_seed)
     set_on_policy_rkl_block_seed(args.block_seed)
     set_judge_probe_block_seed(args.block_seed)
+    set_bench_block_seed(args.block_seed)
 
     # Auto-detect tensor-parallel size when unset (0 = all visible GPUs).
     # Allow override via DISTIL_TP_SIZE env var even when caller forgot the flag.
@@ -4294,6 +5018,54 @@ def main():
                     )
             except Exception as e:
                 print(f"[eval] Judge probe collection error (non-fatal): {e}", flush=True)
+
+        # ── Pareto holistic bench battery (SHADOW) ─────────────────────
+        # 2026-04-24 — Five absolute-correctness axes drawn from public
+        # held-out benchmarks (GSM8K/MATH, HumanEval, BBH, MMLU-Pro,
+        # IFEval). Shadow mode: computed + logged + shown on dashboard
+        # but not yet in the composite ranking gate. See
+        # ``reports/2026-04-24-pareto-holistic-eval-v2.md``.
+        bench_this = (
+            student is not None
+            and BENCH_BATTERY_ENABLED
+        )
+        if is_king and king_model is not None and student is king_model and load_time == 0.0:
+            bench_this = False
+        if bench_this:
+            try:
+                bench_res = run_bench_battery(student, tokenizer, device)
+                total_w = bench_res.pop("_total_wall_s", 0.0)
+                results["students"].setdefault(student_name, {})
+                summary_bits = []
+                for axis_name, payload in bench_res.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    results["students"][student_name][axis_name] = {
+                        "n": payload.get("n", 0),
+                        "correct": payload.get("correct", 0),
+                        "pass_frac": round(payload.get("pass_frac", 0.0), 3),
+                        "wall_s": payload.get("wall_s", 0.0),
+                        "items": payload.get("items", []),
+                        "error": payload.get("error"),
+                    }
+                    short = axis_name.replace("_bench", "")
+                    if payload.get("error"):
+                        summary_bits.append(f"{short}=ERR")
+                    elif payload.get("n", 0) > 0:
+                        summary_bits.append(
+                            f"{short}={payload['correct']}/{payload['n']} "
+                            f"({payload['pass_frac']*100:.0f}%)"
+                        )
+                    else:
+                        summary_bits.append(f"{short}=skip")
+                print(
+                    f"[eval] Bench battery (SHADOW): "
+                    f"{' | '.join(summary_bits)} "
+                    f"[total {total_w:.1f}s]",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[eval] Bench battery error (non-fatal): {e}", flush=True)
 
         # ── Activation fingerprint (for functional copy detection) ──
         if student is not None:

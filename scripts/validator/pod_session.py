@@ -72,6 +72,20 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     finally:
         os.unlink(prompts_file)
     pod.upload(eval_script, remote_eval_script, max_attempts=5)
+    # 2026-04-24 — Pareto holistic eval v2 ships two small helper modules
+    # alongside pod_eval.py: a vendored IFEval verifier set and a HumanEval
+    # subprocess sandbox. They live next to pod_eval.py so the bench
+    # probes can import them without touching sys.path.
+    _aux_modules = [
+        ("scripts/ifeval_vendor.py", "ifeval_vendor.py"),
+        ("scripts/humaneval_sandbox.py", "humaneval_sandbox.py"),
+    ]
+    for local_aux, remote_name in _aux_modules:
+        if os.path.isfile(local_aux):
+            try:
+                pod.upload(local_aux, f"{run_dir}/{remote_name}", max_attempts=3)
+            except Exception as exc:
+                logger.warning(f"Failed to upload {local_aux} (bench probes will skip): {exc}")
     try:
         # VLLM v1 spawns a child process that renames itself to "VLLM::EngineCore"
         # via prctl(PR_SET_NAME). That process holds the GPU allocation but will
