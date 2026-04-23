@@ -82,6 +82,24 @@ All axes are in `[0, 1]`, higher-is-better. Missing axes (e.g. probe outage) are
 | `tool_use_bench`             | Math items with an injected Python REPL. Model emits `<python>…</python>`, stdout spliced back into a 2nd generation pass, final boxed answer scored. Rewards agentic capability. |
 | `self_consistency_bench`     | Hard math, K=5 samples at T=0.7 each, majority vote on the boxed answer. Rewards underlying knowledge vs one-shot luck. |
 
+**Arena v3 Session 3.1 — SHADOW, added 2026-04-25:**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `arc_bench`                  | AI2 ARC-Challenge (~1172 grade-school science items), 6/round. Letter-choice MC, completely disjoint from MMLU-Pro/BBH. |
+
+**Arena v3 Session 3.2 — SHADOW, added 2026-04-25 (addresses "models over-think simple questions"):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `reasoning_density`          | `pass_frac × length_bonus` averaged across benches, where `length_bonus = 1.0` if `mean_gen_tokens_correct ≤ target` (e.g. knowledge ≤30 tok, math ≤400 tok) and decays with `1/(1+ratio−1)` above target. Penalizes both over-thinking trivia AND verbose-but-wrong answers. Cannot be gamed by short-wrong: pass_frac=0 → axis=0. |
+
+**Arena v3 Session 3.3 — SHADOW, added 2026-04-25 (multi-turn coherence):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `chat_turns_probe`           | 6 hand-authored 3-turn dialogues/round. Student generates 3 assistant turns with accumulated context; teacher grades the full transcript on a 1-5 rubric (coherence + consistency + helpfulness). Directly probes deployment-quality multi-turn dialogue — a capability pure climbmix-KL distillation does NOT reward. |
+
 All bench pools rotate per-round via `block_seed`, so every validator picks the same items but items differ between rounds (anti-memorization).
 
 ### Dethrone gates (all must pass)
@@ -110,6 +128,9 @@ The fastest way to climb Arena v3 is to broaden your distillation data mix so th
 | `ifeval_bench`               | Alpaca-Instruct + SuperNaturalInstructions + IFEval train. Teach explicit-format obedience.           |
 | `tool_use_bench`             | Function-calling / tool-use datasets (Gorilla, ToolBench, APIBench). Teach the model to emit code when compute is useful and parse stdout. |
 | `self_consistency_bench`     | Robust CoT + majority-vote SFT. Temperature-robustness matters — if your model is 80% at T=0 but 30% at T=0.7, this axis will drop you. |
+| `arc_bench`                  | Science MC (grade-school to middle-school). AI2 ARC-Challenge train + Easy splits make strong pretraining data; anything teaching MC letter outputs (A/B/C/D) generalizes. |
+| `reasoning_density`          | Train your model to emit short correct answers on trivia and medium-length on reasoning. Use the teacher's own output length as the target (the `RD_*_TARGET` values). Long-CoT on `knowledge_bench` or `arc_bench` is strictly worse than short-CoT. |
+| `chat_turns_probe`           | Multi-turn SFT (OpenAssistant Conversations, ShareGPT, UltraChat, LMSYS-chat-1M). Teach the model to reference its own earlier turns when asked ("based on your last answer…"). A model that resets context every turn will score ~2/5. |
 
 **Two anti-patterns to avoid:**
 
@@ -189,9 +210,9 @@ All endpoints are on `api.arbos.life`.
 | Max new tokens | 8,192 |
 | Max prompt tokens | 1,024 |
 | Dethronement threshold | paired t-test, p < 0.03 AND worst-axis ≥ 0.20 |
-| Composite version | Arena v3 (shadow v5) |
+| Composite version | Arena v3 (shadow v7) |
 | Live axes | kl, on_policy_rkl, capability, length, degeneracy, judge_probe, math_bench, code_bench, reasoning_bench, knowledge_bench, ifeval_bench |
-| Shadow axes (live 2026-04-26) | aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench, pareto_dominance |
+| Shadow axes (live 2026-04-26) | aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench, arc_bench, reasoning_density, chat_turns_probe, pareto_dominance |
 | Top-N always included | 5 |
 | Dataset (distillation) | `karpathy/climbmix-400b-shuffle` |
 | Reference baseline | `Qwen/Qwen3.5-4B` (UID -1) |

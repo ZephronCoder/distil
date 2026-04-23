@@ -40,6 +40,15 @@ interface CompositeAxes {
   self_consistency_bench?: number;
   // Arena v3 Session 3.1 (SHADOW) — commonsense science MC (ARC-Challenge).
   arc_bench?: number;
+  // Arena v3 Session 3.2 (SHADOW) — bench-level token efficiency.
+  // pass_frac * length_bonus averaged over each bench with correct items.
+  // Overfit-resistant: short answers only score high if they're correct.
+  reasoning_density?: number;
+  // Arena v3 Session 3.3 (SHADOW) — multi-turn dialogue coherence.
+  // Teacher grades 3-turn transcripts on coherence + consistency +
+  // helpfulness; normalized to [0, 1]. Probes deployment-quality
+  // dialogue ability that single-turn KL distillation misses.
+  chat_turns_probe?: number;
 }
 
 interface ParetoSummary {
@@ -71,6 +80,8 @@ interface Composite {
   judge_in_composite?: boolean;
   bench_in_composite?: boolean;
   arena_v3_in_composite?: boolean;
+  reasoning_density_in_composite?: boolean;
+  chat_turns_in_composite?: boolean;
   pareto?: ParetoSummary;
 }
 
@@ -100,6 +111,10 @@ interface BenchBlock {
   k_samples?: number;
   temperature?: number;
   top_p?: number;
+  /** Session 3.2 (2026-04-25) — bench-level token stats for the
+   * reasoning_density axis. */
+  mean_gen_tokens?: number;
+  mean_gen_tokens_correct?: number;
 }
 
 interface RoundResult {
@@ -128,6 +143,12 @@ interface RoundResult {
   judge_normalized?: number;
   judge_n_valid?: number;
   judge_n?: number;
+  // Session 3.3 (SHADOW) — multi-turn coherence probe.
+  chat_turns_mean_score?: number;
+  chat_turns_normalized?: number;
+  chat_turns_n_valid?: number;
+  chat_turns_n?: number;
+  chat_turns_n_turns?: number;
   // Arena v3 Session 2 (PRODUCTION)
   math_bench?: BenchBlock | null;
   code_bench?: BenchBlock | null;
@@ -663,6 +684,17 @@ export function TelemetryTab() {
                                   <span className="text-amber-400/70"> (shadow)</span>
                                 </div>
                               )}
+                              {r.chat_turns_mean_score != null && (
+                                <div>
+                                  chat_turns: {r.chat_turns_mean_score.toFixed(2)}/5
+                                  {r.chat_turns_n_valid != null && r.chat_turns_n != null && (
+                                    <span className="text-muted-foreground/40"> · {r.chat_turns_n_valid}/{r.chat_turns_n}×{r.chat_turns_n_turns ?? 3}t</span>
+                                  )}
+                                  <span className={r.composite?.chat_turns_in_composite ? "text-emerald-400/80" : "text-amber-400/70"}>
+                                    {r.composite?.chat_turns_in_composite ? " (live)" : " (shadow)"}
+                                  </span>
+                                </div>
+                              )}
                               {r.early_stopped && <div className="text-amber-400">early-stopped</div>}
                               {r.dq_reason && (
                                 <div className="col-span-2 md:col-span-4 text-red-300">
@@ -746,6 +778,16 @@ export function TelemetryTab() {
                                     <span title="mean(bench axes) − mean(relative axes). Positive gap > 0.20 may indicate rotation-memorization without policy-level improvement.">
                                       bench−rel=<span className={(r.composite.bench_vs_rel_gap ?? 0) >= 0.20 ? "text-amber-400" : "text-foreground/60"}>
                                         {r.composite.bench_vs_rel_gap >= 0 ? "+" : ""}{r.composite.bench_vs_rel_gap.toFixed(2)}
+                                      </span>
+                                    </span>
+                                  )}
+                                  {ax.reasoning_density != null && (
+                                    <span title="Session 3.2 (shadow): pass_frac × length_bonus averaged across benches. High = concise + correct. Low = either wrong or over-thinking. Penalizes over-distilled or verbose models.">
+                                      density=<span className={axisColor(ax.reasoning_density)}>
+                                        {ax.reasoning_density.toFixed(2)}
+                                      </span>
+                                      <span className="text-muted-foreground/40">
+                                        {" "}{r.composite?.reasoning_density_in_composite ? "(live)" : "(shadow)"}
                                       </span>
                                     </span>
                                   )}
@@ -891,10 +933,12 @@ function BenchCell({ label, b }: { label: string; b?: BenchBlock | null }) {
     );
   }
   const pct = b.pass_frac;
+  const tok = b.mean_gen_tokens_correct;
+  const tokenHint = tok && tok > 0 ? ` · ${Math.round(tok)} tok/correct` : "";
   return (
     <div
       className="flex items-center gap-1"
-      title={`${b.correct}/${b.n} correct${b.wall_s != null ? ` · ${b.wall_s.toFixed(1)}s` : ""}`}
+      title={`${b.correct}/${b.n} correct${b.wall_s != null ? ` · ${b.wall_s.toFixed(1)}s` : ""}${tokenHint}`}
     >
       <span className="text-muted-foreground/50 w-12">{label}</span>
       <span className={`tabular-nums ${axisColor(pct)}`}>
@@ -903,6 +947,11 @@ function BenchCell({ label, b }: { label: string; b?: BenchBlock | null }) {
       <span className="text-muted-foreground/30 tabular-nums">
         ({b.correct ?? 0}/{b.n ?? 0})
       </span>
+      {tok != null && tok > 0 && (
+        <span className="text-muted-foreground/30 tabular-nums">
+          · {Math.round(tok)}t
+        </span>
+      )}
     </div>
   );
 }

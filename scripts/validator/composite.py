@@ -141,6 +141,60 @@ ARENA_V3_AXIS_WEIGHTS = {
 
 ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "0") != "0"
 
+# ── 2026-04-25 — Session 3.2 reasoning_density axis (SHADOW) ──────────
+# User-reported pathology: "models are too distilled and think for too
+# long about simple questions." The existing ``length`` axis addresses
+# chat-probe length only. Bench probes give us per-axis mean_gen_tokens
+# (see ``_bench_finalize_token_stats`` in pod_eval_vllm.py), so we can
+# now score bench-level efficiency: pass_frac × length_bonus per bench,
+# averaged across whichever benches emitted valid data.
+#
+# Target token counts are calibrated to the teacher's typical bench
+# output lengths (empirical, April 2026). When a student gets the
+# answer right in ≤ target tokens → length_bonus = 1.0. When they use
+# 2× target → bonus ≈ 0.5. 4× target → bonus ≈ 0.25. This directly
+# penalizes both the "over-think simple questions" failure mode and
+# the "memorize answer-only training data" failure mode (a model that
+# outputs "42" with 5 tokens still needs to get the answer right on a
+# rotating pool; if it does, fine — the axis is neutral).
+#
+# SHADOW until the +48h public notice, then flip
+# ``REASONING_DENSITY_AXIS_IN_COMPOSITE=1`` to promote. Weight tuned
+# low so it's an auxiliary signal, not a dominant one.
+REASONING_DENSITY_TARGET_TOKENS = {
+    "math_bench":            float(os.environ.get("RD_MATH_TARGET", "400")),
+    "code_bench":            float(os.environ.get("RD_CODE_TARGET", "300")),
+    "reasoning_bench":       float(os.environ.get("RD_REASONING_TARGET", "150")),
+    "knowledge_bench":       float(os.environ.get("RD_KNOWLEDGE_TARGET", "30")),
+    "ifeval_bench":          float(os.environ.get("RD_IFEVAL_TARGET", "250")),
+    "aime_bench":            float(os.environ.get("RD_AIME_TARGET", "800")),
+    "mbpp_bench":            float(os.environ.get("RD_MBPP_TARGET", "250")),
+    "tool_use_bench":        float(os.environ.get("RD_TOOL_USE_TARGET", "300")),
+    "self_consistency_bench": float(os.environ.get("RD_SC_TARGET", "300")),
+    "arc_bench":             float(os.environ.get("RD_ARC_TARGET", "50")),
+}
+REASONING_DENSITY_WEIGHT = float(os.environ.get("REASONING_DENSITY_WEIGHT", "0.05"))
+REASONING_DENSITY_IN_COMPOSITE = (
+    os.environ.get("REASONING_DENSITY_IN_COMPOSITE", "0") != "0"
+)
+
+# ── 2026-04-25 — Session 3.3 chat_turns_probe axis (SHADOW) ───────────
+# Multi-turn coherence probe. Teacher grades a 3-turn transcript on a
+# 1-5 rubric (coherence + consistency + helpfulness). Normalized to
+# [0, 1]; identical shape to judge_probe so axis values are directly
+# comparable in telemetry. A model that aces single-turn KL but can't
+# hold context gets flagged by this axis — directly addressing the
+# user-reported "models are too distilled, forget context" pathology.
+#
+# Shadow-first: dashboard shows it alongside judge; promote to composite
+# ranking once we've observed at least one 48h window of stable teacher
+# scoring. See MINER_FAQ.md and reports/2026-04-24-arena-v3.md.
+CHAT_TURNS_AXIS_WEIGHT = float(os.environ.get("CHAT_TURNS_AXIS_WEIGHT", "0.08"))
+CHAT_TURNS_AXIS_IN_COMPOSITE = (
+    os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "0") != "0"
+)
+CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "3"))
+
 # Per-axis minimum valid-item count below which the axis drops as
 # "insufficient sample". Small pools (code_bench samples only 4 items
 # per round by design) get a lower floor so rounding noise doesn't
@@ -161,7 +215,7 @@ BENCH_MIN_VALID = {
     "arc_bench": 4,
 }
 
-COMPOSITE_SHADOW_VERSION = 5  # bumped for Arena v3
+COMPOSITE_SHADOW_VERSION = 7  # bumped for Session 3.3 chat_turns_probe
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a
@@ -309,6 +363,30 @@ def _axis_judge_probe(student: dict) -> float | None:
     return max(0.0, min(1.0, float(norm)))
 
 
+def _axis_chat_turns_probe(student: dict) -> float | None:
+    """Multi-turn coherence axis. 2026-04-25 Session 3.3 (SHADOW).
+
+    Teacher judges 6 rotated 3-turn transcripts on a 1-5 rubric
+    (coherence / consistency / helpfulness). Returns the normalized
+    mean or ``None`` when fewer than ``CHAT_TURNS_MIN_VALID`` convos
+    parsed cleanly (guards against a broken rubric silently scoring).
+
+    Rationale: KL distillation only optimizes against single-turn
+    climbmix-style prompts; a model can ace KL yet fall apart on
+    multi-turn dialogue. This axis forces miners to keep multi-turn
+    coherence in the loss tent.
+    """
+    ct = student.get("chat_turns_probe") or {}
+    if not ct:
+        return None
+    norm = ct.get("normalized")
+    if norm is None:
+        return None
+    if (ct.get("n_valid") or 0) < CHAT_TURNS_MIN_VALID:
+        return None
+    return max(0.0, min(1.0, float(norm)))
+
+
 def _axis_bench_pass_frac(student: dict, axis_name: str) -> float | None:
     """Generic [0, 1] pass-fraction extractor for Pareto holistic eval v2.
 
@@ -373,6 +451,66 @@ def _axis_arc_bench(student: dict) -> float | None:
     return _axis_bench_pass_frac(student, "arc_bench")
 
 
+def _axis_reasoning_density(student: dict) -> float | None:
+    """Reasoning-density axis (Session 3.2, 2026-04-25).
+
+    For each bench axis the student actually ran, compute
+    ``efficiency = pass_frac * length_bonus`` where ``length_bonus`` is a
+    soft penalty around the per-bench target token count:
+
+        ratio   = mean_gen_tokens_correct / target
+        bonus   = 1.0                             (ratio <= 1)
+                  1 / (1 + (ratio-1))              (1 < ratio)
+
+    So at ratio=1 we get 1.0, at ratio=2 we get 0.5, at ratio=4 we get
+    0.25. No bonus below ratio=1 so a concise correct model gets the
+    same credit as one that matches target exactly; this rewards
+    efficiency without penalizing further.
+
+    The axis value is the mean of per-bench efficiencies over whichever
+    benches emitted ``mean_gen_tokens_correct`` > 0. Returns None if
+    no bench reported correct tokens (e.g. a shadow round where every
+    bench was skipped or the student got zero correct — then the axis
+    has nothing to say and falls back to other capability axes).
+
+    Rationale for absolute targets (not teacher-relative): the teacher
+    currently doesn't run the full bench battery. Absolute targets
+    drawn from observed teacher behavior (April 2026) avoid needing a
+    teacher-bench pass and are easy to recalibrate as the teacher
+    changes. See composite.py REASONING_DENSITY_TARGET_TOKENS.
+    """
+    per_bench_scores: list[float] = []
+    for axis_name, target in REASONING_DENSITY_TARGET_TOKENS.items():
+        payload = student.get(axis_name) or {}
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("error"):
+            continue
+        n = int(payload.get("n") or 0)
+        if n < BENCH_MIN_VALID.get(axis_name, 2):
+            continue
+        correct = int(payload.get("correct") or 0)
+        if correct == 0:
+            # Zero-correct benches contribute zero to the axis: a model
+            # that fails every problem on a bench shouldn't sneak a
+            # high reasoning_density score just by using few tokens.
+            per_bench_scores.append(0.0)
+            continue
+        mean_tok = float(payload.get("mean_gen_tokens_correct") or 0.0)
+        if mean_tok <= 0 or target <= 0:
+            # Missing token data — skip this bench rather than
+            # inventing a score. Old-code rounds will have no token
+            # stats, which is the fail-open path we want.
+            continue
+        ratio = mean_tok / target
+        bonus = 1.0 if ratio <= 1.0 else 1.0 / (1.0 + (ratio - 1.0))
+        pass_frac = correct / n
+        per_bench_scores.append(pass_frac * bonus)
+    if not per_bench_scores:
+        return None
+    return max(0.0, min(1.0, sum(per_bench_scores) / len(per_bench_scores)))
+
+
 def _axis_on_policy_rkl(student: dict, king_rkl: float | None) -> float:
     """Normalize on-policy reverse KL to [0, 1] higher-is-better.
 
@@ -427,6 +565,7 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "length": _axis_length(student),
         "degeneracy": _axis_degeneracy(student),
         "judge_probe": _axis_judge_probe(student),
+        "chat_turns_probe": _axis_chat_turns_probe(student),
         "math_bench": _axis_math_bench(student),
         "code_bench": _axis_code_bench(student),
         "reasoning_bench": _axis_reasoning_bench(student),
@@ -437,6 +576,7 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "tool_use_bench": _axis_tool_use_bench(student),
         "self_consistency_bench": _axis_self_consistency_bench(student),
         "arc_bench": _axis_arc_bench(student),
+        "reasoning_density": _axis_reasoning_density(student),
     }
 
 
@@ -468,6 +608,10 @@ def resolve_teacher_broken_axes(teacher_student_row: dict | None,
     if ARENA_V3_AXES_IN_COMPOSITE:
         for k in ARENA_V3_AXIS_WEIGHTS:
             applicable.add(k)
+    if REASONING_DENSITY_IN_COMPOSITE:
+        applicable.add("reasoning_density")
+    if CHAT_TURNS_AXIS_IN_COMPOSITE:
+        applicable.add("chat_turns_probe")
     for axis, val in teacher_axes.items():
         if axis not in applicable:
             continue
@@ -518,6 +662,10 @@ def compute_composite(student: dict, king_kl: float | None = None,
         for k, w in ARENA_V3_AXIS_WEIGHTS.items():
             if w > 0:
                 effective_weights[k] = w
+    if REASONING_DENSITY_IN_COMPOSITE and REASONING_DENSITY_WEIGHT > 0:
+        effective_weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
+    if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
+        effective_weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
     ranked = {
         k: v for k, v in axes.items()
         if v is not None
@@ -530,7 +678,9 @@ def compute_composite(student: dict, king_kl: float | None = None,
                 "broken_axes": sorted(broken_axes) if broken_axes else [],
                 "judge_in_composite": JUDGE_AXIS_IN_COMPOSITE,
                 "bench_in_composite": BENCH_AXES_IN_COMPOSITE,
-                "arena_v3_in_composite": ARENA_V3_AXES_IN_COMPOSITE}
+                "arena_v3_in_composite": ARENA_V3_AXES_IN_COMPOSITE,
+                "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
+                "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE}
     worst = min(ranked.values())
     total_w = sum(effective_weights[k] for k in ranked)
     weighted = sum(effective_weights[k] * v for k, v in ranked.items()) / total_w if total_w else None
@@ -558,7 +708,8 @@ def compute_composite(student: dict, king_kl: float | None = None,
         var = sum((v - m) ** 2 for v in all_values) / len(all_values)
         axis_spread = var ** 0.5
 
-    rel_keys = ("kl", "on_policy_rkl", "capability", "judge_probe", "length", "degeneracy")
+    rel_keys = ("kl", "on_policy_rkl", "capability", "judge_probe",
+                "chat_turns_probe", "length", "degeneracy")
     bench_keys = tuple(BENCH_AXIS_WEIGHTS.keys()) + tuple(ARENA_V3_AXIS_WEIGHTS.keys())
     rel_vals = [axes[k] for k in rel_keys if axes.get(k) is not None]
     bench_vals = [axes[k] for k in bench_keys if axes.get(k) is not None]
@@ -578,6 +729,8 @@ def compute_composite(student: dict, king_kl: float | None = None,
         "judge_in_composite": JUDGE_AXIS_IN_COMPOSITE,
         "bench_in_composite": BENCH_AXES_IN_COMPOSITE,
         "arena_v3_in_composite": ARENA_V3_AXES_IN_COMPOSITE,
+        "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
+        "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE,
     }
 
 
@@ -619,6 +772,7 @@ def compute_pareto_dominance(
     axes_to_consider |= set(BENCH_AXIS_WEIGHTS.keys())
     if include_shadow:
         axes_to_consider |= set(ARENA_V3_AXIS_WEIGHTS.keys())
+        axes_to_consider |= {"reasoning_density", "chat_turns_probe"}
 
     wins: list[str] = []
     losses: list[str] = []

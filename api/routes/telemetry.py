@@ -231,6 +231,11 @@ def _compact_bench(payload):
         "wall_s": payload.get("wall_s"),
         "error": payload.get("error"),
         "items": compact,
+        # Session 3.2 (2026-04-25) — per-bench token stats for the
+        # reasoning_density axis. Populated by _bench_finalize_token_stats
+        # in pod_eval_vllm.py.
+        "mean_gen_tokens": payload.get("mean_gen_tokens"),
+        "mean_gen_tokens_correct": payload.get("mean_gen_tokens_correct"),
     }
     # Session 3 axis-level extras.
     if payload.get("tool_used_count") is not None:
@@ -257,6 +262,7 @@ def _compact_round(h2h, last_eval):
         tp = s.get("think_probe") or {}
         adv = s.get("adversarial") or {}
         jp = s.get("judge_probe") or {}
+        ctp = s.get("chat_turns_probe") or {}
         rows.append({
             "uid": r.get("uid"),
             "model": model,
@@ -286,6 +292,16 @@ def _compact_round(h2h, last_eval):
             "judge_normalized": jp.get("normalized"),
             "judge_n_valid": jp.get("n_valid"),
             "judge_n": jp.get("n"),
+            # Session 3.3 (2026-04-25, SHADOW) — multi-turn coherence.
+            # Teacher grades 3-turn transcripts on a 1-5 rubric; mean
+            # normalized to [0, 1]. Directly analogous to judge_probe
+            # but probes conversational ability that single-turn KL
+            # distillation doesn't cover.
+            "chat_turns_mean_score": ctp.get("mean_score"),
+            "chat_turns_normalized": ctp.get("normalized"),
+            "chat_turns_n_valid": ctp.get("n_valid"),
+            "chat_turns_n": ctp.get("n"),
+            "chat_turns_n_turns": ctp.get("n_turns"),
             # Arena v3 Session 2 (2026-04-24, PRODUCTION) — five
             # absolute-correctness bench axes drawn from public held-out
             # benchmarks.

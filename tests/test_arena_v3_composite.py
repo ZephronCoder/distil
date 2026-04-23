@@ -463,5 +463,200 @@ class TestAxisSummaryStats(unittest.TestCase):
             "balanced student shouldn't show suspiciously large gap")
 
 
+def _bench_with_tokens(pass_frac: float, n: int,
+                       mean_tokens_correct: float,
+                       mean_tokens_all: float | None = None) -> dict:
+    """Fabricate a bench payload complete with Session 3.2 token stats."""
+    return {
+        "n": n,
+        "correct": int(round(pass_frac * n)),
+        "pass_frac": pass_frac,
+        "items": [],
+        "mean_gen_tokens_correct": mean_tokens_correct,
+        "mean_gen_tokens": mean_tokens_all if mean_tokens_all is not None
+                           else mean_tokens_correct,
+    }
+
+
+class TestReasoningDensity(unittest.TestCase):
+    """Session 3.2 (2026-04-25) — reasoning_density bell-curve axis."""
+
+    def _student_with_bench_tokens(self, bench_payloads: dict) -> dict:
+        student = _make_student()
+        for k, v in bench_payloads.items():
+            student[k] = v
+        return student
+
+    def test_axis_high_for_efficient_correct_student(self):
+        from scripts.validator.composite import _axis_reasoning_density
+        student = self._student_with_bench_tokens({
+            "math_bench":     _bench_with_tokens(0.80, 8, 300),   # under 400 target
+            "code_bench":     _bench_with_tokens(0.75, 4, 200),   # under 300 target
+            "knowledge_bench": _bench_with_tokens(0.70, 8, 20),   # under 30 target
+        })
+        rd = _axis_reasoning_density(student)
+        self.assertIsNotNone(rd)
+        self.assertGreater(rd, 0.60,
+            "efficient correct student should score high on reasoning_density")
+
+    def test_axis_drops_for_over_thinker(self):
+        from scripts.validator.composite import _axis_reasoning_density
+        student = self._student_with_bench_tokens({
+            "math_bench":     _bench_with_tokens(0.80, 8, 1600),  # 4x target
+            "code_bench":     _bench_with_tokens(0.75, 4, 1200),  # 4x target
+            "knowledge_bench": _bench_with_tokens(0.70, 8, 120),  # 4x target
+        })
+        rd = _axis_reasoning_density(student)
+        self.assertIsNotNone(rd)
+        self.assertLess(rd, 0.35,
+            "4x over-thinker should get much lower reasoning_density")
+
+    def test_axis_none_when_no_bench_meets_min_valid(self):
+        from scripts.validator.composite import _axis_reasoning_density
+        # Benches with n < BENCH_MIN_VALID are skipped entirely; if no
+        # bench qualifies there's no data to score → None.
+        student = self._student_with_bench_tokens({
+            "math_bench": _bench_with_tokens(0.0, 1, 0),  # n=1 < min 4
+            "code_bench": _bench_with_tokens(0.0, 1, 0),  # n=1 < min 2
+        })
+        rd = _axis_reasoning_density(student)
+        self.assertIsNone(rd)
+
+    def test_axis_zero_when_all_benches_wrong(self):
+        from scripts.validator.composite import _axis_reasoning_density
+        # Some benches have correct=0 with known mean_tokens → score 0
+        # Others have 0 correct → contribute 0.
+        # As long as *any* bench meets min_valid, we return something.
+        student = self._student_with_bench_tokens({
+            "math_bench": _bench_with_tokens(0.0, 8, 500,
+                                             mean_tokens_all=500),
+            "code_bench": _bench_with_tokens(0.0, 4, 400,
+                                             mean_tokens_all=400),
+        })
+        rd = _axis_reasoning_density(student)
+        # Both benches have correct=0 (per _axis_reasoning_density logic
+        # that's a 0 contribution). Mean of zeros → 0.0.
+        self.assertIsNotNone(rd)
+        self.assertEqual(rd, 0.0)
+
+    def test_shadow_excluded_from_worst_by_default(self):
+        from scripts.validator.composite import compute_composite
+        import scripts.validator.composite as _c
+        # Save + force shadow.
+        saved = _c.REASONING_DENSITY_IN_COMPOSITE
+        _c.REASONING_DENSITY_IN_COMPOSITE = False
+        try:
+            student = self._student_with_bench_tokens({
+                # 10x target → density would be 0.1 × pass_frac → ~0.08
+                "math_bench": _bench_with_tokens(0.85, 8, 4000),
+            })
+            comp = compute_composite(student, king_kl=0.3, king_rkl=0.1)
+            self.assertIsNotNone(comp["axes"]["reasoning_density"])
+            # Despite a terrible density score, worst is not dragged down
+            # because the axis isn't in ``ranked`` (shadow).
+            self.assertGreater(comp["worst"], 0.50)
+        finally:
+            _c.REASONING_DENSITY_IN_COMPOSITE = saved
+
+    def test_promoted_density_gates_worst(self):
+        from scripts.validator.composite import compute_composite
+        import scripts.validator.composite as _c
+        saved = _c.REASONING_DENSITY_IN_COMPOSITE
+        _c.REASONING_DENSITY_IN_COMPOSITE = True
+        try:
+            student = self._student_with_bench_tokens({
+                "math_bench": _bench_with_tokens(0.85, 8, 4000),  # 10x
+                "code_bench": _bench_with_tokens(0.80, 4, 3000),
+                "knowledge_bench": _bench_with_tokens(0.80, 8, 300),
+            })
+            comp = compute_composite(student, king_kl=0.3, king_rkl=0.1)
+            self.assertIsNotNone(comp["axes"]["reasoning_density"])
+            # Worst axis now drops because reasoning_density is in ranked.
+            self.assertLess(comp["axes"]["reasoning_density"], 0.30)
+            self.assertLessEqual(
+                comp["worst"], comp["axes"]["reasoning_density"] + 1e-4,
+                "promoted reasoning_density should be able to set worst",
+            )
+        finally:
+            _c.REASONING_DENSITY_IN_COMPOSITE = saved
+
+
+class TestChatTurnsProbe(unittest.TestCase):
+    """Session 3.3 (2026-04-25, SHADOW) — multi-turn coherence axis."""
+
+    def _student_with_chat_turns(self, normalized, n_valid=5, n=6, n_turns=3) -> dict:
+        s = _make_student()
+        s["chat_turns_probe"] = {
+            "normalized": normalized,
+            "mean_score": 1 + 4 * (normalized if normalized is not None else 0.0),
+            "n_valid": n_valid,
+            "n": n,
+            "n_turns": n_turns,
+            "in_composite": False,
+        }
+        return s
+
+    def test_axis_returns_normalized_when_enough_valid(self):
+        from scripts.validator.composite import _axis_chat_turns_probe
+        s = self._student_with_chat_turns(normalized=0.72, n_valid=5)
+        self.assertAlmostEqual(_axis_chat_turns_probe(s), 0.72, places=3)
+
+    def test_axis_none_when_too_few_valid(self):
+        from scripts.validator.composite import (
+            CHAT_TURNS_MIN_VALID, _axis_chat_turns_probe,
+        )
+        s = self._student_with_chat_turns(
+            normalized=0.9, n_valid=max(0, CHAT_TURNS_MIN_VALID - 1))
+        self.assertIsNone(_axis_chat_turns_probe(s))
+
+    def test_axis_none_when_probe_missing(self):
+        from scripts.validator.composite import _axis_chat_turns_probe
+        s = _make_student()
+        s.pop("chat_turns_probe", None)
+        self.assertIsNone(_axis_chat_turns_probe(s))
+
+    def test_shadow_excluded_from_worst_by_default(self):
+        from scripts.validator.composite import compute_composite
+        s = self._student_with_chat_turns(normalized=0.1, n_valid=5)
+        s.update(_make_student(bench={
+            "math_bench": 0.9, "code_bench": 0.9,
+            "reasoning_bench": 0.9, "knowledge_bench": 0.9,
+            "ifeval_bench": 0.9,
+        }))
+        s["chat_turns_probe"] = {
+            "normalized": 0.1, "mean_score": 1.4,
+            "n_valid": 5, "n": 6, "n_turns": 3,
+            "in_composite": False,
+        }
+        comp = compute_composite(s, king_kl=0.3, king_rkl=0.1)
+        self.assertIsNotNone(comp["axes"]["chat_turns_probe"])
+        self.assertFalse(comp["chat_turns_in_composite"])
+        self.assertGreater(comp["worst"], 0.5,
+            "chat_turns_probe=0.1 must NOT drag worst when in shadow")
+
+    def test_promoted_chat_turns_gates_worst(self):
+        import scripts.validator.composite as _c
+        from scripts.validator.composite import compute_composite
+        saved = _c.CHAT_TURNS_AXIS_IN_COMPOSITE
+        _c.CHAT_TURNS_AXIS_IN_COMPOSITE = True
+        try:
+            s = _make_student(bench={
+                "math_bench": 0.9, "code_bench": 0.9,
+                "reasoning_bench": 0.9, "knowledge_bench": 0.9,
+                "ifeval_bench": 0.9,
+            })
+            s["chat_turns_probe"] = {
+                "normalized": 0.12, "mean_score": 1.48,
+                "n_valid": 5, "n": 6, "n_turns": 3,
+                "in_composite": True,
+            }
+            comp = compute_composite(s, king_kl=0.3, king_rkl=0.1)
+            self.assertTrue(comp["chat_turns_in_composite"])
+            self.assertLess(comp["worst"], 0.20,
+                "promoted chat_turns axis must be able to set worst")
+        finally:
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

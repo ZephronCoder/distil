@@ -1133,6 +1133,390 @@ def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda
     return agg
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# § chat_turns_probe — 2026-04-25 (Session 3.3, SHADOW)
+# ═══════════════════════════════════════════════════════════════════════
+# Multi-turn coherence probe. Single-turn judge_probe captures "answers
+# one question well"; chat_turns_probe tests whether the model can hold
+# context across multiple turns — a direct probe of deployment-quality
+# dialogue ability that pure climbmix-KL distillation does NOT reward.
+#
+# A distilled model can ace single-turn KL yet still repeat itself,
+# forget what it just said, or contradict itself the moment the user
+# asks a follow-up. This axis penalizes that failure mode.
+#
+# Design:
+#   * A pool of 24 hand-authored 3-turn conversations. 6 picked per
+#     round via block_seed rotation (same pattern as judge_probe).
+#   * Phase A: student generates an assistant response after every user
+#     turn, with the accumulated transcript as context.
+#   * Phase B: teacher is shown the full transcript and grades on a 1-5
+#     rubric focused on coherence + helpfulness + consistency.
+#   * Normalized to [0, 1]; shadow-only until promotion.
+#
+# Overfitting this axis produces models that maintain coherent
+# multi-turn conversations → the exact capability users expect from a
+# chat model. Goodhart-resistant because scoring is holistic.
+CHAT_TURNS_PROBE_POOL = (
+    (
+        "I'm planning a small dinner party for 6 people. Can you help me pick a theme?",
+        "Great — now suggest a 3-course menu for that theme.",
+        "One of the guests is vegetarian. Adjust the menu to accommodate them and list the final menu.",
+    ),
+    (
+        "I want to start running. Give me a simple 4-week plan for a complete beginner.",
+        "I have asthma — any modifications to the plan?",
+        "On which weeks can I safely try a timed 2k effort, based on the plan you just gave?",
+    ),
+    (
+        "Explain what a hash table is to someone new to programming.",
+        "Using your explanation, walk through how insertion works when there's a collision.",
+        "What was the worst-case complexity you implied in your last answer, and why?",
+    ),
+    (
+        "Suggest three book recommendations for someone who loved '1984' by Orwell.",
+        "Pick the one you'd recommend first and justify it in 2 sentences.",
+        "What is the publication year of that book you just picked?",
+    ),
+    (
+        "My tomato plants have yellow leaves. What could be wrong?",
+        "I last watered them 3 days ago, and they're in a sunny south-facing bed. Does that narrow it down?",
+        "Give me exactly three concrete actions to take this week, in priority order.",
+    ),
+    (
+        "Help me debug: my Python script prints 'Hello' twice even though I only called print once.",
+        "I'm importing the script as a module in another file. Does that matter?",
+        "Given what I just told you, what's the most likely cause and the one-line fix?",
+    ),
+    (
+        "Recommend a weekend road trip from Chicago under 4 hours drive.",
+        "We'd like somewhere with outdoor activities, not a city.",
+        "Among the options you mentioned, which is best for October weather?",
+    ),
+    (
+        "I want to learn guitar. Should I start with acoustic or electric?",
+        "I mostly listen to classic rock and blues. Does that change your answer?",
+        "Based on what I said, what is the single first song I should learn?",
+    ),
+    (
+        "Write a haiku about autumn.",
+        "Now write a second haiku continuing the image from the first.",
+        "Summarize the arc across both haikus in one sentence.",
+    ),
+    (
+        "Explain the difference between `let`, `const`, and `var` in JavaScript.",
+        "Give a one-line example where choosing `var` instead of `let` would cause a bug.",
+        "What was the scoping rule that made the bug happen in your last example?",
+    ),
+    (
+        "My coworker thinks TDD slows down development. Help me respond.",
+        "They specifically mentioned startups don't have time for it. Address that.",
+        "Summarize your whole argument in 3 bullet points.",
+    ),
+    (
+        "I'm choosing between Python and Rust for a new backend service.",
+        "The service is expected to handle 50k req/s. Does that narrow it?",
+        "Given that requirement, what is your final recommendation and the single biggest trade-off?",
+    ),
+    (
+        "I'm trying to eat less sugar. Any realistic tips?",
+        "I mostly fail at snack time in the afternoon. Tailor advice to that.",
+        "Pick one tip you gave me and turn it into a specific plan for tomorrow.",
+    ),
+    (
+        "Describe the plot of Hamlet in 2 sentences.",
+        "Who is responsible for the deaths of Ophelia and Polonius, in your telling?",
+        "Is your answer to the previous question consistent with your 2-sentence plot? Explain briefly.",
+    ),
+    (
+        "What is a good beginner-friendly introduction to quantum computing?",
+        "I have a CS background but no physics. Does that change your recommendation?",
+        "For the resource you just picked, what is the first concept I should focus on?",
+    ),
+    (
+        "I'm writing a resume for a software engineering job. What should I highlight?",
+        "I have 2 years of experience, mostly with React. How should that shape it?",
+        "Given that context, write me one strong bullet for a past project.",
+    ),
+    (
+        "Briefly explain why interest rates affect the stock market.",
+        "Does the effect go in the same direction for growth stocks vs value stocks?",
+        "Summarize in one sentence: when rates rise sharply, which of the two suffers more, and why?",
+    ),
+    (
+        "Give me a simple recipe for chocolate chip cookies.",
+        "I don't have baking soda. Can I substitute?",
+        "Using your substitution, how does the final cookie differ from the original recipe?",
+    ),
+    (
+        "I want to meditate but can't focus. Any practical starting advice?",
+        "5 minutes feels too long. Suggest something shorter.",
+        "Over the first week, how should I progress from your short starting practice?",
+    ),
+    (
+        "Describe Dijkstra's shortest path algorithm at a high level.",
+        "What data structure does the algorithm use for efficient selection?",
+        "If I replace that data structure with a plain list, what is the new time complexity?",
+    ),
+    (
+        "I want to switch careers into data science. Where do I start?",
+        "I have a math background but no coding experience. Adjust your plan accordingly.",
+        "Give me a realistic timeline, in weeks, for your plan.",
+    ),
+    (
+        "Can you suggest some indoor activities for a rainy Saturday with kids?",
+        "The kids are 5 and 8 — still safe?",
+        "Pick one activity and describe exactly what materials we'd need.",
+    ),
+    (
+        "Explain what a binary heap is in one paragraph.",
+        "What is the difference between a min-heap and a max-heap?",
+        "Given your definitions, sketch in pseudocode how to get the top-3 largest items from an unsorted array.",
+    ),
+    (
+        "I'm nervous about my first job interview next week. Any tips?",
+        "It's a software engineering role. Does that change the advice?",
+        "Walk me through how I should structure my answer to 'Tell me about yourself'.",
+    ),
+)
+CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "6"))
+CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "200"))
+CHAT_TURNS_PROBE_ENABLED = os.environ.get("CHAT_TURNS_PROBE", "1") != "0"
+CHAT_TURNS_PROBE_IN_COMPOSITE = os.environ.get("CHAT_TURNS_PROBE_IN_COMPOSITE", "0") != "0"
+
+
+def _pick_chat_turns_prompts(block_seed):
+    """Deterministically sample 6 multi-turn conversations per round.
+
+    Uses a sub-stream distinct from judge_probe / think_probe / rkl so
+    rotations don't phase-lock.
+    """
+    import random
+    if block_seed is None:
+        return list(CHAT_TURNS_PROBE_POOL[:CHAT_TURNS_PROBE_PER_ROUND])
+    try:
+        seed_val = int(block_seed)
+    except (TypeError, ValueError):
+        return list(CHAT_TURNS_PROBE_POOL[:CHAT_TURNS_PROBE_PER_ROUND])
+    rng = random.Random(seed_val ^ 0xBF58476D1CE4E5B9)  # distinct mixer
+    pool = list(CHAT_TURNS_PROBE_POOL)
+    rng.shuffle(pool)
+    return pool[:min(CHAT_TURNS_PROBE_PER_ROUND, len(pool))]
+
+
+CHAT_TURNS_PROBE_PROMPTS = _pick_chat_turns_prompts(None)
+_CHAT_TURNS_PROBE_BLOCK_SEED = None
+
+
+def set_chat_turns_probe_block_seed(block_seed):
+    global _CHAT_TURNS_PROBE_BLOCK_SEED, CHAT_TURNS_PROBE_PROMPTS
+    if block_seed is None or block_seed == _CHAT_TURNS_PROBE_BLOCK_SEED:
+        return
+    _CHAT_TURNS_PROBE_BLOCK_SEED = block_seed
+    CHAT_TURNS_PROBE_PROMPTS = _pick_chat_turns_prompts(block_seed)
+
+
+CHAT_TURNS_RUBRIC_TEMPLATE = (
+    "You are a strict grader evaluating a multi-turn dialogue. Read the "
+    "transcript below and score the ASSISTANT's overall performance on a "
+    "1-5 scale based on three criteria:\n"
+    " - COHERENCE: does the assistant stay on-topic across turns?\n"
+    " - CONSISTENCY: does it avoid contradicting its own earlier claims?\n"
+    " - HELPFULNESS: does it address each user turn and build on context?\n"
+    "5 = excellent on all three criteria, reads like a thoughtful human.\n"
+    "4 = good; minor issues on at most one criterion.\n"
+    "3 = mediocre; forgets context or gives vague answers.\n"
+    "2 = poor; often unhelpful, inconsistent, or off-topic.\n"
+    "1 = bad; contradictory, nonsensical, or unrelated to user turns.\n"
+    "Output ONLY the single digit, nothing else.\n\n"
+    "TRANSCRIPT:\n{transcript}\n\n"
+    "SCORE (just the digit):"
+)
+
+
+def _render_chat_multi_turn(tokenizer, msgs, enable_thinking: bool = False):
+    """Apply the tokenizer's chat template to a list of messages.
+
+    ``msgs`` is a list of {"role": "user"|"assistant", "content": ...}.
+    Appends a generation prompt so the next generated token is the
+    assistant's response.
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+        )
+
+
+def _format_transcript(convo_turns, responses) -> str:
+    lines = []
+    for i, turn in enumerate(convo_turns):
+        lines.append(f"USER (turn {i+1}): {turn.strip()}")
+        if i < len(responses):
+            resp = (responses[i] or "").strip()[:800]
+            lines.append(f"ASSISTANT (turn {i+1}): {resp}")
+    return "\n".join(lines)
+
+
+def chat_turns_response_probe(model, tokenizer, device="cuda"):
+    """Phase A — student generates assistant responses across multi-turn
+    conversations.
+
+    Returns a dict with ``{'prompts': [...], 'responses': [[r1,r2,r3], ...],
+    'gen_tokens': [[t1,t2,t3], ...], 'n_turns': 3}`` shaped for the teacher
+    grader below. Each conversation is independent (fresh KV cache) —
+    the only thing that persists is the message list.
+    """
+    out = {
+        "prompts": list(CHAT_TURNS_PROBE_PROMPTS),
+        "responses": [],
+        "gen_tokens": [],
+        "n_turns": 3,
+    }
+    if tokenizer is None or model is None or not CHAT_TURNS_PROBE_PROMPTS:
+        return out
+    if not getattr(tokenizer, "chat_template", None):
+        return out
+    eos_ids = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_ids[0] if eos_ids else 0
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for convo in CHAT_TURNS_PROBE_PROMPTS:
+                turn_responses: list[str] = []
+                turn_tokens: list[int] = []
+                msgs: list[dict] = []
+                for user_turn in convo:
+                    msgs.append({"role": "user", "content": user_turn})
+                    try:
+                        rendered = _render_chat_multi_turn(
+                            tokenizer, msgs, enable_thinking=False)
+                        ids = tokenizer(
+                            rendered, return_tensors="pt",
+                            truncation=True, max_length=3072,
+                        ).input_ids.to(device)
+                        gen = model.generate(
+                            ids, max_new_tokens=CHAT_TURNS_PROBE_MAX_TOKENS,
+                            do_sample=False, temperature=1.0, top_p=1.0,
+                            pad_token_id=pad_id, eos_token_id=eos_ids,
+                            use_cache=True,
+                        )
+                        new_ids = gen[0, ids.shape[1]:]
+                        text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                        resp = _strip_thinking_probe(text)
+                        turn_responses.append(resp)
+                        turn_tokens.append(int(new_ids.shape[0]))
+                        msgs.append({"role": "assistant", "content": resp})
+                    except Exception as e:
+                        turn_responses.append("")
+                        turn_tokens.append(0)
+                        msgs.append({"role": "assistant", "content": ""})
+                        print(f"[chat-turns-probe] student gen error: "
+                              f"{str(e)[:120]}", flush=True)
+                out["responses"].append(turn_responses)
+                out["gen_tokens"].append(turn_tokens)
+    finally:
+        if was_training:
+            model.train()
+    return out
+
+
+def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
+                             device: str = "cuda") -> dict:
+    """Phase B — teacher scores each multi-turn transcript on a 1-5
+    rubric focused on coherence/consistency/helpfulness. Mean score is
+    normalized to [0, 1]. Distribution + per-conversation scores stored
+    for dashboard transparency.
+    """
+    agg = {
+        "n": 0, "n_valid": 0, "mean_score": None,
+        "normalized": None, "per_convo": [],
+        "n_turns": (collected or {}).get("n_turns", 3),
+    }
+    if teacher is None or tokenizer is None or not collected:
+        return agg
+    prompts = collected.get("prompts") or []
+    responses = collected.get("responses") or []
+    if not prompts or not responses:
+        return agg
+    eos_ids = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_ids[0] if eos_ids else 0
+    was_training = teacher.training
+    teacher.eval()
+    scores: list[int | None] = []
+    try:
+        with torch.no_grad():
+            for convo, convo_responses in zip(prompts, responses):
+                agg["n"] += 1
+                try:
+                    transcript = _format_transcript(convo, convo_responses)
+                    rubric = CHAT_TURNS_RUBRIC_TEMPLATE.format(
+                        transcript=transcript[:4096])
+                    rendered = _render_chat_prompt(
+                        tokenizer, rubric, enable_thinking=False)
+                    ids = tokenizer(
+                        rendered, return_tensors="pt",
+                        truncation=True, max_length=6144,
+                    ).input_ids.to(device)
+                    gen = teacher.generate(
+                        ids, max_new_tokens=8,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids,
+                        use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    score = _parse_judge_score(text)
+                    scores.append(score)
+                    seed_preview = (convo[0] or "")[:120]
+                    agg["per_convo"].append({
+                        "seed": seed_preview,
+                        "raw": text[:24],
+                        "score": score,
+                    })
+                    if score is not None:
+                        agg["n_valid"] += 1
+                except Exception as e:
+                    scores.append(None)
+                    agg["per_convo"].append({
+                        "seed": (convo[0] or "")[:120] if convo else "",
+                        "error": str(e)[:120],
+                        "score": None,
+                    })
+    finally:
+        if was_training:
+            teacher.train()
+    valid = [s for s in scores if s is not None]
+    if valid:
+        mean = sum(valid) / len(valid)
+        agg["mean_score"] = round(mean, 3)
+        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    return agg
+
+
 _CAPABILITY_STATIC_POOL = [
     {"q": "What is the capital of France? One word.", "a": "paris", "kind": "word"},
     {"q": "What is the capital of Japan? One word.", "a": "tokyo", "kind": "word"},
@@ -2486,6 +2870,39 @@ def _math_score_one(pred: str, gold: str) -> int:
         return 0
 
 
+def _bench_finalize_token_stats(out: dict) -> None:
+    """Populate ``mean_gen_tokens`` and ``mean_gen_tokens_correct`` from
+    the per-item ``gen_tokens`` fields. Called by every bench probe right
+    before returning so the Session 3.2 ``reasoning_density`` axis can
+    detect both answer-only memorization (too few tokens) and
+    inefficient over-thinking (too many tokens).
+
+    Items with an ``error`` field are skipped. ``gen_tokens`` is an
+    integer — if absent we fall back to zero rather than None so the
+    aggregate math is safe.
+    """
+    items = out.get("items") or []
+    tok_sum_all = 0
+    tok_sum_correct = 0
+    n_all = 0
+    n_correct = 0
+    for it in items:
+        if not isinstance(it, dict) or it.get("error"):
+            continue
+        tok = int(it.get("gen_tokens") or 0)
+        if tok <= 0:
+            continue
+        tok_sum_all += tok
+        n_all += 1
+        if it.get("ok"):
+            tok_sum_correct += tok
+            n_correct += 1
+    out["mean_gen_tokens"] = round(tok_sum_all / n_all, 1) if n_all else 0.0
+    out["mean_gen_tokens_correct"] = (
+        round(tok_sum_correct / n_correct, 1) if n_correct else 0.0
+    )
+
+
 def math_bench_probe(model, tokenizer, device="cuda"):
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
     samples = _BENCH_SAMPLES.get("math") or []
@@ -2498,7 +2915,7 @@ def math_bench_probe(model, tokenizer, device="cuda"):
             for it in samples:
                 try:
                     prompt_text = _math_format_prompt(it["question"], it.get("src", ""))
-                    text, _ = _bench_generate(
+                    text, tok = _bench_generate(
                         model, tokenizer, prompt_text,
                         BENCH_MATH_MAX_TOKENS, device, enable_thinking=False,
                     )
@@ -2509,6 +2926,7 @@ def math_bench_probe(model, tokenizer, device="cuda"):
                         "pred": pred[:80],
                         "gold": it["gold"][:40],
                         "ok": bool(ok),
+                        "gen_tokens": int(tok),
                         "tail": text[-120:],
                     })
                     out["n"] += 1
@@ -2518,6 +2936,7 @@ def math_bench_probe(model, tokenizer, device="cuda"):
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -2547,22 +2966,22 @@ def code_bench_probe(model, tokenizer, device="cuda"):
                         "Output only the function body (no extra explanation, no markdown fences).\n\n"
                         f"{it['prompt']}"
                     )
-                    gen, _ = _bench_generate(
+                    gen, tok = _bench_generate(
                         model, tokenizer, prompt_text,
                         BENCH_CODE_MAX_TOKENS, device, enable_thinking=False,
                     )
-                    generations.append((gen, it))
+                    generations.append((gen, int(tok), it))
                 except Exception as e:
-                    generations.append(("", {**it, "gen_error": str(e)[:120]}))
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
         if was_training:
             model.train()
         sandbox_input = [
             (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
-            for gen, it in generations if "gen_error" not in it
+            for gen, _tok, it in generations if "gen_error" not in it
         ]
         sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
         idx = 0
-        for gen, it in generations:
+        for gen, tok, it in generations:
             if "gen_error" in it:
                 out["items"].append({
                     "task_id": it.get("task_id"), "error": it["gen_error"],
@@ -2575,12 +2994,14 @@ def code_bench_probe(model, tokenizer, device="cuda"):
                 "task_id": it.get("task_id"),
                 "entry_point": it.get("entry_point"),
                 "ok": ok,
+                "gen_tokens": int(tok),
                 "reason": (r.reason if r else "no_result")[:120],
                 "tail": (gen or "")[-160:],
             })
             out["n"] += 1
             out["correct"] += int(ok)
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -2652,7 +3073,7 @@ def reasoning_bench_probe(model, tokenizer, device="cuda"):
             for it in samples:
                 try:
                     prompt_text = _reasoning_format_prompt(it["question"], it["gold"])
-                    text, _ = _bench_generate(
+                    text, tok = _bench_generate(
                         model, tokenizer, prompt_text,
                         BENCH_REASONING_MAX_TOKENS, device, enable_thinking=False,
                     )
@@ -2663,6 +3084,7 @@ def reasoning_bench_probe(model, tokenizer, device="cuda"):
                         "pred": pred[:80],
                         "gold": it["gold"][:40],
                         "ok": bool(ok),
+                        "gen_tokens": int(tok),
                         "tail": text[-120:],
                     })
                     out["n"] += 1
@@ -2672,6 +3094,7 @@ def reasoning_bench_probe(model, tokenizer, device="cuda"):
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -2704,7 +3127,7 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
             for it in samples:
                 try:
                     prompt_text = _format_mmlu_prompt(it)
-                    text, _ = _bench_generate(
+                    text, tok = _bench_generate(
                         model, tokenizer, prompt_text,
                         BENCH_KNOWLEDGE_MAX_TOKENS, device, enable_thinking=False,
                     )
@@ -2718,6 +3141,7 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
                         "pred": pred,
                         "gold": it["gold_letter"],
                         "ok": bool(ok),
+                        "gen_tokens": int(tok),
                         "tail": text[-120:],
                     })
                     out["n"] += 1
@@ -2727,6 +3151,7 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -2750,7 +3175,7 @@ def ifeval_bench_probe(model, tokenizer, device="cuda"):
         with torch.no_grad():
             for it in samples:
                 try:
-                    text, _ = _bench_generate(
+                    text, tok = _bench_generate(
                         model, tokenizer, it["prompt"],
                         BENCH_IFEVAL_MAX_TOKENS, device, enable_thinking=False,
                     )
@@ -2763,6 +3188,7 @@ def ifeval_bench_probe(model, tokenizer, device="cuda"):
                         "instruction_ids": it["instruction_ids"],
                         "per_instruction": per,
                         "ok": bool(all_pass),
+                        "gen_tokens": int(tok),
                         "tail": text[-120:],
                     })
                     out["n"] += 1
@@ -2772,6 +3198,7 @@ def ifeval_bench_probe(model, tokenizer, device="cuda"):
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -2879,7 +3306,7 @@ def aime_bench_probe(model, tokenizer, device="cuda"):
             for it in samples:
                 try:
                     prompt_text = _aime_format_prompt(it["question"])
-                    text, _ = _bench_generate(
+                    text, tok = _bench_generate(
                         model, tokenizer, prompt_text,
                         BENCH_AIME_MAX_TOKENS, device, enable_thinking=False,
                     )
@@ -2890,6 +3317,7 @@ def aime_bench_probe(model, tokenizer, device="cuda"):
                         "pred": pred[:20],
                         "gold": it["gold"][:20],
                         "ok": bool(ok),
+                        "gen_tokens": int(tok),
                         "tail": text[-120:],
                     })
                     out["n"] += 1
@@ -2899,6 +3327,7 @@ def aime_bench_probe(model, tokenizer, device="cuda"):
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -2930,20 +3359,20 @@ def mbpp_bench_probe(model, tokenizer, device="cuda"):
         out["error"] = "humaneval_sandbox not importable on pod"
         return out
     try:
-        generations: list[tuple[str, dict]] = []
+        generations: list[tuple[str, int, dict]] = []
         was_training = model.training
         model.eval()
         with torch.no_grad():
             for it in samples:
                 try:
                     prompt_text = _mbpp_build_prompt(it)
-                    gen, _ = _bench_generate(
+                    gen, tok = _bench_generate(
                         model, tokenizer, prompt_text,
                         BENCH_MBPP_MAX_TOKENS, device, enable_thinking=False,
                     )
-                    generations.append((gen, it))
+                    generations.append((gen, int(tok), it))
                 except Exception as e:
-                    generations.append(("", {**it, "gen_error": str(e)[:120]}))
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
         if was_training:
             model.train()
         # MBPP solutions often don't stub the function signature at the
@@ -2972,11 +3401,11 @@ def mbpp_bench_probe(model, tokenizer, device="cuda"):
             ("", _strip_thinking_probe(gen or ""),
              _wrap_for_sandbox(it["test"], it["entry_point"]),
              it["entry_point"])
-            for gen, it in generations if "gen_error" not in it
+            for gen, _tok, it in generations if "gen_error" not in it
         ]
         sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
         idx = 0
-        for gen, it in generations:
+        for gen, tok, it in generations:
             if "gen_error" in it:
                 out["items"].append({
                     "task_id": it.get("task_id"), "error": it["gen_error"],
@@ -2989,12 +3418,14 @@ def mbpp_bench_probe(model, tokenizer, device="cuda"):
                 "task_id": it.get("task_id"),
                 "entry_point": it.get("entry_point"),
                 "ok": ok,
+                "gen_tokens": int(tok),
                 "reason": (r.reason if r else "no_result")[:120],
                 "tail": (gen or "")[-160:],
             })
             out["n"] += 1
             out["correct"] += int(ok)
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -3083,10 +3514,11 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                     pass1_prompt = (
                         f"{it['question']}\n\n{_TOOL_USE_INSTRUCTION}"
                     )
-                    text1, _ = _bench_generate(
+                    text1, tok1 = _bench_generate(
                         model, tokenizer, pass1_prompt,
                         BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=False,
                     )
+                    tok_total = int(tok1)
                     m = _TOOL_CALL_RE.search(text1)
                     tool_result = None
                     tool_used = False
@@ -3109,10 +3541,11 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                             "Based on the tool output, give your final answer "
                             "in \\boxed{ANSWER}."
                         )
-                        text2, _ = _bench_generate(
+                        text2, tok2 = _bench_generate(
                             model, tokenizer, pass2_prompt,
                             BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=False,
                         )
+                        tok_total += int(tok2)
                         combined_text = (
                             text1[:m.end()]
                             + f"\n<output>{tool_result}</output>\n"
@@ -3128,6 +3561,7 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                         "pred": pred[:40],
                         "gold": it["gold"][:40],
                         "ok": bool(ok),
+                        "gen_tokens": tok_total,
                         "tail": combined_text[-160:],
                     })
                     out["n"] += 1
@@ -3140,6 +3574,7 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
         out["tool_used_count"] = sum(
             1 for i in out["items"] if isinstance(i, dict) and i.get("tool_used")
         )
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -3174,9 +3609,10 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
                     prompt_text = _math_format_prompt(it["question"], "math500")
                     votes: dict[str, int] = {}
                     raw_preds: list[str] = []
+                    tok_total = 0
                     for s_idx in range(k_samples):
                         sample_seed = (base_seed + q_idx * 1024 + s_idx) & 0xFFFFFFFF
-                        text, _ = _bench_generate_sampled(
+                        text, tok = _bench_generate_sampled(
                             model, tokenizer, prompt_text,
                             BENCH_SELF_CONSISTENCY_MAX_TOKENS, device,
                             temperature=BENCH_SELF_CONSISTENCY_TEMP,
@@ -3184,6 +3620,7 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
                             seed=sample_seed,
                             enable_thinking=False,
                         )
+                        tok_total += int(tok)
                         pred_raw = _math_extract_answer(text, "math500")
                         # Canonicalize for voting (strip trailing dots,
                         # commas, $, leading zeros).
@@ -3197,6 +3634,7 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
                             "ok": False,
                             "reason": "no_extraction",
                             "samples": raw_preds,
+                            "gen_tokens": tok_total,
                         })
                         out["n"] += 1
                         continue
@@ -3210,6 +3648,7 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
                         "k": k_samples,
                         "gold": it["gold"][:40],
                         "ok": bool(ok),
+                        "gen_tokens": tok_total,
                     })
                     out["n"] += 1
                     out["correct"] += ok
@@ -3221,6 +3660,7 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
         out["k_samples"] = k_samples
         out["temperature"] = BENCH_SELF_CONSISTENCY_TEMP
         out["top_p"] = BENCH_SELF_CONSISTENCY_TOPP
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -3250,7 +3690,7 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
             for it in samples:
                 try:
                     prompt_text = _format_arc_prompt(it)
-                    text, _ = _bench_generate(
+                    text, tok = _bench_generate(
                         model, tokenizer, prompt_text,
                         BENCH_ARC_MAX_TOKENS, device, enable_thinking=False,
                     )
@@ -3263,6 +3703,7 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
                         "pred": pred,
                         "gold": it["gold_letter"],
                         "ok": bool(ok),
+                        "gen_tokens": int(tok),
                         "tail": text[-120:],
                     })
                     out["n"] += 1
@@ -3272,6 +3713,7 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
@@ -4965,6 +5407,7 @@ def main():
     set_capability_block_seed(args.block_seed)
     set_on_policy_rkl_block_seed(args.block_seed)
     set_judge_probe_block_seed(args.block_seed)
+    set_chat_turns_probe_block_seed(args.block_seed)
     set_bench_block_seed(args.block_seed)
 
     # Auto-detect tensor-parallel size when unset (0 = all visible GPUs).
@@ -5850,6 +6293,51 @@ def main():
             except Exception as e:
                 print(f"[eval] Judge probe collection error (non-fatal): {e}", flush=True)
 
+        # ── Multi-turn coherence probe (Phase A — student) ────────────
+        # 2026-04-25 (Session 3.3, SHADOW) — student generates assistant
+        # responses across 6 rotated 3-turn conversations; teacher scoring
+        # runs in Phase B after all students are unloaded (see below).
+        # Pure KL distillation does NOT cover multi-turn coherence; this
+        # axis rewards a genuine capability the user sees at deployment.
+        chat_turns_collect_this = (
+            student is not None
+            and CHAT_TURNS_PROBE_ENABLED
+        )
+        if is_king and king_model is not None and student is king_model and load_time == 0.0:
+            chat_turns_collect_this = False
+        if chat_turns_collect_this:
+            try:
+                _ct_start = time.time()
+                chat_turns_raw = chat_turns_response_probe(
+                    student, tokenizer, device)
+                _ct_dur = time.time() - _ct_start
+                if chat_turns_raw and chat_turns_raw.get("responses"):
+                    _chat_store = globals().setdefault(
+                        "_CHAT_TURNS_ROLLOUTS", {})
+                    _chat_store[student_name] = chat_turns_raw
+                    all_toks = [
+                        t for conv_toks in (chat_turns_raw.get("gen_tokens") or [])
+                        for t in conv_toks
+                    ]
+                    avg_len = (sum(all_toks) / len(all_toks)) if all_toks else 0.0
+                    results["students"].setdefault(
+                        student_name, {})["chat_turns_probe_meta"] = {
+                        "n_convos": len(chat_turns_raw.get("prompts") or []),
+                        "n_turns": chat_turns_raw.get("n_turns", 3),
+                        "mean_gen_tokens": round(avg_len, 1),
+                        "collected_at": round(_ct_dur, 1),
+                    }
+                    print(
+                        f"[eval] Chat-turns probe (collect): "
+                        f"{len(chat_turns_raw['responses'])} convos × "
+                        f"{chat_turns_raw.get('n_turns', 3)} turns, "
+                        f"avg_gen={avg_len:.0f} tokens ({_ct_dur:.1f}s)",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(f"[eval] Chat-turns probe collection error "
+                      f"(non-fatal): {e}", flush=True)
+
         # ── Pareto holistic bench battery (SHADOW) ─────────────────────
         # 2026-04-24 — Five absolute-correctness axes drawn from public
         # held-out benchmarks (GSM8K/MATH, HumanEval, BBH, MMLU-Pro,
@@ -5878,6 +6366,10 @@ def main():
                         "wall_s": payload.get("wall_s", 0.0),
                         "items": payload.get("items", []),
                         "error": payload.get("error"),
+                        "mean_gen_tokens": payload.get("mean_gen_tokens", 0.0),
+                        "mean_gen_tokens_correct": payload.get(
+                            "mean_gen_tokens_correct", 0.0
+                        ),
                     }
                     short = axis_name.replace("_bench", "")
                     if payload.get("error"):
@@ -5889,12 +6381,33 @@ def main():
                         )
                     else:
                         summary_bits.append(f"{short}=skip")
+                # Collect a compact mean-tokens line so we can eyeball
+                # over-thinking vs memorization at a glance. Only axes
+                # that actually emitted items get a number; shadow-axes
+                # that ran at n=0 are omitted.
+                token_bits = []
+                for axis_name, payload in bench_res.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("error") or not payload.get("n"):
+                        continue
+                    mg = payload.get("mean_gen_tokens") or 0.0
+                    mgc = payload.get("mean_gen_tokens_correct") or 0.0
+                    token_bits.append(
+                        f"{axis_name.replace('_bench', '')}={mg:.0f}/{mgc:.0f}"
+                    )
                 print(
                     f"[eval] Bench battery (Arena v3 — S2 live, S3 shadow): "
                     f"{' | '.join(summary_bits)} "
                     f"[total {total_w:.1f}s]",
                     flush=True,
                 )
+                if token_bits:
+                    print(
+                        "[eval] Bench tokens (all/correct): "
+                        + " | ".join(token_bits),
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"[eval] Bench battery error (non-fatal): {e}", flush=True)
 
@@ -6257,12 +6770,18 @@ def main():
     # Results are merged back into each student's dict.
     _rkl_store = globals().get("_ON_POLICY_ROLLOUTS") or {}
     _judge_store = globals().get("_JUDGE_ROLLOUTS") or {}
-    _need_teacher = (ON_POLICY_RKL_ENABLED and _rkl_store) or (JUDGE_PROBE_ENABLED and _judge_store)
+    _chat_store = globals().get("_CHAT_TURNS_ROLLOUTS") or {}
+    _need_teacher = (
+        (ON_POLICY_RKL_ENABLED and _rkl_store)
+        or (JUDGE_PROBE_ENABLED and _judge_store)
+        or (CHAT_TURNS_PROBE_ENABLED and _chat_store)
+    )
     if _need_teacher:
         try:
             print(f"\n[eval] Phase B: teacher-side scoring "
                   f"(RKL={'on' if (ON_POLICY_RKL_ENABLED and _rkl_store) else 'off'}, "
-                  f"judge={'on' if (JUDGE_PROBE_ENABLED and _judge_store) else 'off'})",
+                  f"judge={'on' if (JUDGE_PROBE_ENABLED and _judge_store) else 'off'}, "
+                  f"chat_turns={'on' if (CHAT_TURNS_PROBE_ENABLED and _chat_store) else 'off'})",
                   flush=True)
             # Free the king if it's still resident — teacher forward pass
             # wants all the VRAM it can get.
@@ -6356,6 +6875,52 @@ def main():
                       f"in {timings['judge_probe']:.1f}s (SHADOW — not in composite)",
                       flush=True)
 
+            # ── Phase B.3: chat_turns probe scoring (SHADOW) ────────
+            # 2026-04-25 — Teacher grades the full multi-turn
+            # transcript on a 1-5 rubric (coherence + consistency +
+            # helpfulness). Same single-digit scoring shape as the
+            # single-turn judge probe — normalization is identical so
+            # axis values are directly comparable.
+            if CHAT_TURNS_PROBE_ENABLED and _chat_store:
+                _ct_t0 = time.time()
+                chat_scored = 0
+                for sn, collected in _chat_store.items():
+                    try:
+                        _ct_s_t0 = time.time()
+                        judged = chat_turns_teacher_score(
+                            teacher_b, tokenizer, collected, device=device)
+                        dur = time.time() - _ct_s_t0
+                        payload = {
+                            "n": judged["n"],
+                            "n_valid": judged["n_valid"],
+                            "n_turns": judged.get("n_turns", 3),
+                            "mean_score": judged["mean_score"],
+                            "normalized": judged["normalized"],
+                            "per_convo": judged.get("per_convo", []),
+                            "scoring_time": round(dur, 1),
+                            "in_composite": CHAT_TURNS_PROBE_IN_COMPOSITE,
+                            "version": 1,
+                        }
+                        if sn in results["students"]:
+                            results["students"][sn]["chat_turns_probe"] = payload
+                        chat_scored += 1
+                        print(
+                            f"  [{sn}] chat_turns mean={payload['mean_score']} "
+                            f"norm={payload['normalized']} "
+                            f"valid={payload['n_valid']}/{payload['n']} "
+                            f"(×{payload['n_turns']} turns, {dur:.1f}s)",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"  [{sn}] chat_turns scoring error: "
+                              f"{str(e)[:160]}", flush=True)
+                timings["chat_turns_probe"] = time.time() - _ct_t0
+                print(f"[eval] Chat-turns probe: scored {chat_scored}/"
+                      f"{len(_chat_store)} students in "
+                      f"{timings['chat_turns_probe']:.1f}s "
+                      f"(SHADOW — not in composite)",
+                      flush=True)
+
             try:
                 del teacher_b
             except Exception:
@@ -6367,6 +6932,7 @@ def main():
         finally:
             globals()["_ON_POLICY_ROLLOUTS"] = {}
             globals()["_JUDGE_ROLLOUTS"] = {}
+            globals()["_CHAT_TURNS_ROLLOUTS"] = {}
 
     # ── Teacher sanity row (2026-04-23) ─────────────────────────────
     # Emit a synthetic row under ``results['students'][<teacher>]`` that
