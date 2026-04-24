@@ -285,6 +285,14 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                         f"worst={health.get('king_worst'):.3f} "
                         f"(floor={health.get('floor')}) — streak reset."
                     )
+                # Persist the streak. save_h2h() above ran before this block
+                # so the in-memory mutation wouldn't hit disk without this
+                # second write. atomic_json_write is cheap on a 2-key dict.
+                atomic_json_write(
+                    state._path("king_regression_streak.json"),
+                    state.king_regression_streak,
+                    indent=2,
+                )
         except Exception as exc:
             logger.warning(f"king_regression_streak update failed (non-fatal): {exc}")
 
