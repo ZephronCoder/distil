@@ -339,21 +339,31 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
         if uid_str in state.scores and state.scores[uid_str] > 0:
             kl = state.scores[uid_str]
             prev = state.model_score_history.get(model_name, {})
+            # 2026-04-24 (distil-97): a past rollback persisted {"best_kl": null,
+            # "best_kl_before_rollback_*": <float>} for ~500 entries. Plain
+            # ``prev.get("best_kl", float("inf"))`` returned None (default is
+            # only used for missing keys, not for explicit None values), and
+            # ``kl < None`` blew up every epoch with the infamous EPOCH ERROR:
+            # '<' not supported between instances of 'float' and 'NoneType'.
+            # Collapse None to inf/0 sentinels so the comparisons stay total.
             if kl <= MAX_KL_THRESHOLD:
-                prev_best = prev.get("best_kl", float("inf"))
+                prev_best_raw = prev.get("best_kl")
+                prev_best = float("inf") if prev_best_raw is None else prev_best_raw
                 if kl < prev_best:
                     state.model_score_history[model_name] = {
                         **prev, "best_kl": round(kl, 6), "uid": uid,
                         "block": current_block, "timestamp": time.time(),
                     }
             else:
-                prev_worst = prev.get("worst_kl", 0)
+                prev_worst_raw = prev.get("worst_kl")
+                prev_worst = 0 if prev_worst_raw is None else prev_worst_raw
                 if kl > prev_worst:
                     state.model_score_history[model_name] = {
                         **prev, "worst_kl": round(kl, 6), "uid": uid,
                         "block": current_block, "timestamp": time.time(),
                     }
-                if "best_kl" not in state.model_score_history.get(model_name, {}):
+                existing = state.model_score_history.get(model_name, {})
+                if existing.get("best_kl") is None:
                     state.model_score_history.setdefault(model_name, {})["best_kl"] = round(kl, 6)
 
     if king_kl > 0 and king_kl < float("inf"):
