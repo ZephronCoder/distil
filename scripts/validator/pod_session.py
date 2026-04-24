@@ -322,6 +322,20 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     logger.info(f"Running eval ({n_eval_models} models, {n_prompts} prompts, timeout={eval_timeout // 60}m)")
     log_event(f"Running eval on pod: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
     eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", ""), "TOKENIZERS_PARALLELISM": "false"}
+    # 2026-04-24 (distil-97, leeroyjkin): the heavy bench battery (Session 3
+    # shadow axes: aime/mbpp/tool_use/self_consistency/arc/truthful/long_context)
+    # adds ~6 min/student (~84 min/round for 14 students). Propagate the
+    # tunables from validator env so we can flip them via systemd override
+    # without redeploying code. See ``scripts/pod_eval_vllm.py`` for semantics.
+    for _propagate in (
+        "BENCH_BATTERY_ENABLED",
+        "BENCH_BATTERY_SHADOW_AXES",
+        "BENCH_BATTERY_LITE",
+        "POD_PER_MODEL_TIMEOUT",
+    ):
+        _v = os.environ.get(_propagate)
+        if _v is not None:
+            eval_env[_propagate] = _v
     try:
         start_res = pod.exec(start_cmd, env=eval_env, timeout=120)
         if not start_res.get("success"):
