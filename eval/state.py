@@ -225,8 +225,33 @@ class ValidatorState:
         atomic_json_write(self._path(MODEL_HASHES_FILE), self.model_hashes, indent=2)
 
     def save_progress(self, data: dict = None):
-        """Write eval progress for dashboard live display."""
-        atomic_json_write(self._path(EVAL_PROGRESS_FILE), data or self.eval_progress)
+        """Write eval progress for dashboard live display.
+
+        When ``data`` is a full dict (``active`` is present and a bool),
+        replace both disk and ``self.eval_progress`` atomically —
+        full-round overwrites are the normal path.
+
+        When ``data`` is a partial update (e.g. ``{"failed": True}``),
+        merge it into ``self.eval_progress`` first and write the merged
+        result. This prevents the 220m phantom-age false-kill where a
+        round-end partial update truncated ``started_at`` out of the
+        on-disk progress, while the stale in-memory dict still said
+        ``active=True`` with a started_at from the validator's original
+        bootstrap — ``ensure_clean_state``'s ``age_min`` check then
+        computed ~3.5h and nuked a fresh, healthy round at ~1m age.
+        2026-04-24, distil-97.
+        """
+        if data is None:
+            payload = dict(self.eval_progress)
+        else:
+            has_full_active = "active" in data and isinstance(data.get("active"), bool)
+            if has_full_active and len(data) > 3:
+                payload = dict(data)
+            else:
+                payload = dict(self.eval_progress)
+                payload.update(data)
+        atomic_json_write(self._path(EVAL_PROGRESS_FILE), payload)
+        self.eval_progress = payload
 
     def save_round(self, data: dict = None):
         """Save current round state for crash recovery."""
