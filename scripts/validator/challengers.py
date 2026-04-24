@@ -1,10 +1,30 @@
 import logging
+import os
 
 from eval.scoring import disqualify
 from eval.state import ValidatorState
 from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
 
 logger = logging.getLogger("distillation.remote_validator")
+
+
+# 2026-04-24 (distil-97): once the subnet enters steady-state (all ~65
+# valid models in ``state.scores``), ``select_challengers`` yields zero
+# P1/P3 candidates because every UID is considered "already evaluated".
+# ``add_top5_contenders`` then fills with the 4 H2H leaderboard slots
+# and the round settles at 5-6 models — fine for tracking the king vs
+# top-4 but blind to any dormant miner whose global KL (measured vs an
+# earlier king on a different prompt set) is actually better than the
+# current king's H2H KL. Without re-rotation, the subnet ranking
+# silently goes stale and dormant miners with legitimately better
+# models cannot regain the crown without re-uploading.
+#
+# ``DORMANT_ROTATION_N`` adds that many dormant miners per round,
+# filtered to those whose ``state.scores[uid]`` beats the current
+# king's h2h_kl (so we only spend compute on candidates who could
+# plausibly win). Default 2 = ~16 extra minutes per round with
+# shadow axes off, fits inside the 60-75min target.
+DORMANT_ROTATION_N = int(os.environ.get("DORMANT_ROTATION_N", "2"))
 
 
 def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
@@ -126,6 +146,58 @@ def add_top5_contenders(challengers, valid_models, state: ValidatorState, king_u
         logger.info(
             f"🏆 Added {contenders_added} top-{TOP_N_ALWAYS_INCLUDE} contender(s) "
             f"to eval (from global scores — fallback)"
+        )
+
+
+def add_dormant_rotation(challengers, valid_models, state: ValidatorState,
+                         king_uid, king_kl):
+    """Rotate in ``DORMANT_ROTATION_N`` dormant miners whose global KL beats
+    the current king.
+
+    Rationale: once the subnet is steady-state, no new P1/P3 fires and the
+    round shrinks to king+top-4. Miners who scored very well against an
+    earlier king sit in ``state.scores`` forever without re-entering the
+    ranking. This function picks the N best dormant scorers whose KL is
+    below the current king's h2h_kl, so they can either:
+      (a) confirm they're genuinely strong and climb back into the top-N,
+      (b) show their old score was noise from an easier prompt set and
+          settle back out of the running next round.
+
+    Defensive filters:
+      * skip king, skip current challengers, skip permanently_bad_models
+      * require ``state.scores[uid] < king_kl`` (no point re-testing
+        already-worse models)
+      * require uid in ``valid_models`` (passed precheck this round)
+
+    Opt-out: set ``DORMANT_ROTATION_N=0`` in the validator env to disable.
+    """
+    if king_uid is None or DORMANT_ROTATION_N <= 0:
+        return
+    if king_kl is None or king_kl == float("inf"):
+        return
+    candidates = []
+    for uid, info in valid_models.items():
+        if uid == king_uid or uid in challengers:
+            continue
+        if info.get("model") in state.permanently_bad_models:
+            continue
+        uid_str = str(uid)
+        kl = state.scores.get(uid_str)
+        if kl is None or kl <= 0 or kl >= float("inf"):
+            continue
+        if kl >= king_kl:
+            continue
+        candidates.append((uid, kl))
+    candidates.sort(key=lambda x: x[1])
+    added = []
+    for uid, kl in candidates[:DORMANT_ROTATION_N]:
+        challengers[uid] = valid_models[uid]
+        added.append((uid, kl))
+    if added:
+        roster = ", ".join(f"UID {u}(kl={k:.4f})" for u, k in added)
+        logger.info(
+            f"♻️  Dormant rotation: added {len(added)} of {len(candidates)} "
+            f"candidates better than king_kl={king_kl:.4f}: {roster}"
         )
 
 

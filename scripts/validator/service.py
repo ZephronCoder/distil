@@ -26,6 +26,7 @@ from eval.state import ValidatorState, atomic_json_write, log_event
 from scripts.validator.announcements import announce_new_king
 from scripts.validator.chain import write_api_commitments_cache
 from scripts.validator.challengers import (
+    add_dormant_rotation,
     add_top5_contenders,
     assert_top_contenders_present,
     cap_challengers,
@@ -541,6 +542,12 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
         state_dir=state_dir,
     )
     add_top5_contenders(challengers, valid_models, state, king_uid)
+    # 2026-04-24 (distil-97): rotate in ~N dormant high-scorers per round
+    # so the ranking doesn't go stale when no new submissions land. No-op
+    # when king_kl is unknown or DORMANT_ROTATION_N=0 is set in env.
+    # Runs AFTER add_top5_contenders so leaderboard slots are preserved
+    # but BEFORE cap_challengers so it competes for cap slots fairly.
+    add_dormant_rotation(challengers, valid_models, state, king_uid, king_kl)
     cap_challengers(challengers, state, king_uid)
     assert_top_contenders_present(challengers, valid_models, state, king_uid)
     has_new = len(challengers_before_top5) > 0
