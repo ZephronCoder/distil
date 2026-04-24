@@ -7032,13 +7032,15 @@ def main():
 
         # Record results
         if scoring_error and not kl_per_prompt:
-            preserved = {
-                k: v for k, v in results["students"].get(student_name, {}).items()
-                if k in ("think_probe", "capability", "activation_fingerprint")
-            }
-            results["students"][student_name] = {
-                "status": "scoring_error", "error": scoring_error[:500],
-                "kl_global_avg": None, **preserved}
+            # Merge (not overwrite) so bench/judge/chat probes collected
+            # before the scoring error survive — same bug as the
+            # successful-path below (distil-97, 2026-04-24).
+            existing = results["students"].setdefault(student_name, {})
+            existing.update({
+                "status": "scoring_error",
+                "error": scoring_error[:500],
+                "kl_global_avg": None,
+            })
         elif kl_per_prompt:
             kl_avg = sum(d["mean"] for d in kl_per_prompt) / len(kl_per_prompt)
             n_scored = len(kl_per_prompt)
@@ -7171,13 +7173,23 @@ def main():
                 except Exception as e:
                     print(f"  → On-policy rollouts skipped: {str(e)[:140]}", flush=True)
 
-            # Preserve probes and fingerprint already written into this
-            # student's dict — overwriting it blanks them.
-            preserved = {
-                k: v for k, v in results["students"].get(student_name, {}).items()
-                if k in ("think_probe", "capability", "activation_fingerprint", "on_policy_rkl")
-            }
-            results["students"][student_name] = {**student_result, **preserved}
+            # Merge KL scoring fields into the existing student dict
+            # instead of replacing it — all the probes and benches above
+            # (capability, judge_probe_meta, chat_turns_probe_meta, math_bench,
+            # code_bench, reasoning_bench, knowledge_bench, ifeval_bench,
+            # aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench,
+            # arc_bench, truthful_bench, long_context_bench, think_probe,
+            # chat_probe, activation_fingerprint, on_policy_rkl…) already
+            # live in ``results["students"][student_name]`` and were silently
+            # wiped by a previous overwrite-with-preserved-4-keys pattern.
+            # The bug surfaced on 2026-04-24 (distil-97 Discord, leeroyjkin /
+            # mrchen): last clean round's h2h_latest.json showed every v3
+            # axis as ``null`` for every challenger — only ``kl``,
+            # ``capability``, ``length`` populated. Root cause was this
+            # overwrite dropping ~16 keys. The composite became a 3-axis
+            # system in practice even though the code registered 20 axes.
+            existing = results["students"].setdefault(student_name, {})
+            existing.update(student_result)
 
             if kl_avg > 0.001 and not early_stopped and not scoring_error:
                 if best_kl_so_far is None or kl_avg < best_kl_so_far:
