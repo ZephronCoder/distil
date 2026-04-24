@@ -3220,6 +3220,46 @@ def reasoning_bench_probe(model, tokenizer, device="cuda"):
 
 _MMLU_LETTER_RE = re.compile(r"\b([A-J])\b")
 
+# 2026-04-24 (distil-97): knowledge_bench/arc_bench/truthful_bench
+# consistently scored 0/8 or 0/6 for most students on the previous bench
+# battery because `_MMLU_LETTER_RE.search(text)` returns the FIRST match.
+# When a model generates "Looking at option A vs option D, the answer is D.",
+# the first-match regex picks A → counted wrong even though the student
+# concluded with D. Prefer explicit answer markers first, then fall back
+# to the last letter (models typically conclude with their final answer),
+# and finally first letter as a last resort. Covers the same
+# MMLU-style 10-way MC surface as knowledge_bench / arc_bench / truthful_bench.
+_ANSWER_MARKER_RES = tuple(
+    re.compile(pat, re.IGNORECASE) for pat in (
+        r"(?:the\s+)?(?:correct\s+)?(?:final\s+)?answer\s*(?:is|:|=)\s*\(?\s*([A-J])\s*\)?",
+        r"(?:option|choice|letter)\s*\(?\s*([A-J])\s*\)?\s+is\s+(?:the\s+)?(?:correct|right|answer)",
+        r"\banswer:\s*\(?\s*([A-J])\s*\)?",
+        r"\(?\s*([A-J])\s*\)?\s+is\s+(?:the\s+)?(?:correct|right|answer)",
+    )
+)
+
+
+def _extract_mmlu_letter(text: str, max_letter: str = "J") -> str:
+    """Letter extractor for MC benches. Prefers explicit "answer is X" markers,
+    then the LAST standalone letter (models conclude with their answer),
+    then the first letter as last resort. ``max_letter`` caps the valid range
+    (J for 10-way MC, D for 4-way, etc.) — letters above are filtered out.
+    """
+    if not text:
+        return ""
+    max_ord = ord(max_letter.upper())
+    for pat in _ANSWER_MARKER_RES:
+        matches = pat.findall(text)
+        if matches:
+            cand = matches[-1].upper()
+            if "A" <= cand <= max_letter.upper():
+                return cand
+    letters = _MMLU_LETTER_RE.findall(text)
+    filtered = [c for c in letters if ord(c.upper()) <= max_ord]
+    if filtered:
+        return filtered[-1].upper()
+    return ""
+
 
 def _format_mmlu_prompt(item: dict) -> str:
     letters = "ABCDEFGHIJ"
@@ -3248,9 +3288,8 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
                         BENCH_KNOWLEDGE_MAX_TOKENS, device, enable_thinking=False,
                     )
                     cleaned = _strip_thinking_probe(text or "").strip()
-                    m = _MMLU_LETTER_RE.search(cleaned)
-                    pred = m.group(1) if m else ""
-                    ok = 1 if pred and pred.upper() == it["gold_letter"] else 0
+                    pred = _extract_mmlu_letter(cleaned, max_letter="J")
+                    ok = 1 if pred and pred == it["gold_letter"] else 0
                     out["items"].append({
                         "src": it.get("src", ""),
                         "category": it.get("category", ""),
@@ -3811,8 +3850,7 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
                         BENCH_ARC_MAX_TOKENS, device, enable_thinking=False,
                     )
                     cleaned = _strip_thinking_probe(text or "").strip()
-                    m = _MMLU_LETTER_RE.search(cleaned)
-                    pred = m.group(1).upper() if m else ""
+                    pred = _extract_mmlu_letter(cleaned, max_letter="E")
                     ok = 1 if pred and pred == it["gold_letter"] else 0
                     out["items"].append({
                         "src": it.get("src", ""),
@@ -4010,8 +4048,7 @@ def truthful_bench_probe(model, tokenizer, device="cuda"):
                         BENCH_TRUTHFUL_MAX_TOKENS, device, enable_thinking=False,
                     )
                     cleaned = _strip_thinking_probe(text or "").strip()
-                    m = _MMLU_LETTER_RE.search(cleaned)
-                    pred = m.group(1).upper() if m else ""
+                    pred = _extract_mmlu_letter(cleaned, max_letter="J")
                     ok = 1 if pred and pred == it["gold_letter"] else 0
                     out["items"].append({
                         "src": it.get("src", ""),
