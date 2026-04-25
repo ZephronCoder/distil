@@ -485,34 +485,20 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
     # ~90 min of evaluation by aborting here (regression observed
     # 2026-04-25 18:26 UTC, lost the round that started 16:57 UTC).
     if king_uid is not None and king_uid not in models_to_eval:
-        # IMPORTANT: single_eval exposes a *function* `is_single_eval_mode()`, not
-        # a `SINGLE_EVAL_MODE` constant. The previous getattr-with-default returned
-        # False even when the module imported cleanly, defeating the guard. We now
-        # call the function if available and fall back to the env var either way
-        # (handles both ImportError and AttributeError without silently swallowing
-        # the policy flag).
-        single_eval_active = False
-        try:
-            from scripts.validator import single_eval as _single_eval_mod
-            checker = getattr(_single_eval_mod, "is_single_eval_mode", None)
-            if callable(checker):
-                single_eval_active = bool(checker())
-        except Exception:
-            single_eval_active = False
-        if not single_eval_active:
-            single_eval_active = bool(int(os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
-        if single_eval_active:
-            logger.info(
-                "Resume: king UID %s correctly absent from models_to_eval "
-                "(single-eval mode — king is selected cross-round from composite_scores). "
-                "Proceeding with challenger result apply.", king_uid,
-            )
-        else:
-            logger.warning("Resume: king UID %s is no longer valid in this round; aborting apply", king_uid)
-            state.clear_round()
-            state.save_progress({"active": False, "failed": True, "failed_at": time.time(),
-                                 "stage": "resume_king_invalid"})
-            return
+        # The king is often absent from models_to_eval during resume:
+        # - In single-eval mode the king is never seated as a student
+        # - In normal mode a round may not include the king as a student
+        # Either way, discarding a completed GPU eval (~90 min) just because
+        # the king isn't in the student list is wrong.  The king's score is
+        # already stored in h2h_latest.json / state.scores.  Proceed and let
+        # apply_results_and_weights resolve the king from stored state.
+        # (Regression first observed 2026-04-25 18:26 UTC; previous guards
+        # gated on SINGLE_EVAL_MODE which wasn't always set.)
+        logger.info(
+            "Resume: king UID %s absent from models_to_eval — expected when "
+            "king was not a student this round. Using stored king score. "
+            "Proceeding with challenger result apply.", king_uid,
+        )
 
     king_kl = state.scores.get(str(king_uid), MAX_KL_THRESHOLD)
     challengers = {
