@@ -322,6 +322,12 @@ def _compact_round(h2h, last_eval):
             "truthful_bench": _compact_bench(s.get("truthful_bench")),
             # Session 3.5 (2026-04-25, SHADOW) — procedural needle-in-haystack.
             "long_context_bench": _compact_bench(s.get("long_context_bench")),
+            # Session 3.6 (2026-04-25, LIVE) — block-seeded synthetic
+            # reasoning / instruction-following / factual retrieval.
+            "procedural_bench": _compact_bench(s.get("procedural_bench")),
+            # Session 3.7 (2026-04-25, LIVE) — paraphrase-robustness on
+            # math items; punishes prompt-pattern memorization.
+            "robustness_bench": _compact_bench(s.get("robustness_bench")),
         })
     return {
         "block": h2h.get("block"),

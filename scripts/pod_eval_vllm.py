@@ -2236,61 +2236,77 @@ BENCH_BATTERY_ENABLED = os.environ.get("BENCH_BATTERY_ENABLED", "1") != "0"
 
 # 2026-04-24 — `leeroyjkin` on distil-97 flagged the bench battery as the
 # new bottleneck after the teacher-gen GIL fix (379s/student × 14 ≈ 88 min
-# extra on B200). The full battery runs 12 probes; shadow axes alone are
-# 7 of those. Two configurable knobs:
-#   * BENCH_BATTERY_SHADOW_AXES=0  → skip Session 3 (aime/mbpp/tool_use/
-#                                    self_consistency/arc/truthful/long_context).
-#                                    Keeps Session 2 (math/code/reasoning/
-#                                    knowledge/ifeval) which ARE in the
-#                                    live composite. Saves ~50% bench wall.
+# extra on B200). The full battery runs 13 probes; live-v3 axes alone are
+# 8 of those. Two configurable knobs:
+#   * BENCH_BATTERY_SHADOW_AXES=0  → legacy emergency skip for Session 3.
+#                                    Ignored when ARENA_V3_AXES_IN_COMPOSITE=1
+#                                    because those axes are live.
 #   * BENCH_BATTERY_LITE=1         → alias for SHADOW_AXES=0 (friendlier).
 #
 # Default is `full battery` because Session 3 axes just started populating
 # for the first time today after the overwrite-bug fix (48b890d); we want
 # the data first, then decide whether to keep or kill. Flip to `0` for the
 # next round if bench signal is noisy/degenerate.
+ARENA_V3_AXES_LIVE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "1") != "0"
 BENCH_BATTERY_SHADOW_AXES = (
-    os.environ.get("BENCH_BATTERY_SHADOW_AXES", "1") != "0"
-    and os.environ.get("BENCH_BATTERY_LITE", "0") == "0"
+    ARENA_V3_AXES_LIVE
+    or (
+        os.environ.get("BENCH_BATTERY_SHADOW_AXES", "1") != "0"
+        and os.environ.get("BENCH_BATTERY_LITE", "0") == "0"
+    )
 )
 
 # Session 2 per-round sample counts.
-BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "8"))
-BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "4"))
-BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "8"))
-BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "8"))
-BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
+BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "10"))
+BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "6"))
+BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "10"))
+BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "10"))
+BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "10"))
 
 # Session 3 per-round sample counts — kept small since these axes are
 # heavier per item (olympiad math needs more tokens; self-consistency
 # generates 5 samples; tool use requires 2 passes).
-BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "4"))
-BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "4"))
-BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "4"))
-BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PER_ROUND", "4"))
+BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "6"))
+BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "6"))
+BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "6"))
+BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PER_ROUND", "6"))
 BENCH_SELF_CONSISTENCY_SAMPLES = int(os.environ.get("BENCH_SELF_CONSISTENCY_SAMPLES", "5"))
 BENCH_SELF_CONSISTENCY_TEMP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TEMP", "0.7"))
 BENCH_SELF_CONSISTENCY_TOPP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TOPP", "0.9"))
 # Session 3.1 (added 2026-04-25): ARC-Challenge commonsense science reasoning.
 # 1172-item pool; independent of MMLU so miners can't climb `knowledge_bench`
 # by memorizing one taxonomy.
-BENCH_ARC_PER_ROUND = int(os.environ.get("BENCH_ARC_PER_ROUND", "6"))
+BENCH_ARC_PER_ROUND = int(os.environ.get("BENCH_ARC_PER_ROUND", "8"))
 # Session 3.4 (added 2026-04-25): TruthfulQA factual-grounding probe. 817
 # adversarially-designed questions where naive pretraining priors produce
 # confidently-wrong answers ("What happens if you swallow gum?"). Direct
 # hallucination-resistance signal; disjoint from every other bench.
-BENCH_TRUTHFUL_PER_ROUND = int(os.environ.get("BENCH_TRUTHFUL_PER_ROUND", "4"))
+BENCH_TRUTHFUL_PER_ROUND = int(os.environ.get("BENCH_TRUTHFUL_PER_ROUND", "6"))
 # Session 3.5 (added 2026-04-25): long-context needle-in-haystack. A
 # procedural axis (no dataset dep) that tests retrieval over a 1500-token
 # filler context. The needle + distractors are regenerated fresh every
 # round from the block_seed, so miners literally cannot memorize the
 # items. Directly probes long-context attention that every other axis
 # misses (prompts elsewhere are < 1k tokens).
-BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "3"))
+BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "4"))
 # Number of distractor "facts" injected before + after the needle. Each
 # fact averages ~30 tokens, so 40 distractors => ~1200 filler tokens +
 # needle + question ≈ 1400 tokens total input.
 BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "40"))
+# Session 3.6 (added 2026-04-25): block-seeded procedural tasks mixing
+# arithmetic reasoning, instruction following, and invented-fact retrieval.
+# This is intentionally synthetic: there is no public pool to memorize, but
+# solving it requires the same skills miners should train for.
+BENCH_PROCEDURAL_PER_ROUND = int(os.environ.get("BENCH_PROCEDURAL_PER_ROUND", "6"))
+# Session 3.7 (added 2026-04-25): robustness_bench. Same items as
+# ``math_bench`` (independent stream so we usually pick *different* items
+# than the canonical math probe), but each item is asked under K
+# block-rotated paraphrase wrappers. A model that overfits the canonical
+# wording of public math items will pass math_bench and fail this — the
+# axis directly punishes prompt-pattern memorization without re-evaling
+# anyone. Pure string transforms, no LLM call required.
+BENCH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_ROBUSTNESS_PER_ROUND", "4"))
+BENCH_ROBUSTNESS_PERTURB_K = int(os.environ.get("BENCH_ROBUSTNESS_PERTURB_K", "2"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
@@ -2306,6 +2322,8 @@ BENCH_TOOL_USE_SANDBOX_TIMEOUT_S = float(os.environ.get("BENCH_TOOL_USE_SANDBOX_
 BENCH_ARC_MAX_TOKENS = int(os.environ.get("BENCH_ARC_MAX_TOKENS", "48"))
 BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "48"))
 BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "32"))
+BENCH_PROCEDURAL_MAX_TOKENS = int(os.environ.get("BENCH_PROCEDURAL_MAX_TOKENS", "64"))
+BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "384"))
 
 # Per-bench RNG stream offsets so the axes draw from independent
 # substreams even when given the same block_seed. Hex constants are
@@ -2324,18 +2342,22 @@ _BENCH_STREAM = {
     "arc": 0xAC0DE317,            # Session 3.1
     "truthful": 0x74717A01,       # Session 3.4 — "tqa."
     "long_context": 0x10C0001D,  # Session 3.5 — long context needle
+    "procedural": 0x9E71C0DE,    # Session 3.6 — procedural synthesis
+    "robustness": 0x80B057E5,    # Session 3.7 — robustness_bench (math-pool reuse)
 }
 
 _BENCH_BLOCK_SEED = None
 _BENCH_POOLS: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
-    "arc": [], "truthful": [], "long_context": [],
+    "arc": [], "truthful": [], "long_context": [], "procedural": [],
+    "robustness": [],
 }
 _BENCH_SAMPLES: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
-    "arc": [], "truthful": [], "long_context": [],
+    "arc": [], "truthful": [], "long_context": [], "procedural": [],
+    "robustness": [],
 }
 
 
@@ -2742,6 +2764,13 @@ def _bench_load_pools(verbose: bool = True):
         if verbose:
             print(f"[bench] truthful_qa load error: {e}", flush=True)
 
+    # 2026-04-25 (Session 3.7): robustness shares the math pool but uses
+    # an independent stream offset (_BENCH_STREAM["robustness"]) so it
+    # samples different items than math_bench in the same round. We
+    # alias rather than copy so the pool grows as math_bench grows
+    # (e.g. if we add new public-math sources later).
+    _BENCH_POOLS["robustness"] = _BENCH_POOLS["math"]
+
     if verbose:
         print(
             f"[bench] pools loaded: "
@@ -2756,7 +2785,9 @@ def _bench_load_pools(verbose: bool = True):
             f"self_consistency={len(_BENCH_POOLS['self_consistency'])}, "
             f"arc={len(_BENCH_POOLS['arc'])}, "
             f"truthful={len(_BENCH_POOLS['truthful'])}, "
-            f"long_context=procedural ({BENCH_LC_DISTRACTORS} distractors/item)",
+            f"long_context=procedural ({BENCH_LC_DISTRACTORS} distractors/item), "
+            f"procedural=procedural, "
+            f"robustness=alias(math)",
             flush=True,
         )
 
@@ -2846,6 +2877,15 @@ def set_bench_block_seed(block_seed):
     _BENCH_SAMPLES["long_context"] = _generate_long_context_items(
         block_seed, BENCH_LC_PER_ROUND, BENCH_LC_DISTRACTORS,
     )
+    _BENCH_SAMPLES["procedural"] = _generate_procedural_items(
+        block_seed, BENCH_PROCEDURAL_PER_ROUND,
+    )
+    # Session 3.7: robustness reuses math items but draws under its own
+    # stream offset, so the canonical math probe and the robustness
+    # probe are usually scored on disjoint items in the same round.
+    _BENCH_SAMPLES["robustness"] = _pick_bench_items(
+        "robustness", block_seed, BENCH_ROBUSTNESS_PER_ROUND,
+    )
     print(
         f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
         f"code={len(_BENCH_SAMPLES['code'])}, "
@@ -2858,7 +2898,9 @@ def set_bench_block_seed(block_seed):
         f"self_consistency={len(_BENCH_SAMPLES['self_consistency'])}, "
         f"arc={len(_BENCH_SAMPLES['arc'])}, "
         f"truthful={len(_BENCH_SAMPLES['truthful'])}, "
-        f"long_context={len(_BENCH_SAMPLES['long_context'])}",
+        f"long_context={len(_BENCH_SAMPLES['long_context'])}, "
+        f"procedural={len(_BENCH_SAMPLES['procedural'])}, "
+        f"robustness={len(_BENCH_SAMPLES['robustness'])}",
         flush=True,
     )
 
@@ -4011,6 +4053,331 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
     return out
 
 
+# ── procedural_bench (Session 3.6 — fresh synthetic tasks) ────────────
+
+_PROC_NAMES = [
+    "Aster", "Beryl", "Canto", "Doria", "Elowen", "Faro", "Galen", "Hedra",
+    "Ivara", "Juno", "Kestrel", "Lumen", "Mira", "Nadir", "Orin", "Pavo",
+]
+
+
+def _rot_text(s: str, n: int) -> str:
+    if not s:
+        return s
+    n = n % len(s)
+    return s[n:] + s[:n]
+
+
+def _generate_procedural_items(block_seed: int, n_items: int) -> list[dict]:
+    """Generate block-seeded exact-answer tasks.
+
+    Five templates rotate in a block-shuffled order:
+      * arithmetic over invented records (reasoning),
+      * string/instruction transforms (instruction following),
+      * short-context synthetic fact retrieval (factual grounding).
+      * tabular aggregation (structured numerical reasoning),
+      * constraint filtering (multi-condition retrieval).
+
+    The answer key is generated from ``block_seed`` and never lives in a
+    static dataset. Miners can overfit the *skills* but cannot memorize
+    this round's items before the block exists.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["procedural"]) & 0xFFFFFFFF)
+    out: list[dict] = []
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    kinds = ["reasoning", "instruction", "retrieval", "table", "constraint"]
+    rng.shuffle(kinds)
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        kind = kinds[i % len(kinds)]
+        if kind == "reasoning":
+            a, b, c = r.randint(11, 89), r.randint(7, 73), r.randint(5, 61)
+            mod = r.choice([83, 89, 97])
+            gold = str((3 * a + 2 * b - c) % mod)
+            prompt = (
+                "Synthetic reasoning task. Use the following record values:\n"
+                f"- alpha = {a}\n- beta = {b}\n- gamma = {c}\n\n"
+                f"Compute (3 * alpha + 2 * beta - gamma) modulo {mod}.\n"
+                "Answer with only the integer."
+            )
+            src = "procedural/reasoning"
+        elif kind == "instruction":
+            word = "".join(r.choice(alphabet) for _ in range(8))
+            rot = r.randint(1, 6)
+            transformed = _rot_text(word[::-1], rot)
+            checksum = sum(ord(ch) for ch in transformed) % 97
+            gold = f"{transformed}-{checksum:02d}"
+            prompt = (
+                "Synthetic instruction-following task.\n"
+                f"Codeword: {word}\n"
+                "Instructions: reverse the codeword, rotate the result left by "
+                f"{rot} characters, then append a hyphen and a two-digit checksum. "
+                "The checksum is the sum of ASCII codes of the rotated string modulo 97.\n"
+                "Answer with only the final string."
+            )
+            src = "procedural/instruction"
+        elif kind == "retrieval":
+            records = []
+            target_idx = r.randint(0, 4)
+            for j in range(5):
+                name = f"{r.choice(_PROC_NAMES)}-{r.randint(10, 99)}"
+                color = r.choice(["amber", "blue", "crimson", "green", "silver", "violet"])
+                rank = r.randint(100, 999)
+                records.append((name, color, rank))
+            target = records[target_idx]
+            ask_rank = r.choice([True, False])
+            gold = str(target[2]) if ask_rank else target[1]
+            lines = "\n".join(
+                f"- {name}: color={color}; rank={rank}" for name, color, rank in records
+            )
+            prompt = (
+                "Synthetic factual retrieval task. The following registry is invented for this question:\n"
+                f"{lines}\n\n"
+                f"What is the {'rank' if ask_rank else 'color'} of {target[0]}?\n"
+                "Answer with only the requested value."
+            )
+            src = "procedural/retrieval"
+        elif kind == "table":
+            rows = []
+            zones = ["north", "south", "east", "west"]
+            target_zone = r.choice(zones)
+            for j in range(6):
+                zone = target_zone if j in (1, 4) else r.choice(zones)
+                units = r.randint(3, 19)
+                price = r.randint(7, 31)
+                rows.append((f"lot-{r.randint(100, 999)}", zone, units, price))
+            gold_val = sum(units * price for _, zone, units, price in rows if zone == target_zone)
+            gold = str(gold_val)
+            table = "\n".join(
+                f"{lot} | zone={zone} | units={units} | price={price}"
+                for lot, zone, units, price in rows
+            )
+            prompt = (
+                "Synthetic table task. Compute only from the table below.\n"
+                f"{table}\n\n"
+                f"What is the total value for rows where zone is {target_zone}? "
+                "Value means units multiplied by price, summed across matching rows.\n"
+                "Answer with only the integer."
+            )
+            src = "procedural/table"
+        else:
+            target_color = r.choice(["amber", "blue", "crimson", "green", "silver", "violet"])
+            target_tier = r.choice(["A", "B", "C"])
+            rows = []
+            forced_name = None
+            best_score = -1
+            for j in range(7):
+                name = f"{r.choice(_PROC_NAMES)}-{r.randint(100, 999)}"
+                color = target_color if j in (2, 5) else r.choice(["amber", "blue", "crimson", "green", "silver", "violet"])
+                tier = target_tier if j in (2, 5) else r.choice(["A", "B", "C"])
+                score = r.randint(20, 98)
+                rows.append((name, color, tier, score))
+                if color == target_color and tier == target_tier and score > best_score:
+                    best_score = score
+                    forced_name = name
+            gold = str(forced_name or rows[0][0])
+            registry = "\n".join(
+                f"- id={name}; color={color}; tier={tier}; score={score}"
+                for name, color, tier, score in rows
+            )
+            prompt = (
+                "Synthetic constraint task. Select from this invented registry only:\n"
+                f"{registry}\n\n"
+                f"Which id has color={target_color} and tier={target_tier} with the highest score?\n"
+                "Answer with only the id."
+            )
+            src = "procedural/constraint"
+        out.append({"src": src, "prompt": prompt, "answer": gold})
+    return out
+
+
+def _answer_exact_in_text(gold: str, text: str, strict: bool = False) -> bool:
+    gold = str(gold or "").strip()
+    if not gold:
+        return False
+    cleaned = str(text or "").strip()
+    if strict:
+        # Procedural prompts explicitly request "only" the answer. Accept a
+        # bare answer or common boxed form, but reject verbose completions that
+        # merely contain the answer somewhere.
+        normalized = cleaned.strip().strip("`'\" .,\n\t")
+        boxed = re.fullmatch(r"\\boxed\{([^{}]+)\}", normalized)
+        if boxed:
+            normalized = boxed.group(1).strip()
+        return normalized.upper() == gold.upper()
+    # Alphanumeric answers should match as a token, not as a substring
+    # ("3" should not pass on "13"). Mixed code strings use escaped exact
+    # containment because they may contain hyphens.
+    if re.fullmatch(r"[A-Za-z0-9]+", gold):
+        return re.search(rf"(?<![A-Za-z0-9]){re.escape(gold)}(?![A-Za-z0-9])", cleaned, re.I) is not None
+    return gold.upper() in cleaned.upper()
+
+
+# ── robustness_bench (Session 3.7 — paraphrase-robustness on math items)
+#
+# Goal: directly punish miners who memorize canonical wordings of public
+# math items without learning the underlying problem-solving. We re-use
+# the math pool (no new dataset cost) but ask each item under K rotated
+# paraphrase wrappers per round. The wrapper rotation is block-seeded so
+# *every* validator sees the same wrappers in the same round — but a
+# different set the next round. A model that can only answer the
+# canonical phrasing will pass math_bench and fail robustness_bench.
+#
+# Pure string transforms — no LLM call — so the axis is cheap and
+# deterministic. The grader is the same boxed/integer extractor as
+# math_bench.
+_ROBUSTNESS_PERTURBATION_TEMPLATES: tuple[tuple[str, "callable[[str], str]"], ...] = (
+    (
+        "solve_prefix",
+        lambda p: "Solve the following problem.\n\n" + p,
+    ),
+    (
+        "brief_postfix",
+        lambda p: p.rstrip() + "\n\nProvide a clear, concise final answer.",
+    ),
+    (
+        "polite_request",
+        lambda p: "Could you please answer the following question?\n\n" + p,
+    ),
+    (
+        "thinker_prefix",
+        lambda p: "Take a careful moment to think, then answer:\n\n" + p,
+    ),
+    (
+        "context_prefix",
+        lambda p: (
+            "I'm reviewing exam problems and ran into this one — "
+            "please solve it.\n\n" + p
+        ),
+    ),
+    (
+        "framed_question",
+        lambda p: f"Question:\n{p.strip()}\n\nYour answer:",
+    ),
+    (
+        "imperative_postfix",
+        lambda p: p.rstrip() + "\n\nWork through it carefully and give the final value.",
+    ),
+)
+
+
+def _pick_robustness_perturbations(
+    block_seed, k: int,
+) -> list[tuple[str, "callable[[str], str]"]]:
+    """Deterministically pick K paraphrase wrappers for this round.
+
+    Block-seeded so every validator agrees on which wrappers run this
+    round but the set rotates between rounds. ``k`` is clamped to the
+    template count.
+    """
+    import random
+    if not _ROBUSTNESS_PERTURBATION_TEMPLATES:
+        return []
+    pool = list(_ROBUSTNESS_PERTURBATION_TEMPLATES)
+    seed = _coerce_block_seed(block_seed)
+    if seed is None:
+        return pool[:max(1, k)]
+    rng = random.Random((seed ^ _BENCH_STREAM.get("robustness", 0)) & 0xFFFFFFFF)
+    rng.shuffle(pool)
+    return pool[: max(1, min(int(k), len(pool)))]
+
+
+def robustness_bench_probe(model, tokenizer, device="cuda"):
+    out: dict = {
+        "n": 0, "correct": 0, "pass_frac": 0.0,
+        "items": [], "perturbations": [],
+    }
+    samples = _BENCH_SAMPLES.get("robustness") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    perturbations = _pick_robustness_perturbations(
+        _BENCH_BLOCK_SEED, BENCH_ROBUSTNESS_PERTURB_K,
+    )
+    out["perturbations"] = [name for name, _ in perturbations]
+    if not perturbations:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                base_prompt = _math_format_prompt(
+                    it["question"], it.get("src", ""),
+                )
+                for name, perturb in perturbations:
+                    try:
+                        prompt = perturb(base_prompt)
+                        text, tok = _bench_generate(
+                            model, tokenizer, prompt,
+                            BENCH_ROBUSTNESS_MAX_TOKENS, device,
+                            enable_thinking=False,
+                        )
+                        pred = _math_extract_answer(text, it.get("src", ""))
+                        ok = _math_score_one(pred, it["gold"])
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "perturbation": name,
+                            "pred": (pred or "")[:80],
+                            "gold": str(it.get("gold", ""))[:40],
+                            "ok": bool(ok),
+                            "gen_tokens": int(tok),
+                        })
+                        out["n"] += 1
+                        out["correct"] += ok
+                    except Exception as e:
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "perturbation": name,
+                            "error": str(e)[:120],
+                        })
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def procedural_bench_probe(model, tokenizer, device="cuda"):
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("procedural") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    text, tok = _bench_generate(
+                        model, tokenizer, it["prompt"],
+                        BENCH_PROCEDURAL_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    gold = str(it.get("answer", ""))
+                    ok = 1 if _answer_exact_in_text(gold, cleaned, strict=True) else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "gold": gold,
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "pred_tail": cleaned[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
 # ── truthful_bench (Session 3.4 — adversarial factuality MC) ─────────
 
 def _format_truthful_prompt(item: dict) -> str:
@@ -4167,6 +4534,8 @@ def run_bench_battery(model, tokenizer, device="cuda"):
         ("arc_bench", arc_bench_probe),
         ("truthful_bench", truthful_bench_probe),
         ("long_context_bench", long_context_bench_probe),
+        ("procedural_bench", procedural_bench_probe),
+        ("robustness_bench", robustness_bench_probe),
     )
     _probes = _live_probes + (_shadow_probes if BENCH_BATTERY_SHADOW_AXES else ())
     if not BENCH_BATTERY_SHADOW_AXES:
@@ -6867,7 +7236,7 @@ def main():
                         f"{axis_name.replace('_bench', '')}={mg:.0f}/{mgc:.0f}"
                     )
                 print(
-                    f"[eval] Bench battery (Arena v3 — S2 live, S3 shadow): "
+                    f"[eval] Bench battery (Arena v3 — live composite axes): "
                     f"{' | '.join(summary_bits)} "
                     f"[total {total_w:.1f}s]",
                     flush=True,

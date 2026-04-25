@@ -9,7 +9,7 @@ import { formatFixed, formatPromptCount, timeAgo } from "@/lib/utils";
 // Axis display order + short labels — stable across the UI so miners
 // can build mental models around what each abbreviation means. Grouped
 // into KL-like (relative), capability, judge/probe, benchmark, and
-// Session 3.2/3.3 shadow axes.
+// live v3 extension axes.
 const AXIS_DISPLAY: Array<{ key: keyof NonNullable<H2hComposite["axes"]>; label: string; group: string }> = [
   { key: "kl", label: "KL", group: "rel" },
   { key: "on_policy_rkl", label: "RKL", group: "rel" },
@@ -27,8 +27,12 @@ const AXIS_DISPLAY: Array<{ key: keyof NonNullable<H2hComposite["axes"]>; label:
   { key: "tool_use_bench", label: "tool", group: "bench" },
   { key: "self_consistency_bench", label: "scon", group: "bench" },
   { key: "arc_bench", label: "arc", group: "bench" },
-  { key: "reasoning_density", label: "rd", group: "shadow" },
-  { key: "chat_turns_probe", label: "chat", group: "shadow" },
+  { key: "truthful_bench", label: "truth", group: "bench" },
+  { key: "long_context_bench", label: "long", group: "bench" },
+  { key: "procedural_bench", label: "proc", group: "bench" },
+  { key: "robustness_bench", label: "robust", group: "bench" },
+  { key: "reasoning_density", label: "rd", group: "live" },
+  { key: "chat_turns_probe", label: "chat", group: "live" },
 ];
 
 // Colour-code an axis value on a 0–1 scale. A floor of 0.8 is where

@@ -45,12 +45,20 @@ interface CompositeAxes {
   // popular-but-wrong answer looks attractive; a model grounded in facts
   // wins, a model leaning on pretraining priors loses.
   truthful_bench?: number;
-  // Arena v3 Session 3.5 (SHADOW) — procedural needle-in-haystack.
+  // Arena v3 Session 3.5 (LIVE) — procedural needle-in-haystack.
   // Items are generated fresh every round from the block_seed, so the
   // test set literally does not exist outside the live round. Tests
   // long-context retrieval (~1400 tokens) — the only axis doing so.
   long_context_bench?: number;
-  // Arena v3 Session 3.2 (SHADOW) — bench-level token efficiency.
+  // Arena v3 Session 3.6 (LIVE) — block-seeded synthetic reasoning,
+  // instruction following, and invented-fact retrieval.
+  procedural_bench?: number;
+  // Arena v3 Session 3.7 (LIVE) — paraphrase-robustness on math items.
+  // Reuses the math pool (independent stream offset) but asks each item
+  // under K block-rotated paraphrase wrappers. A model that only
+  // memorizes the canonical wording fails here.
+  robustness_bench?: number;
+  // Arena v3 Session 3.2 (LIVE) — bench-level token efficiency.
   // pass_frac * length_bonus averaged over each bench with correct items.
   // Overfit-resistant: short answers only score high if they're correct.
   reasoning_density?: number;
@@ -165,17 +173,21 @@ interface RoundResult {
   reasoning_bench?: BenchBlock | null;
   knowledge_bench?: BenchBlock | null;
   ifeval_bench?: BenchBlock | null;
-  // Arena v3 Session 3 (SHADOW)
+  // Arena v3 Session 3 (LIVE)
   aime_bench?: BenchBlock | null;
   mbpp_bench?: BenchBlock | null;
   tool_use_bench?: BenchBlock | null;
   self_consistency_bench?: BenchBlock | null;
-  // Arena v3 Session 3.1 (SHADOW) — commonsense science MC.
+  // Arena v3 Session 3.1 (LIVE) — commonsense science MC.
   arc_bench?: BenchBlock | null;
-  // Arena v3 Session 3.4 (SHADOW) — adversarial factuality MC.
+  // Arena v3 Session 3.4 (LIVE) — adversarial factuality MC.
   truthful_bench?: BenchBlock | null;
-  // Arena v3 Session 3.5 (SHADOW) — needle-in-haystack long-context.
+  // Arena v3 Session 3.5 (LIVE) — needle-in-haystack long-context.
   long_context_bench?: BenchBlock | null;
+  // Arena v3 Session 3.6 (LIVE) — block-seeded procedural exact-answer tasks.
+  procedural_bench?: BenchBlock | null;
+  // Arena v3 Session 3.7 (LIVE) — paraphrase-robustness on math items.
+  robustness_bench?: BenchBlock | null;
 }
 
 interface RoundDetail {
@@ -570,8 +582,8 @@ export function TelemetryTab() {
                   <th className="pr-2">Deg</th>
                   <th className="pr-2" title="Teacher-as-judge score (PROMOTED 2026-04-24). Normalized from 1-5 rubric on 16 rotated prompts per round.">Judge</th>
                   <th className="pr-2" title="Arena v3 Session 2 (PROMOTED 2026-04-24) — worst of math/code/reason/know/ifeval absolute-correctness axes.">Bench</th>
-                  <th className="pr-2" title="Arena v3 Session 3 (SHADOW, promote +48h) — worst of aime/mbpp/tool_use/self_consistency/arc/truthful/long_ctx.">V3*</th>
-                  <th className="pr-2" title="Pareto vs king: W/L/T across all axes (shadow gate).">Pareto*</th>
+                  <th className="pr-2" title="Arena v3 Session 3 (LIVE) — worst of aime/mbpp/tool_use/self_consistency/arc/truthful/long_ctx/procedural.">V3</th>
+                  <th className="pr-2" title="Pareto vs king: W/L/T across all axes (live dethrone gate).">Pareto</th>
                   <th className="pr-2">Worst</th>
                   <th className="pr-2">vs King</th>
                 </tr>
@@ -591,7 +603,7 @@ export function TelemetryTab() {
                     ax.ifeval_bench,
                   ].filter((v): v is number => v != null);
                   const benchWorst = benchAxisValues.length > 0 ? Math.min(...benchAxisValues) : undefined;
-                  // Worst of Session 3 shadow bench axes (null-aware)
+                  // Worst of Session 3 live bench axes (null-aware)
                   const v3AxisValues = [
                     ax.aime_bench,
                     ax.mbpp_bench,
@@ -600,6 +612,8 @@ export function TelemetryTab() {
                     ax.arc_bench,
                     ax.truthful_bench,
                     ax.long_context_bench,
+                    ax.procedural_bench,
+                    ax.robustness_bench,
                   ].filter((v): v is number => v != null);
                   const v3Worst = v3AxisValues.length > 0 ? Math.min(...v3AxisValues) : undefined;
                   const pareto = r.composite?.pareto;
@@ -643,8 +657,8 @@ export function TelemetryTab() {
                           className={`pr-2 tabular-nums ${axisColor(v3Worst)} ${r.composite?.arena_v3_in_composite ? "" : "opacity-70"}`}
                           title={
                             r.composite?.arena_v3_in_composite
-                              ? "Arena v3 Session 3 — worst of aime/mbpp/tool_use/self_consistency/arc/truthful/long_ctx (live)"
-                              : "Arena v3 Session 3 — worst of aime/mbpp/tool_use/self_consistency/arc/truthful/long_ctx (SHADOW — promote +48h)"
+                              ? "Arena v3 Session 3 — worst of aime/mbpp/tool_use/self_consistency/arc/truthful/long_ctx/procedural (live)"
+                              : "Arena v3 Session 3 — worst of hard capability axes (shadow)"
                           }
                         >
                           {v3Worst == null ? "—" : v3Worst.toFixed(2)}
@@ -735,15 +749,15 @@ export function TelemetryTab() {
                                 </div>
                               </div>
                             )}
-                            {/* Arena v3 Session 3 — shadow axes */}
-                            {(r.aime_bench || r.mbpp_bench || r.tool_use_bench || r.self_consistency_bench || r.arc_bench || r.truthful_bench || r.long_context_bench) && (
+                            {/* Arena v3 Session 3 — live axes */}
+                            {(r.aime_bench || r.mbpp_bench || r.tool_use_bench || r.self_consistency_bench || r.arc_bench || r.truthful_bench || r.long_context_bench || r.procedural_bench || r.robustness_bench) && (
                               <div className="mt-1 border-t border-border/10 pt-2">
                                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground/40 mb-1">
                                   Arena v3 — capability extension <span className={r.composite?.arena_v3_in_composite ? "text-emerald-400" : "text-amber-400/80"}>
-                                    {r.composite?.arena_v3_in_composite ? "(live)" : "(shadow, promote +48h)"}
+                                    {r.composite?.arena_v3_in_composite ? "(live)" : "(shadow)"}
                                   </span>
                                 </div>
-                                <div className="grid grid-cols-2 md:grid-cols-7 gap-2 text-[10px]">
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px]">
                                   <BenchCell label="aime" b={r.aime_bench} />
                                   <BenchCell label="mbpp" b={r.mbpp_bench} />
                                   <BenchCell label="tool_use" b={r.tool_use_bench} />
@@ -751,13 +765,15 @@ export function TelemetryTab() {
                                   <BenchCell label="arc" b={r.arc_bench} />
                                   <BenchCell label="truthful" b={r.truthful_bench} />
                                   <BenchCell label="long_ctx" b={r.long_context_bench} />
+                                  <BenchCell label="procedural" b={r.procedural_bench} />
+                                  <BenchCell label="robustness" b={r.robustness_bench} />
                                 </div>
                               </div>
                             )}
                             {pareto && pareto.comparable != null && pareto.comparable > 0 && (
                               <div className="mt-1 border-t border-border/10 pt-2">
                                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground/40 mb-1">
-                                  Pareto vs king <span className="text-amber-400/80">(shadow)</span>
+                                  Pareto vs king <span className="text-emerald-400/80">(live gate)</span>
                                 </div>
                                 <div className="text-[10px] text-muted-foreground/70">
                                   <span className="text-emerald-400">{pareto.n_wins ?? 0}W</span>

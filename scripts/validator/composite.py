@@ -41,7 +41,7 @@ Status: PRODUCTION — ranking + dethrone veto.
     distilled model of a non-SOTA teacher ranked #1 but couldn't do
     grade-school math. New axes score against ground truth so
     overfitting them ⇒ SOTA small model.
-  * 2026-04-24: **Session 3 axes added in SHADOW** (promote +48h):
+  * 2026-04-24: **Session 3 axes promoted live**:
     ``aime_bench`` (AIME olympiad math), ``mbpp_bench`` (MBPP+ code),
     ``tool_use_bench`` (agentic Python tool use), and
     ``self_consistency_bench`` (majority-vote over sampled generations).
@@ -49,12 +49,10 @@ Status: PRODUCTION — ranking + dethrone veto.
     pointing towards a genuinely valuable capability. See
     ``reports/2026-04-24-arena-v3.md`` for the full Affine-Cortex-
     inspired design.
-  * 2026-04-24: **Pareto majority dominance** (SHADOW): in addition
+  * 2026-04-24: **Pareto majority dominance**: in addition
     to the worst-axis floor, a challenger that beats the king on KL
-    but loses on a majority of axes is flagged. Today informational
-    only (logged + surfaced in telemetry). Becomes part of the
-    dethrone gate when ``PARETO_DOMINANCE_GATE=1`` (after +48h
-    notice on Discord).
+    but loses on a majority of axes is blocked. This is part of the
+    dethrone gate by default after the public telemetry window.
   * 2026-04-25: Session 3.1 ``arc_bench`` (AI2 ARC-Challenge
     commonsense science MC), 3.2 ``reasoning_density`` (pass_frac ×
     length_bonus — explicitly penalizes over-think-on-trivia),
@@ -63,9 +61,10 @@ Status: PRODUCTION — ranking + dethrone veto.
     3.5 ``long_context_bench`` (procedural needle-in-haystack
     over ~1400 tokens — literally uncheatable because items are
     generated fresh every round from the block_seed, no fixed
-    dataset exists) — all SHADOW. Each targets a capability that
-    Session 2 + relative axes don't already reward, so climbing
-    them requires genuine model improvement. See
+    dataset exists), and 3.6 ``procedural_bench`` (block-seeded
+    synthetic reasoning / instruction following / factual retrieval).
+    Each targets a capability that Session 2 + relative axes don't
+    already reward, so climbing them requires genuine model improvement. See
     ``reports/2026-04-24-arena-v3.md`` and the ``MINER_FAQ.md``
     playbook.
 
@@ -131,15 +130,14 @@ BENCH_AXIS_WEIGHTS = {
 
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"
 
-# ── 2026-04-24 — Arena v3 Session 3 (SHADOW, promote +48h) ────────────
+# ── 2026-04-24 — Arena v3 Session 3 (PRODUCTION) ─────────────────────
 # Four capability-extending axes inspired by Affine Cortex's environment
 # suite. Each scores absolute correctness against a public gold source;
 # the ordering gain is in **coverage** — a model that overfits AIME
 # still had to actually learn olympiad math, a model that overfits
 # tool_use_bench still had to actually learn when to write Python.
-# Tuned weights are conservative (5-8%) so Session 2 + the relative
-# axes keep dominating the composite until the +48h public notice
-# completes. Flip ``ARENA_V3_AXES_IN_COMPOSITE=1`` to promote.
+# Tuned weights are conservative (3-6%) so Session 2 + the relative
+# axes remain important while hard capability coverage is binding.
 ARENA_V3_AXIS_WEIGHTS = {
     "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.06")),
     "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.06")),
@@ -166,11 +164,25 @@ ARENA_V3_AXIS_WEIGHTS = {
     # under 1k tokens). Cheap because we reuse _bench_generate with
     # enable_thinking=False.
     "long_context_bench":       float(os.environ.get("BENCH_LC_WEIGHT", "0.03")),
+    # Session 3.6 — procedural synthetic tasks (added 2026-04-25).
+    # Fresh every round from block_seed: arithmetic reasoning,
+    # instruction-following string transforms, and invented fact
+    # retrieval. There is no static answer key to memorize.
+    "procedural_bench":         float(os.environ.get("BENCH_PROCEDURAL_WEIGHT", "0.05")),
+    # Session 3.7 — robustness_bench (added 2026-04-25). Same items as
+    # math_bench (pulled with an independent stream offset so usually
+    # different in any given round) but each item is asked under
+    # ``BENCH_ROBUSTNESS_PERTURB_K`` block-rotated paraphrase wrappers.
+    # Directly punishes prompt-pattern memorization without re-evaling
+    # anyone — a model that overfits the canonical wording of public
+    # math items will pass math_bench and fail this. Pure string
+    # transforms, no extra LLM call.
+    "robustness_bench":         float(os.environ.get("BENCH_ROBUSTNESS_WEIGHT", "0.04")),
 }
 
-ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "0") != "0"
+ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "1") != "0"
 
-# ── 2026-04-25 — Session 3.2 reasoning_density axis (SHADOW) ──────────
+# ── 2026-04-25 — Session 3.2 reasoning_density axis (PRODUCTION) ─────
 # User-reported pathology: "models are too distilled and think for too
 # long about simple questions." The existing ``length`` axis addresses
 # chat-probe length only. Bench probes give us per-axis mean_gen_tokens
@@ -187,9 +199,7 @@ ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "0") !
 # outputs "42" with 5 tokens still needs to get the answer right on a
 # rotating pool; if it does, fine — the axis is neutral).
 #
-# SHADOW until the +48h public notice, then flip
-# ``REASONING_DENSITY_AXIS_IN_COMPOSITE=1`` to promote. Weight tuned
-# low so it's an auxiliary signal, not a dominant one.
+# Live with low weight so it is an auxiliary signal, not a dominant one.
 REASONING_DENSITY_TARGET_TOKENS = {
     "math_bench":            float(os.environ.get("RD_MATH_TARGET", "400")),
     "code_bench":            float(os.environ.get("RD_CODE_TARGET", "300")),
@@ -203,13 +213,18 @@ REASONING_DENSITY_TARGET_TOKENS = {
     "arc_bench":             float(os.environ.get("RD_ARC_TARGET", "50")),
     "truthful_bench":        float(os.environ.get("RD_TRUTHFUL_TARGET", "40")),
     "long_context_bench":    float(os.environ.get("RD_LC_TARGET", "30")),
+    "procedural_bench":      float(os.environ.get("RD_PROCEDURAL_TARGET", "50")),
+    # Session 3.7 — robustness reuses math items so target ≈ math but
+    # tighter (the perturbation prefixes inflate input slightly; a
+    # 380-token cap keeps the comparison fair across wrappers).
+    "robustness_bench":      float(os.environ.get("RD_ROBUSTNESS_TARGET", "400")),
 }
 REASONING_DENSITY_WEIGHT = float(os.environ.get("REASONING_DENSITY_WEIGHT", "0.05"))
 REASONING_DENSITY_IN_COMPOSITE = (
-    os.environ.get("REASONING_DENSITY_IN_COMPOSITE", "0") != "0"
+    os.environ.get("REASONING_DENSITY_IN_COMPOSITE", "1") != "0"
 )
 
-# ── 2026-04-25 — Session 3.3 chat_turns_probe axis (SHADOW) ───────────
+# ── 2026-04-25 — Session 3.3 chat_turns_probe axis (PRODUCTION) ──────
 # Multi-turn coherence probe. Teacher grades a 3-turn transcript on a
 # 1-5 rubric (coherence + consistency + helpfulness). Normalized to
 # [0, 1]; identical shape to judge_probe so axis values are directly
@@ -217,12 +232,11 @@ REASONING_DENSITY_IN_COMPOSITE = (
 # hold context gets flagged by this axis — directly addressing the
 # user-reported "models are too distilled, forget context" pathology.
 #
-# Shadow-first: dashboard shows it alongside judge; promote to composite
-# ranking once we've observed at least one 48h window of stable teacher
-# scoring. See MINER_FAQ.md and reports/2026-04-24-arena-v3.md.
+# Live: single-turn KL specialists should not dethrone if they cannot
+# maintain coherence over a short dialogue.
 CHAT_TURNS_AXIS_WEIGHT = float(os.environ.get("CHAT_TURNS_AXIS_WEIGHT", "0.08"))
 CHAT_TURNS_AXIS_IN_COMPOSITE = (
-    os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "0") != "0"
+    os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "1") != "0"
 )
 CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "3"))
 
@@ -236,22 +250,28 @@ BENCH_MIN_VALID = {
     "reasoning_bench": 4,
     "knowledge_bench": 4,
     "ifeval_bench": 4,
-    # Session 3 axes — small per-round budgets, so very tight floors.
-    "aime_bench": 2,
-    "mbpp_bench": 2,
-    "tool_use_bench": 2,
-    "self_consistency_bench": 2,
+    # Session 3 axes — now live, so require enough items to dampen lucky
+    # pass_frac spikes while still failing open on probe outages.
+    "aime_bench": 3,
+    "mbpp_bench": 3,
+    "tool_use_bench": 3,
+    "self_consistency_bench": 3,
     # Session 3.1 — ARC larger budget (6 per round), keep floor at 4
     # so one parse failure doesn't drop the axis.
     "arc_bench": 4,
     # Session 3.4 — TruthfulQA 4 per round, tight floor at 2.
-    "truthful_bench": 2,
+    "truthful_bench": 3,
     # Session 3.5 — long-context 3 per round, tight floor at 2 since
     # each item is expensive (~1400 input tokens).
     "long_context_bench": 2,
+    "procedural_bench": 4,
+    # Session 3.7 — robustness draws K_perturb generations per item, so
+    # a 4-item budget yields 8+ generations: hold the min_valid floor
+    # at K_perturb so a single item drop doesn't kill the axis.
+    "robustness_bench": 2,
 }
 
-COMPOSITE_SHADOW_VERSION = 9  # bumped for Session 3.5 long_context_bench
+COMPOSITE_SHADOW_VERSION = 11  # Session 3.7 — robustness_bench live
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a
@@ -262,7 +282,7 @@ COMPOSITE_SHADOW_VERSION = 9  # bumped for Session 3.5 long_context_bench
 # public notice.
 PARETO_DOMINANCE_MARGIN = float(os.environ.get("PARETO_DOMINANCE_MARGIN", "0.02"))
 PARETO_DOMINANCE_MIN_COMPARABLE = int(os.environ.get("PARETO_DOMINANCE_MIN_COMPARABLE", "5"))
-PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "0") != "0"
+PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "1") != "0"
 
 # ── King regression health (2026-04-24, SHADOW) ──────────────────────────
 # leeroyjkin (distil-97, 2026-04-24): "Why is the king safe when it scores
@@ -286,7 +306,7 @@ PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "0") != "0"
 # in the current round that also passed the structural gates.
 KING_COMPOSITE_FLOOR = float(os.environ.get("KING_COMPOSITE_FLOOR", "0.20"))
 KING_REGRESSION_MIN_STREAK = int(os.environ.get("KING_REGRESSION_MIN_STREAK", "3"))
-KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "0") != "0"
+KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 
 # ── Teacher sanity gate (2026-04-23) ──────────────────────────────────────
 # For each ranking axis we can optionally compute the axis value for the
@@ -519,6 +539,14 @@ def _axis_long_context_bench(student: dict) -> float | None:
     return _axis_bench_pass_frac(student, "long_context_bench")
 
 
+def _axis_procedural_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "procedural_bench")
+
+
+def _axis_robustness_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "robustness_bench")
+
+
 def _axis_reasoning_density(student: dict) -> float | None:
     """Reasoning-density axis (Session 3.2, 2026-04-25).
 
@@ -646,6 +674,8 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "arc_bench": _axis_arc_bench(student),
         "truthful_bench": _axis_truthful_bench(student),
         "long_context_bench": _axis_long_context_bench(student),
+        "procedural_bench": _axis_procedural_bench(student),
+        "robustness_bench": _axis_robustness_bench(student),
         "reasoning_density": _axis_reasoning_density(student),
     }
 
