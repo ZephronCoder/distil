@@ -53,6 +53,12 @@ SCORES_FILE = "scores.json"
 FAILURES_FILE = "failures.json"
 DISQUALIFIED_FILE = "disqualified.json"
 EVALUATED_UIDS_FILE = "evaluated_uids.json"
+# 2026-04-25 (distil-97): per-UID canonical composite record. Each entry is
+# the absolute composite from the single eval that UID's current commitment
+# received. Used by SINGLE_EVAL_MODE to rank kings cross-round without
+# re-evaluating models, and by the API/dashboard to surface stable per-UID
+# scores. Format: {uid_str: {worst, weighted, axes, model, revision, block, ts}}.
+COMPOSITE_SCORES_FILE = "composite_scores.json"
 H2H_LATEST_FILE = "h2h_latest.json"
 H2H_HISTORY_FILE = "h2h_history.json"
 MODEL_SCORE_HISTORY_FILE = "model_score_history.json"
@@ -131,6 +137,10 @@ class ValidatorState:
         self.failure_models: dict[str, str] = {}  # UID -> model_name at time of failure
         self.dq_reasons: dict[str, str] = {}
         self.evaluated_uids: set[str] = set()
+        # Canonical absolute composite per UID (one-eval-per-commitment).
+        # uid_str -> {"worst", "weighted", "axes", "model", "revision",
+        #             "block", "ts", "n_axes"}.
+        self.composite_scores: dict[str, dict] = {}
 
         # Head-to-head state
         self.h2h_latest: dict = {}
@@ -172,6 +182,9 @@ class ValidatorState:
         raw = _load_json(self._path(EVALUATED_UIDS_FILE), [])
         self.evaluated_uids = set(raw) if isinstance(raw, list) else set()
 
+        raw_comp = _load_json(self._path(COMPOSITE_SCORES_FILE), {})
+        self.composite_scores = raw_comp if isinstance(raw_comp, dict) else {}
+
         self.h2h_latest = _load_json(self._path(H2H_LATEST_FILE), {})
         raw_history = _load_json(self._path(H2H_HISTORY_FILE), [])
         self.h2h_history = raw_history if isinstance(raw_history, list) else []
@@ -207,6 +220,7 @@ class ValidatorState:
         atomic_json_write(self._path(DISQUALIFIED_FILE), self.dq_reasons, indent=2)
         atomic_json_write(self._path(EVALUATED_UIDS_FILE), list(self.evaluated_uids))
         atomic_json_write(self._path(UID_HOTKEY_MAP_FILE), self.uid_hotkey_map)
+        atomic_json_write(self._path(COMPOSITE_SCORES_FILE), self.composite_scores, indent=2)
 
     def save_h2h(self):
         """Persist head-to-head state files."""
