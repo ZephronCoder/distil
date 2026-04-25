@@ -374,10 +374,18 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
         state_dir=state_dir,
     )
 
+    # 2026-04-25 (sn97): pass resume_pod_eval so run_eval_on_pod skips the
+    # cleanup + start path and instead attaches to the existing pod process.
+    # Without this, every validator restart mid-eval re-entered cleanup,
+    # killed the in-flight process, and started over from scratch (regression
+    # observed lost ~75 min of student scoring during a 2026-04-25 17:00 UTC
+    # systemctl restart).
+    resume_pod_eval = cr.get("pod_eval") if isinstance(cr.get("pod_eval"), dict) else None
     results = run_eval_on_pod(
         pod, models_to_eval, king_uid, n_prompts, prompt_texts,
         state, is_full_eval, use_vllm, eval_script,
         block_seed=current_block,
+        resume_pod_eval=resume_pod_eval,
     )
     if results is None:
         logger.warning("Resumed eval did not produce usable results — clearing round state")
