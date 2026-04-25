@@ -4,6 +4,7 @@ import os
 from eval.scoring import disqualify
 from eval.state import ValidatorState
 from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
+from scripts.validator import single_eval as single_eval_mod
 from scripts.validator.single_eval import (
     bootstrap_composite_from_h2h,
     evict_stale_evaluated_uids,
@@ -84,9 +85,42 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                 continue
             if uid_str in state.composite_scores:
                 continue
-            if uid_str in state.evaluated_uids and uid_str in state.scores:
+            # Strict no-re-eval: a UID in evaluated_uids has been through a
+            # full round once already. Even if its score row got dropped
+            # later (DQ revert, partial-state reset, etc.), per single-eval
+            # policy it should not run again unless its commitment changed
+            # — and ``evict_stale_evaluated_uids`` already pulled out the
+            # commitment-changed entries above. The previous filter required
+            # both ``evaluated_uids`` AND ``scores`` to be set, which let
+            # historical UIDs sneak back into the queue when state was
+            # partially rebuilt.
+            if uid_str in state.evaluated_uids:
                 continue
             challengers[uid] = info
+        # FIFO cap: oldest commitment first. Without this the planner
+        # queues every pending new commit at once and rounds bloat to 8h
+        # of pod compute. The cap forces rotation across rounds so each
+        # individual round stays in the 60–75 min target. We read the
+        # live cap from the single_eval module each call so unit tests
+        # (and operators editing the env at runtime) can override it
+        # without restarting the planner.
+        cap = int(single_eval_mod.SINGLE_EVAL_MAX_PER_ROUND)
+        if challengers and cap > 0 and len(challengers) > cap:
+            ordered = sorted(
+                challengers.items(),
+                key=lambda kv: (
+                    int((kv[1] or {}).get("commit_block") or 0),
+                    kv[0],
+                ),
+            )
+            kept = dict(ordered[:cap])
+            deferred = [uid for uid, _ in ordered[cap:]]
+            logger.info(
+                f"single-eval: capping round at {cap} of {len(challengers)} "
+                f"pending new commitments (FIFO by commit_block); deferred "
+                f"to next round: {deferred}"
+            )
+            challengers = kept
         if challengers:
             logger.info(
                 f"single-eval: {len(challengers)} new commitment(s) to evaluate "

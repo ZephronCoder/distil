@@ -272,14 +272,34 @@ class ValidatorState:
         atomic_json_write(self._path(CURRENT_ROUND_FILE), data or self.current_round)
 
     def clear_round(self):
-        """Clear round state after successful completion."""
+        """Clear round state after successful completion.
+
+        IMPORTANT: also resets the in-memory ``self.current_round`` dict.
+        Without that step the next epoch's ``_detect_resumable_round`` reads
+        the stale in-memory copy (still pointing at a dead pod ``run_dir``),
+        wrongly enters resume mode, and then aborts with
+        ``Resume: king UID … is no longer valid`` — which on 2026-04-25
+        repeatedly discarded fully-completed single-eval rounds. The on-disk
+        unlink without the in-memory reset was the actual root cause behind
+        commit 0b82081's residual recurrence.
+        """
         path = self._path(CURRENT_ROUND_FILE)
         if path.exists():
             path.unlink()
+        self.current_round = {}
 
     def save_top4(self):
         """Persist top-4 leaderboard."""
         atomic_json_write(self._path(TOP4_LEADERBOARD_FILE), self.top4_leaderboard, indent=2)
+
+    def save_composite_scores(self):
+        """Persist canonical per-UID composite scores immediately.
+
+        Used by single-eval bootstrap and merge so the validator can crash
+        or restart at any point without losing the ranking table. Cheaper
+        than ``save()`` (one file vs ~13).
+        """
+        atomic_json_write(self._path(COMPOSITE_SCORES_FILE), self.composite_scores, indent=2)
 
     def save_announcement(self, data: dict):
         """Write a pending announcement for async Discord posting.

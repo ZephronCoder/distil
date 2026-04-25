@@ -485,10 +485,21 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
     # ~90 min of evaluation by aborting here (regression observed
     # 2026-04-25 18:26 UTC, lost the round that started 16:57 UTC).
     if king_uid is not None and king_uid not in models_to_eval:
+        # IMPORTANT: single_eval exposes a *function* `is_single_eval_mode()`, not
+        # a `SINGLE_EVAL_MODE` constant. The previous getattr-with-default returned
+        # False even when the module imported cleanly, defeating the guard. We now
+        # call the function if available and fall back to the env var either way
+        # (handles both ImportError and AttributeError without silently swallowing
+        # the policy flag).
+        single_eval_active = False
         try:
             from scripts.validator import single_eval as _single_eval_mod
-            single_eval_active = bool(getattr(_single_eval_mod, "SINGLE_EVAL_MODE", False))
+            checker = getattr(_single_eval_mod, "is_single_eval_mode", None)
+            if callable(checker):
+                single_eval_active = bool(checker())
         except Exception:
+            single_eval_active = False
+        if not single_eval_active:
             single_eval_active = bool(int(os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
         if single_eval_active:
             logger.info(

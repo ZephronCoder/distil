@@ -3,6 +3,7 @@ State file management: H2H state, scores, commitments, leaderboard updates.
 """
 import json
 import logging
+import os
 import time
 
 from eval.state import ValidatorState, atomic_json_write
@@ -179,10 +180,33 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
     # See MIN_PROMPTS_FOR_LEADERBOARD docstring above for the 2026-04-24
     # Pete-warned-us incident this prevents.
     king_prompts_completed = len(king_per_prompt) if king_per_prompt else 0
-    round_is_canonical = (
-        king_prompts_completed >= MIN_PROMPTS_FOR_LEADERBOARD
-        and not (king_uid is not None and king_h2h_kl is None)
-    )
+    # SINGLE_EVAL_MODE: the king is intentionally absent from this round
+    # (cross-round composite selector instead). king_uid is None and king
+    # never gets paired prompts — so the legacy "king must complete N
+    # prompts" canonicality check would mark every single-eval round as
+    # PARTIAL, refuse to advance h2h_latest.block, and trick
+    # _detect_resumable_round into treating the *just-applied* round as
+    # still in flight on the next epoch (the 2026-04-25 abort loop).
+    try:
+        from scripts.validator.single_eval import is_single_eval_mode as _is_single
+        single_eval_active = bool(_is_single())
+    except Exception:
+        single_eval_active = bool(int(os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
+    # In single-eval mode the previous-round king is *intentionally* absent
+    # from this round's prompt evaluation (cross-round composite picks the
+    # next king). The legacy paired-prompt threshold is meaningless here, so
+    # treat the round as canonical as long as the actual challengers
+    # produced results. Detection: single-eval on AND king has zero paired
+    # prompts (which is exactly the deliberate-absence signal because
+    # process_results would have nulled king_uid before scoring).
+    single_eval_kingless = single_eval_active and king_prompts_completed == 0
+    if single_eval_kingless:
+        round_is_canonical = bool(h2h_results)
+    else:
+        round_is_canonical = (
+            king_prompts_completed >= MIN_PROMPTS_FOR_LEADERBOARD
+            and not (king_uid is not None and king_h2h_kl is None)
+        )
     if not round_is_canonical:
         logger.warning(
             f"🚧 Round at block {current_block} is PARTIAL "
@@ -190,6 +214,12 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
             f"threshold={MIN_PROMPTS_FOR_LEADERBOARD}). h2h_history entry will "
             f"be marked `_invalid_for_leaderboard=True`; skipping "
             f"top4_leaderboard/scores/h2h_tested_against_king writes."
+        )
+    elif single_eval_kingless:
+        logger.info(
+            f"single-eval round at block {current_block}: king deliberately "
+            f"absent (cross-round composite selection); treating round as "
+            f"canonical with {len(h2h_results)} challenger results."
         )
 
     h2h_round = {

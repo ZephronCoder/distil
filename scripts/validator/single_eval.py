@@ -52,6 +52,23 @@ SINGLE_EVAL_DETHRONE_MARGIN = float(
 )
 
 
+# Hard ceiling on how many never-evaluated commitments enter a single round.
+# When a backlog of new commits accumulates faster than rounds can consume
+# them (e.g. after a 12 h restart loop), the planner would otherwise queue
+# 20+ models per round and each round bloats to 8+ hours of pod compute.
+# That hurts everyone: miners can't see results, base-model regression
+# checks slow to a crawl, and a single bad node in the queue takes the
+# whole round down with it. The cap forces FIFO rotation by commit_block
+# (oldest commitment first), so every miner is evaluated within a few
+# rounds without a single round being a multi-hour wallclock fire.
+#
+# Default 10 keeps round target around 60–75 min on H200 with shadow axes
+# off. Override per-deployment with ``SINGLE_EVAL_MAX_PER_ROUND`` env.
+SINGLE_EVAL_MAX_PER_ROUND = int(
+    os.environ.get("SINGLE_EVAL_MAX_PER_ROUND", "10")
+)
+
+
 def _commit_signature(info: dict | None) -> tuple:
     """Return a tuple that uniquely identifies a commitment.
 
@@ -73,36 +90,66 @@ def commitment_changed(
 ) -> bool:
     """True iff the stored composite record describes a different commitment.
 
-    Missing record → "changed" (we have nothing on file). Records older than
-    the new commitment → changed. Same model/revision/block → unchanged.
+    Missing record → "changed" (we have nothing on file).
+
+    Records produced by ``merge_composite_scores`` carry the UID's actual
+    on-chain ``commit_block`` and ``revision`` — strict tuple match.
+
+    Records produced by ``bootstrap_composite_from_h2h`` come from
+    ``state.h2h_latest`` which only records the H2H round block (not the
+    miner's commit_block) and frequently has ``revision=None`` for
+    commitments that were stored without an explicit pin. We can only
+    trust the **model name** for bootstrap records — comparing on block
+    or revision evicts every seeded UID on first restart, which is what
+    happened during round 8045570 (2026-04-25): all 8 prior-king-era
+    UIDs were re-queued for evaluation and the round ballooned to 30+
+    students. A model swap is still detected and re-eval'd.
     """
     if not composite_record:
         return True
-    stored = (
-        str(composite_record.get("model") or ""),
-        str(composite_record.get("revision") or "main"),
-        composite_record.get("block"),
-    )
-    return stored != _commit_signature(current_info)
+    cur = _commit_signature(current_info)
+    stored_model = str(composite_record.get("model") or "")
+    if stored_model != cur[0]:
+        return True
+    if composite_record.get("_bootstrapped"):
+        return False
+    stored_rev = str(composite_record.get("revision") or "main")
+    if stored_rev != cur[1]:
+        return True
+    return composite_record.get("block") != cur[2]
 
 
 def evict_stale_evaluated_uids(state, valid_models: dict) -> list[str]:
-    """Remove ``evaluated_uids`` entries whose stored commitment no longer
-    matches the current on-chain commitment.
+    """Remove stale composite + evaluated_uids entries when on-chain
+    commitments have moved since the last eval.
 
-    Returns the list of evicted UID strings (for logging). The single-eval
-    planner relies on ``evaluated_uids`` as the "seen this commitment" set,
-    so this prevents a re-committed miner from being silently skipped.
+    Iterates **every** UID in ``valid_models`` that has either an
+    ``evaluated_uids`` flag or a ``composite_scores`` row, and drops the
+    bookkeeping if the stored commitment no longer matches. Without
+    this, a UID whose only stored row is a bootstrapped composite (no
+    evaluated_uids entry) silently stays "filtered" forever even after
+    the miner re-uploads — exactly the bug surfaced 2026-04-25 round
+    8046286, where UID 12 re-committed natrium43/p1 → natrium43/t2 but
+    the stale bootstrap record kept it out of the queue.
+
+    Returns the list of evicted UID strings (for logging).
     """
     evicted: list[str] = []
+    composite_scores = state.composite_scores or {}
     for uid, info in valid_models.items():
         uid_str = str(uid)
-        if uid_str not in state.evaluated_uids:
+        in_eu = uid_str in state.evaluated_uids
+        in_cs = uid_str in composite_scores
+        if not (in_eu or in_cs):
             continue
-        stored = (state.composite_scores or {}).get(uid_str)
-        if stored is None:
+        stored = composite_scores.get(uid_str)
+        if stored is None and in_eu:
+            # No composite to compare against — leave evaluated_uids alone.
+            # Edge case: precheck-DQ'd UIDs that never got a composite row.
+            # Re-commits will still be picked up because the DQ row carries
+            # the new commit_block; the planner ignores DQ'd UIDs anyway.
             continue
-        if commitment_changed(stored, info):
+        if stored is not None and commitment_changed(stored, info):
             state.evaluated_uids.discard(uid_str)
             state.scores.pop(uid_str, None)
             state.composite_scores.pop(uid_str, None)
@@ -112,6 +159,10 @@ def evict_stale_evaluated_uids(state, valid_models: dict) -> list[str]:
             f"single-eval: evicted {len(evicted)} stale evaluated UIDs "
             f"(re-committed since last eval): {evicted}"
         )
+        try:
+            persist_composite_scores(state)
+        except Exception as exc:
+            logger.warning(f"single-eval: failed to persist composite_scores after eviction (non-fatal): {exc}")
     return evicted
 
 
@@ -161,6 +212,11 @@ def merge_composite_scores(
         }
         state.composite_scores[uid_str] = record
         n_updated += 1
+    if n_updated:
+        try:
+            persist_composite_scores(state)
+        except Exception as exc:
+            logger.warning(f"single-eval: failed to persist composite_scores after merge (non-fatal): {exc}")
     return n_updated
 
 
@@ -191,6 +247,16 @@ def _is_eligible_uid(
     return not is_disqualified(uid, hotkey, dq_reasons, commit_block=commit_block)
 
 
+# Records produced before Arena v3 promotion (n_axes=3: on_policy_rkl, kl,
+# capability) carry artificially high ``composite.worst`` because they
+# never had to pass AIME/MBPP/tool-use/etc — those axes simply weren't
+# scored. Mixing them into king selection lets a long-dormant 3-axis UID
+# leapfrog a current 20-axis incumbent whose worst sits at 0 because of
+# one hard axis. We require modern records to carry at least this many
+# axes to participate in king selection.
+_KING_SELECTION_MIN_AXES = 10
+
+
 def select_king_by_composite(
     state,
     valid_models: dict,
@@ -201,38 +267,97 @@ def select_king_by_composite(
 
     Returns (uid, record) or (None, None) when no eligible composite-scored
     UID remains. ``record`` is the entry from ``state.composite_scores``.
+
+    Selection order (designed to keep the crown stable across the bootstrap
+    path described in Discord 2026-04-25 — the broader history bootstrap
+    was reseeding old 3-axis records that out-rank current 20-axis ones):
+
+    1. **Trust the prior round's king** — if ``h2h_latest.king_uid`` exists,
+       is eligible, and has a stored composite record, return them. The
+       paired-KL test already chose this UID; we shouldn't dethrone via
+       composite comparison until a real future round produces a clearly
+       better challenger on the *current* schema.
+    2. Otherwise, pick the UID with highest ``worst`` from records that
+       were scored on the current Arena v3 schema (``n_axes >= 10``).
+       Legacy 3-axis bootstrap records are skipped to avoid the apples-
+       to-oranges comparison.
+    3. Tie-breakers: prior-king bonus → ``weighted`` → UID.
+    4. If no schema-current records are available (e.g. very early state),
+       fall back to **all** records using the same tiebreakers — better
+       to crown a stale legacy king than no king at all.
     """
-    candidates: list[tuple[float, float, int]] = []
     composite_scores = getattr(state, "composite_scores", {}) or {}
-    for uid_str, rec in composite_scores.items():
-        try:
-            uid = int(uid_str)
-        except (TypeError, ValueError):
-            continue
-        if not _is_eligible_uid(
-            state, uid, valid_models, state.dq_reasons,
+    prior_king_uid = None
+    h2h_latest = getattr(state, "h2h_latest", None) or {}
+    try:
+        prior_king_uid = (
+            int(h2h_latest.get("king_uid"))
+            if h2h_latest.get("king_uid") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        prior_king_uid = None
+
+    # Fast path: prior round's king is eligible and has composite data.
+    if prior_king_uid is not None:
+        prior_record = composite_scores.get(str(prior_king_uid))
+        if prior_record and _is_eligible_uid(
+            state, prior_king_uid, valid_models, state.dq_reasons,
             uid_to_hotkey, commitments,
         ):
-            continue
-        worst = rec.get("worst")
-        if worst is None:
-            continue
-        try:
-            worst_f = float(worst)
-        except (TypeError, ValueError):
-            continue
-        if math.isnan(worst_f) or math.isinf(worst_f):
-            continue
-        weighted = rec.get("weighted")
-        try:
-            weighted_f = float(weighted) if weighted is not None else 0.0
-        except (TypeError, ValueError):
-            weighted_f = 0.0
-        candidates.append((worst_f, weighted_f, uid))
+            logger.info(
+                f"single-eval: preserving prior king UID {prior_king_uid} from "
+                f"h2h_latest (worst={prior_record.get('worst')}, "
+                f"n_axes={prior_record.get('n_axes')})"
+            )
+            return prior_king_uid, prior_record
+
+    def _build_candidates(min_axes: int) -> list[tuple[float, int, float, int]]:
+        out: list[tuple[float, int, float, int]] = []
+        for uid_str, rec in composite_scores.items():
+            try:
+                uid = int(uid_str)
+            except (TypeError, ValueError):
+                continue
+            if not _is_eligible_uid(
+                state, uid, valid_models, state.dq_reasons,
+                uid_to_hotkey, commitments,
+            ):
+                continue
+            n_axes = rec.get("n_axes")
+            try:
+                n_axes_i = int(n_axes) if n_axes is not None else 0
+            except (TypeError, ValueError):
+                n_axes_i = 0
+            if n_axes_i < min_axes:
+                continue
+            worst = rec.get("worst")
+            if worst is None:
+                continue
+            try:
+                worst_f = float(worst)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(worst_f) or math.isinf(worst_f):
+                continue
+            weighted = rec.get("weighted")
+            try:
+                weighted_f = float(weighted) if weighted is not None else 0.0
+            except (TypeError, ValueError):
+                weighted_f = 0.0
+            prior_bonus = 1 if uid == prior_king_uid else 0
+            out.append((worst_f, prior_bonus, weighted_f, uid))
+        return out
+
+    candidates = _build_candidates(_KING_SELECTION_MIN_AXES)
+    if not candidates:
+        # No schema-current records — fall back to legacy behaviour so
+        # we still produce a king on a freshly-bootstrapped state.
+        candidates = _build_candidates(0)
     if not candidates:
         return None, None
     candidates.sort(reverse=True)
-    _, _, top_uid = candidates[0]
+    _, _, _, top_uid = candidates[0]
     return top_uid, composite_scores.get(str(top_uid))
 
 
@@ -263,18 +388,12 @@ def resolve_dethrone(
     return float(ch_worst) > threshold
 
 
-def bootstrap_composite_from_h2h(state) -> int:
-    """Seed ``state.composite_scores`` from the latest canonical H2H round.
+def _seed_one_h2h_round(state, latest: dict) -> int:
+    """Seed composite_scores from a single H2H round payload.
 
-    Used once on first switch to single-eval mode so the king-by-composite
-    selector has data to compare against. Reads ``state.h2h_latest.results``
-    (which contains composite annotations for every scored UID in that
-    round) and writes one record per non-DQ, non-reference row that isn't
-    already populated. Returns the number of seeded records.
+    Skips any UID already present in ``state.composite_scores`` (older rounds
+    must not overwrite newer data). Returns count of newly seeded records.
     """
-    if not isinstance(getattr(state, "composite_scores", None), dict):
-        state.composite_scores = {}
-    latest = getattr(state, "h2h_latest", None) or {}
     rows = latest.get("results") or []
     block = latest.get("block")
     seeded = 0
@@ -307,9 +426,68 @@ def bootstrap_composite_from_h2h(state) -> int:
             "_bootstrapped": True,
         }
         seeded += 1
+    return seeded
+
+
+def bootstrap_composite_from_h2h(state) -> int:
+    """Seed ``state.composite_scores`` from every canonical H2H round we have.
+
+    Originally only seeded from ``state.h2h_latest`` (one round = ~8 UIDs).
+    But h2h_history contains every previous round, often with 60+ unique UIDs
+    that were already scored before single-eval mode existed. Without those,
+    a re-committed validator would re-evaluate 70+ historically-scored UIDs
+    on the first round after restart — exactly the opposite of "one
+    eval per commitment" (see Discord 2026-04-25, sebastian + leeroyjkin).
+
+    Iteration order is newest → oldest so the most recent score for any UID
+    wins (older rounds cannot overwrite a UID that's already been seeded
+    from a more recent round). Persists immediately so a second restart
+    can read from disk instead of re-walking history.
+
+    Returns the total number of seeded records across all sources.
+    """
+    if not isinstance(getattr(state, "composite_scores", None), dict):
+        state.composite_scores = {}
+    latest = getattr(state, "h2h_latest", None) or {}
+    seeded_latest = _seed_one_h2h_round(state, latest) if latest else 0
+    history = getattr(state, "h2h_history", None) or []
+
+    def _round_block(entry: dict) -> int:
+        try:
+            return int(entry.get("block") or entry.get("round_block") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    seeded_history = 0
+    for entry in sorted(history, key=_round_block, reverse=True):
+        seeded_history += _seed_one_h2h_round(state, entry or {})
+    seeded = seeded_latest + seeded_history
     if seeded:
         logger.info(
-            f"single-eval bootstrap: seeded {seeded} composite_scores "
-            f"records from latest H2H (block={block})"
+            f"single-eval bootstrap: seeded {seeded} composite_scores records "
+            f"({seeded_latest} from latest H2H block={latest.get('block')}, "
+            f"{seeded_history} from {len(history)} historical rounds)"
         )
+        try:
+            persist_composite_scores(state)
+        except Exception as exc:
+            logger.warning(f"single-eval: failed to persist composite_scores after bootstrap (non-fatal): {exc}")
     return seeded
+
+
+def persist_composite_scores(state) -> None:
+    """Write ``state.composite_scores`` to disk immediately.
+
+    Called eagerly after bootstrap and after every ``merge_composite_scores``
+    so a validator restart never loses the canonical ranking table. The
+    full ``state.save()`` path is also fine, but it only runs at end of
+    round; if a round crashes mid-flight the bootstrap+merge work otherwise
+    evaporates.
+    """
+    save_fn = getattr(state, "save_composite_scores", None)
+    if callable(save_fn):
+        save_fn()
+        return
+    save_state = getattr(state, "save", None)
+    if callable(save_state):
+        save_state()
