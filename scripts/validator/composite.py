@@ -297,7 +297,7 @@ BENCH_MIN_VALID = {
     "noise_resistance_bench": 2,
 }
 
-COMPOSITE_SHADOW_VERSION = 12  # Session 3.7 — noise_resistance_bench live
+COMPOSITE_SHADOW_VERSION = 13  # Session 3.8 — long_context_bench confuser-rejection grader (lenient substring match → strict gold-AND-no-confuser). Old records' lc_bench=1.0 is gameable; v13+ records use the hardened grader.
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a

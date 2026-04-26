@@ -32,6 +32,8 @@ import os
 import time
 from typing import Any
 
+from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
+
 logger = logging.getLogger("distillation.remote_validator")
 
 
@@ -293,6 +295,18 @@ def _is_eligible_uid(
 # gate are still tracked, just not eligible for kingship.
 _KING_SELECTION_MIN_AXES = 17
 
+# Schema-version gate. Records stamped with ``version >= MIN_VERSION`` were
+# graded by the current scoring code; older records (``version < MIN_VERSION``
+# or ``version is None``) come from a stale grader. The latest schema bump
+# (v13) was triggered by the long_context_bench confuser-rejection grader: pre-
+# v13 records have ``long_context_bench=1.0`` because the lenient substring
+# matcher rewarded "dump every 7-char code" attacks. Mixing them with v13
+# records would let a stale-grader UID inherit the crown via inflated lc/wgt
+# scores. The selector therefore filters to v_current first and only falls
+# through to legacy records when no v_current candidates exist (graceful
+# bootstrap so we don't go kingless during the v12→v13 transition).
+_KING_SELECTION_MIN_VERSION = COMPOSITE_SHADOW_VERSION
+
 
 def select_king_by_composite(
     state,
@@ -310,9 +324,13 @@ def select_king_by_composite(
     returned the prior king unconditionally on eligibility, which silently
     locked the crown forever once any king was crowned):
 
-    1. Build candidate list from records on the current Arena v3 schema
-       (``n_axes >= _KING_SELECTION_MIN_AXES``). Falls through to legacy
-       records only if no schema-current records exist.
+    1. Build candidate list with a three-tier fallback:
+       - Tier 1: ``n_axes >= _KING_SELECTION_MIN_AXES`` AND
+         ``version >= _KING_SELECTION_MIN_VERSION`` — schema-current AND
+         graded by the current scoring code. Strongly preferred.
+       - Tier 2: ``n_axes >= _KING_SELECTION_MIN_AXES`` (any version) —
+         bridges the transition window after a schema bump.
+       - Tier 3: any record with a ``worst`` score — bootstrap.
     2. Sort candidates by ``(worst desc, weighted desc, prior_bonus desc,
        uid desc)``. The prior-king bonus is a tiebreaker that activates
        only on exact ties — it never overrides a measurably-better
@@ -341,7 +359,10 @@ def select_king_by_composite(
     except (TypeError, ValueError):
         prior_king_uid = None
 
-    def _build_candidates(min_axes: int) -> list[tuple[float, int, float, int]]:
+    def _build_candidates(
+        min_axes: int,
+        min_version: int | None = None,
+    ) -> list[tuple[float, int, float, int]]:
         out: list[tuple[float, int, float, int]] = []
         for uid_str, rec in composite_scores.items():
             try:
@@ -353,6 +374,14 @@ def select_king_by_composite(
                 uid_to_hotkey, commitments,
             ):
                 continue
+            if min_version is not None:
+                rec_version = rec.get("version")
+                try:
+                    rec_version_i = int(rec_version) if rec_version is not None else -1
+                except (TypeError, ValueError):
+                    rec_version_i = -1
+                if rec_version_i < min_version:
+                    continue
             n_axes = rec.get("n_axes")
             try:
                 n_axes_i = int(n_axes) if n_axes is not None else 0
@@ -389,10 +418,20 @@ def select_king_by_composite(
             out.append((worst_f, weighted_f, prior_bonus, uid))
         return out
 
-    candidates = _build_candidates(_KING_SELECTION_MIN_AXES)
+    # Tier 1 — schema-current AND grader-current records. These were graded
+    # under the latest scoring code (e.g. the long_context_bench confuser-
+    # rejection grader). Strongly preferred so a stale-grader record can't
+    # inherit kingship from inflated bench scores.
+    candidates = _build_candidates(
+        _KING_SELECTION_MIN_AXES, min_version=_KING_SELECTION_MIN_VERSION,
+    )
     if not candidates:
-        # No schema-current records — fall back to legacy behaviour so
-        # we still produce a king on a freshly-bootstrapped state.
+        # Tier 2 — schema-current shape, any grader version. Used during the
+        # transition window after a schema bump while v_current records are
+        # still being collected, so we don't go kingless.
+        candidates = _build_candidates(_KING_SELECTION_MIN_AXES)
+    if not candidates:
+        # Tier 3 — any record with a worst score. Bootstrap fallback.
         candidates = _build_candidates(0)
     if not candidates:
         return None, None
@@ -400,24 +439,38 @@ def select_king_by_composite(
     _, _, _, top_uid = candidates[0]
     top_record = composite_scores.get(str(top_uid))
 
-    # Stability bias: if the prior king is in the candidate pool and the
-    # top candidate hasn't beaten them by ``SINGLE_EVAL_DETHRONE_MARGIN``,
-    # keep the prior king. This is the dethrone gate: noise-level
-    # differences shouldn't flip the crown, but a clear win should.
-    if (
-        prior_king_uid is not None
-        and top_uid != prior_king_uid
-        and any(uid == prior_king_uid for _, _, _, uid in candidates)
-    ):
+    # Stability bias: dethrone gate. A challenger must beat the prior king
+    # by ``SINGLE_EVAL_DETHRONE_MARGIN`` on either ``worst`` or ``weighted``
+    # (see ``resolve_dethrone``); noise-level differences shouldn't flip
+    # the crown, but a clear win should.
+    #
+    # We deliberately apply the gate even when the prior king isn't in the
+    # active candidate tier (e.g. they're a v12 record after a schema bump
+    # to v13). The version-filter restricts which records *compete* for
+    # kingship, but it shouldn't strip the crown without measurement: if
+    # the prior king has a stored composite at all and is still eligible
+    # to hold the crown (not deregistered/DQ'd), they get a margin check.
+    # Otherwise a single v13 challenger could grab the crown unchecked
+    # during the transition window.
+    if prior_king_uid is not None and top_uid != prior_king_uid:
         prior_record = composite_scores.get(str(prior_king_uid))
-        if prior_record and not resolve_dethrone(
+        prior_eligible = (
+            prior_record is not None
+            and prior_record.get("worst") is not None
+            and _is_eligible_uid(
+                state, prior_king_uid, valid_models, state.dq_reasons,
+                uid_to_hotkey, commitments,
+            )
+        )
+        if prior_eligible and not resolve_dethrone(
             prior_king_uid, prior_record, top_uid, top_record,
         ):
             logger.info(
                 f"single-eval: top candidate UID {top_uid} (worst={top_record.get('worst')}, "
-                f"weighted={top_record.get('weighted')}) did not clear dethrone margin against "
-                f"prior king UID {prior_king_uid} (worst={prior_record.get('worst')}, "
-                f"weighted={prior_record.get('weighted')}); preserving prior king."
+                f"weighted={top_record.get('weighted')}, version={top_record.get('version')}) "
+                f"did not clear dethrone margin against prior king UID {prior_king_uid} "
+                f"(worst={prior_record.get('worst')}, weighted={prior_record.get('weighted')}, "
+                f"version={prior_record.get('version')}); preserving prior king."
             )
             return prior_king_uid, prior_record
     return top_uid, top_record

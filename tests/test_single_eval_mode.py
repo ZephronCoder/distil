@@ -706,6 +706,102 @@ class SelectKingByCompositeTests(unittest.TestCase):
         uid, _ = single_eval.select_king_by_composite(state, valid_models)
         self.assertEqual(uid, 111)
 
+    def test_v_current_records_preferred_over_legacy(self):
+        """2026-04-26 schema bump (v12 → v13: long_context_bench grader hardened).
+        Pre-v13 records have lc_bench=1.0 because the lenient substring grader
+        rewarded "dump every code" attacks; post-v13 records use the strict
+        confuser-rejection grader. King selection must prefer v_current
+        records when both tiers exist, otherwise the inflated lc/wgt scores
+        of v12 records would block a competing v13 challenger.
+
+        Setup mirrors the early-v13 transition: UID 48 has a higher worst
+        and weighted under the OLD grader (v12), UID 111 has slightly lower
+        scores under the NEW grader (v13). Without version filtering, UID 48
+        wins. With it, UID 111 wins because v13 is the only tier with
+        candidates that both sides can be fairly compared on."""
+        state = _FakeState()
+        state.h2h_latest = {}
+        v_current = single_eval._KING_SELECTION_MIN_VERSION
+        state.composite_scores = {
+            "48":  {"worst": 0.50, "weighted": 0.70, "n_axes": 20, "version": v_current - 1},
+            "111": {"worst": 0.40, "weighted": 0.60, "n_axes": 20, "version": v_current},
+        }
+        valid_models = {48: {"model": "a"}, 111: {"model": "b"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 111)
+
+    def test_falls_through_when_no_v_current_records(self):
+        """Transition window: after a schema bump, v_current records don't
+        exist yet. Selector must gracefully fall through to schema-current
+        legacy records (Tier 2) so we don't go kingless."""
+        state = _FakeState()
+        state.h2h_latest = {}
+        v_current = single_eval._KING_SELECTION_MIN_VERSION
+        state.composite_scores = {
+            "48":  {"worst": 0.50, "weighted": 0.70, "n_axes": 20, "version": v_current - 1},
+            "111": {"worst": 0.30, "weighted": 0.50, "n_axes": 20, "version": v_current - 2},
+        }
+        valid_models = {48: {"model": "a"}, 111: {"model": "b"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 48)
+
+    def test_prior_king_v12_gets_dethrone_check_against_v13_challenger(self):
+        """Critical guarantee: when the only candidate-pool records are v13
+        (after the schema bump fully takes hold) but the prior king is
+        still v12, they MUST get a margin check before losing the crown.
+        Otherwise a single weak v13 challenger steals the throne by
+        default during the transition.
+
+        Prior king UID 48 (v12, weighted=0.85) vs lone v13 challenger UID 111
+        (weighted=0.60). UID 111 is in Tier 1 (the only candidate); UID 48
+        isn't. But the dethrone gate compares them anyway and rejects UID
+        111 because they're not measurably better."""
+        state = _FakeState()
+        state.h2h_latest = {"king_uid": 48}
+        v_current = single_eval._KING_SELECTION_MIN_VERSION
+        state.composite_scores = {
+            "48":  {"worst": 0.40, "weighted": 0.85, "n_axes": 20, "version": v_current - 1},
+            "111": {"worst": 0.40, "weighted": 0.60, "n_axes": 20, "version": v_current},
+        }
+        valid_models = {48: {"model": "a"}, 111: {"model": "b"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 48, "prior king must get a margin check even when on a stale grader")
+
+    def test_v13_challenger_dethrones_v12_king_when_clearly_better(self):
+        """Counterpart to the above: the prior-king margin check should NOT
+        permanently lock the crown to a v12 record. A v13 challenger that
+        clears the dethrone gate (3% margin on worst or weighted) takes the
+        crown — that's the whole point of the schema bump."""
+        state = _FakeState()
+        state.h2h_latest = {"king_uid": 48}
+        v_current = single_eval._KING_SELECTION_MIN_VERSION
+        state.composite_scores = {
+            "48":  {"worst": 0.40, "weighted": 0.55, "n_axes": 20, "version": v_current - 1},
+            "111": {"worst": 0.50, "weighted": 0.70, "n_axes": 20, "version": v_current},  # clear win
+        }
+        valid_models = {48: {"model": "a"}, 111: {"model": "b"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 111)
+
+    def test_records_without_version_field_treated_as_legacy(self):
+        """Records stored before the version field was introduced have
+        ``version=None`` (or the field missing entirely). They should be
+        treated as legacy (i.e. not Tier-1 eligible)."""
+        state = _FakeState()
+        state.h2h_latest = {}
+        v_current = single_eval._KING_SELECTION_MIN_VERSION
+        state.composite_scores = {
+            # UID 48: legacy, version field missing
+            "48":  {"worst": 0.50, "weighted": 0.70, "n_axes": 20},
+            # UID 111: explicit None version (also legacy)
+            "111": {"worst": 0.55, "weighted": 0.75, "n_axes": 20, "version": None},
+            # UID 222: schema-current
+            "222": {"worst": 0.30, "weighted": 0.50, "n_axes": 20, "version": v_current},
+        }
+        valid_models = {48: {"model": "a"}, 111: {"model": "b"}, 222: {"model": "c"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 222, "v_current record (Tier 1) must beat legacy records (Tier 2)")
+
 
 class ResolveDethroneTests(unittest.TestCase):
     def test_no_incumbent_accepts_any_positive(self):
