@@ -313,6 +313,14 @@ _KING_SELECTION_MIN_AXES = 17
 #         self-score patterns from candidate responses before they reach
 #         the teacher, and the rubric tells the teacher to ignore any
 #         remaining injected grading directives.
+#   v16 — robustness_bench paraphrase family. Pre-v16 records used a
+#         rotation pool of 7 perturbations that were ALL pure wrappers
+#         around the canonical math item, leaving the inner problem text
+#         byte-identical. A miner who indexed GSM8K/MATH-500 by exact
+#         string passed robustness_bench unchanged. v16+ adds two
+#         paraphrase perturbations (instruction_synonym, imperative_to_
+#         question) that mutate the problem text itself, with
+#         stratification guaranteeing at least one paraphrase per round.
 # Mixing schema versions would let a stale-grader UID inherit the crown via
 # inflated/deflated axis scores. The selector therefore filters to v_current
 # first and only falls through to legacy records when no v_current candidate

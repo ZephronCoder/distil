@@ -106,31 +106,110 @@ class TestRobustnessPerturbations(unittest.TestCase):
         for name, fn in self.mod._ROBUSTNESS_PERTURBATION_TEMPLATES:
             out = fn(original)
             self.assertIsInstance(out, str, f"{name} must return str")
-            self.assertGreater(
-                len(out), len(original),
-                f"{name} wrapper produced output no longer than the "
-                f"original — that's effectively a no-op",
-            )
-            # The original prompt content must still be present so the
-            # grader can find the math problem. We check substring of
-            # the question portion ("2 + 2") as a stable anchor.
+            # Wrapper-family perturbations strictly extend the prompt;
+            # paraphrase-family perturbations may shorten or keep it the
+            # same length (e.g., ``Find the area of X.`` has the same
+            # character count as ``What is the area of X?``).
+            if name not in self.mod._ROBUSTNESS_PARAPHRASE_NAMES:
+                self.assertGreater(
+                    len(out), len(original),
+                    f"{name} wrapper produced output no longer than the "
+                    f"original — that's effectively a no-op",
+                )
+            # The numeric content must survive every perturbation —
+            # both wrappers (which never touch it) and paraphrases
+            # (which only swap instruction words).
             self.assertIn(
                 "2 + 2", out,
-                f"{name} wrapper dropped the original question content",
+                f"{name} perturbation dropped the original numeric content",
             )
 
     def test_no_wrapper_collapses_to_template_only(self):
-        # Negative test: if any wrapper returned only the boilerplate
+        # Negative test: if any perturbation returned only the boilerplate
         # ("Solve the following problem.") with the actual question
-        # truncated, the axis would be vacuous. Anchor: the question's
-        # closing question mark ('?') must survive every wrapper.
+        # truncated, the axis would be vacuous. Wrapper-family checks the
+        # closing question mark survives. Paraphrase-family is exempt
+        # (imperative_to_question may rewrite "what is x?" → "What is the
+        # value of x?" which preserves semantics but not the literal
+        # phrase).
         original = "If x + 5 = 12, what is x?"
         for name, fn in self.mod._ROBUSTNESS_PERTURBATION_TEMPLATES:
+            if name in self.mod._ROBUSTNESS_PARAPHRASE_NAMES:
+                # For paraphrase entries we only check that the math
+                # content (``x + 5 = 12``) survives — instruction words
+                # may be swapped.
+                out = fn(original)
+                self.assertIn(
+                    "x + 5 = 12", out,
+                    f"{name} paraphrase dropped the math content",
+                )
+                continue
             out = fn(original)
             self.assertIn(
                 "what is x?", out,
                 f"{name} wrapper dropped the closing question",
             )
+
+    def test_paraphrase_family_exists(self):
+        """Stratification depends on at least one paraphrase entry being
+        present in the templates table. If a refactor accidentally
+        removes them, the picker would silently fall back to wrapper-only
+        rounds and reopen the memorization-bypass hole."""
+        names = {n for n, _ in self.mod._ROBUSTNESS_PERTURBATION_TEMPLATES}
+        self.assertTrue(
+            self.mod._ROBUSTNESS_PARAPHRASE_NAMES & names,
+            "Templates table lost all paraphrase-family entries — "
+            "memorization defense disabled",
+        )
+
+    def test_pick_always_includes_a_paraphrase_when_available(self):
+        """Stratification rule: every round must include at least one
+        paraphrase-family perturbation. Probe over many block seeds and
+        K values; if any round comes back wrapper-only we have a
+        regression that lets memorizers pass."""
+        for seed in (1, 100, 12345, 999999, 8052008):
+            for k in (1, 2, 3, 4):
+                picked = self.mod._pick_robustness_perturbations(seed, k=k)
+                names = {n for n, _ in picked}
+                self.assertTrue(
+                    names & self.mod._ROBUSTNESS_PARAPHRASE_NAMES,
+                    f"seed={seed} k={k} produced wrapper-only set: {names}",
+                )
+
+    def test_paraphrase_actually_changes_inner_text(self):
+        """A paraphrase that returns the input unchanged is a silent
+        no-op — same Goodhart hole as a wrapper. Verify each paraphrase
+        function actually modifies a synthetic prompt."""
+        sample = (
+            "Find the total cost of 5 apples at $2 each.\n\n"
+            "Solve step by step and end with '#### N' where N is the final numeric answer."
+        )
+        for name, fn in self.mod._ROBUSTNESS_PERTURBATION_TEMPLATES:
+            if name not in self.mod._ROBUSTNESS_PARAPHRASE_NAMES:
+                continue
+            out = fn(sample)
+            self.assertNotEqual(
+                out, sample,
+                f"{name} paraphrase returned input unchanged on a sample "
+                f"that contains common instruction-domain anchors",
+            )
+
+    def test_paraphrase_preserves_numeric_content(self):
+        """A paraphrase that drops or changes digits would change the
+        answer — fatal for grading. Verify numeric tokens survive."""
+        sample = (
+            "Find the total cost of 5 apples at $2 each.\n\n"
+            "Solve step by step and end with '#### N' where N is the final numeric answer."
+        )
+        for name, fn in self.mod._ROBUSTNESS_PERTURBATION_TEMPLATES:
+            if name not in self.mod._ROBUSTNESS_PARAPHRASE_NAMES:
+                continue
+            out = fn(sample)
+            for digit in ("5", "2"):
+                self.assertIn(
+                    digit, out,
+                    f"{name} paraphrase removed digit '{digit}' — grading would break",
+                )
 
     def test_robustness_pool_is_alias_of_math(self):
         # _BENCH_POOLS is module-level state. We don't load the math

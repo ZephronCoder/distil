@@ -4472,6 +4472,120 @@ def _answer_exact_in_text(gold: str, text: str, strict: bool = False) -> bool:
 # Pure string transforms — no LLM call — so the axis is cheap and
 # deterministic. The grader is the same boxed/integer extractor as
 # math_bench.
+#
+# Two perturbation families:
+#
+# 1. ``wrapper`` family: prepend / append / re-frame instructions while
+#    leaving the inner problem text byte-identical. Tests instruction-
+#    following robustness across surface phrasings of the *task* (not
+#    of the problem).
+# 2. ``paraphrase`` family (Session 3.10, 2026-04-26): apply word-level
+#    substitutions / sentence-form changes inside the problem text.
+#    These are the only perturbations that actually defeat exact-string
+#    memorization of the canonical GSM8K / MATH-500 wording. A miner
+#    indexing problems by SHA-of-question or substring lookup table
+#    would pass every wrapper-family round under v3.7 — the paraphrase
+#    family closes that hole. We stratify (see ``_pick_robustness_
+#    perturbations``) so at least one paraphrase fires per round.
+def _apply_instruction_synonyms(text: str, seed: int) -> str:
+    """Word-boundary synonym swap on instruction-domain verbs/nouns.
+
+    Picks ONE source word that appears in ``text`` (deterministic given
+    seed) and replaces every occurrence with one of its synonyms. The
+    synonym table is small and math-domain safe — every pair is
+    semantically interchangeable in the context of a word-problem
+    instruction (``find`` ≡ ``determine`` ≡ ``compute`` ≡ ``calculate``).
+    Single-word replacement keeps the change small enough that
+    answer-extraction (boxed / hash-N / numeric tail) still works.
+
+    We never replace digits, operators, ``\\boxed{...}`` blocks, ``####``
+    delimiters, or LaTeX ``$...$`` blocks. Word boundaries are enforced
+    so ``"find"`` does not match ``"finding"`` and ``"sum"`` does not
+    match inside ``"summary"``.
+    """
+    import random
+    import re as _re
+    table: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("find", ("determine", "calculate", "compute")),
+        ("calculate", ("find", "compute", "determine")),
+        ("compute", ("find", "calculate", "determine")),
+        ("determine", ("find", "calculate", "compute")),
+        ("solve", ("work out", "figure out")),
+        ("the question", ("the problem",)),
+        ("the problem", ("the question",)),
+        ("answer", ("result", "value")),
+        ("each", ("every",)),
+        ("every", ("each",)),
+        ("total", ("sum",)),
+        ("how many", ("what number of",)),
+        ("how much", ("what amount of",)),
+        ("what is", ("compute the value of",)),
+    )
+    rng = random.Random(seed & 0xFFFFFFFF)
+    candidates = [
+        (src, alts) for src, alts in table
+        if _re.search(rf"\b{_re.escape(src)}\b", text, flags=_re.IGNORECASE)
+    ]
+    if not candidates:
+        return text
+    src, alts = rng.choice(candidates)
+    rep = rng.choice(alts)
+    def _swap(match: "_re.Match[str]") -> str:
+        word = match.group(0)
+        if word.isupper():
+            return rep.upper()
+        if word[:1].isupper():
+            return rep[:1].upper() + rep[1:]
+        return rep
+    return _re.sub(rf"\b{_re.escape(src)}\b", _swap, text, flags=_re.IGNORECASE)
+
+
+def _imperative_to_question(text: str, seed: int) -> str:
+    """Rewrite the LAST imperative sentence as an interrogative.
+
+    Targets the closing sentence of the question portion (before the
+    "\\n\\n" delimiter to the format suffix, if present). Pattern:
+    ``(Find|Calculate|Compute|Determine) (the )? <body> .`` →
+    ``What is (the)? <body>?``. We preserve a leading ``the`` if the
+    original sentence had one (``Find the value of X.`` →
+    ``What is the value of X?``); without that we'd produce
+    ungrammatical ``What is value of X?``. If no match, returns
+    ``text`` unchanged so the perturbation degrades gracefully.
+    Affects the problem text only, not the format suffix.
+    """
+    import re as _re
+    if "\n\n" in text:
+        question_part, sep, suffix = text.partition("\n\n")
+    else:
+        question_part, sep, suffix = text, "", ""
+    pattern = _re.compile(
+        r"(?P<verb>Find|Calculate|Compute|Determine)\s+"
+        r"(?P<the>the\s+)?"
+        r"(?P<body>[^.?\n]+?)\s*\.\s*$",
+        _re.IGNORECASE,
+    )
+    m = pattern.search(question_part)
+    if not m:
+        return text
+    body = m.group("body").strip()
+    if len(body) < 3 or len(body) > 200:
+        return text
+    the_part = m.group("the") or ""
+    rewritten = pattern.sub(f"What is {the_part}{body}?", question_part, count=1)
+    return rewritten + sep + suffix
+
+
+def _stable_seed_from_text(text: str, block_seed) -> int:
+    """Derive a stable per-prompt seed combining the block_seed and the
+    text hash, so different prompts in the same round get different
+    paraphrase picks while every validator agrees."""
+    import hashlib
+    h = hashlib.md5(text.encode("utf-8", errors="ignore")).digest()[:4]
+    base = int.from_bytes(h, "little")
+    bs = _coerce_block_seed(block_seed) or 0
+    return (base ^ (bs & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+
 _ROBUSTNESS_PERTURBATION_TEMPLATES: tuple[tuple[str, "callable[[str], str]"], ...] = (
     (
         "solve_prefix",
@@ -4504,28 +4618,81 @@ _ROBUSTNESS_PERTURBATION_TEMPLATES: tuple[tuple[str, "callable[[str], str]"], ..
         "imperative_postfix",
         lambda p: p.rstrip() + "\n\nWork through it carefully and give the final value.",
     ),
+    # ── paraphrase family (Session 3.10) ──────────────────────────────
+    # These mutate the problem text itself, breaking exact-string and
+    # naive-substring memorization defenses. Stratification in
+    # ``_pick_robustness_perturbations`` guarantees at least one of these
+    # fires every round (when K >= 1 and the templates table contains
+    # any paraphrase entry).
+    (
+        "instruction_synonym",
+        lambda p: _apply_instruction_synonyms(
+            p, _stable_seed_from_text(p, _BENCH_BLOCK_SEED),
+        ),
+    ),
+    (
+        "imperative_to_question",
+        lambda p: _imperative_to_question(
+            p, _stable_seed_from_text(p, _BENCH_BLOCK_SEED),
+        ),
+    ),
 )
+
+# Names from ``_ROBUSTNESS_PERTURBATION_TEMPLATES`` that mutate the
+# problem text (paraphrase family). Used by the picker to enforce the
+# "at least one paraphrase per round" stratification rule.
+_ROBUSTNESS_PARAPHRASE_NAMES: frozenset[str] = frozenset({
+    "instruction_synonym",
+    "imperative_to_question",
+})
 
 
 def _pick_robustness_perturbations(
     block_seed, k: int,
 ) -> list[tuple[str, "callable[[str], str]"]]:
-    """Deterministically pick K paraphrase wrappers for this round.
+    """Deterministically pick K perturbations for this round.
 
-    Block-seeded so every validator agrees on which wrappers run this
-    round but the set rotates between rounds. ``k`` is clamped to the
-    template count.
+    Block-seeded so every validator agrees on which perturbations run
+    this round but the set rotates between rounds. ``k`` is clamped to
+    the template count.
+
+    Stratification (Session 3.10): when at least one paraphrase-family
+    entry exists in the templates table AND ``k >= 1``, we guarantee
+    one paraphrase is always picked. This prevents memorization-bypass
+    rounds where the rotation happens to draw only wrappers, in which
+    case a model that memorized canonical GSM8K/MATH-500 wordings could
+    pass robustness_bench unchanged. Wrappers still rotate freely
+    around the guaranteed paraphrase.
     """
     import random
     if not _ROBUSTNESS_PERTURBATION_TEMPLATES:
         return []
     pool = list(_ROBUSTNESS_PERTURBATION_TEMPLATES)
     seed = _coerce_block_seed(block_seed)
+    target_k = max(1, min(int(k), len(pool)))
     if seed is None:
-        return pool[:max(1, k)]
+        # No block context — return a deterministic-but-arbitrary slice
+        # that still satisfies the "at least one paraphrase" rule when
+        # the table contains paraphrases.
+        paraphrase = [t for t in pool if t[0] in _ROBUSTNESS_PARAPHRASE_NAMES]
+        wrapper = [t for t in pool if t[0] not in _ROBUSTNESS_PARAPHRASE_NAMES]
+        if paraphrase and target_k >= 1:
+            chosen = [paraphrase[0]] + wrapper[: target_k - 1]
+            return chosen[:target_k]
+        return pool[:target_k]
     rng = random.Random((seed ^ _BENCH_STREAM.get("robustness", 0)) & 0xFFFFFFFF)
     rng.shuffle(pool)
-    return pool[: max(1, min(int(k), len(pool)))]
+    paraphrase = [t for t in pool if t[0] in _ROBUSTNESS_PARAPHRASE_NAMES]
+    wrapper = [t for t in pool if t[0] not in _ROBUSTNESS_PARAPHRASE_NAMES]
+    if paraphrase and target_k >= 1:
+        # Reserve slot 0 for a paraphrase, fill the rest from the
+        # remaining shuffled order (wrappers first, then any leftover
+        # paraphrases when target_k > 1).
+        chosen = [paraphrase[0]]
+        remaining = wrapper + paraphrase[1:]
+        chosen.extend(remaining[: target_k - 1])
+        return chosen[:target_k]
+    return pool[:target_k]
 
 
 def robustness_bench_probe(model, tokenizer, device="cuda"):
