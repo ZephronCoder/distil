@@ -2643,37 +2643,48 @@ BENCH_BATTERY_SHADOW_AXES = (
 )
 
 # Session 2 per-round sample counts.
-BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "10"))
-BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "6"))
+# 2026-04-26 (v28) — quality > quantity rebalance:
+#   * math_bench:      10 → 12 (more depth on the hardest single axis;
+#                                weight bumped 0.12 → 0.14).
+#   * code_bench:       6 →  8 (HumanEval-quality, weight 0.12 → 0.14).
+#   * reasoning_bench: 10 → 10 (BBH MC, kept; weight 0.08 → 0.10).
+#   * knowledge_bench: 10 →  0 (axis muted; the only signal it carried
+#                                  beyond reasoning_bench was the
+#                                  v27-upgraded arithmetic_mc, which is
+#                                  now better captured by capability +
+#                                  math_bench at no extra wall-time).
+#   * ifeval_bench:    10 →  8 (instruction-following, weight 0.05 → 0.07).
+BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "12"))
+BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "8"))
 BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "10"))
-BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "10"))
-BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "10"))
+BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "0"))
+BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
 
-# Session 3 per-round sample counts — kept small since these axes are
-# heavier per item (olympiad math needs more tokens; self-consistency
-# generates 5 samples; tool use requires 2 passes).
-BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "6"))
-BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "6"))
+# Session 3 per-round sample counts — quality > quantity rebalance:
+#   * aime_bench:              6 → 8 (olympiad math, weight 0.06 → 0.10).
+#   * mbpp_bench:              6 → 8 (programming breadth, 0.06 → 0.08).
+#   * tool_use_bench:          6 → 6 (agentic Python, 0.04 → 0.06).
+#   * self_consistency_bench:  6 → 0 (axis muted: same items as
+#                                       math_bench, just majority-voted —
+#                                       no marginal signal).
+BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "8"))
+BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "8"))
 BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "6"))
-BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PER_ROUND", "6"))
+BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PER_ROUND", "0"))
 BENCH_SELF_CONSISTENCY_SAMPLES = int(os.environ.get("BENCH_SELF_CONSISTENCY_SAMPLES", "5"))
 BENCH_SELF_CONSISTENCY_TEMP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TEMP", "0.7"))
 BENCH_SELF_CONSISTENCY_TOPP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TOPP", "0.9"))
-# Session 3.1 (added 2026-04-25): ARC-Challenge commonsense science reasoning.
-# 1172-item pool; independent of MMLU so miners can't climb `knowledge_bench`
-# by memorizing one taxonomy.
-BENCH_ARC_PER_ROUND = int(os.environ.get("BENCH_ARC_PER_ROUND", "8"))
-# Session 3.4 (added 2026-04-25): TruthfulQA factual-grounding probe. 817
-# adversarially-designed questions where naive pretraining priors produce
-# confidently-wrong answers ("What happens if you swallow gum?"). Direct
-# hallucination-resistance signal; disjoint from every other bench.
-BENCH_TRUTHFUL_PER_ROUND = int(os.environ.get("BENCH_TRUTHFUL_PER_ROUND", "6"))
-# Session 3.5 (added 2026-04-25): long-context needle-in-haystack. A
-# procedural axis (no dataset dep) that tests retrieval over a 1500-token
-# filler context. The needle + distractors are regenerated fresh every
-# round from the block_seed, so miners literally cannot memorize the
-# items. Directly probes long-context attention that every other axis
-# misses (prompts elsewhere are < 1k tokens).
+# Muted in v28 — covered by knowledge_bench's procedural arithmetic_mc +
+# capability axis. Kept addressable via env override for emergency
+# rollback.
+BENCH_ARC_PER_ROUND = int(os.environ.get("BENCH_ARC_PER_ROUND", "0"))
+# Muted in v28 — narrow factuality surface, dominated by refusal-trained
+# heuristics. Kept env-addressable.
+BENCH_TRUTHFUL_PER_ROUND = int(os.environ.get("BENCH_TRUTHFUL_PER_ROUND", "0"))
+# Long-context needle-in-haystack. v28 keeps this axis at small budget
+# because each item is ~1400 input tokens and the procedural generator
+# is uniquely uncheatable (no static answer key). Composite weight
+# 0.03 → 0.04 reflects renewed importance after the cuts.
 BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "4"))
 # Number of distractor "facts" injected before + after the needle. Each
 # fact averages ~30 tokens, so 40 distractors => ~1200 filler tokens +
@@ -2691,7 +2702,9 @@ BENCH_LC_N_CONFUSERS = int(os.environ.get("BENCH_LC_N_CONFUSERS", "3"))
 # arithmetic reasoning, instruction following, and invented-fact retrieval.
 # This is intentionally synthetic: there is no public pool to memorize, but
 # solving it requires the same skills miners should train for.
-BENCH_PROCEDURAL_PER_ROUND = int(os.environ.get("BENCH_PROCEDURAL_PER_ROUND", "6"))
+# Muted in v28 — duplicates capability + math_bench after the v27
+# procedural rewrite. Kept env-addressable for emergency rollback.
+BENCH_PROCEDURAL_PER_ROUND = int(os.environ.get("BENCH_PROCEDURAL_PER_ROUND", "0"))
 # Session 3.7 (added 2026-04-25): robustness_bench. Same items as
 # ``math_bench`` (independent stream so we usually pick *different* items
 # than the canonical math probe), but each item is asked under K
@@ -2699,7 +2712,11 @@ BENCH_PROCEDURAL_PER_ROUND = int(os.environ.get("BENCH_PROCEDURAL_PER_ROUND", "6
 # wording of public math items will pass math_bench and fail this — the
 # axis directly punishes prompt-pattern memorization without re-evaling
 # anyone. Pure string transforms, no LLM call required.
-BENCH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_ROBUSTNESS_PER_ROUND", "4"))
+# 2026-04-26 (v28) — robustness now absorbs the noise_resistance signal
+# under one umbrella. Per-round count bumped 4 → 6 to keep statistical
+# power across both perturbation families (paraphrase + surface noise),
+# weight 0.04 → 0.07.
+BENCH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_ROBUSTNESS_PER_ROUND", "6"))
 BENCH_ROBUSTNESS_PERTURB_K = int(os.environ.get("BENCH_ROBUSTNESS_PERTURB_K", "2"))
 # Session 3.7 (added 2026-04-25): noise_resistance_bench. Sibling of
 # ``robustness_bench``; same pool (alias of math) but the perturbations
@@ -2709,7 +2726,11 @@ BENCH_ROBUSTNESS_PERTURB_K = int(os.environ.get("BENCH_ROBUSTNESS_PERTURB_K", "2
 # of public math items breaks under realistic chat-noise distribution
 # shift. Pure string transforms (no LLM call), block-seeded rotation,
 # answer-extraction-safe (we never touch digits/operators).
-BENCH_NOISE_PER_ROUND = int(os.environ.get("BENCH_NOISE_PER_ROUND", "4"))
+# Muted in v28. The noise resistance signal is now sampled inside
+# robustness_bench's expanded perturbation menu (paraphrase OR surface
+# noise per item, block-rotated) so we don't pay for the same items
+# twice. Kept env-addressable for emergency rollback.
+BENCH_NOISE_PER_ROUND = int(os.environ.get("BENCH_NOISE_PER_ROUND", "0"))
 BENCH_NOISE_PERTURB_K = int(os.environ.get("BENCH_NOISE_PERTURB_K", "2"))
 
 # Token budgets.
@@ -7132,6 +7153,35 @@ _ROBUSTNESS_PERTURBATION_TEMPLATES: tuple[tuple[str, "callable[[str], str]"], ..
             p, _stable_seed_from_text(p, _BENCH_BLOCK_SEED),
         ),
     ),
+    # ── surface-noise family (v28: noise_resistance folded in) ────────
+    # Pre-v28 these lived in their own ``noise_resistance_bench`` axis.
+    # Folding here lets robustness_bench cover both perturbation
+    # families under one weight (0.07) without paying twice for the
+    # same items. Each lambda mixes the per-prompt seed so the same
+    # (block_seed, prompt) pair always produces the same noise and
+    # cross-validator agreement is preserved.
+    (
+        "light_typos",
+        lambda p: _noise_safe_letter_swap(
+            p, rate=0.025, rng_seed=_stable_seed_from_text(p, _BENCH_BLOCK_SEED),
+        ),
+    ),
+    (
+        "case_jitter",
+        lambda p: _noise_case_jitter(
+            p, rate=0.04, rng_seed=_stable_seed_from_text(p, _BENCH_BLOCK_SEED),
+        ),
+    ),
+    (
+        "extra_whitespace",
+        lambda p: _noise_extra_whitespace(
+            p, rng_seed=_stable_seed_from_text(p, _BENCH_BLOCK_SEED),
+        ),
+    ),
+    (
+        "common_misspellings",
+        lambda p: _noise_common_misspellings(p),
+    ),
 )
 
 # Names from ``_ROBUSTNESS_PERTURBATION_TEMPLATES`` that mutate the
@@ -7140,6 +7190,18 @@ _ROBUSTNESS_PERTURBATION_TEMPLATES: tuple[tuple[str, "callable[[str], str]"], ..
 _ROBUSTNESS_PARAPHRASE_NAMES: frozenset[str] = frozenset({
     "instruction_synonym",
     "imperative_to_question",
+})
+
+# Names of surface-noise entries (folded in from the muted
+# ``noise_resistance_bench`` axis in v28). These mutate characters
+# in-place rather than appending boilerplate, so they do NOT strictly
+# extend the prompt — invariant tests should treat them like the
+# paraphrase family.
+_ROBUSTNESS_NOISE_NAMES: frozenset[str] = frozenset({
+    "light_typos",
+    "case_jitter",
+    "extra_whitespace",
+    "common_misspellings",
 })
 
 

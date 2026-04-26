@@ -293,7 +293,13 @@ def _is_eligible_uid(
 # cohort. Legacy UIDs can re-enter kingship by submitting a new on-chain
 # commitment which triggers a fresh full-schema eval. Records below the
 # gate are still tracked, just not eligible for kingship.
-_KING_SELECTION_MIN_AXES = 17
+# 2026-04-26 (v28): six axes muted to weight 0 (knowledge / arc /
+# truthful / procedural / self_consistency / noise_resistance), so the
+# realistic max is ~16 active axes per round. We reduce the floor from
+# 17 → 12 to leave headroom for routine reference-broken drops on
+# aime / tool_use plus a few stragglers in flight, while still
+# excluding clearly under-graded legacy records.
+_KING_SELECTION_MIN_AXES = 12
 
 # Schema-version gate. Records stamped with ``version >= MIN_VERSION`` were
 # graded by the current scoring code; older records (``version < MIN_VERSION``
