@@ -215,6 +215,9 @@ def merge_composite_scores(
             ),
             "axes": dict(comp.get("axes") or {}),
             "n_axes": int(comp.get("present_count") or 0),
+            "present_count": int(comp.get("present_count") or 0),
+            "broken_axes": list(comp.get("broken_axes") or []),
+            "version": comp.get("version"),
             "model": info.get("model") or row.get("model") or "",
             "revision": info.get("revision") or "main",
             "block": info.get("commit_block") or current_block,
@@ -272,16 +275,23 @@ def _is_eligible_uid(
 #   n_axes=4:   8 records (legacy + 1 bench)
 #   n_axes=10: 30 records (Arena v2 cohort) — 60% have worst > 0 because
 #              they never faced the new bench axes
-#   n_axes=19: 28 records (current Arena v3.7 schema) — 0% have worst > 0
+#   n_axes=18:  2 records (Arena v3.7 + ref-broken filter active — 1-2
+#              bench axes dropped because the reference base scored 0,
+#              eval-setup signal)
+#   n_axes=19: 28 records (current Arena v3.7 schema, pre-ref-broken
+#              filter) — 0% have worst > 0
 #   n_axes=20:  8 records (Arena v3.7 + judge_probe / chat_turns_probe)
 #              also 0% have worst > 0
 #
-# Bumping the gate to 19 forces apples-to-apples king comparison: only
-# records from the same hardness regime compete. Legacy UIDs can re-enter
-# kingship by submitting a new on-chain commitment which triggers a fresh
-# full-schema eval. Records below the gate are still tracked, just not
-# eligible for kingship.
-_KING_SELECTION_MIN_AXES = 19
+# Bumping the gate to 17 forces apples-to-apples king comparison: only
+# records from the current Arena v3.7 schema compete. The 17-axis floor
+# accommodates the reference-broken-axes filter, which can drop up to 3
+# bench axes (aime / tool_use / self_consistency are routinely 0 for
+# the reference Qwen base) without leaking into the legacy 10-axis
+# cohort. Legacy UIDs can re-enter kingship by submitting a new on-chain
+# commitment which triggers a fresh full-schema eval. Records below the
+# gate are still tracked, just not eligible for kingship.
+_KING_SELECTION_MIN_AXES = 17
 
 
 def select_king_by_composite(
