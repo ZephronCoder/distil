@@ -4799,11 +4799,22 @@ def _format_long_context_prompt(item: dict) -> str:
 def long_context_bench_probe(model, tokenizer, device="cuda"):
     """Needle-in-haystack retrieval over ~1400-token context.
 
-    Grading: case-insensitive substring containment of the needle ``ANS``
-    in the model's output. That's deliberately lenient so a model that
-    answers "42" or "the code is 42" or "The vault code is 42." all count.
-    The adversarial bar is: if the model HALLUCINATED a different code,
-    the substring check fails.
+    Grading rule (Goodhart-hardened 2026-04-26):
+      * Pass = output contains the real ``gold`` AND mentions NO confuser
+        codes. The "no confuser" half blocks the dump-all attack: a model
+        that emits every 7-char code from the document (or a random
+        subset that happens to include the gold) is no longer rewarded.
+        It must actually read the question and pick exactly one needle.
+      * Fail (confuser_hit telemetry): output contains a confuser. We
+        record this even when gold is also present, so we can tell
+        "model dumped everything" from "model picked the wrong needle".
+
+    The substring check on ``gold`` itself stays lenient (case-insensitive
+    containment) so a competent model can still answer "9MJAAWY" or
+    "The code is 9MJAAWY." without being penalised for prose. The
+    confuser-rejection layer above is what makes it adversarial: the
+    moment the model says ANY other code, it loses the item — even if
+    the gold is also somewhere in the output.
     """
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
     samples = _BENCH_SAMPLES.get("long_context") or []
@@ -4822,17 +4833,17 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
                     )
                     cleaned = _strip_thinking_probe(text or "").strip()
                     gold = str(it.get("answer", ""))
-                    ok = 1 if gold and gold.upper() in cleaned.upper() else 0
-                    # Detect "confuser hits": pred contains a confuser
-                    # answer but not the real one. Useful to debug whether
-                    # increasing confusers actually causes failures.
                     confuser_answers = it.get("confuser_answers") or []
                     pred_upper = cleaned.upper()
-                    confuser_hit = bool(
-                        confuser_answers
-                        and not ok
-                        and any(ca and ca.upper() in pred_upper for ca in confuser_answers)
+                    gold_in_pred = bool(gold and gold.upper() in pred_upper)
+                    confuser_in_pred = any(
+                        ca and ca.upper() in pred_upper for ca in confuser_answers
                     )
+                    ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
+                    # confuser_hit = the model emitted a confuser code,
+                    # whether or not it also emitted the gold. This is the
+                    # axis we expect bad models to fail on.
+                    confuser_hit = bool(confuser_answers and confuser_in_pred)
                     out["items"].append({
                         "src": it.get("src", ""),
                         "gold": gold,
@@ -4842,6 +4853,7 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
                         "needle_position": it.get("needle_position"),
                         "confuser_positions": it.get("confuser_positions", []),
                         "confuser_hit": confuser_hit,
+                        "gold_in_pred": gold_in_pred,
                     })
                     out["n"] += 1
                     out["correct"] += ok
