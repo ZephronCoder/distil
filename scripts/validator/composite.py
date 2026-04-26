@@ -849,12 +849,27 @@ def compute_composite(student: dict, king_kl: float | None = None,
       useful during the grace period so we don't suddenly dethrone the
       current king while miners re-tool.
 
-    ``broken_axes`` (2026-04-23): axes where the teacher itself failed
-    the sanity floor this round. They are computed + logged per-student
-    but excluded from ``worst`` / ``weighted`` aggregation. Caller is
-    responsible for passing the result of ``resolve_teacher_broken_axes``
-    once per round (it only depends on the teacher row and the king
-    anchors).
+    ``broken_axes`` (2026-04-23 / refined 2026-04-26): axes that should
+    not gate the dethrone decision. Two distinct sources:
+      * teacher-broken — the teacher itself failed the sanity floor this
+        round (``resolve_teacher_broken_axes``).
+      * reference-broken — the reference base model scored 0 on the axis
+        (``resolve_reference_broken_axes``). This indicates an
+        eval-setup signal (token truncation, parsing bug, unsolvable
+        items), not student skill.
+
+    Filter semantics (refined 2026-04-26):
+      * ``worst`` excludes broken axes — otherwise the worst-axis
+        anti-gaming rule degenerates to ``min == 0`` for every student
+        whenever an axis hits a setup floor.
+      * ``weighted`` KEEPS broken axes when computable — a student who
+        scores >0 on a broken axis (e.g. they actually solved
+        tool_use_bench while Qwen base couldn't) still gets credit in
+        the soft aggregator. Only axes a student didn't even score
+        (None) drop out of weighted.
+
+    Caller is responsible for passing the union of teacher-broken and
+    reference-broken sets via ``broken_axes``.
     """
     axes = compute_axes(student, king_kl, king_rkl)
     # Build effective weights. Shadow-only axes flip in when their
@@ -877,11 +892,21 @@ def compute_composite(student: dict, king_kl: float | None = None,
         effective_weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
     if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
         effective_weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
+    # ``ranked`` = axes used by ``worst()``: drops broken axes so the
+    # min is not artificially floored by an axis the eval setup itself
+    # can't pass (the dethrone gate degenerates to 0=0=0 otherwise).
     ranked = {
         k: v for k, v in axes.items()
         if v is not None
         and k in effective_weights
         and (not broken_axes or k not in broken_axes)
+    }
+    # ``weighted_axes`` = axes used by ``weighted``: KEEP broken axes
+    # so a student who beats the reference on a broken axis still gets
+    # credit in the soft aggregator. Only None values drop out.
+    weighted_axes = {
+        k: v for k, v in axes.items()
+        if v is not None and k in effective_weights
     }
     if not ranked:
         return {"version": COMPOSITE_SHADOW_VERSION, "axes": axes,
@@ -893,8 +918,11 @@ def compute_composite(student: dict, king_kl: float | None = None,
                 "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
                 "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE}
     worst = min(ranked.values())
-    total_w = sum(effective_weights[k] for k in ranked)
-    weighted = sum(effective_weights[k] * v for k, v in ranked.items()) / total_w if total_w else None
+    total_w = sum(effective_weights[k] for k in weighted_axes)
+    weighted = (
+        sum(effective_weights[k] * v for k, v in weighted_axes.items()) / total_w
+        if total_w else None
+    )
 
     # 2026-04-25 — anti-gaming visibility. Two informational scores that
     # tell operators when a student is unusually narrow:

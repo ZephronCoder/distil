@@ -676,6 +676,91 @@ class TestReferenceBrokenAxes(unittest.TestCase):
             _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
             _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
 
+    def test_worst_drops_broken_but_weighted_keeps_them(self):
+        """Asymmetric filter (refined 2026-04-26): the worst-axis gate
+        excludes broken axes (else it degenerates to 0=0=0), but the
+        weighted aggregator KEEPS them so a student who beats the
+        reference on a broken axis still gets credit.
+        """
+        import scripts.validator.composite as _c
+        saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
+        saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        saved_rd = _c.REASONING_DENSITY_IN_COMPOSITE
+        saved_chat = _c.CHAT_TURNS_AXIS_IN_COMPOSITE
+        try:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = True
+            _c.BENCH_AXES_IN_COMPOSITE = True
+            _c.REASONING_DENSITY_IN_COMPOSITE = False
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = False
+
+            ref_bench = {
+                "aime_bench": 0.0,
+                "tool_use_bench": 0.0,
+                "math_bench": 0.5,
+                "reasoning_bench": 0.5,
+                "knowledge_bench": 0.5,
+                "ifeval_bench": 0.5,
+                "arc_bench": 0.5,
+                "truthful_bench": 0.5,
+                "long_context_bench": 0.5,
+                "procedural_bench": 0.5,
+                "robustness_bench": 0.5,
+                "noise_resistance_bench": 0.5,
+                "self_consistency_bench": 0.5,
+                "mbpp_bench": 0.5,
+                "code_bench": 0.5,
+            }
+            # Two students with identical NON-broken axes but differ on
+            # the broken (aime/tool_use) axes:
+            #   * weak: 0 on both broken axes (same as ref).
+            #   * strong: 1.0 on both broken axes (genuinely better).
+            # If weighted ignores broken axes, weak == strong on
+            # weighted. If weighted keeps them, strong > weak.
+            ref_name = "Qwen/Qwen3.5-4B"
+            students_data = {
+                ref_name: _make_student(kl=0.0, rkl=0.0, cap_frac=1.0, bench=ref_bench),
+                "weak/m": _make_student(
+                    kl=0.2, rkl=0.05, cap_frac=0.8,
+                    bench={**ref_bench, "aime_bench": 0.0, "tool_use_bench": 0.0},
+                ),
+                "strong/m": _make_student(
+                    kl=0.2, rkl=0.05, cap_frac=0.8,
+                    bench={**ref_bench, "aime_bench": 1.0, "tool_use_bench": 1.0},
+                ),
+            }
+            h2h_results = [
+                {"uid": -1, "model": ref_name, "is_reference": True, "is_king": False},
+                {"uid": 100, "model": "weak/m", "is_king": False},
+                {"uid": 101, "model": "strong/m", "is_king": False},
+            ]
+            _c.annotate_h2h_with_composite(
+                h2h_results, king_kl=0.2,
+                students_data=students_data,
+                reference_model=ref_name,
+                reference_uid=-1,
+            )
+            weak = next(r for r in h2h_results if r["uid"] == 100)["composite"]
+            strong = next(r for r in h2h_results if r["uid"] == 101)["composite"]
+
+            # broken_axes set is identical for both (it's round-local).
+            self.assertSetEqual(set(weak["broken_axes"]), set(strong["broken_axes"]))
+            self.assertIn("aime_bench", weak["broken_axes"])
+            self.assertIn("tool_use_bench", weak["broken_axes"])
+
+            # WORST: identical for both (broken axes excluded).
+            self.assertEqual(weak["worst"], strong["worst"],
+                "worst() should drop broken axes — weak and strong tie there")
+
+            # WEIGHTED: strong > weak (broken axes still contribute).
+            self.assertGreater(strong["weighted"], weak["weighted"],
+                f"weighted() should KEEP broken axes so genuine wins are "
+                f"rewarded: strong={strong['weighted']} weak={weak['weighted']}")
+        finally:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
+            _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
+
 
 class TestAnnotateH2HWithPareto(unittest.TestCase):
     """annotate_h2h_with_composite attaches the pareto sub-dict per row."""
