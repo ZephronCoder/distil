@@ -3561,11 +3561,27 @@ def _mbpp_build_prompt(item: dict) -> str:
     """MBPP items typically frame as 'write a function that X. Your code should
     pass these tests: [...]'. We pass the prompt verbatim so the model sees
     the same specification a miner targets in their dataset pipeline.
+
+    Bug fix 2026-04-26: MBPP entry_point names are non-canonical (e.g.
+    ``issort_list`` for "is sorted", ``reverse_Array_Upto_K`` for "reverse
+    array up to position K"). Without the entry-point hint, the model
+    writes a sensible Python name (``is_sorted``, ``reverse_array``) and
+    fails the test harness with NameError. We saw 2/3 MBPP failures on
+    Qwen base were *correct logic* with mismatched function names. Adding
+    the entry-point line at the top recovers signal without changing the
+    task semantics. Pass-rate jumped from ~17 % (1/3 baseline) toward the
+    real Qwen-class skill ceiling (~50–70 % expected).
     """
+    entry = item.get("entry_point") or ""
+    name_hint = (
+        f"Define a function named `{entry}` that solves the task. "
+        if entry else ""
+    )
     return (
         "You are an expert Python programmer. Write a complete, correct "
-        "Python solution for the task below. Output only the function "
-        "definition (no markdown fences, no explanation, no commentary).\n\n"
+        f"Python solution for the task below. {name_hint}Output only the "
+        "function definition (no markdown fences, no explanation, no "
+        "commentary).\n\n"
         f"{item['prompt']}"
     )
 

@@ -76,8 +76,11 @@ probe outage to freeze the crown.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Five-axis composite (T1.3). On-policy RKL is the primary distillation
@@ -348,6 +351,26 @@ KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 # stochasticity in the teacher's own generations (temperature=0 helps but
 # vLLM sampling can still jitter), while still catching outright bugs.
 TEACHER_SANITY_FLOOR = 0.70
+
+# Reference-broken-axes filter (2026-04-26). The reference model is the
+# baseline undistilled Qwen base; every round it runs through the same
+# bench probes the students do. If the reference scores ``pass_frac == 0``
+# on a bench axis, that axis is *not* measuring student skill — it is
+# measuring an eval-setup bug (token truncation, malformed prompt,
+# unsolvable item set, etc.). Audit 2026-04-26 of last_eval.json showed
+# the reference scoring 0 on aime_bench (token truncation), code_bench,
+# tool_use_bench, and noise_resistance_bench — locking ``worst() == 0``
+# for all 36 current-schema records and making the dethrone gate
+# degenerate. By dropping such axes from ``worst()`` we restore signal
+# without giving miners a free pass: the axes still appear in the
+# ``axes`` dict and contribute to ``weighted`` aggregation.
+#
+# We're more conservative than ``TEACHER_SANITY_FLOOR`` (0.70) here
+# because the reference model is a *small* base model (Qwen3.5-4B) — it
+# legitimately fails some hard items. Only the ``pass_frac == 0`` exact
+# floor is treated as eval-broken; partial scores 0.25-0.50 are kept so
+# students who outperform the reference are properly rewarded.
+REFERENCE_BROKEN_BENCH_FLOOR = 0.0
 
 
 def _axis_kl(student: dict, king_kl: float | None) -> float | None:
@@ -714,6 +737,60 @@ def compute_axes(student: dict, king_kl: float | None = None,
     }
 
 
+def resolve_reference_broken_axes(reference_student_row: dict | None) -> set[str]:
+    """Identify bench axes where the reference base model itself scored 0.
+
+    The reference model (Qwen3.5-4B base, ``REFERENCE_UID = -1``) is the
+    undistilled control we run every round. It is a small 4B base model,
+    so we expect it to fail some hard items — that's *real* signal a
+    distilled student can pick up. But if the reference scores
+    ``pass_frac == 0`` on a bench axis, the axis is broken at the
+    eval-setup level (token truncation, malformed prompt, unsolvable
+    items): the *base* model can't even partially attempt it, so any
+    student score on that axis is noise.
+
+    Audit 2026-04-26 found:
+      * aime_bench: reference 0/3 — 256-token cap truncates derivations
+      * code_bench: reference 0/3 — also token-bound
+      * tool_use_bench: reference 0/3 — 192-token cap + tool format
+      * noise_resistance_bench: reference 0/6 — perturbation strength
+
+    These four axes alone caused 100 % of current-schema records to sit
+    at ``worst == 0``, breaking the dethrone gate. Dropping them from
+    ``worst()`` (but keeping them in ``weighted`` and the per-axis
+    dashboard) restores signal without giving miners a free pass.
+
+    Returns the set of axis names to exclude. Empty set if the
+    reference row is absent (round didn't include reference) or all
+    reference scores are non-zero.
+    """
+    if not reference_student_row:
+        return set()
+    broken: set[str] = set()
+    # Axes we consider eval-setup-fragile. Relative axes (kl, rkl,
+    # capability, length, degeneracy) reference at 1.0 by definition,
+    # so they're never in this set.
+    bench_axes = {
+        "aime_bench", "mbpp_bench", "code_bench", "math_bench",
+        "knowledge_bench", "reasoning_bench", "tool_use_bench",
+        "robustness_bench", "noise_resistance_bench", "ifeval_bench",
+        "self_consistency_bench", "arc_bench", "truthful_bench",
+        "long_context_bench", "procedural_bench",
+    }
+    for axis in bench_axes:
+        bench = reference_student_row.get(axis)
+        if not isinstance(bench, dict):
+            continue
+        n = bench.get("n") or 0
+        pass_frac = bench.get("pass_frac")
+        # Only flag if the reference *attempted* the axis (n>0) and
+        # scored exactly 0. ``n == 0`` means the axis didn't run at all,
+        # which is a different failure mode.
+        if n > 0 and pass_frac is not None and float(pass_frac) <= REFERENCE_BROKEN_BENCH_FLOOR:
+            broken.add(axis)
+    return broken
+
+
 def resolve_teacher_broken_axes(teacher_student_row: dict | None,
                                 king_kl: float | None = None,
                                 king_rkl: float | None = None) -> set[str]:
@@ -1078,6 +1155,26 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     """
     king_rkl = _resolve_king_rkl(king_kl, students_data, h2h_results)
     broken = resolve_teacher_broken_axes(teacher_student_row, king_kl, king_rkl)
+    # Layer 2 (2026-04-26): reference-broken axes. The reference base model
+    # (REFERENCE_UID = -1, Qwen3.5-4B) runs the same bench probes as
+    # students; an axis where the reference scores 0 is testing the eval
+    # setup, not student skill. Drop it from worst() / weighted to keep
+    # the dethrone gate from degenerating to "everyone is at 0".
+    reference_row = None
+    if reference_model and reference_model in students_data:
+        reference_row = students_data[reference_model]
+    reference_broken = resolve_reference_broken_axes(reference_row)
+    if reference_broken:
+        try:
+            logger.info(
+                "composite: dropping reference-broken axes this round: "
+                f"{sorted(reference_broken)} (reference={reference_model} "
+                "scored pass_frac=0 on each — eval-setup signal, not "
+                "student skill)"
+            )
+        except Exception:
+            pass
+    broken = (broken or set()) | reference_broken
 
     king_model = None
     king_entry = next((r for r in h2h_results if r.get("is_king")), None)

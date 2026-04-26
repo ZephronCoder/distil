@@ -527,6 +527,156 @@ class TestTeacherSanityGate(unittest.TestCase):
             _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
 
 
+class TestReferenceBrokenAxes(unittest.TestCase):
+    """Reference-broken-axes filter: drop bench axes the base model
+    cannot even partially attempt. Audit 2026-04-26 found the reference
+    Qwen-4B scored pass_frac=0 on aime/code/tool_use/noise_resistance
+    every round, locking ``worst() == 0`` for all challengers."""
+
+    def test_reference_zero_axes_marked_broken(self):
+        from scripts.validator.composite import resolve_reference_broken_axes
+        ref = _make_student(bench={
+            "aime_bench": 0.0,         # truncation → eval-broken
+            "code_bench": 0.0,         # truncation → eval-broken
+            "tool_use_bench": 0.0,     # bad prompt → eval-broken
+            "math_bench": 0.5,         # genuine signal — ref can do
+            "reasoning_bench": 0.75,   # genuine signal
+            "arc_bench": 1.0,          # genuine signal
+        })
+        broken = resolve_reference_broken_axes(ref)
+        self.assertEqual(broken, {"aime_bench", "code_bench", "tool_use_bench"})
+        self.assertNotIn("math_bench", broken)
+        self.assertNotIn("reasoning_bench", broken)
+        self.assertNotIn("arc_bench", broken)
+
+    def test_partial_reference_axis_kept(self):
+        """Reference scoring 0.25 (= 1/4) is still useful signal — a
+        student outperforming the reference there is meaningfully better.
+        Only the *exact zero* floor is treated as eval-broken."""
+        from scripts.validator.composite import resolve_reference_broken_axes
+        ref = _make_student(bench={
+            "math_bench": 0.25,
+            "code_bench": 0.25,
+        })
+        broken = resolve_reference_broken_axes(ref)
+        self.assertEqual(broken, set())
+
+    def test_missing_reference_returns_empty(self):
+        """Fail open if reference row is absent."""
+        from scripts.validator.composite import resolve_reference_broken_axes
+        self.assertEqual(resolve_reference_broken_axes(None), set())
+        self.assertEqual(resolve_reference_broken_axes({}), set())
+
+    def test_axis_with_n_zero_not_marked_broken(self):
+        """If the axis didn't run at all (n=0), don't mark it broken
+        from the reference side — that's a different failure mode
+        (probe didn't run) handled elsewhere."""
+        from scripts.validator.composite import resolve_reference_broken_axes
+        ref = {
+            "aime_bench": {"n": 0, "correct": 0, "pass_frac": 0.0},
+            "code_bench": {"n": 3, "correct": 0, "pass_frac": 0.0},
+        }
+        broken = resolve_reference_broken_axes(ref)
+        self.assertEqual(broken, {"code_bench"})
+
+    def test_relative_axes_never_in_broken_set(self):
+        """KL/RKL/capability/length/degeneracy reference at 1.0 by
+        construction; the broken-axes filter only inspects bench axes."""
+        from scripts.validator.composite import resolve_reference_broken_axes
+        ref = {
+            "kl_global_avg": 0.0,
+            "on_policy_rkl": {"mean_rkl": 0.0},
+            "capability": {"pass_frac": 1.0},
+            "length_axis": {"penalty": 1.0},
+            # No bench axes at all.
+        }
+        broken = resolve_reference_broken_axes(ref)
+        self.assertEqual(broken, set())
+
+    def test_annotate_drops_reference_broken_from_worst(self):
+        """End-to-end: annotate_h2h_with_composite must drop reference-
+        broken bench axes from ``worst`` so the gate doesn't degenerate."""
+        import scripts.validator.composite as _c
+        saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
+        saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        saved_rd = _c.REASONING_DENSITY_IN_COMPOSITE
+        saved_chat = _c.CHAT_TURNS_AXIS_IN_COMPOSITE
+        try:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = True
+            _c.BENCH_AXES_IN_COMPOSITE = True
+            # Disable rd/chat for this test — _make_student doesn't
+            # populate them and we want to isolate the bench-axis drop.
+            _c.REASONING_DENSITY_IN_COMPOSITE = False
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = False
+            ref_name = "Qwen/Qwen3.5-4B"
+            students_data = {
+                ref_name: _make_student(kl=0.0, rkl=0.0, cap_frac=1.0,
+                    bench={
+                        "aime_bench": 0.0,        # ref zero → drop
+                        "code_bench": 0.0,        # ref zero → drop
+                        "math_bench": 0.5,        # ref OK
+                        "reasoning_bench": 0.75,
+                        "knowledge_bench": 0.5,
+                        "ifeval_bench": 0.5,
+                        "arc_bench": 1.0,
+                        "truthful_bench": 1.0,
+                        "long_context_bench": 1.0,
+                        "procedural_bench": 0.5,
+                        "robustness_bench": 0.5,
+                        "noise_resistance_bench": 0.33,
+                        "self_consistency_bench": 0.33,
+                        "mbpp_bench": 0.5,
+                        "tool_use_bench": 0.33,
+                    }),
+                "challenger/m": _make_student(kl=0.2, rkl=0.05, cap_frac=0.8,
+                    bench={
+                        "aime_bench": 0.0,        # broken — should NOT drag worst
+                        "code_bench": 0.0,        # broken — should NOT drag worst
+                        "math_bench": 0.5,
+                        "reasoning_bench": 0.75,
+                        "knowledge_bench": 0.5,
+                        "ifeval_bench": 0.5,
+                        "arc_bench": 1.0,
+                        "truthful_bench": 1.0,
+                        "long_context_bench": 1.0,
+                        "procedural_bench": 0.5,
+                        "robustness_bench": 0.5,
+                        "noise_resistance_bench": 0.33,
+                        "self_consistency_bench": 0.33,
+                        "mbpp_bench": 0.5,
+                        "tool_use_bench": 0.33,
+                    }),
+            }
+            h2h_results = [
+                {"uid": -1, "model": ref_name, "is_reference": True, "is_king": False},
+                {"uid": 100, "model": "challenger/m", "is_king": False},
+            ]
+            _c.annotate_h2h_with_composite(
+                h2h_results, king_kl=0.2,
+                students_data=students_data,
+                reference_model=ref_name,
+                reference_uid=-1,
+            )
+            challenger = next(r for r in h2h_results if r["uid"] == 100)
+            comp = challenger["composite"]
+            # Without the reference-broken filter, worst would be 0.0
+            # (aime_bench / code_bench dragging). With it, worst should
+            # equal the next-lowest axis (noise_resistance_bench=0.33,
+            # self_consistency_bench=0.33, or tool_use_bench=0.33 — note
+            # tool_use only stays in if not reference-broken; here ref has
+            # tool_use=0.33 so it's kept).
+            self.assertGreater(comp["worst"], 0.0,
+                f"Reference-broken aime/code should drop from worst, "
+                f"got {comp['worst']} with axes {comp['axes']}")
+            self.assertIn("aime_bench", comp.get("broken_axes", []))
+            self.assertIn("code_bench", comp.get("broken_axes", []))
+        finally:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
+            _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
+
+
 class TestAnnotateH2HWithPareto(unittest.TestCase):
     """annotate_h2h_with_composite attaches the pareto sub-dict per row."""
 
