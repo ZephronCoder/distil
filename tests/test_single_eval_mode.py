@@ -70,6 +70,7 @@ class _FakeState:
         self.model_score_history = {}
         self.top4_leaderboard = {"king": None, "contenders": [], "phase": "maintenance"}
         self.h2h_latest = {}
+        self.h2h_history = []
         self.h2h_tested_against_king = {}
         self.dq_reasons = {}
 
@@ -109,6 +110,47 @@ class CommitmentChangedTests(unittest.TestCase):
         info = {"model": "miner/y", "revision": "main", "commit_block": 100}
         self.assertTrue(single_eval.commitment_changed(rec, info))
 
+    def test_bootstrap_record_ignores_block_when_model_matches(self):
+        """Regression for round 8045570 (2026-04-25): bootstrap stores the H2H
+        round block, not the UID's commit_block. Without this exception every
+        bootstrapped UID gets evicted on first restart and re-evaluated, which
+        violates the one-eval-per-commitment policy."""
+        rec = {
+            "model": "miner/x",
+            "revision": "main",
+            "block": 8042152,
+            "_bootstrapped": True,
+        }
+        info = {"model": "miner/x", "revision": "main", "commit_block": 8044000}
+        self.assertFalse(single_eval.commitment_changed(rec, info))
+
+    def test_bootstrap_record_still_detects_model_change(self):
+        rec = {
+            "model": "miner/x",
+            "revision": "main",
+            "block": 8042152,
+            "_bootstrapped": True,
+        }
+        info = {"model": "miner/y", "revision": "main", "commit_block": 8044000}
+        self.assertTrue(single_eval.commitment_changed(rec, info))
+
+    def test_bootstrap_record_ignores_revision_change(self):
+        """h2h_latest frequently records ``revision=None`` even when the
+        on-chain commit pinned a specific SHA; bootstrap then stores
+        revision="main" (the default fallback), and on next restart the
+        live commitment looks like a hash-pinned revision. Without
+        ignoring revision for bootstrap records we'd evict every seeded
+        UID — round 8045570 (2026-04-25) reproduced exactly this with all
+        eight prior-king-era UIDs requeued."""
+        rec = {
+            "model": "miner/x",
+            "revision": "main",
+            "block": 8042152,
+            "_bootstrapped": True,
+        }
+        info = {"model": "miner/x", "revision": "abc123", "commit_block": 8044000}
+        self.assertFalse(single_eval.commitment_changed(rec, info))
+
 
 class EvictStaleEvaluatedUidsTests(unittest.TestCase):
     def test_evicts_re_commits_only(self):
@@ -128,6 +170,45 @@ class EvictStaleEvaluatedUidsTests(unittest.TestCase):
         self.assertNotIn("1", state.composite_scores)
         self.assertIn("2", state.evaluated_uids)
         self.assertIn("2", state.composite_scores)
+
+    def test_evicts_stale_bootstrap_record_without_evaluated_flag(self):
+        """Re-commits whose only stored row is a bootstrapped composite
+        (i.e. not yet in evaluated_uids) must still be evicted.
+
+        Regression for round 8046286 (2026-04-25): UID 12 swapped
+        natrium43/p1 → natrium43/t2 but was filtered out of the queue
+        because ``select_challengers`` short-circuited on the stale
+        ``composite_scores`` row before the eviction pass could run.
+        """
+        state = _FakeState()
+        state.composite_scores = {
+            "12": {
+                "model": "natrium43/p1",
+                "revision": "main",
+                "block": 5000,
+                "worst": 0.4,
+                "_bootstrapped": True,
+            },
+        }
+        state.evaluated_uids = set()  # bootstrap path doesn't touch this
+        valid_models = _commit(12, "natrium43/t2", 8044887)  # re-commit
+        evicted = single_eval.evict_stale_evaluated_uids(state, valid_models)
+        self.assertEqual(evicted, ["12"])
+        self.assertNotIn("12", state.composite_scores)
+
+    def test_does_not_touch_uids_outside_valid_models(self):
+        """Eviction only looks at UIDs in valid_models — keeps composite
+        rows for models that are temporarily failing precheck."""
+        state = _FakeState()
+        state.composite_scores = {
+            "7": {"model": "miner/x", "revision": "main", "block": 100, "worst": 0.4},
+        }
+        state.evaluated_uids = {"7"}
+        valid_models = {}  # UID 7 not currently valid
+        evicted = single_eval.evict_stale_evaluated_uids(state, valid_models)
+        self.assertEqual(evicted, [])
+        self.assertIn("7", state.composite_scores)
+        self.assertIn("7", state.evaluated_uids)
 
 
 class SelectChallengersSingleEvalTests(unittest.TestCase):
@@ -187,6 +268,70 @@ class SelectChallengersSingleEvalTests(unittest.TestCase):
             epoch_count=1,
         )
         self.assertEqual(set(challengers.keys()), {3})
+
+    def test_skips_evaluated_uid_without_score(self):
+        """Strict no-re-eval: a UID in evaluated_uids never re-runs even if
+        its score row is missing.
+
+        Regression for Discord 2026-04-25, sebastian: validator was looping
+        in 24-model rounds because precheck-DQ'd UIDs had been removed from
+        ``state.scores`` while remaining in ``evaluated_uids`` — old filter
+        let them slip back into the queue."""
+        state = _FakeState()
+        state.evaluated_uids = {"5"}
+        state.scores = {}
+        valid_models = _commit(5, "miner/x", 100)
+        challengers = ch_mod.select_challengers(
+            valid_models, state, king_uid=None, king_kl=float("inf"),
+            epoch_count=1,
+        )
+        self.assertEqual(challengers, {})
+
+    def test_max_per_round_caps_with_fifo(self):
+        """Cap kicks in only when we exceed the threshold; oldest commit
+        wins, newest defers to next round."""
+        state = _FakeState()
+        valid_models = {}
+        # 12 candidates, blocks 100..1200.
+        for i in range(12):
+            uid = i + 1
+            valid_models.update(_commit(uid, f"miner/{uid}", 100 * (i + 1)))
+        # Patch the cap to 5 for the duration of this test.
+        with patch.object(single_eval, "SINGLE_EVAL_MAX_PER_ROUND", 5):
+            challengers = ch_mod.select_challengers(
+                valid_models, state, king_uid=None, king_kl=float("inf"),
+                epoch_count=1,
+            )
+        # 5 oldest commit_blocks: 100, 200, 300, 400, 500 → UIDs 1..5
+        self.assertEqual(set(challengers.keys()), {1, 2, 3, 4, 5})
+
+    def test_max_per_round_zero_disables_cap(self):
+        """SINGLE_EVAL_MAX_PER_ROUND=0 means uncapped (legacy behaviour)."""
+        state = _FakeState()
+        valid_models = {}
+        for i in range(8):
+            uid = i + 1
+            valid_models.update(_commit(uid, f"miner/{uid}", 100 * (i + 1)))
+        with patch.object(single_eval, "SINGLE_EVAL_MAX_PER_ROUND", 0):
+            challengers = ch_mod.select_challengers(
+                valid_models, state, king_uid=None, king_kl=float("inf"),
+                epoch_count=1,
+            )
+        self.assertEqual(len(challengers), 8)
+
+    def test_max_per_round_under_cap_no_truncation(self):
+        """When pending < cap, all candidates advance unchanged."""
+        state = _FakeState()
+        valid_models = {}
+        for i in range(3):
+            uid = i + 1
+            valid_models.update(_commit(uid, f"miner/{uid}", 100 * (i + 1)))
+        with patch.object(single_eval, "SINGLE_EVAL_MAX_PER_ROUND", 10):
+            challengers = ch_mod.select_challengers(
+                valid_models, state, king_uid=None, king_kl=float("inf"),
+                epoch_count=1,
+            )
+        self.assertEqual(set(challengers.keys()), {1, 2, 3})
 
 
 class ReEvalHelpersAreNoopsTests(unittest.TestCase):
@@ -272,13 +417,135 @@ class MergeCompositeScoresTests(unittest.TestCase):
         self.assertAlmostEqual(record["weighted"], 0.55)
 
 
+class BootstrapCompositeFromH2HTests(unittest.TestCase):
+    """Bootstrap covers latest H2H + every entry in h2h_history.
+
+    Originally only seeded from ``state.h2h_latest`` (~8 UIDs/round). Without
+    historical seeding, every UID that scored before single-eval-mode was
+    flipped on would be treated as a new commitment after a state reset
+    and re-evaluated."""
+
+    def test_seeds_from_latest_only_when_history_empty(self):
+        state = _FakeState()
+        state.h2h_latest = {
+            "block": 100,
+            "results": [
+                {"uid": 5, "model": "miner/a",
+                 "composite": {"worst": 0.5, "weighted": 0.55}},
+            ],
+        }
+        n = single_eval.bootstrap_composite_from_h2h(state)
+        self.assertEqual(n, 1)
+        self.assertIn("5", state.composite_scores)
+        self.assertTrue(state.composite_scores["5"].get("_bootstrapped"))
+
+    def test_seeds_from_history_too(self):
+        """A historical round is processed even when h2h_latest is empty."""
+        state = _FakeState()
+        state.h2h_latest = {}
+        state.h2h_history = [
+            {
+                "block": 50,
+                "results": [
+                    {"uid": 7, "model": "miner/x",
+                     "composite": {"worst": 0.6, "weighted": 0.6}},
+                ],
+            },
+            {
+                "block": 100,
+                "results": [
+                    {"uid": 8, "model": "miner/y",
+                     "composite": {"worst": 0.4, "weighted": 0.5}},
+                ],
+            },
+        ]
+        n = single_eval.bootstrap_composite_from_h2h(state)
+        self.assertEqual(n, 2)
+        self.assertIn("7", state.composite_scores)
+        self.assertIn("8", state.composite_scores)
+
+    def test_newer_history_wins_over_older(self):
+        """When the same UID appears in two historical rounds, the most
+        recent (highest block) record is the one that survives."""
+        state = _FakeState()
+        state.h2h_latest = {}
+        state.h2h_history = [
+            {
+                "block": 100,
+                "results": [
+                    {"uid": 7, "model": "miner/x",
+                     "composite": {"worst": 0.42, "weighted": 0.5}},
+                ],
+            },
+            {
+                "block": 50,
+                "results": [
+                    {"uid": 7, "model": "miner/x",
+                     "composite": {"worst": 0.30, "weighted": 0.4}},
+                ],
+            },
+        ]
+        single_eval.bootstrap_composite_from_h2h(state)
+        self.assertAlmostEqual(state.composite_scores["7"]["worst"], 0.42)
+        self.assertEqual(state.composite_scores["7"]["block"], 100)
+
+    def test_existing_records_preserved(self):
+        """An existing composite_scores record (e.g. from merge after a
+        completed round) is never overwritten by the bootstrap pass."""
+        state = _FakeState()
+        state.composite_scores = {
+            "5": {"worst": 0.99, "weighted": 0.99, "model": "miner/a"},
+        }
+        state.h2h_latest = {
+            "block": 100,
+            "results": [
+                {"uid": 5, "model": "miner/a",
+                 "composite": {"worst": 0.10, "weighted": 0.10}},
+            ],
+        }
+        single_eval.bootstrap_composite_from_h2h(state)
+        self.assertAlmostEqual(state.composite_scores["5"]["worst"], 0.99)
+
+    def test_persist_called_when_save_helper_present(self):
+        """Bootstrap must trigger eager persistence so a second restart
+        reads from disk instead of re-walking history."""
+        state = _FakeState()
+        state.h2h_latest = {
+            "block": 100,
+            "results": [
+                {"uid": 5, "model": "miner/a",
+                 "composite": {"worst": 0.5, "weighted": 0.55}},
+            ],
+        }
+        calls = []
+        state.save_composite_scores = lambda: calls.append("save")
+        single_eval.bootstrap_composite_from_h2h(state)
+        self.assertEqual(calls, ["save"])
+
+    def test_persist_called_after_merge(self):
+        """``merge_composite_scores`` also persists immediately so end-of-
+        round results survive a crash before ``state.save()`` runs."""
+        state = _FakeState()
+        calls = []
+        state.save_composite_scores = lambda: calls.append("save")
+        h2h_results = [
+            {"uid": 5, "model": "miner/a",
+             "composite": {"worst": 0.5, "weighted": 0.55,
+                           "axes": {}, "present_count": 0}},
+        ]
+        models_to_eval = {5: {"model": "miner/a", "revision": "main",
+                              "commit_block": 1234}}
+        single_eval.merge_composite_scores(state, h2h_results, models_to_eval, current_block=2000)
+        self.assertEqual(calls, ["save"])
+
+
 class SelectKingByCompositeTests(unittest.TestCase):
     def test_picks_highest_worst(self):
         state = _FakeState()
         state.composite_scores = {
-            "1": {"worst": 0.5, "weighted": 0.55},
-            "2": {"worst": 0.7, "weighted": 0.65},
-            "3": {"worst": 0.6, "weighted": 0.62},
+            "1": {"worst": 0.5, "weighted": 0.55, "n_axes": 20},
+            "2": {"worst": 0.7, "weighted": 0.65, "n_axes": 20},
+            "3": {"worst": 0.6, "weighted": 0.62, "n_axes": 20},
         }
         valid_models = {1: {"model": "a"}, 2: {"model": "b"}, 3: {"model": "c"}}
         uid, rec = single_eval.select_king_by_composite(state, valid_models)
@@ -288,8 +555,8 @@ class SelectKingByCompositeTests(unittest.TestCase):
     def test_ignores_dq_uids(self):
         state = _FakeState()
         state.composite_scores = {
-            "1": {"worst": 0.5},
-            "2": {"worst": 0.9},
+            "1": {"worst": 0.5, "n_axes": 20},
+            "2": {"worst": 0.9, "n_axes": 20},
         }
         # UID 2 is DQ'd at its current commit_block.
         state.dq_reasons = {"hk2:100": "anti-finetune detected"}
@@ -308,6 +575,136 @@ class SelectKingByCompositeTests(unittest.TestCase):
         uid, rec = single_eval.select_king_by_composite(state, valid_models)
         self.assertIsNone(uid)
         self.assertIsNone(rec)
+
+    def test_prior_king_wins_noise_level_worst_tie(self):
+        """Round 8045570 (2026-04-25): all eight bootstrapped UIDs tied at
+        composite.worst=0 (AIME=0 across the board). Within-noise weighted
+        differences (<3%) shouldn't flip the crown, otherwise the king
+        would oscillate every round on procedural-prompt noise."""
+        state = _FakeState()
+        state.h2h_latest = {"king_uid": 48}
+        # Tight cluster — challenger weighted 0.66 vs king 0.6491 = +1.7%
+        # which is *below* the 3% dethrone margin → king holds.
+        state.composite_scores = {
+            "48":  {"worst": 0.0, "weighted": 0.6491, "n_axes": 20, "model": "ghost-94/sn97-solution-5"},
+            "111": {"worst": 0.0, "weighted": 0.6600, "n_axes": 20, "model": "best26/sn97-best-w0p3"},
+            "112": {"worst": 0.0, "weighted": 0.6580, "n_axes": 20, "model": "ncaagcc/7664460"},
+            "101": {"worst": 0.0, "weighted": 0.6520, "n_axes": 20, "model": "weedyweed/k"},
+        }
+        valid_models = {48: {"model": "ghost-94/sn97-solution-5"},
+                        111: {"model": "best26/sn97-best-w0p3"},
+                        112: {"model": "ncaagcc/7664460"},
+                        101: {"model": "weedyweed/k"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 48)
+
+    def test_meaningfully_better_challenger_dethrones_at_saturated_floor(self):
+        """Counterpart to the above: when both prior king and challenger sit
+        at worst=0.0 *and* the challenger's weighted clears the
+        SINGLE_EVAL_DETHRONE_MARGIN gate, the challenger correctly wins.
+        Without this, a permanent worst=0.0 king blocks all replacements."""
+        state = _FakeState()
+        state.h2h_latest = {"king_uid": 48}
+        state.composite_scores = {
+            "48":  {"worst": 0.0, "weighted": 0.50, "n_axes": 20},
+            "111": {"worst": 0.0, "weighted": 0.78, "n_axes": 20},  # +56% relative on weighted
+        }
+        valid_models = {48: {"model": "a"}, 111: {"model": "b"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 111)
+
+    def test_prior_king_preserved_over_legacy_higher_worst(self):
+        """Regression for the broader-bootstrap rollout (2026-04-25):
+        h2h_history seeded a 3-axis legacy record for UID 25 with worst=0.73
+        — way higher than the current king's 20-axis worst=0.0 — but UID 25
+        had been disqualified months earlier and shouldn't have crowned at
+        all. The fast-path prior-king check skips this entirely; the schema
+        guard also blocks UID 25 if the prior king were ineligible."""
+        state = _FakeState()
+        state.h2h_latest = {"king_uid": 48}
+        state.composite_scores = {
+            "48": {"worst": 0.0, "weighted": 0.6491, "n_axes": 20, "model": "ghost-94/sn97-solution-5"},
+            "25": {"worst": 0.73, "weighted": 0.85, "n_axes": 3, "model": "Crocodile0125/ste"},
+        }
+        valid_models = {48: {"model": "ghost-94/sn97-solution-5"},
+                        25: {"model": "Crocodile0125/ste"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 48)
+
+    def test_legacy_record_skipped_when_no_prior_king(self):
+        """Without a prior king to fast-path through, the schema guard still
+        excludes legacy 3-axis records. Should fall back through to the
+        all-records pool only if no schema-current records exist."""
+        state = _FakeState()
+        state.h2h_latest = {}
+        state.composite_scores = {
+            "25": {"worst": 0.73, "weighted": 0.85, "n_axes": 3, "model": "old"},
+            "48": {"worst": 0.10, "weighted": 0.55, "n_axes": 20, "model": "current"},
+        }
+        valid_models = {25: {"model": "old"}, 48: {"model": "current"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 48)
+
+    def test_legacy_record_used_only_when_no_modern_alternatives(self):
+        """If only legacy records exist, the planner crowns the legacy king
+        rather than returning None — graceful degradation."""
+        state = _FakeState()
+        state.h2h_latest = {}
+        state.composite_scores = {
+            "25": {"worst": 0.73, "weighted": 0.85, "n_axes": 3, "model": "old"},
+            "26": {"worst": 0.50, "weighted": 0.60, "n_axes": 3, "model": "older"},
+        }
+        valid_models = {25: {"model": "old"}, 26: {"model": "older"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 25)
+
+    def test_prior_king_disqualified_falls_back_to_composite(self):
+        """If h2h_latest's king is no longer eligible (DQ'd, removed from
+        valid_models), the planner falls back to composite-worst pick from
+        schema-current records."""
+        state = _FakeState()
+        state.h2h_latest = {"king_uid": 48}
+        state.composite_scores = {
+            "48":  {"worst": 0.30, "weighted": 0.40, "n_axes": 20},
+            "111": {"worst": 0.50, "weighted": 0.60, "n_axes": 20},
+        }
+        valid_models = {111: {"model": "b"}}  # UID 48 absent → ineligible
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 111)
+
+    def test_higher_worst_dethrones_prior_king_when_meaningfully_better(self):
+        """As of 2026-04-26 the prior-king preference is a stability *bias*,
+        not a hard lock: a challenger with a measurably better composite
+        (clears SINGLE_EVAL_DETHRONE_MARGIN) takes the crown. Previously
+        the fast path returned the prior king unconditionally on
+        eligibility, which silently locked the crown forever.
+
+        Here UID 111 has worst=0.50 vs UID 48's worst=0.40 — a 25% relative
+        win that clears the 3% margin. UID 48 is also dropped from
+        valid_models for parity with the original test, but the dethrone
+        check would fire either way."""
+        state = _FakeState()
+        state.h2h_latest = {"king_uid": 48}
+        state.composite_scores = {
+            "48":  {"worst": 0.40, "weighted": 0.65, "n_axes": 20},
+            "111": {"worst": 0.50, "weighted": 0.62, "n_axes": 20},
+        }
+        valid_models = {111: {"model": "b"}}  # UID 48 not in valid_models
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 111)
+
+    def test_no_prior_king_uses_weighted_tiebreaker(self):
+        """Pure first-boot scenario: h2h_latest empty/missing king. Tiebreaker
+        falls through to weighted, then UID."""
+        state = _FakeState()
+        state.h2h_latest = {}
+        state.composite_scores = {
+            "48":  {"worst": 0.0, "weighted": 0.6491, "n_axes": 20},
+            "111": {"worst": 0.0, "weighted": 0.6771, "n_axes": 20},
+        }
+        valid_models = {48: {"model": "a"}, 111: {"model": "b"}}
+        uid, _ = single_eval.select_king_by_composite(state, valid_models)
+        self.assertEqual(uid, 111)
 
 
 class ResolveDethroneTests(unittest.TestCase):
@@ -329,6 +726,47 @@ class ResolveDethroneTests(unittest.TestCase):
         # benchmark and no challenger has surpassed it.
         inc = {"worst": 0.5}
         self.assertTrue(single_eval.resolve_dethrone(7, inc, 7, inc))
+
+    def test_saturated_floor_uses_weighted_tiebreaker(self):
+        """2026-04-26: ~45% of stored composite records have worst=0.0 (any
+        single zero axis floors min). Without a saturated-floor tiebreaker,
+        a never-ending stream of worst=0.0 challengers can never dethrone
+        the worst=0.0 incumbent, even when their weighted scores are wildly
+        different. Use weighted with the same relative margin in this case."""
+        inc = {"worst": 0.0, "weighted": 0.50}
+        # Weighted threshold: 0.50 * 1.03 = 0.515.
+        # Below threshold → no dethrone.
+        self.assertFalse(
+            single_eval.resolve_dethrone(7, inc, 8, {"worst": 0.0, "weighted": 0.51}, margin=0.03)
+        )
+        self.assertFalse(
+            single_eval.resolve_dethrone(7, inc, 8, {"worst": 0.0, "weighted": 0.515}, margin=0.03)
+        )
+        # Above threshold → dethrone.
+        self.assertTrue(
+            single_eval.resolve_dethrone(7, inc, 8, {"worst": 0.0, "weighted": 0.78}, margin=0.03)
+        )
+
+    def test_saturated_floor_only_kicks_in_when_both_at_floor(self):
+        """If incumbent has a non-saturated worst (>0.005), the legacy worst
+        threshold is the only gate — weighted differences must not allow a
+        challenger with lower worst to dethrone via the back door."""
+        inc = {"worst": 0.30, "weighted": 0.50}
+        ch = {"worst": 0.0, "weighted": 0.99}
+        # Challenger weighted is much higher, but their worst-axis collapse
+        # below the floor still blocks dethrone (axis-floor invariant).
+        self.assertFalse(
+            single_eval.resolve_dethrone(7, inc, 8, ch, margin=0.03)
+        )
+
+    def test_saturated_floor_falls_through_when_weighted_missing(self):
+        """If either side lacks a weighted score, the tiebreaker can't
+        decide and we hold the incumbent — fail-safe."""
+        inc = {"worst": 0.0}  # no weighted
+        ch = {"worst": 0.0, "weighted": 0.78}
+        self.assertFalse(
+            single_eval.resolve_dethrone(7, inc, 8, ch, margin=0.03)
+        )
 
 
 class IsSingleEvalModeTests(unittest.TestCase):

@@ -69,6 +69,18 @@ SINGLE_EVAL_MAX_PER_ROUND = int(
 )
 
 
+# When `worst` (min over axes) is at-or-below this epsilon, treat the UID as
+# saturated at the floor and use `weighted` as a tiebreaker. ~45% of stored
+# composite records have worst=0.0 because a *single* zero axis (e.g. mbpp
+# pass_frac=0 for a non-coding model) bottoms the min. Without this floor
+# epsilon, an incumbent at worst=0.0 can never be dethroned by another
+# saturated-floor challenger even if the challenger has a much higher
+# weighted score across the other 19 axes.
+SINGLE_EVAL_WORST_FLOOR_EPSILON = float(
+    os.environ.get("SINGLE_EVAL_WORST_FLOOR_EPSILON", "0.005")
+)
+
+
 def _commit_signature(info: dict | None) -> tuple:
     """Return a tuple that uniquely identifies a commitment.
 
@@ -263,28 +275,34 @@ def select_king_by_composite(
     uid_to_hotkey: dict | None = None,
     commitments: dict | None = None,
 ) -> tuple[int | None, dict | None]:
-    """Pick the UID with the highest composite-worst from stored scores.
+    """Pick the network's king from stored composite scores.
 
     Returns (uid, record) or (None, None) when no eligible composite-scored
     UID remains. ``record`` is the entry from ``state.composite_scores``.
 
-    Selection order (designed to keep the crown stable across the bootstrap
-    path described in Discord 2026-04-25 — the broader history bootstrap
-    was reseeding old 3-axis records that out-rank current 20-axis ones):
+    Algorithm (revised 2026-04-26 to make the prior-king preference a
+    *stability bias* rather than a hard lock — the previous fast path
+    returned the prior king unconditionally on eligibility, which silently
+    locked the crown forever once any king was crowned):
 
-    1. **Trust the prior round's king** — if ``h2h_latest.king_uid`` exists,
-       is eligible, and has a stored composite record, return them. The
-       paired-KL test already chose this UID; we shouldn't dethrone via
-       composite comparison until a real future round produces a clearly
-       better challenger on the *current* schema.
-    2. Otherwise, pick the UID with highest ``worst`` from records that
-       were scored on the current Arena v3 schema (``n_axes >= 10``).
-       Legacy 3-axis bootstrap records are skipped to avoid the apples-
-       to-oranges comparison.
-    3. Tie-breakers: prior-king bonus → ``weighted`` → UID.
-    4. If no schema-current records are available (e.g. very early state),
-       fall back to **all** records using the same tiebreakers — better
-       to crown a stale legacy king than no king at all.
+    1. Build candidate list from records on the current Arena v3 schema
+       (``n_axes >= _KING_SELECTION_MIN_AXES``). Falls through to legacy
+       records only if no schema-current records exist.
+    2. Sort candidates by ``(worst desc, weighted desc, prior_bonus desc,
+       uid desc)``. The prior-king bonus is a tiebreaker that activates
+       only on exact ties — it never overrides a measurably-better
+       challenger. ``weighted`` before ``prior_bonus`` so the ~45% of
+       UIDs sitting at saturated worst=0.0 still rank by how good they
+       are on the other axes.
+    3. Best candidate = candidates[0]. If best is the prior king, return.
+    4. If best is a different UID, run ``resolve_dethrone`` against the
+       prior king with the same margin the apply-path dethrone gate
+       uses (``SINGLE_EVAL_DETHRONE_MARGIN``, default 3%). Best wins
+       only if they clear the margin; otherwise the prior king holds.
+       This blocks pure-noise dethrones while permitting clear wins.
+    5. If the prior king isn't in the candidate pool (deregistered,
+       DQ'd, or the bootstrap state lacks them), the best candidate
+       wins outright.
     """
     composite_scores = getattr(state, "composite_scores", {}) or {}
     prior_king_uid = None
@@ -297,20 +315,6 @@ def select_king_by_composite(
         )
     except (TypeError, ValueError):
         prior_king_uid = None
-
-    # Fast path: prior round's king is eligible and has composite data.
-    if prior_king_uid is not None:
-        prior_record = composite_scores.get(str(prior_king_uid))
-        if prior_record and _is_eligible_uid(
-            state, prior_king_uid, valid_models, state.dq_reasons,
-            uid_to_hotkey, commitments,
-        ):
-            logger.info(
-                f"single-eval: preserving prior king UID {prior_king_uid} from "
-                f"h2h_latest (worst={prior_record.get('worst')}, "
-                f"n_axes={prior_record.get('n_axes')})"
-            )
-            return prior_king_uid, prior_record
 
     def _build_candidates(min_axes: int) -> list[tuple[float, int, float, int]]:
         out: list[tuple[float, int, float, int]] = []
@@ -346,7 +350,18 @@ def select_king_by_composite(
             except (TypeError, ValueError):
                 weighted_f = 0.0
             prior_bonus = 1 if uid == prior_king_uid else 0
-            out.append((worst_f, prior_bonus, weighted_f, uid))
+            # Sort tuple ordering matters here:
+            #   (worst desc, weighted desc, prior_bonus desc, uid desc)
+            # Why weighted before prior_bonus: in the current state ~45% of
+            # composite records have worst=0.0 (any axis at 0.0 floors the
+            # min). With prior_bonus higher in the tuple than weighted, the
+            # prior king *always* wins among the worst=0.0 group regardless
+            # of how poorly they rank on the 19 other axes — even if a
+            # never-king UID has weighted=0.78 vs the prior king's 0.50.
+            # Putting weighted first means prior_bonus only matters when two
+            # UIDs are *also* tied on weighted (essentially a coin flip
+            # stabilizer, not a sticky-king bias).
+            out.append((worst_f, weighted_f, prior_bonus, uid))
         return out
 
     candidates = _build_candidates(_KING_SELECTION_MIN_AXES)
@@ -358,7 +373,29 @@ def select_king_by_composite(
         return None, None
     candidates.sort(reverse=True)
     _, _, _, top_uid = candidates[0]
-    return top_uid, composite_scores.get(str(top_uid))
+    top_record = composite_scores.get(str(top_uid))
+
+    # Stability bias: if the prior king is in the candidate pool and the
+    # top candidate hasn't beaten them by ``SINGLE_EVAL_DETHRONE_MARGIN``,
+    # keep the prior king. This is the dethrone gate: noise-level
+    # differences shouldn't flip the crown, but a clear win should.
+    if (
+        prior_king_uid is not None
+        and top_uid != prior_king_uid
+        and any(uid == prior_king_uid for _, _, _, uid in candidates)
+    ):
+        prior_record = composite_scores.get(str(prior_king_uid))
+        if prior_record and not resolve_dethrone(
+            prior_king_uid, prior_record, top_uid, top_record,
+        ):
+            logger.info(
+                f"single-eval: top candidate UID {top_uid} (worst={top_record.get('worst')}, "
+                f"weighted={top_record.get('weighted')}) did not clear dethrone margin against "
+                f"prior king UID {prior_king_uid} (worst={prior_record.get('worst')}, "
+                f"weighted={prior_record.get('weighted')}); preserving prior king."
+            )
+            return prior_king_uid, prior_record
+    return top_uid, top_record
 
 
 def resolve_dethrone(
@@ -370,9 +407,16 @@ def resolve_dethrone(
 ) -> bool:
     """Return True iff challenger should take the crown from incumbent.
 
-    Rule: challenger.worst > incumbent.worst * (1 + margin). If there is no
-    incumbent record, any challenger with a positive composite_worst is
-    eligible (covers the bootstrap case after a king regression / DQ).
+    Primary rule: ``challenger.worst > incumbent.worst * (1 + margin)``.
+
+    Saturated-floor tiebreaker (added 2026-04-26): if both UIDs have
+    ``worst <= SINGLE_EVAL_WORST_FLOOR_EPSILON`` (effectively zero —
+    ~45% of current composite records sit here because any axis at 0.0
+    floors ``min(axes)``), fall back to ``weighted`` with the same
+    relative margin. Without this gate, two saturated-floor UIDs with
+    weighted scores 0.50 and 0.78 are indistinguishable and the prior
+    king wins via the king-selection prior_bonus, even though the
+    challenger is meaningfully better on the other 19 axes.
     """
     ch_worst = (challenger_record or {}).get("worst")
     if ch_worst is None:
@@ -384,8 +428,31 @@ def resolve_dethrone(
     inc_worst = incumbent_record.get("worst")
     if inc_worst is None:
         return float(ch_worst) > 0.0
-    threshold = float(inc_worst) * (1.0 + max(0.0, float(margin)))
-    return float(ch_worst) > threshold
+    inc_worst_f = float(inc_worst)
+    ch_worst_f = float(ch_worst)
+    threshold = inc_worst_f * (1.0 + max(0.0, float(margin)))
+    if ch_worst_f > threshold:
+        return True
+    # Tiebreaker: when both are at the saturated floor (worst <= ε),
+    # use weighted with the same relative margin.
+    if (
+        inc_worst_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
+        and ch_worst_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
+    ):
+        ch_w = (challenger_record or {}).get("weighted")
+        inc_w = incumbent_record.get("weighted")
+        if ch_w is None or inc_w is None:
+            return False
+        try:
+            ch_w_f = float(ch_w)
+            inc_w_f = float(inc_w)
+        except (TypeError, ValueError):
+            return False
+        if inc_w_f <= 0.0:
+            return ch_w_f > 0.0
+        weighted_threshold = inc_w_f * (1.0 + max(0.0, float(margin)))
+        return ch_w_f > weighted_threshold
+    return False
 
 
 def _seed_one_h2h_round(state, latest: dict) -> int:

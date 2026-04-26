@@ -710,12 +710,50 @@ def apply_results_and_weights(
     # persistence step runs in post_round.
     if is_single_eval_mode():
         try:
-            valid_models = {
-                uid: info for uid, info in models_to_eval.items()
-                if not info.get("is_reference")
-            }
+            # Build the kingship-eligible set across the *whole* network, not
+            # just this round's challengers. In single-eval mode the prior
+            # king is never re-evaluated, so they're absent from
+            # ``models_to_eval``. If we passed only ``models_to_eval`` to
+            # ``select_king_by_composite``, the prior king would fail
+            # ``_is_eligible_uid`` (`uid not in valid_models` → False) and we'd
+            # silently dethrone them every round on whichever challenger happens
+            # to score best — even if the prior king has a far better stored
+            # composite. (Caught 2026-04-26: UID 149 was dethroned by UID 162
+            # even though 149's stored composite_worst was higher; the apply
+            # path's narrow valid_models was the cause.)
+            #
+            # The kingship-eligible set is: every UID with a composite_scores
+            # record OR participating in the current round, that has a
+            # current on-chain commitment. ``select_king_by_composite``
+            # then applies the DQ + reference-row checks via
+            # ``_is_eligible_uid`` as before.
+            kingship_models: dict = {}
+            for uid_str in (getattr(state, "composite_scores", {}) or {}).keys():
+                try:
+                    uid_i = int(uid_str)
+                except (TypeError, ValueError):
+                    continue
+                commit = (commitments or {}).get(uid_i)
+                if not commit:
+                    # No on-chain commitment for this UID anymore — they
+                    # deregistered or got replaced. Drop from kingship pool.
+                    continue
+                kingship_models[uid_i] = {
+                    "model": commit.get("model"),
+                    "revision": commit.get("revision"),
+                    "commit_block": commit.get("block"),
+                    "hotkey": (uid_to_hotkey or {}).get(uid_i, ""),
+                    "is_reference": False,
+                }
+            # Include this round's challengers too — they were just scored
+            # and merge_composite_scores will have written their records by
+            # now, but defensive in case the merge raced.
+            for uid_i, info in (models_to_eval or {}).items():
+                if info.get("is_reference"):
+                    continue
+                kingship_models.setdefault(uid_i, info)
             composite_king_uid, composite_record = select_king_by_composite(
-                state, valid_models, uid_to_hotkey=uid_to_hotkey,
+                state, kingship_models, uid_to_hotkey=uid_to_hotkey,
                 commitments=commitments,
             )
         except Exception as exc:
