@@ -3134,6 +3134,62 @@ def _coerce_block_seed(block_seed) -> int | None:
             return None
 
 
+def _paraphrase_aime_problem(question: str, block_seed) -> str:
+    """Per-round paraphrase wrapper for AIME problems.
+
+    Goodhart hardening (round 21): the AIME pool is ~90 public items
+    drawn from ``HuggingFaceH4/aime_2025`` + ``Maxwell-Jia/AIME_2024`` +
+    ``AI-MO/aimo-validation-aime``. Answers are integers 0–999. A miner
+    who pre-trained on the public datasets can build a
+    ``{problem_text → answer}`` lookup keyed on the canonical wording
+    and answer ``aime_bench`` from cache without doing any math.
+
+    Defence: reuse the math-domain-safe paraphrase machinery already
+    used by ``robustness_bench`` (``_apply_instruction_synonyms`` +
+    ``_imperative_to_question``) keyed on
+    ``(block_seed, sha(question))``. The synonym table only swaps
+    instruction-domain words (find / calculate / determine / what is)
+    and the imperative→question rewrite only touches the closing
+    sentence, so:
+
+    * Numeric constants, LaTeX (``$...$``, ``\\boxed{...}``), and answer
+      format are untouched — the math reasoning remains identical.
+    * Exact-text and naive-substring lookups break because the wording
+      rotates per round.
+    * A model that genuinely understands the problem still solves it
+      because the underlying math is unchanged.
+
+    Forward reference note: ``_apply_instruction_synonyms`` and
+    ``_imperative_to_question`` are defined later in this module
+    (with the rest of the robustness-bench infrastructure). That's
+    fine because this function is only called at round-start from
+    ``set_bench_block_seed``, by which point all module-level defs
+    exist. Returns ``question`` unchanged when ``block_seed`` is
+    None (dev/replay mode).
+
+    Order of operations: the imperative→question rewrite is applied
+    PROBABILISTICALLY (50% per question per round) rather than
+    unconditionally. Without this, every "Find / Calculate / Compute
+    / Determine X." imperative collapses to the same "What is X?"
+    string and the synonym-swap variants on ``find/calculate/compute``
+    are lost — defeating the per-round rotation. With the coin flip,
+    half the rounds keep the imperative form and rotate via the
+    synonym table; the other half rewrite to the question form and
+    then rotate via "what is" → "compute the value of". Combined
+    surface count typically ≥ 4 per imperative problem.
+    """
+    seed = _coerce_block_seed(block_seed)
+    if seed is None:
+        return question
+    import random
+    stable_seed = _stable_seed_from_text(question, block_seed)
+    out = question
+    if random.Random(stable_seed).random() < 0.5:
+        out = _imperative_to_question(out, stable_seed)
+    out = _apply_instruction_synonyms(out, stable_seed)
+    return out
+
+
 def _shuffle_mc_options_for_round(item: dict, block_seed) -> dict:
     """Per-round, per-question deterministic shuffle of MC option order.
 
@@ -3273,6 +3329,15 @@ def set_bench_block_seed(block_seed):
     _BENCH_SAMPLES["knowledge"] = _pick_bench_items("knowledge", block_seed, BENCH_KNOWLEDGE_PER_ROUND)
     _BENCH_SAMPLES["ifeval"] = _pick_bench_items("ifeval", block_seed, BENCH_IFEVAL_PER_ROUND)
     _BENCH_SAMPLES["aime"] = _pick_bench_items("aime", block_seed, BENCH_AIME_PER_ROUND)
+    # Round 21 Goodhart hardening: paraphrase the AIME problem text per
+    # round so a miner who memorised the canonical public wordings sees
+    # a rotated phrasing each round. Math-content is preserved by the
+    # synonym table (only instruction verbs / imperative→question
+    # transforms; never digits, LaTeX, or boxed format).
+    _BENCH_SAMPLES["aime"] = [
+        {**it, "question": _paraphrase_aime_problem(it["question"], block_seed)}
+        for it in _BENCH_SAMPLES["aime"]
+    ]
     _BENCH_SAMPLES["mbpp"] = _pick_bench_items("mbpp", block_seed, BENCH_MBPP_PER_ROUND)
     _BENCH_SAMPLES["tool_use"] = _pick_bench_items("tool_use", block_seed, BENCH_TOOL_USE_PER_ROUND)
     _BENCH_SAMPLES["self_consistency"] = _pick_bench_items(
@@ -4845,7 +4910,13 @@ def _imperative_to_question(text: str, seed: int) -> str:
     if len(body) < 3 or len(body) > 200:
         return text
     the_part = m.group("the") or ""
-    rewritten = pattern.sub(f"What is {the_part}{body}?", question_part, count=1)
+    # Use a function-form replacement so backslash escapes in the body
+    # (e.g. ``\\sqrt``, ``\\boxed{}``, ``\\frac``) are NOT interpreted as
+    # regex backreferences. Bug discovered when paraphrasing AIME
+    # problems containing LaTeX: ``re.error: bad escape \s at position
+    # 22`` from a body containing ``\\sqrt{k}``.
+    replacement = f"What is {the_part}{body}?"
+    rewritten = pattern.sub(lambda _m: replacement, question_part, count=1)
     return rewritten + sep + suffix
 
 

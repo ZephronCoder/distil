@@ -376,6 +376,19 @@ _KING_SELECTION_MIN_AXES = 17
 #         would let an old letter-memoriser keep their saturated
 #         arc_bench floor while honest miners regrade against the
 #         rotated mix; the king filter quarantines old records.
+#   v21 — AIME problem paraphrase per round. Pre-v21 ``aime_bench``
+#         used the canonical AIME problem wording verbatim from the
+#         public pool (~90 items, integer answers 0-999). A miner
+#         pre-training on the public datasets can build a
+#         ``{problem_text → answer}`` cache keyed on canonical
+#         wording. v21+ applies the same math-domain-safe
+#         paraphrase helpers that ``robustness_bench`` uses
+#         (instruction-synonym swap + imperative→question rewrite)
+#         keyed on ``(block_seed, sha(question))``. Numbers, LaTeX,
+#         and ``\\boxed{...}`` formatting are untouched so the math
+#         is unchanged; only the surface phrasing rotates. Mixing
+#         v20 and v21 records would let a wording-memoriser keep
+#         their AIME floor; the king filter quarantines old records.
 # Mixing schema versions would let a stale-grader UID inherit the crown via
 # inflated/deflated axis scores. The selector therefore filters to v_current
 # first and only falls through to legacy records when no v_current candidate
