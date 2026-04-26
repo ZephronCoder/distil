@@ -4041,55 +4041,94 @@ _LC_NEEDLE_TEMPLATES = [
 
 def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: int) -> list[dict]:
     """Create ``n_items`` fresh needle-in-haystack prompts seeded by the
-    round's block_seed. Document structure:
+    round's block_seed.
+
+    Each document contains a real needle (whose question is asked) AND a
+    confuser needle from a different template with a different fake
+    answer. Document structure:
 
         distractor_1
-        distractor_2
         ...
-        distractor_k        <- needle inserted at a random position
-        needle (with unique ANS)
-        distractor_{k+2}
+        confuser_needle      <- fake-answer needle from a different topic
+        ...
+        real_needle          <- the one whose question is asked
         ...
 
-    The model must return ANS. We grade with case-insensitive substring
-    containment so the model can answer "42" or "the code is 42".
+    Models that just regex out any 7-character ALL-CAPS code would grab
+    the confuser's answer and fail. To pass, the model must match the
+    question to the right needle in the document. Current 4B models pass
+    the no-confuser version 100% — this re-introduces signal.
+
+    The model must return the real ANS. Grading: case-insensitive
+    substring containment so the model can answer "XYZ1234" or "the code
+    is XYZ1234". A response that contains *only* the confuser's answer
+    fails because the substring check is for the real ANS.
     """
     import random
     out: list[dict] = []
     rng = random.Random((block_seed ^ _BENCH_STREAM["long_context"]) & 0xFFFFFFFF)
+    alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no confusing chars
+    n_templates = len(_LC_NEEDLE_TEMPLATES)
     for i in range(n_items):
         # Seed each item independently so swapping n_items doesn't change
         # the first item's content.
         r = random.Random(rng.randint(0, 2**31 - 1))
-        needle_tpl, question = r.choice(_LC_NEEDLE_TEMPLATES)
-        # Generate a unique answer ~6-8 chars, easy to extract.
-        alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no confusing chars
+        # Pick two distinct templates: one real, one confuser.
+        idxs = r.sample(range(n_templates), 2) if n_templates >= 2 else [0, 0]
+        real_idx, confuser_idx = idxs[0], idxs[1]
+        needle_tpl, question = _LC_NEEDLE_TEMPLATES[real_idx]
+        confuser_tpl, _ = _LC_NEEDLE_TEMPLATES[confuser_idx]
+        # Real and confuser answers must be different. Make confuser answer
+        # the same length so it looks equally plausible.
         answer = "".join(r.choice(alphabet) for _ in range(7))
+        confuser_answer = answer
+        while confuser_answer == answer:
+            confuser_answer = "".join(r.choice(alphabet) for _ in range(7))
         # Pick distractors without replacement; fall back to sampling with
         # replacement if n_distractors exceeds pool size.
         if n_distractors <= len(_LC_DISTRACTORS):
             distractors = r.sample(_LC_DISTRACTORS, n_distractors)
         else:
             distractors = [r.choice(_LC_DISTRACTORS) for _ in range(n_distractors)]
-        # Personalize distractor names so they vary across rounds. Replace
-        # one-off instances of common names with new random ones.
-        personalized = []
-        for d in distractors:
-            personalized.append(d)  # simple variant — leave as-is; the
-            # procedural pool rotation + answer rotation already ensures
-            # fresh content across rounds.
-        # Insert needle at a random position NOT at start/end, so models
-        # can't win by reading only the first or last sentence.
-        needle_sentence = needle_tpl.format(ANS=answer)
-        insertion = r.randint(n_distractors // 4, 3 * n_distractors // 4)
-        lines = personalized[:insertion] + [needle_sentence] + personalized[insertion:]
+        real_sentence = needle_tpl.format(ANS=answer)
+        confuser_sentence = confuser_tpl.format(ANS=confuser_answer)
+        # Pick positions in the FINAL-document index space so the recorded
+        # ``needle_position`` / ``confuser_position`` match the rendered
+        # context. Real needle in the middle half (NOT at start/end);
+        # confuser at least 3 lines away so the two don't cluster.
+        final_n = n_distractors + 2
+        real_pos = r.randint(final_n // 4, 3 * final_n // 4)
+        confuser_pos = real_pos
+        attempts = 0
+        while abs(confuser_pos - real_pos) < 3 and attempts < 16:
+            confuser_pos = r.randint(0, final_n - 1)
+            attempts += 1
+        # Build the final document directly so positions are exact. Two
+        # slots are reserved for the needles; the rest are distractors in
+        # order (their internal order doesn't matter for grading).
+        slot_positions = sorted([
+            (real_pos, real_sentence),
+            (confuser_pos, confuser_sentence),
+        ])
+        next_slot = 0
+        distract_idx = 0
+        lines: list[str] = []
+        for j in range(final_n):
+            if next_slot < 2 and j == slot_positions[next_slot][0]:
+                lines.append(slot_positions[next_slot][1])
+                next_slot += 1
+            else:
+                lines.append(distractors[distract_idx])
+                distract_idx += 1
         context = "\n".join(lines)
         out.append({
             "src": "long_context",
             "context": context,
             "question": question,
             "answer": answer,
-            "needle_position": insertion,
+            "confuser_answer": confuser_answer,
+            "needle_position": real_pos,
+            "confuser_position": confuser_pos,
         })
     return out
 
