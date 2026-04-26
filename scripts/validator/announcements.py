@@ -45,11 +45,14 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
     if single_eval_active:
         prompt_line = f"🧪 Scored on {prompt_count} block-seeded prompts"
         gate_explainer = (
-            "Dethronement: composite-worst score across 20 axes (math, code, "
+            "Dethronement uses an absolute composite across 20 axes (math, code, "
             "reasoning, knowledge, ifeval, aime, mbpp, tool-use, self-consistency, "
             "arc, truthful, long-context, procedural, robustness, noise, judge, "
-            "chat-turns, length, degeneracy, KL) must beat the king by ≥0.03 with "
-            "axis floor + Pareto dominance. One eval per commitment; no re-evals."
+            "chat-turns, length, degeneracy, KL). 3-stage gate: clear win on `worst` "
+            "(>3% margin) → take crown; clear regression on `worst` (<-3%) → reject; "
+            "tied region → fall back to `weighted` with the same 3% margin. KL "
+            "shown above is the global distillation distance, not the ranking key. "
+            "One eval per commitment; no re-evals."
         )
     else:
         prompt_line = f"🧪 Compared on {prompt_count} paired prompts"
