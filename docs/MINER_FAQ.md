@@ -254,14 +254,18 @@ All endpoints are on `api.arbos.life`.
 | Required architecture | `Qwen3_5ForConditionalGeneration` |
 | Required model_type | `qwen3_5` |
 | Vocab size | 248,320 |
-| Eval prompts (head-to-head) | 300 |
+| Eval prompts per UID | 300 (block-seeded, single-eval policy) |
 | Eval prompts (broad sweep) | 60 |
 | Max new tokens | 8,192 |
 | Max prompt tokens | 1,024 |
-| Dethronement threshold | paired t-test, p < 0.03 AND worst-axis ≥ 0.20 |
-| Composite version | Arena v3 (v10) |
-| Live axes | kl, on_policy_rkl, capability, length, degeneracy, judge_probe, math_bench, code_bench, reasoning_bench, knowledge_bench, ifeval_bench, aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench, arc_bench, truthful_bench, long_context_bench, procedural_bench, reasoning_density, chat_turns_probe, pareto_dominance |
+| Eval policy | `SINGLE_EVAL_MODE=1` — one commitment, one eval |
+| Challengers per round (cap) | `SINGLE_EVAL_MAX_PER_ROUND=10` (FIFO by `commit_block`) |
+| Dethronement gate | `challenger.composite.worst > incumbent.composite.worst × 1.03` (cross-round, on absolute composite) |
+| Saturated-floor tiebreaker | when both `worst ≤ 0.005`, same 3% margin on `composite.weighted` |
+| King selection schema floor | `_KING_SELECTION_MIN_AXES = 17` (Arena v3.7) |
+| Composite version | Arena v3.7 |
+| Live axes | kl, on_policy_rkl, capability, length, degeneracy, judge_probe, math_bench, code_bench, reasoning_bench, knowledge_bench, ifeval_bench, aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench, arc_bench, truthful_bench, long_context_bench, procedural_bench, robustness_bench, noise_resistance_bench, reasoning_density, chat_turns_probe, pareto_dominance |
 | Shadow axes | none |
-| Top-N always included | 7 |
+| Top-N always included | n/a in single-eval mode (no re-eval rotation) |
 | Dataset (distillation) | `karpathy/climbmix-400b-shuffle` |
 | Reference baseline | `Qwen/Qwen3.5-4B` (UID -1) |
