@@ -7,8 +7,45 @@ import time
 
 from eval.state import ValidatorState
 from scripts.validator.config import DISTIL_ROLE_ID, PAIRED_TEST_ALPHA, EVAL_PROMPTS_H2H
+from scripts.validator.composite import (
+    ARENA_V3_AXIS_WEIGHTS,
+    BENCH_AXIS_WEIGHTS,
+    COMPOSITE_SHADOW_VERSION,
+)
 
 logger = logging.getLogger("distillation.remote_validator")
+
+
+# Structural / relative axes are always part of the composite dethrone gate
+# regardless of which bench axes are weighted in the current schema. Listing
+# them keeps the public Discord text honest (we *do* score chat behaviour,
+# KL, judge probes, etc) without implying they're optional.
+_STRUCTURAL_AXES = (
+    "on_policy_rkl",
+    "kl",
+    "capability",
+    "judge_probe",
+    "chat_turns_probe",
+    "length",
+    "degeneracy",
+    "reasoning_density",
+)
+
+
+def _active_axis_summary() -> tuple[int, str]:
+    """Return ``(count, comma-separated names)`` of axes with non-zero composite
+    weight, computed live from ``BENCH_AXIS_WEIGHTS`` + ``ARENA_V3_AXIS_WEIGHTS``
+    plus the always-on structural axes.
+
+    Used by the Discord announcement so the axis list can never drift after a
+    schema bump (v27 → v28 muted six bench axes and the literal text was left
+    stale, which surfaced in Discord as inaccurate axis attribution).
+    """
+    active_bench = [k for k, w in BENCH_AXIS_WEIGHTS.items() if w > 0]
+    active_arena = [k for k, w in ARENA_V3_AXIS_WEIGHTS.items() if w > 0]
+    names = active_bench + active_arena + list(_STRUCTURAL_AXES)
+    pretty = ", ".join(n.replace("_bench", "") for n in names)
+    return len(names), pretty
 
 
 def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
@@ -44,15 +81,14 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
     # the actual gate. In legacy paired-t-test mode keep the old wording.
     if single_eval_active:
         prompt_line = f"🧪 Scored on {prompt_count} block-seeded prompts"
+        n_axes, axis_list = _active_axis_summary()
         gate_explainer = (
-            "Dethronement uses an absolute composite across 20 axes (math, code, "
-            "reasoning, knowledge, ifeval, aime, mbpp, tool-use, self-consistency, "
-            "arc, truthful, long-context, procedural, robustness, noise, judge, "
-            "chat-turns, length, degeneracy, KL). 3-stage gate: clear win on `worst` "
-            "(>3% margin) → take crown; clear regression on `worst` (<-3%) → reject; "
-            "tied region → fall back to `weighted` with the same 3% margin. KL "
-            "shown above is the global distillation distance, not the ranking key. "
-            "One eval per commitment; no re-evals."
+            f"Dethronement uses an absolute composite across {n_axes} weighted axes "
+            f"({axis_list}). 3-stage gate: clear win on `worst` (>3% margin) → take "
+            f"crown; clear regression on `worst` (<-3%) → reject; tied region → "
+            f"fall back to `weighted` with the same 3% margin. KL shown above is "
+            f"the global distillation distance, not the ranking key. One eval per "
+            f"commitment; no re-evals. (composite schema v{COMPOSITE_SHADOW_VERSION})"
         )
     else:
         prompt_line = f"🧪 Compared on {prompt_count} paired prompts"
