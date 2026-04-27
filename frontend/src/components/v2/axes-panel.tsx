@@ -44,12 +44,25 @@ interface MinerSummary {
   composite: CompositePayload;
 }
 
-interface LeaderboardResponse {
+/**
+ * Public API shape: {"leaderboard": {king, contenders, phase, ...}}.
+ * The router wraps the leaderboard payload one level deep so this
+ * panel needs to dereference json.leaderboard.king on the response.
+ * Found on 2026-04-27 pass #4 — earlier I assumed king was top-level
+ * which made the panel render empty against the deployed API.
+ */
+interface LeaderboardInner {
   king: MinerSummary | null;
   contenders: MinerSummary[];
   phase?: string | null;
   initial_eval_complete?: boolean;
   completed_at?: number | null;
+}
+interface LeaderboardResponse {
+  leaderboard?: LeaderboardInner | null;
+  // Fallback shape: some deployments expose it flat. Try both.
+  king?: MinerSummary | null;
+  contenders?: MinerSummary[];
 }
 
 const MACRO_AXES: { label: string; members: string[]; description: string }[] = [
@@ -116,8 +129,9 @@ export function AxesPanel() {
           const json = (await res.json()) as LeaderboardResponse;
           setData(json);
           setLoading(false);
-          if (primaryUid == null && json?.king?.uid != null) {
-            setPrimaryUid(json.king.uid);
+          const king = json?.leaderboard?.king ?? json?.king ?? null;
+          if (primaryUid == null && king?.uid != null) {
+            setPrimaryUid(king.uid);
           }
         }
       } catch {
@@ -133,16 +147,19 @@ export function AxesPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const inner: LeaderboardInner | null =
+    data?.leaderboard ?? (data?.king ? { king: data.king, contenders: data.contenders ?? [] } : null);
+
   const all: MinerSummary[] = (() => {
     const out: MinerSummary[] = [];
-    if (data?.king) out.push(data.king);
-    for (const c of data?.contenders ?? []) out.push(c);
+    if (inner?.king) out.push(inner.king);
+    for (const c of inner?.contenders ?? []) out.push(c);
     return out.filter((r) => r.composite?.worst != null);
   })();
 
-  const primary = all.find((r) => r.uid === primaryUid) ?? data?.king ?? null;
+  const primary = all.find((r) => r.uid === primaryUid) ?? inner?.king ?? null;
   const compare = compareUid != null ? all.find((r) => r.uid === compareUid) ?? null : null;
-  const isKing = primary?.uid === data?.king?.uid && data?.king != null;
+  const isKing = primary?.uid === inner?.king?.uid && inner?.king != null;
 
   return (
     <div className="px-6 sm:px-9 py-8 min-h-[calc(100vh-3.5rem-3rem)] overflow-y-auto">
@@ -178,14 +195,14 @@ export function AxesPanel() {
             value={primaryUid}
             onChange={setPrimaryUid}
             results={all}
-            kingUid={data?.king?.uid ?? null}
+            kingUid={inner?.king?.uid ?? null}
           />
           <UidPicker
             label="Compare"
             value={compareUid}
             onChange={setCompareUid}
             results={all.filter((r) => r.uid !== primaryUid)}
-            kingUid={data?.king?.uid ?? null}
+            kingUid={inner?.king?.uid ?? null}
             allowClear
           />
         </div>
