@@ -15,6 +15,13 @@ interface BenchmarkPayload {
   timestamp?: string | number;
   fetched_at?: number;
   limit?: number | null;
+  /** Marks the row as a full held-out evalscope run (vs the
+   * lighter auto-bench). When present we prefer it for the king row
+   * because the auto-bench sometimes returns 0-count for benches it
+   * couldn't complete, and full evalscope is the canonical source.
+   */
+  is_evalscope_full?: boolean;
+  label?: string;
 }
 
 interface BenchmarksResponse {
@@ -102,12 +109,40 @@ export function BenchPanel() {
     };
   }, []);
 
+  // Prefer the explicit current king from /api/benchmarks. The
+  // auto-bench is the most-recent source for the live king but can
+  // miss benches (counts==0). Use the full evalscope row (if any) as
+  // a fallback per-bench when the king's auto-bench score is missing
+  // for that task.
   const king = data?.models.find((m) => m.is_king) ?? data?.models[0] ?? null;
+  const evalscope = data?.models.find((m) => m.is_evalscope_full) ?? null;
   // Try to find a teacher entry. Otherwise teacher is the reference baseline.
   const teacher = data?.models.find((m) =>
     m.model.toLowerCase().includes("35b")
   );
   const reference = data?.baseline ?? null;
+
+  // Synthesise a "king-with-fallback" view: same model identity as the
+  // king, but each bench score falls back to the evalscope row when
+  // the auto-bench returned count==0.
+  const kingFilled: BenchmarkPayload | null = (() => {
+    if (!king) return null;
+    if (!evalscope) return king;
+    const merged: Record<string, number | null> = { ...king.benchmarks };
+    const mergedCounts: Record<string, number | null> = { ...(king.counts ?? {}) };
+    for (const k of Object.keys(evalscope.benchmarks)) {
+      const cur = king.counts?.[k];
+      if (cur == null || cur === 0) {
+        merged[k] = evalscope.benchmarks[k] ?? null;
+        mergedCounts[k] = evalscope.counts?.[k] ?? null;
+      }
+    }
+    return {
+      ...king,
+      benchmarks: merged,
+      counts: mergedCounts,
+    };
+  })();
 
   // Surface limit (e.g. 50 items) so the user knows this is the
   // auto-bench cut, not the full evalscope run.
@@ -119,7 +154,11 @@ export function BenchPanel() {
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 grid-rows-[1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)]">
       {HEADLINE.map((b, i) => {
-        const k = pickScoreAndCount(king?.benchmarks, king?.counts, b.key);
+        const k = pickScoreAndCount(
+          kingFilled?.benchmarks,
+          kingFilled?.counts,
+          b.key,
+        );
         const t = pickScoreAndCount(teacher?.benchmarks, teacher?.counts, b.key);
         const r = pickScoreAndCount(reference?.benchmarks, reference?.counts, b.key);
         const isLastCol = (i + 1) % 3 === 0;
@@ -146,10 +185,20 @@ export function BenchPanel() {
             <span className="num">{king.model}</span>.
           </>
         )}
+        {evalscope && (
+          <>
+            {" "}Where the auto-bench couldn&apos;t complete a task, we fall back to the{" "}
+            <strong className="text-foreground">{evalscope.label ?? "v28-full evalscope"}</strong>{" "}
+            run on{" "}
+            <span className="num">
+              UID {evalscope.uid ?? "?"} · {evalscope.model}
+            </span>
+            .
+          </>
+        )}
         {" "}A bench shown as <strong className="text-foreground">n/a</strong> means
-        the auto-bench backend didn&apos;t complete that task for this UID — not
-        that the model failed. The full held-out evalscope run is at{" "}
-        <code className="font-mono">benchmark_results/v28-full/</code>.
+        neither source has data for it. The full held-out evalscope reports
+        live at <code className="font-mono">benchmark_results/v28-full/</code>.
       </div>
     </div>
   );
