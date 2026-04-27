@@ -148,8 +148,8 @@ export function MinersPanel({
             <Th align="right" title="composite.worst — the ranking key (lowest of 17 axes)">
               Worst
             </Th>
-            <Th align="right" title="composite.weighted — Σ wᵢ·axisᵢ / Σ wᵢ">
-              Weighted
+            <Th title="The single axis bottlenecking this miner's composite.worst. Train data here to push it up.">
+              Limiting axis
             </Th>
             <Th align="right" title="KL axis only — one of 17, never the gate">
               KL <span className="opacity-60">(1/17)</span>
@@ -235,19 +235,18 @@ export function MinersPanel({
                 </Td>
                 <Td align="right" className="num font-medium">
                   {m.compositeWorst != null ? m.compositeWorst.toFixed(3) : "—"}
-                  {m.limitingAxis && (
-                    <div
-                      className="text-[10px] text-meta truncate max-w-[72px] ml-auto"
-                      title={`limiting axis: ${m.limitingAxis}`}
-                    >
-                      {m.limitingAxis.replace("_bench", "")}
-                    </div>
-                  )}
                 </Td>
-                <Td align="right" className="num text-meta">
-                  {/* No weighted in MinerEntry yet — show "—" until we
-                      surface composite.weighted from H2H. */}
-                  —
+                <Td className="text-[12px]">
+                  {m.limitingAxis ? (
+                    <span
+                      className="text-foreground"
+                      title={`limiting axis: ${m.limitingAxis} — train data targeting this axis to improve the ranking key`}
+                    >
+                      {m.limitingAxis.replace(/_bench$/, "").replace(/_/g, " ")}
+                    </span>
+                  ) : (
+                    <span className="text-meta">—</span>
+                  )}
                 </Td>
                 <Td align="right" className="num text-meta">
                   {m.klScore != null ? m.klScore.toFixed(4) : "—"}

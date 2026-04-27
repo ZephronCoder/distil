@@ -13,7 +13,21 @@ interface H2hResult {
   composite?: {
     worst?: number | null;
     weighted?: number | null;
+    axes?: Record<string, number | null | undefined>;
   } | null;
+}
+
+function findLimitingAxis(r: H2hResult | null | undefined): string | null {
+  if (!r?.composite?.axes) return null;
+  const entries = Object.entries(r.composite.axes).filter(
+    (e): e is [string, number] => typeof e[1] === "number" && Number.isFinite(e[1]),
+  );
+  if (entries.length === 0) return null;
+  return entries.reduce((best, cur) => (cur[1] < best[1] ? cur : best))[0];
+}
+
+function prettyAxis(s: string): string {
+  return s.replace(/_bench$/, "").replace(/_/g, " ");
 }
 
 interface H2hRound {
@@ -199,6 +213,7 @@ function Side({ side, loser, result, showAnnotation, annotation, margin }: SideP
     return <div className={side === "right" ? "text-right" : ""}>—</div>;
   }
   const worst = result.composite?.worst ?? null;
+  const limiting = findLimitingAxis(result);
   const align = side === "right" ? "items-end text-right" : "items-start";
   return (
     <div className={["flex flex-col gap-0.5 min-w-0", align].join(" ")}>
@@ -215,6 +230,14 @@ function Side({ side, loser, result, showAnnotation, annotation, margin }: SideP
           ? `worst ${worst.toFixed(3)}`
           : `KL ${result.kl.toFixed(4)}`}
       </div>
+      {limiting && worst != null && (
+        <div
+          className="text-[9px] text-meta tracking-[0.05em] truncate max-w-full"
+          title={`limiting axis (lowest non-broken): ${limiting}`}
+        >
+          ↳ {prettyAxis(limiting)}
+        </div>
+      )}
       {showAnnotation && (
         <div className="text-[9px] text-meta uppercase tracking-[0.12em] num mt-0.5">
           <strong className="text-foreground font-medium">{annotation}</strong>

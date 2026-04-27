@@ -135,13 +135,20 @@ function LiveBadge({
   return (
     <button
       onClick={onClick}
-      title={live ? "Validator running an eval" : "Validator idle"}
-      className="inline-flex items-center gap-1.5 text-[10px] uppercase tracking-[0.15em] text-meta cursor-default"
+      title={
+        live
+          ? "Validator is running an eval right now. Click for the Live tab."
+          : "Validator is idle. Next round starts when new on-chain commitments arrive."
+      }
+      className={[
+        "inline-flex items-center gap-1.5 text-[10px] uppercase tracking-[0.15em]",
+        live ? "text-foreground font-medium" : "text-meta",
+      ].join(" ")}
     >
       <span
         className={[
           "w-1.5 h-1.5 rounded-full",
-          live ? "bg-ok live-pulse" : "bg-border-strong",
+          live ? "bg-ok live-pulse" : "bg-[var(--ink-meta-soft)]",
         ].join(" ")}
       />
       <span>{live ? "live" : "idle"}</span>

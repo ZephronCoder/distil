@@ -61,9 +61,14 @@ export function AxesPanel() {
 
   const points = useMemo(() => {
     if (!latest) return [];
-    const pts: { uid: number; worst: number; weighted: number; isKing: boolean }[] = [];
+    const pts: {
+      uid: number;
+      worst: number;
+      weighted: number;
+      isKing: boolean;
+      isDq: boolean;
+    }[] = [];
     for (const r of latest.results) {
-      if (r.disqualified) continue;
       if (r.uid == null) continue;
       const w = r.composite?.worst;
       const wm = r.composite?.weighted;
@@ -73,6 +78,7 @@ export function AxesPanel() {
         worst: w,
         weighted: wm,
         isKing: !!r.is_king,
+        isDq: !!r.disqualified,
       });
     }
     return pts;
@@ -123,7 +129,13 @@ function HeadRow({ title, meta }: { title: string; meta: string }) {
 function ParetoChart({
   points,
 }: {
-  points: { uid: number; worst: number; weighted: number; isKing: boolean }[];
+  points: {
+    uid: number;
+    worst: number;
+    weighted: number;
+    isKing: boolean;
+    isDq: boolean;
+  }[];
 }) {
   if (points.length === 0) {
     return (
@@ -136,18 +148,15 @@ function ParetoChart({
   const H = 480;
   const P = 44;
 
-  // Both axes are 0..1 (composite is normalised per axis).
   const xof = (k: number) => P + Math.min(1, Math.max(0, k)) * (W - P * 2);
   const yof = (k: number) =>
     H - P - Math.min(1, Math.max(0, k)) * (H - P * 2);
 
-  // Pareto frontier: scan in order of increasing worst, keep highest weighted.
-  const sortedByWorst = [...points].sort((a, b) => a.worst - b.worst);
+  // Pareto frontier excludes DQ'd points — they're not in the running.
+  const live = points.filter((p) => !p.isDq);
+  const sortedByWorst = [...live].sort((a, b) => a.worst - b.worst);
   let bestWeighted = -Infinity;
-  const front: typeof points = [];
-  // We want the upper-right frontier — iterate from the *highest worst*
-  // downward and keep monotonically rising weighted; that gives us the
-  // "no other point dominates" set.
+  const front: typeof live = [];
   for (const p of [...sortedByWorst].reverse()) {
     if (p.weighted > bestWeighted) {
       front.unshift(p);
@@ -158,6 +167,18 @@ function ParetoChart({
   const frontPath = front
     .map((p, i) => `${i === 0 ? "M" : "L"}${xof(p.worst)},${yof(p.weighted)}`)
     .join(" ");
+
+  // Pick which UIDs deserve a label so we don't overlap with 50+ entries.
+  // Rule: top 5 by composite.worst among the live set (= the ones in
+  // realistic dethrone range), plus the king and any DQ'd UID with a
+  // notably high worst (>= 0.4 — they're DQ'd but still worth seeing).
+  const liveSorted = [...live].sort((a, b) => b.worst - a.worst);
+  const labelSet = new Set<number>();
+  liveSorted.slice(0, 5).forEach((p) => labelSet.add(p.uid));
+  for (const p of points) {
+    if (p.isKing) labelSet.add(p.uid);
+    if (p.isDq && p.worst >= 0.4) labelSet.add(p.uid);
+  }
 
   return (
     <svg
@@ -173,14 +194,17 @@ function ParetoChart({
         fill="#fff"
         stroke="#ebebeb"
       />
-      {/* Gridlines at quartiles */}
       {[1, 2, 3].map((i) => {
         const x = P + (i * (W - P * 2)) / 4;
-        return <line key={`vx${i}`} x1={x} x2={x} y1={P} y2={H - P} stroke="#f4f4f4" />;
+        return (
+          <line key={`vx${i}`} x1={x} x2={x} y1={P} y2={H - P} stroke="#f4f4f4" />
+        );
       })}
       {[1, 2, 3].map((i) => {
         const y = P + (i * (H - P * 2)) / 4;
-        return <line key={`hy${i}`} x1={P} x2={W - P} y1={y} y2={y} stroke="#f4f4f4" />;
+        return (
+          <line key={`hy${i}`} x1={P} x2={W - P} y1={y} y2={y} stroke="#f4f4f4" />
+        );
       })}
 
       {front.length > 1 && (
@@ -196,25 +220,39 @@ function ParetoChart({
       {points.map((p) => {
         const x = xof(p.worst);
         const y = yof(p.weighted);
+        const labeled = labelSet.has(p.uid);
+        const fill = p.isKing
+          ? "#0a0a0a"
+          : p.isDq
+            ? "#e0e0e0"
+            : "#bdbdbd";
+        const size = p.isDq ? 4 : 8;
+        const strokeColor = p.isDq ? "#bdbdbd" : "transparent";
         return (
           <g key={p.uid}>
             <rect
-              x={x - 4}
-              y={y - 4}
-              width={8}
-              height={8}
-              fill={p.isKing ? "#0a0a0a" : "#bdbdbd"}
+              x={x - size / 2}
+              y={y - size / 2}
+              width={size}
+              height={size}
+              fill={fill}
+              stroke={strokeColor}
+              strokeWidth={p.isDq ? 1 : 0}
             />
-            <text
-              x={x + 10}
-              y={y + 4}
-              fontFamily="Inter, sans-serif"
-              fontSize={11}
-              fill={p.isKing ? "#0a0a0a" : "#8a8a8a"}
-              fontWeight={p.isKing ? 500 : 400}
-            >
-              {p.uid}
-            </text>
+            {labeled && (
+              <text
+                x={x + 10}
+                y={y + 4}
+                fontFamily="Inter, sans-serif"
+                fontSize={11}
+                fill={p.isKing ? "#0a0a0a" : p.isDq ? "#bdbdbd" : "#8a8a8a"}
+                fontWeight={p.isKing ? 500 : 400}
+                fontStyle={p.isDq ? "italic" : "normal"}
+              >
+                {p.uid}
+                {p.isDq ? " dq" : ""}
+              </text>
+            )}
           </g>
         );
       })}
