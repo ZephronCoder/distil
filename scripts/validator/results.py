@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import time
 from pathlib import Path
 
@@ -141,6 +142,110 @@ def _pairwise_two_sided_p(a_per_prompt: list[float], b_per_prompt: list[float]) 
     mean_delta = sum(deltas) / n
     _t, _p_one, p_two = _paired_t_stats(deltas)
     return mean_delta, p_two, n
+
+
+def _baseline_floor_dethrone_veto(
+    challenger_model: str | None,
+    reference_model: str | None,
+    students_data: dict,
+) -> dict | None:
+    """Veto a dethrone if the challenger regresses below the Qwen 4B base.
+
+    Goodhart guard (2026-04-28): the held-out evalscope canary showed
+    kings regressing -7.4pp on gsm8k and -10.2pp on BBH versus the
+    Qwen3.5-4B base (state/benchmarks/baseline_qwen35_4b.json gsm8k
+    0.934 vs king 0.86; bbh 0.879 vs king 0.777). The composite gate
+    can't catch this because the validator's procedural items don't
+    reach that absolute level — a challenger gaming math_bench at 0.92
+    can still be -0.10 below where the *base* model would score on the
+    same items, which is direct evidence the model has *regressed* on
+    real capability rather than gained it.
+
+    This gate is paired-evaluation: when the reference (Qwen3.5-4B
+    base, REFERENCE_UID = -1) is included in the same round
+    (INCLUDE_REFERENCE_IN_ROUND=1), challenger and reference see the
+    *same* block-seeded items, so the comparison is sample-paired and
+    free of cross-round prompt drift. If the reference isn't in the
+    round (legacy behavior), this veto silently fails open.
+
+    Threshold: a challenger that scores below the reference by more
+    than ``BASELINE_FLOOR_MARGIN`` on any of the gsm8k-/humaneval-/bbh-
+    transfer axes (math_bench, code_bench, reasoning_bench,
+    ifeval_bench, aime_bench, mbpp_bench) is blocked from dethrone.
+    Default 0.10 = 10pp absolute margin: a small regression is allowed
+    to avoid sample-noise false positives, but a -10pp absolute drop
+    on a held-out-transfer axis vs the SAME 4B base reads as the
+    model is genuinely worse than the un-distilled control.
+
+    Returns None when:
+      * reference not in the round
+      * fewer than ``BASELINE_FLOOR_MIN_AXES_COMPARABLE`` axes are
+        comparable (insufficient sample, fail open)
+      * no axis regresses by more than the margin (challenger is at
+        least non-regressive)
+    Returns ``{"reason": str, "axis": str, "challenger": float,
+    "reference": float, "margin": float}`` to block dethrone.
+
+    Implementation note: this is in addition to the existing
+    composite-floor / Pareto vetoes. A challenger must pass ALL gates
+    to take the crown.
+    """
+    if not challenger_model or not reference_model:
+        return None
+    c_data = students_data.get(challenger_model) or {}
+    r_data = students_data.get(reference_model) or {}
+    if not c_data or not r_data:
+        return None
+    margin = float(os.environ.get("BASELINE_FLOOR_MARGIN", "0.10"))
+    min_comparable = int(os.environ.get("BASELINE_FLOOR_MIN_AXES_COMPARABLE", "2"))
+    if margin <= 0:
+        return None
+    transfer_axes = (
+        "math_bench", "code_bench", "reasoning_bench",
+        "ifeval_bench", "aime_bench", "mbpp_bench",
+    )
+    comparable: list[tuple[str, float, float]] = []
+    for axis in transfer_axes:
+        c_payload = c_data.get(axis) or {}
+        r_payload = r_data.get(axis) or {}
+        if not c_payload or not r_payload:
+            continue
+        c_pf = c_payload.get("pass_frac")
+        r_pf = r_payload.get("pass_frac")
+        if c_pf is None or r_pf is None:
+            continue
+        try:
+            c_val = float(c_pf)
+            r_val = float(r_pf)
+        except (TypeError, ValueError):
+            continue
+        comparable.append((axis, c_val, r_val))
+    if len(comparable) < min_comparable:
+        return None
+    # Block dethrone if ANY transfer axis regresses below baseline by margin.
+    worst_axis = None
+    worst_gap = 0.0  # most-negative gap seen
+    for axis, c_val, r_val in comparable:
+        gap = c_val - r_val  # negative ⇒ challenger below reference
+        if gap < worst_gap:
+            worst_gap = gap
+            worst_axis = (axis, c_val, r_val)
+    if worst_axis is None or worst_gap > -margin:
+        return None
+    axis, c_val, r_val = worst_axis
+    return {
+        "reason": (
+            f"baseline-floor regression: {axis} challenger={c_val:.3f} "
+            f"vs Qwen-4B-base={r_val:.3f} (gap={worst_gap:+.3f}, "
+            f"margin -{margin:.2f}). Model is worse than the un-distilled "
+            f"reference on a held-out-transfer axis."
+        ),
+        "axis": axis,
+        "challenger": c_val,
+        "reference": r_val,
+        "gap": worst_gap,
+        "margin": margin,
+    }
 
 
 def _composite_dethrone_veto(
@@ -715,6 +820,16 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         king_rkl_ref_early = _resolve_king_rkl(king_h2h_kl, students_data_early, _early_h2h_stub)
     except Exception:
         king_rkl_ref_early = None
+    # Reference (Qwen 4B base) model name for the baseline-floor veto.
+    # When INCLUDE_REFERENCE_IN_ROUND=1 the reference is in models_to_eval
+    # at REFERENCE_UID, so we resolve its model name once here. If the
+    # reference isn't seated this round, _ref_model_name stays None and
+    # the baseline-floor veto silently fails open.
+    try:
+        from eval.runtime import REFERENCE_UID as _REF_UID
+        _ref_model_name = uid_to_model.get(_REF_UID)
+    except Exception:
+        _ref_model_name = None
 
     round_info = getattr(state, "current_round", {}) or {}
     prompt_texts_for_dp = round_info.get("prompts") or []
@@ -779,6 +894,28 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                                 f"UID {uid}: composite floor would block ({comp_veto['reason']}), "
                                 "but king regression gate waived the floor"
                             )
+                        # Baseline-floor gate (2026-04-28): block dethrone
+                        # when challenger regresses below the Qwen 4B base
+                        # on a held-out-transfer axis. Requires reference
+                        # to be in the round (INCLUDE_REFERENCE_IN_ROUND=1).
+                        baseline_veto = _baseline_floor_dethrone_veto(
+                            challenger_model, _ref_model_name, students_data_early,
+                        )
+                        if baseline_veto is not None:
+                            logger.info(
+                                f"UID {uid}: BLOCKED DETHRONE by baseline floor — "
+                                f"{baseline_veto['reason']} (KL passed: p={p_value:.4f}, "
+                                f"delta={mean_delta:.6f}, KL={challenger_kl:.6f})"
+                            )
+                            log_event(
+                                f"Baseline floor blocked dethrone: UID {uid} "
+                                f"axis {baseline_veto['axis']} "
+                                f"challenger={baseline_veto['challenger']:.3f} "
+                                f"vs reference={baseline_veto['reference']:.3f} "
+                                f"(gap={baseline_veto['gap']:+.3f})",
+                                level="warning", state_dir=str(state.state_dir),
+                            )
+                            continue
                         # Pareto-dominance gate (SHADOW until +48h notice).
                         pareto_veto = _pareto_dethrone_veto(
                             challenger_model, king_model_name,
@@ -839,6 +976,24 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                             f"UID {uid}: composite floor would block ({comp_veto['reason']}) "
                             "[legacy path], but king regression gate waived the floor"
                         )
+                    # Baseline-floor gate (legacy path)
+                    baseline_veto = _baseline_floor_dethrone_veto(
+                        challenger_model, _ref_model_name, students_data_early,
+                    )
+                    if baseline_veto is not None:
+                        logger.info(
+                            f"UID {uid}: BLOCKED DETHRONE by baseline floor — "
+                            f"{baseline_veto['reason']} [legacy epsilon path, KL={challenger_kl:.6f}]"
+                        )
+                        log_event(
+                            f"Baseline floor blocked dethrone: UID {uid} "
+                            f"axis {baseline_veto['axis']} "
+                            f"challenger={baseline_veto['challenger']:.3f} "
+                            f"vs reference={baseline_veto['reference']:.3f} "
+                            f"(gap={baseline_veto['gap']:+.3f}) [legacy path]",
+                            level="warning", state_dir=str(state.state_dir),
+                        )
+                        continue
                     pareto_veto = _pareto_dethrone_veto(
                         challenger_model, king_model_name,
                         students_data_early, king_h2h_kl, king_rkl_ref_early,
