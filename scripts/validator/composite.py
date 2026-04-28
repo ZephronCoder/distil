@@ -354,6 +354,25 @@ KING_COMPOSITE_FLOOR = float(os.environ.get("KING_COMPOSITE_FLOOR", "0.20"))
 KING_REGRESSION_MIN_STREAK = int(os.environ.get("KING_REGRESSION_MIN_STREAK", "3"))
 KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 
+# ── Canary-regression auto-dethrone (2026-04-28) ──────────────────────────
+# Sibling of KING_REGRESSION_GATE. The internal at-risk check uses the
+# validator's own composite.worst, which is gameable (the whole point
+# of the goodhart canary). This canary gate uses HELD-OUT evalscope
+# benchmarks that are NEVER inside the validator: when the king's
+# average held-out score across {gsm8k, humaneval, bbh, ifeval} drops
+# more than ``KING_CANARY_MARGIN`` pp below the Qwen 4B base reference
+# for ``KING_CANARY_MIN_STREAK`` consecutive canonical rounds, the
+# composite-floor veto is waived (same mechanism as the at-risk gate).
+# This means a challenger who would normally be blocked by composite-
+# floor veto can dethrone a king whose held-out is regressing — the
+# explicit answer to "did the composite eval produce a model that's
+# actually better, or just better at the composite?".
+KING_CANARY_MARGIN = float(os.environ.get("KING_CANARY_MARGIN", "0.05"))
+KING_CANARY_MIN_STREAK = int(os.environ.get("KING_CANARY_MIN_STREAK", "2"))
+KING_CANARY_GATE = os.environ.get("KING_CANARY_GATE", "1") != "0"
+KING_CANARY_AXES = ("gsm8k", "humaneval", "bbh", "ifeval")
+KING_CANARY_BASELINE_FILE = os.environ.get("KING_CANARY_BASELINE_FILE", "baseline_qwen35_4b.json")
+
 # ── Teacher sanity gate (2026-04-23) ──────────────────────────────────────
 # For each ranking axis we can optionally compute the axis value for the
 # teacher itself (scored as if it were a student). If the teacher's axis
@@ -1171,6 +1190,84 @@ def compute_king_health(
         "gate_active": KING_REGRESSION_GATE,
         "min_streak": KING_REGRESSION_MIN_STREAK,
     }
+
+
+def _compute_king_canary_regression(king_uid: Any, state_dir: Any) -> dict | None:
+    """Detect held-out canary regression of the current king vs Qwen 4B base.
+
+    Reads:
+      ``state/benchmarks/uid_<king_uid>.json``   — most recent canary run
+                                                    for the current king
+      ``state/benchmarks/<KING_CANARY_BASELINE_FILE>`` — Qwen 4B base
+                                                    reference (default
+                                                    ``baseline_qwen35_4b.json``)
+
+    Computes the king's mean held-out score across ``KING_CANARY_AXES``
+    (only axes with positive ``count`` count toward the mean) and the
+    baseline's mean over the same axes, then flags at_risk when the
+    king is more than ``KING_CANARY_MARGIN`` (default 5 pp) below the
+    baseline. Used by ``state_manager.py`` to maintain a separate
+    ``king_canary_streak`` and by ``_king_regression_floor_waived`` to
+    waive the composite-floor veto for canary-regressing kings.
+
+    Returns None if either file is missing, the uid in the king file
+    doesn't match, or there are no comparable axes (fail open — never
+    block dethrones on noisy probe data).
+    """
+    if king_uid is None:
+        return None
+    try:
+        from pathlib import Path
+        import json as _json
+        bench_dir = Path(state_dir) / "benchmarks"
+        if not bench_dir.exists():
+            return None
+        king_file = bench_dir / f"uid_{int(king_uid)}.json"
+        baseline_file = bench_dir / KING_CANARY_BASELINE_FILE
+        if not king_file.exists() or not baseline_file.exists():
+            return None
+        with open(king_file) as fh:
+            king = _json.load(fh)
+        with open(baseline_file) as fh:
+            base = _json.load(fh)
+        if king.get("uid") not in (int(king_uid), str(king_uid)):
+            return None
+        comparable: list[str] = []
+        king_vals: list[float] = []
+        base_vals: list[float] = []
+        for axis in KING_CANARY_AXES:
+            kv = king.get("benchmarks", {}).get(axis)
+            bv = base.get("benchmarks", {}).get(axis)
+            kc = (king.get("counts") or {}).get(axis)
+            bc = (base.get("counts") or {}).get(axis)
+            if not isinstance(kv, (int, float)) or not isinstance(bv, (int, float)):
+                continue
+            if kc is not None and (kc == 0):
+                continue
+            if bc is not None and (bc == 0):
+                continue
+            comparable.append(axis)
+            king_vals.append(float(kv))
+            base_vals.append(float(bv))
+        if not comparable:
+            return None
+        king_mean = sum(king_vals) / len(king_vals)
+        base_mean = sum(base_vals) / len(base_vals)
+        gap = base_mean - king_mean
+        at_risk = gap > KING_CANARY_MARGIN
+        return {
+            "king_canary_mean": round(king_mean, 4),
+            "base_canary_mean": round(base_mean, 4),
+            "gap_pp": round(gap, 4),
+            "axes_compared": comparable,
+            "margin": KING_CANARY_MARGIN,
+            "at_risk": bool(at_risk),
+            "gate_active": KING_CANARY_GATE,
+            "min_streak": KING_CANARY_MIN_STREAK,
+            "baseline_file": KING_CANARY_BASELINE_FILE,
+        }
+    except Exception:
+        return None
 
 
 def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,

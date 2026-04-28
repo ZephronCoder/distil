@@ -398,12 +398,24 @@ def _pareto_dethrone_veto(
 def _king_regression_floor_waived(state, king_uid) -> bool:
     """Return True when a persistently at-risk king loses floor protection.
 
-    The composite floor is challenger-side: it stops a narrow KL specialist
-    from taking the crown. Once the king itself has been at-risk for
-    ``KING_REGRESSION_MIN_STREAK`` canonical rounds, keeping that same floor
-    asymmetrically protects a weak king. In that case we still require the
-    challenger to pass KL significance and Pareto, but we waive only the
-    composite-floor veto.
+    Two independent at-risk signals trigger a waiver:
+
+      (1) Internal composite at-risk: the king's ``composite.worst`` has
+          been below ``KING_COMPOSITE_FLOOR`` (or below the base model)
+          for ``KING_REGRESSION_MIN_STREAK`` consecutive canonical
+          rounds. Tracked via ``state.king_regression_streak``.
+
+      (2) Held-out canary at-risk (2026-04-28): the king's mean
+          held-out evalscope score across ``KING_CANARY_AXES`` has
+          been > ``KING_CANARY_MARGIN`` pp below the Qwen 4B base for
+          ``KING_CANARY_MIN_STREAK`` consecutive canonical rounds.
+          Tracked via ``state.king_canary_streak``.
+
+    The composite floor is challenger-side: it stops a narrow KL
+    specialist from taking the crown. Once EITHER at-risk signal fires,
+    keeping that same floor asymmetrically protects a weak king. We
+    still require the challenger to pass KL significance and Pareto,
+    but we waive only the composite-floor veto.
     """
     if king_uid is None:
         return False
@@ -411,11 +423,18 @@ def _king_regression_floor_waived(state, king_uid) -> bool:
         from scripts.validator.composite import (
             KING_REGRESSION_GATE as _KRG,
             KING_REGRESSION_MIN_STREAK as _KRMS,
+            KING_CANARY_GATE as _KCG,
+            KING_CANARY_MIN_STREAK as _KCMS,
         )
-        if not _KRG:
-            return False
-        streak = int((getattr(state, "king_regression_streak", {}) or {}).get(str(king_uid), 0))
-        return streak >= int(_KRMS)
+        if _KRG:
+            streak = int((getattr(state, "king_regression_streak", {}) or {}).get(str(king_uid), 0))
+            if streak >= int(_KRMS):
+                return True
+        if _KCG:
+            canary_streak = int((getattr(state, "king_canary_streak", {}) or {}).get(str(king_uid), 0))
+            if canary_streak >= int(_KCMS):
+                return True
+        return False
     except Exception:
         return False
 
