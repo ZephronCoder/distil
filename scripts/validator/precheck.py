@@ -315,7 +315,15 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             if original_uid is not None:
                 orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
                 this_block = commit.get("block", float("inf"))
-                if this_block >= orig_block:
+                # --- Anti-griefing guard (2026-04-28) ---
+                # If the "later committed" model was already evaluated (has
+                # composite scores) but the "earlier committed" model was
+                # never evaluated, the earlier model is the real copy — it
+                # committed a slot early and uploaded stolen weights after
+                # seeing the king.  Reverse the DQ direction.
+                this_evaluated = str(uid) in state.evaluated_uids and str(uid) in state.composite_scores
+                orig_evaluated = str(original_uid) in state.evaluated_uids and str(original_uid) in state.composite_scores
+                if this_block >= orig_block and not (this_evaluated and not orig_evaluated):
                     orig_model = commitments.get(original_uid, {}).get("model", "?")
                     logger.info(f"UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}")
                     state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
@@ -327,19 +335,40 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                     )
                     disqualified.add(uid)
                     continue
-                logger.info(f"UID {original_uid} is duplicate of UID {uid} (committed earlier)")
-                state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
-                orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
-                orig_commit_block = commitments.get(original_uid, {}).get("block")
-                disqualify(
-                    orig_hotkey,
-                    f"copy: identical weights to UID {uid} ({model_repo}), committed later",
-                    state.dq_reasons,
-                    commit_block=orig_commit_block,
-                )
-                valid_models.pop(original_uid, None)
-                disqualified.add(original_uid)
-                register_model_hash(model_hash, uid, state.state_dir)
+                if this_evaluated and not orig_evaluated and this_block >= orig_block:
+                    # Griefing detected: earlier commit_block but never evaluated
+                    orig_model = commitments.get(original_uid, {}).get("model", "?")
+                    logger.warning(
+                        f"UID {original_uid} ({orig_model}): GRIEFING COPY — committed earlier "
+                        f"(block {orig_block}) but never evaluated; UID {uid} has composite scores. "
+                        f"DQ'ing the unevaluated model."
+                    )
+                    state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
+                    orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
+                    orig_commit_block = commitments.get(original_uid, {}).get("block")
+                    disqualify(
+                        orig_hotkey,
+                        f"copy: identical weights to UID {uid} ({model_repo}), griefing attack (committed earlier but never evaluated)",
+                        state.dq_reasons,
+                        commit_block=orig_commit_block,
+                    )
+                    valid_models.pop(original_uid, None)
+                    disqualified.add(original_uid)
+                    register_model_hash(model_hash, uid, state.state_dir)
+                else:
+                    logger.info(f"UID {original_uid} is duplicate of UID {uid} (committed earlier)")
+                    state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
+                    orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
+                    orig_commit_block = commitments.get(original_uid, {}).get("block")
+                    disqualify(
+                        orig_hotkey,
+                        f"copy: identical weights to UID {uid} ({model_repo}), committed later",
+                        state.dq_reasons,
+                        commit_block=orig_commit_block,
+                    )
+                    valid_models.pop(original_uid, None)
+                    disqualified.add(original_uid)
+                    register_model_hash(model_hash, uid, state.state_dir)
             else:
                 register_model_hash(model_hash, uid, state.state_dir)
         # Shard-invariant content hash — catches re-sharded copies that slip
@@ -350,7 +379,10 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             if dup_uid is not None:
                 orig_block = commitments.get(dup_uid, {}).get("block", float("inf"))
                 this_block = commit.get("block", float("inf"))
-                if this_block >= orig_block:
+                # --- Anti-griefing guard (content hash path) ---
+                this_evaluated = str(uid) in state.evaluated_uids and str(uid) in state.composite_scores
+                orig_evaluated = str(dup_uid) in state.evaluated_uids and str(dup_uid) in state.composite_scores
+                if this_block >= orig_block and not (this_evaluated and not orig_evaluated):
                     orig_model = commitments.get(dup_uid, {}).get("model", "?")
                     logger.info(f"UID {uid} ({model_repo}): CONTENT-DUPLICATE of UID {dup_uid}")
                     state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
@@ -362,19 +394,39 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                     )
                     disqualified.add(uid)
                     continue
-                orig_hotkey = uid_to_hotkey.get(dup_uid, str(dup_uid))
-                orig_commit_block = commitments.get(dup_uid, {}).get("block")
-                logger.info(f"UID {dup_uid} is content-duplicate of UID {uid} (committed earlier)")
-                state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
-                disqualify(
-                    orig_hotkey,
-                    f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), committed later",
-                    state.dq_reasons,
-                    commit_block=orig_commit_block,
-                )
-                valid_models.pop(dup_uid, None)
-                disqualified.add(dup_uid)
-                register_content_hash(content_hash, uid, state.state_dir)
+                if this_evaluated and not orig_evaluated and this_block >= orig_block:
+                    orig_model = commitments.get(dup_uid, {}).get("model", "?")
+                    logger.warning(
+                        f"UID {dup_uid} ({orig_model}): GRIEFING COPY (content hash) — committed earlier "
+                        f"(block {orig_block}) but never evaluated; UID {uid} has composite scores. "
+                        f"DQ'ing the unevaluated model."
+                    )
+                    state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
+                    orig_hotkey = uid_to_hotkey.get(dup_uid, str(dup_uid))
+                    orig_commit_block = commitments.get(dup_uid, {}).get("block")
+                    disqualify(
+                        orig_hotkey,
+                        f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), griefing attack (committed earlier but never evaluated)",
+                        state.dq_reasons,
+                        commit_block=orig_commit_block,
+                    )
+                    valid_models.pop(dup_uid, None)
+                    disqualified.add(dup_uid)
+                    register_content_hash(content_hash, uid, state.state_dir)
+                else:
+                    orig_hotkey = uid_to_hotkey.get(dup_uid, str(dup_uid))
+                    orig_commit_block = commitments.get(dup_uid, {}).get("block")
+                    logger.info(f"UID {dup_uid} is content-duplicate of UID {uid} (committed earlier)")
+                    state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(
+                        orig_hotkey,
+                        f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), committed later",
+                        state.dq_reasons,
+                        commit_block=orig_commit_block,
+                    )
+                    valid_models.pop(dup_uid, None)
+                    disqualified.add(dup_uid)
+                    register_content_hash(content_hash, uid, state.state_dir)
             else:
                 register_content_hash(content_hash, uid, state.state_dir)
         expected_hash = state.model_hashes.get(str(uid))
