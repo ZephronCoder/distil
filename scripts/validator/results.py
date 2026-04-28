@@ -643,6 +643,8 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 commit_block=this_commit_block,
                 uid_to_commit_block=uid_to_commit_block,
                 uid_to_coldkey=uid_to_coldkey,
+                evaluated_uids=state.evaluated_uids,
+                composite_scores=state.composite_scores,
             )
             if is_copy:
                 if copy_uid == uid:

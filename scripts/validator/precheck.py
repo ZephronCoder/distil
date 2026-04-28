@@ -39,7 +39,8 @@ def _cosine_sim(a: list, b: list) -> float:
 
 def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, state_dir,
                                  commit_block=None, uid_to_commit_block=None,
-                                 uid_to_coldkey=None):
+                                 uid_to_coldkey=None,
+                                 evaluated_uids=None, composite_scores=None):
     """Compare the incoming model's activation fingerprint against stored ones.
 
     Returns: (is_copy, copy_uid, copy_model, original_uid, original_model, sim)
@@ -60,6 +61,18 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
     scoring can use it as a tiebreaker, but we do NOT DQ either side — a miner
     griefing themselves is not the attack we're protecting against, and losing a
     legitimate hotkey slot is worse than letting a self-copy sit un-crowned.
+
+    Anti-griefing guard (2026-04-28, crypsick discord report): if the
+    "later-committed" side has been EVALUATED (in evaluated_uids and has a
+    composite_scores entry) but the "earlier-committed" side has NEVER been
+    evaluated, the earlier UID is the griefing copy — the attacker reserved
+    a slot on-chain ahead of time, then uploaded the king's weights to their
+    HF repo after the king was crowned. In that case we REVERSE the DQ
+    direction: the unevaluated, earlier-committed UID is the copy to DQ.
+    Pass ``evaluated_uids`` (set of stringified UIDs) and ``composite_scores``
+    (dict keyed by stringified UID) to enable the guard. Without them we fall
+    back to the commit_block-only logic, which was vulnerable to the
+    pre-commit-then-copy attack.
     """
     from pathlib import Path
 
@@ -166,6 +179,31 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
                 copy_model = max_sim_model
                 original_uid = uid
                 original_model = model_name
+
+        # ── Anti-griefing guard (2026-04-28) ─────────────────────────────
+        # Reverse the DQ if commit_block-based logic would DQ an evaluated
+        # model in favour of an unevaluated one. See docstring; this is
+        # the activation-fingerprint mirror of the SHA256/content-hash
+        # guard added in beafc1f.
+        if is_copy and evaluated_uids is not None and copy_uid is not None and original_uid is not None:
+            def _is_real_eval(u):
+                if u is None:
+                    return False
+                key = str(u)
+                in_eval = key in evaluated_uids
+                in_comp = composite_scores is None or key in composite_scores
+                return in_eval and in_comp
+            copy_eval = _is_real_eval(copy_uid)
+            orig_eval = _is_real_eval(original_uid)
+            if copy_eval and not orig_eval:
+                logger.warning(
+                    f"ACTIVATION GRIEFING: UID {original_uid} ({original_model}) committed earlier "
+                    f"(block {other_b if original_uid == max_sim_uid else my_b}) but never evaluated; "
+                    f"UID {copy_uid} ({copy_model}) has composite scores. Reversing DQ direction "
+                    f"— UID {original_uid} flagged as the copy, UID {copy_uid} protected."
+                )
+                copy_uid, original_uid = original_uid, copy_uid
+                copy_model, original_model = original_model, copy_model
 
     if not is_copy or copy_uid != uid:
         stored[str(uid)] = {
