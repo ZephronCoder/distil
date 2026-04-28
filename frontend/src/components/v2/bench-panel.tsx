@@ -25,6 +25,13 @@ interface BenchmarkPayload {
    */
   is_evalscope_full?: boolean;
   label?: string;
+  /** 2026-04-28: enrich for goodhart canary co-plot. The validator's
+   * composite.worst for this UID at the time the benchmark was run.
+   * Co-plotted in CanaryCell so divergence between validator score
+   * (climbing) and held-out (dropping) is visible at a glance.
+   */
+  composite_worst?: number | null;
+  composite_weighted?: number | null;
 }
 
 interface BenchmarksResponse {
@@ -314,9 +321,9 @@ function CanaryStrip({ kings, reference }: CanaryStripProps) {
             evalscope vs Qwen3.5-4B baseline · the Goodhart line
           </div>
         </div>
-        <div className="text-[10px] text-meta italic">
-          composite climbing while a sparkline drops below baseline
-          = the canary signal
+        <div className="text-[10px] text-meta italic max-w-[260px] text-right">
+          solid = held-out · dotted = composite.worst.
+          ↯ flag = composite climbing while held-out drops below baseline.
         </div>
       </div>
       <div className="grid grid-cols-3 sm:grid-cols-6 gap-x-6 gap-y-3">
@@ -345,19 +352,38 @@ function CanaryCell({
   benchKey: string;
   baseline: number | null;
 }) {
-  const points: { score: number | null; uid: number | null }[] = kings.map(
+  const points: { score: number | null; uid: number | null; composite: number | null }[] = kings.map(
     (k) => {
       const s = pickScoreAndCount(k.benchmarks, k.counts, benchKey);
-      return { score: s.count === 0 ? null : s.score, uid: k.uid ?? null };
+      return {
+        score: s.count === 0 ? null : s.score,
+        uid: k.uid ?? null,
+        composite: typeof k.composite_worst === "number" ? k.composite_worst : null,
+      };
     },
   );
   const measured = points.filter((p) => p.score != null);
+  const measuredComposite = points.filter((p) => p.composite != null);
   const latest = points[points.length - 1];
   const latestScore = latest?.score ?? null;
+  const latestComposite = latest?.composite ?? null;
   const latestVsBaseline =
     latestScore != null && baseline != null
       ? (latestScore - baseline) * 100
       : null;
+  // Detect a goodhart divergence: composite trended up vs prior 4 kings
+  // while held-out trended down vs baseline. Used to flag the cell red.
+  const compositeTrend = (() => {
+    if (measuredComposite.length < 3) return null;
+    const first = measuredComposite[0].composite as number;
+    const last = measuredComposite[measuredComposite.length - 1].composite as number;
+    return last - first;
+  })();
+  const goodhartDivergence =
+    compositeTrend != null
+      && compositeTrend > 0
+      && latestVsBaseline != null
+      && latestVsBaseline < -2;
   const W = 88;
   const H = 26;
   const PAD = 2;
@@ -374,6 +400,16 @@ function CanaryCell({
           .filter(Boolean)
           .join(" ")
       : null;
+  const compositeLineD =
+    measuredComposite.length >= 2
+      ? points
+          .map((p, i) => {
+            if (p.composite == null) return null;
+            return `${i === 0 || points[i - 1]?.composite == null ? "M" : "L"} ${sx(i).toFixed(1)} ${sy(p.composite).toFixed(1)}`;
+          })
+          .filter(Boolean)
+          .join(" ")
+      : null;
   const baselineY = baseline != null ? sy(baseline) : null;
   const tone =
     latestVsBaseline == null
@@ -381,11 +417,19 @@ function CanaryCell({
       : latestVsBaseline >= 0
       ? "text-foreground"
       : "text-warning";
+  const titleText =
+    goodhartDivergence
+      ? `${label} — GOODHART DIVERGENCE: composite climbing while held-out below baseline (last ${kings.length} kings).`
+      : `${label} held-out trend (solid) vs validator composite.worst (dotted), last ${kings.length} kings`;
   return (
-    <div className="flex flex-col gap-1.5" title={`${label} held-out trend, last ${kings.length} kings`}>
+    <div className="flex flex-col gap-1.5" title={titleText}>
       <div className="flex items-baseline justify-between">
-        <span className="text-[10px] uppercase tracking-[0.18em] text-meta">
+        <span className={[
+          "text-[10px] uppercase tracking-[0.18em]",
+          goodhartDivergence ? "text-warning" : "text-meta",
+        ].join(" ")}>
           {label}
+          {goodhartDivergence && <span className="ml-1">↯</span>}
         </span>
         <span className={`num text-[11px] tabular-nums ${tone}`}>
           {latestScore != null
@@ -404,7 +448,7 @@ function CanaryCell({
         height={H}
         viewBox={`0 0 ${W} ${H}`}
         className="block"
-        aria-label={`${label} sparkline`}
+        aria-label={`${label} sparkline (held-out solid, composite dotted)`}
       >
         {/* Track */}
         <line
@@ -427,11 +471,24 @@ function CanaryCell({
             strokeDasharray="2 2"
           />
         )}
-        {/* Sparkline */}
+        {/* Validator composite.worst trend (dotted, lighter — the
+             gameable side; co-plotted so divergence vs the held-out
+             trend is visible at a glance). */}
+        {compositeLineD && (
+          <path
+            d={compositeLineD}
+            fill="none"
+            stroke="var(--track-fill-softer)"
+            strokeWidth={1}
+            strokeDasharray="1.5 1.5"
+            opacity={0.85}
+          />
+        )}
+        {/* Held-out sparkline (solid, primary). */}
         {lineD && (
           <path d={lineD} fill="none" stroke="currentColor" strokeWidth={1.25} />
         )}
-        {/* Points */}
+        {/* Points (held-out only). */}
         {points.map((p, i) =>
           p.score == null ? null : (
             <circle
@@ -442,6 +499,18 @@ function CanaryCell({
               fill="currentColor"
             />
           ),
+        )}
+        {/* Latest composite tick (small open circle so the line is
+             readable without needing a full second axis). */}
+        {latestComposite != null && (
+          <circle
+            cx={sx(points.length - 1)}
+            cy={sy(latestComposite)}
+            r={1.2}
+            stroke="var(--track-fill-softer)"
+            strokeWidth={0.8}
+            fill="none"
+          />
         )}
       </svg>
     </div>
