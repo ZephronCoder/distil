@@ -311,9 +311,37 @@ function RoundAxisGrid({ round }: { round: H2hRound }) {
                     <span className="text-danger ml-1.5 text-[9px] uppercase">dq</span>
                   )}
                 </td>
-                <td className="text-right px-2 py-1.5 font-medium">
-                  {r.composite?.worst != null ? r.composite.worst.toFixed(3) : "—"}
-                </td>
+                {(() => {
+                  const limAx = findLimitingAxis(r);
+                  const offGrid = limAx
+                    ? !ROUND_AXIS_COLS.some((c) => c.key === limAx)
+                    : false;
+                  const tooltip =
+                    r.composite?.worst != null
+                      ? limAx
+                        ? `worst axis: ${prettyAxis(limAx)} (${limAx}). "worst" is the minimum over ALL ${Object.keys(r.composite?.axes ?? {}).length} composite axes; only 12 are shown in this grid, so the limiting axis is sometimes off-screen (e.g. mbpp_bench, tool_use_bench, long_context_bench, robustness_bench, reasoning_density).`
+                        : "minimum over all composite axes (composite.worst)"
+                      : undefined;
+                  return (
+                    <td className="text-right px-2 py-1.5 font-medium" title={tooltip}>
+                      <div className="flex flex-col items-end leading-tight">
+                        <span>
+                          {r.composite?.worst != null ? r.composite.worst.toFixed(3) : "—"}
+                        </span>
+                        {limAx && (
+                          <span
+                            className={[
+                              "text-[9px] uppercase tracking-[0.08em]",
+                              offGrid ? "text-warning" : "text-meta",
+                            ].join(" ")}
+                          >
+                            ↳ {prettyAxis(limAx)}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                  );
+                })()}
                 <td className="text-right px-2 py-1.5 text-meta">
                   {r.composite?.weighted != null ? r.composite.weighted.toFixed(3) : "—"}
                 </td>
