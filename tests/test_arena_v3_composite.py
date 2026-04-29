@@ -1355,6 +1355,117 @@ class TestBaselineRelativePenalty(unittest.TestCase):
             _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
 
 
+class TestImportanceSampledKLAxis(unittest.TestCase):
+    """v30 (2026-04-29) — importance-sampled KL axis (SHADOW).
+
+    Per Anshumann et al. ACL 2025, this is the unbiased full-vocab KL
+    contribution from the top-K support, replacing the biased
+    renormalised KL on shared support.
+    """
+
+    def test_axis_function_normalises_against_king(self):
+        from scripts.validator.composite import _axis_kl_is
+        student = {"kl_is_mean": 0.20}
+        self.assertAlmostEqual(_axis_kl_is(student, 0.10), 0.5)
+        self.assertAlmostEqual(_axis_kl_is(student, 0.20), 1.0)
+        self.assertAlmostEqual(_axis_kl_is(student, 0.40), 1.0)  # clipped
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_kl_is
+        self.assertIsNone(_axis_kl_is({}, 0.10))
+        self.assertIsNone(_axis_kl_is({"kl_is_mean": None}, 0.10))
+        self.assertIsNone(_axis_kl_is({"kl_is_mean": 0.10}, None))
+        self.assertIsNone(_axis_kl_is({"kl_is_mean": 0.10}, 0.0))
+
+    def test_compute_axes_includes_kl_is(self):
+        from scripts.validator.composite import compute_axes
+        student = _make_student(kl=0.30, rkl=0.10)
+        student["kl_is_mean"] = 0.18
+        axes = compute_axes(
+            student, king_kl=0.30, king_rkl=0.10, king_kl_is=0.09,
+        )
+        self.assertIn("kl_is", axes)
+        self.assertAlmostEqual(axes["kl_is"], 0.5)
+
+
+class TestForkingRKLAxis(unittest.TestCase):
+    """v30 (2026-04-29) — forking-token RKL axis (SHADOW).
+
+    Per Wang et al. 2025 / synthesis §4.2 #5, RKL averaged only at
+    positions in the top quartile of teacher entropy is a stronger
+    predictor than mean RKL.
+    """
+
+    def test_axis_function_normalises_against_king(self):
+        from scripts.validator.composite import _axis_forking_rkl
+        student = {"forking_rkl_mean": 0.40}
+        self.assertAlmostEqual(_axis_forking_rkl(student, 0.20), 0.5)
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_forking_rkl
+        self.assertIsNone(_axis_forking_rkl({}, 0.20))
+        self.assertIsNone(_axis_forking_rkl({"forking_rkl_mean": None}, 0.20))
+
+
+class TestTeacherTracePlausibilityAxis(unittest.TestCase):
+    """v30 (2026-04-29) — teacher-trace plausibility axis (SHADOW).
+
+    Captures "support coverage" — does the student place mass on the
+    teacher's actually-emitted tokens? Distinct from FKL (which weights
+    full distributions) and RKL (which weights student rollouts).
+    """
+
+    def test_axis_function_normalises_against_king(self):
+        from scripts.validator.composite import _axis_teacher_trace_plausibility
+        student = {"teacher_trace_nll_mean": 1.0}
+        # student NLL = king NLL → 1.0
+        self.assertAlmostEqual(_axis_teacher_trace_plausibility(student, 1.0), 1.0)
+        # student NLL = 2× king → 0.5 (worse plausibility = lower score)
+        self.assertAlmostEqual(_axis_teacher_trace_plausibility(student, 0.5), 0.5)
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_teacher_trace_plausibility
+        self.assertIsNone(_axis_teacher_trace_plausibility({}, 1.0))
+        self.assertIsNone(
+            _axis_teacher_trace_plausibility({"teacher_trace_nll_mean": None}, 1.0)
+        )
+
+
+class TestResolveKingMetricMin(unittest.TestCase):
+    """v30 (2026-04-29) — generic king-min resolver for shadow metrics."""
+
+    def test_picks_minimum(self):
+        from scripts.validator.composite import _resolve_king_metric_min
+        students = {
+            "alice": {"kl_is_mean": 0.25},
+            "bob": {"kl_is_mean": 0.10},   # min
+            "carol": {"kl_is_mean": 0.40},
+        }
+        self.assertAlmostEqual(_resolve_king_metric_min(students, "kl_is_mean"), 0.10)
+
+    def test_skips_teacher_near_zero(self):
+        from scripts.validator.composite import _resolve_king_metric_min
+        students = {
+            "Qwen/teacher": {"kl_is_mean": 1e-12},  # below the 1e-4 floor
+            "alice": {"kl_is_mean": 0.10},
+        }
+        self.assertAlmostEqual(_resolve_king_metric_min(students, "kl_is_mean"), 0.10)
+
+    def test_returns_none_when_no_data(self):
+        from scripts.validator.composite import _resolve_king_metric_min
+        students = {"alice": {}, "bob": {"kl_is_mean": None}}
+        self.assertIsNone(_resolve_king_metric_min(students, "kl_is_mean"))
+
+    def test_handles_invalid_types(self):
+        from scripts.validator.composite import _resolve_king_metric_min
+        students = {
+            "alice": {"kl_is_mean": "not a number"},
+            "bob": {"kl_is_mean": float("nan")},
+            "carol": {"kl_is_mean": 0.20},
+        }
+        self.assertAlmostEqual(_resolve_king_metric_min(students, "kl_is_mean"), 0.20)
+
+
 class TestEntropyAwareKLAxis(unittest.TestCase):
     """v30 (2026-04-29) — entropy-aware adaptive KL axis (SHADOW).
 

@@ -13557,6 +13557,94 @@ def compute_kl_from_sparse(teacher_indices, teacher_values, student_logits,
     return kl_per_pos
 
 
+def compute_kl_is_from_sparse(teacher_indices, teacher_values, student_logits,
+                               values_are_logprobs=False):
+    """Importance-sampling-corrected sparse KL estimator (Anshumann et al.,
+    ACL 2025 — "Sparse Logit Sampling: Accelerating KD in LLMs").
+
+    Background. ``compute_kl_from_sparse`` renormalises BOTH teacher and
+    student over the shared top-K support, so the metric it returns is
+    ``KL(p_t_topK || p_s_topK)`` — a real KL but on a different
+    distribution than the full-vocab teacher and student. The bias
+    depends on how much probability mass the teacher places in the
+    tail, which varies per token and per round, and is non-vanishing
+    even at K=128 (~1-3% of mass typically lives outside the top-K).
+
+    The IS estimator drops the renormalisation and instead returns the
+    CONTRIBUTION to the full-vocab KL from the top-K support:
+
+        KL_IS = Σ_{k ∈ top_K_t} p_t_full(k) · (log p_t_full(k) − log p_s_full(k))
+
+    where ``p_t_full(k) = exp(t_logp_raw[k])`` is the teacher's true
+    probability for token k under the full vocab (the top-K vLLM
+    logprobs are already log-probs of the full distribution restricted
+    to the K most likely tokens, NOT renormalised over those K).
+
+    The tail contribution is dropped. For a typical LM this misses
+    ≤0.05 nats of KL even when the full-vocab KL is 0.5+ nats, so the
+    estimator is a tight lower bound on full-vocab KL.
+
+    The ``topk_mass`` output is the per-position teacher mass coverage
+    in top-K, useful for telemetry: positions with ``topk_mass < 0.9``
+    are exactly where the bias of the renormalised KL is largest.
+
+    Returns a dict of [seq_len] (or [B, seq_len]) tensors:
+      * ``kl_is``    — full-vocab KL contribution from top-K support.
+      * ``topk_mass`` — teacher's top-K probability mass coverage.
+    """
+    device = student_logits.device
+    t_idx = teacher_indices.to(device)
+    t_vals = teacher_values.to(device).float()
+
+    if values_are_logprobs:
+        # Raw vLLM log-probs of the teacher's full distribution
+        # restricted to top-K tokens. NO renormalisation — this is the
+        # whole point of the IS-corrected estimator.
+        t_log_p_raw = t_vals
+    else:
+        # Sparse logits from HF top-K cache: we lack the full-vocab
+        # partition function, so we can't recover unbiased log-probs.
+        # Fall back to log_softmax over the top-K (i.e., the original
+        # biased estimator) so the output stays a valid lower bound.
+        t_log_p_raw = F.log_softmax(t_vals, dim=-1)
+
+    t_p_raw = t_log_p_raw.exp()
+
+    s_log_p_full = F.log_softmax(student_logits.float(), dim=-1)
+    s_log_p_k = s_log_p_full.gather(-1, t_idx)
+    del s_log_p_full
+
+    is_3d = (t_log_p_raw.dim() >= 3)
+    n_pos = t_log_p_raw.shape[1] if is_3d else t_log_p_raw.shape[0]
+    out_shape = (t_log_p_raw.shape[0], n_pos) if is_3d else (n_pos,)
+    kl_per_pos = torch.empty(out_shape, device=device)
+    mass_per_pos = torch.empty(out_shape, device=device)
+
+    for i in range(0, n_pos, KL_CHUNK_SIZE):
+        j = min(i + KL_CHUNK_SIZE, n_pos)
+        if is_3d:
+            tp = t_p_raw[:, i:j, :]
+            tlp = t_log_p_raw[:, i:j, :]
+            slp = s_log_p_k[:, i:j, :]
+        else:
+            tp = t_p_raw[i:j, :]
+            tlp = t_log_p_raw[i:j, :]
+            slp = s_log_p_k[i:j, :]
+        kl_chunk = (tp * (tlp - slp)).sum(dim=-1)
+        mass_chunk = tp.sum(dim=-1)
+        if is_3d:
+            kl_per_pos[:, i:j] = kl_chunk
+            mass_per_pos[:, i:j] = mass_chunk
+        else:
+            kl_per_pos[i:j] = kl_chunk
+            mass_per_pos[i:j] = mass_chunk
+
+    return {
+        "kl_is": kl_per_pos,
+        "topk_mass": mass_per_pos,
+    }
+
+
 # ── Entropy-Aware (EOPD-style) metrics — v30 (2026-04-29) ────────────
 # Per the EOPD paper (arXiv 2510.27485), per-token RKL/FKL weighting
 # based on teacher entropy improves Pass@8 by +1.37 to +5.05 on small-
@@ -15744,6 +15832,10 @@ def main():
                     eopd_adaptive_mean = None
                     eopd_rkl_mean = None
                     eopd_h_mean = None
+                    forking_rkl_mean = None
+                    kl_is_mean = None
+                    topk_mass_mean = None
+                    teacher_trace_nll_mean = None
                     if is_sparse:
                         # ── Sparse teacher logits path (top-k from vLLM or HF) ──
                         t_indices = tl_entry["indices"]  # [1, seq_len, k]
@@ -15775,6 +15867,7 @@ def main():
                             # cache and keep it as SHADOW telemetry until
                             # we collect a 48h round of correlation data
                             # to validate the threshold defaults.
+                            forking_rkl_mean = None
                             try:
                                 eopd_metrics = compute_eopd_metrics_from_sparse(
                                     t_indices[:, :min_len, :],
@@ -15791,9 +15884,92 @@ def main():
                                 eopd_h_mean = (
                                     eopd_metrics["teacher_entropy"].mean().item()
                                 )
+                                # ── Forking-token RKL (Wang et al., 2025;
+                                # synthesis §4.2 #5). Average RKL only at
+                                # positions in the top quartile of teacher
+                                # entropy — those are the "decision
+                                # points" where the teacher's feedback is
+                                # most informative. Empirically a stronger
+                                # predictor than mean RKL of downstream
+                                # OPD success.
+                                try:
+                                    H_t = eopd_metrics["teacher_entropy"]
+                                    rkl = eopd_metrics["rkl"]
+                                    # Squeeze leading batch dim if present
+                                    if H_t.dim() >= 2 and H_t.shape[0] == 1:
+                                        H_t = H_t.squeeze(0)
+                                        rkl = rkl.squeeze(0)
+                                    if H_t.numel() >= 4:
+                                        threshold = torch.quantile(H_t, 0.75)
+                                        mask = (H_t >= threshold)
+                                        if mask.any():
+                                            forking_rkl_mean = float(
+                                                (rkl[mask]).mean().item()
+                                            )
+                                except Exception:
+                                    forking_rkl_mean = None
                                 del eopd_metrics
                             except Exception:
                                 pass
+
+                            # ── v30 — Importance-sampled KL (Anshumann
+                            # ACL 2025; synthesis §4.2 #2). Unbiased
+                            # full-vocab KL contribution from top-K
+                            # support, replacing the biased renormalised
+                            # KL on shared support. Also exposes the
+                            # teacher's top-K mass coverage (typically
+                            # 0.95-0.99) as a telemetry signal.
+                            kl_is_mean = None
+                            topk_mass_mean = None
+                            try:
+                                is_metrics = compute_kl_is_from_sparse(
+                                    t_indices[:, :min_len, :],
+                                    t_values[:, :min_len, :],
+                                    s_cont_slice,
+                                    values_are_logprobs=are_logprobs,
+                                )
+                                kl_is_mean = is_metrics["kl_is"].mean().item()
+                                topk_mass_mean = is_metrics["topk_mass"].mean().item()
+                                del is_metrics
+                            except Exception:
+                                pass
+
+                            # ── v30 — Teacher-trace plausibility
+                            # (synthesis §4.2 #4). Average per-token
+                            # negative log-likelihood the student assigns
+                            # to the teacher's actually-emitted tokens
+                            # (greedy continuation). Captures "support
+                            # coverage" — does the student place any mass
+                            # on the teacher's chosen path? Distinct from
+                            # FKL which weights the full top-K
+                            # distribution.
+                            teacher_trace_nll_mean = None
+                            try:
+                                # The teacher's chosen token at position
+                                # ``i`` is full_seq[prompt_len + i]; the
+                                # student's log-prob at that position
+                                # (predicting next token) is
+                                # cont_s[:, i, vocab_id]. We need to
+                                # gather the student's log_softmax at the
+                                # teacher's chosen token id at each
+                                # continuation position.
+                                gen_len_local = full_seq.shape[1] - prompt_len
+                                if gen_len_local > 0 and min_len > 0:
+                                    target_ids = full_seq[
+                                        :, prompt_len:prompt_len + min_len
+                                    ]
+                                    s_log_p_full = F.log_softmax(
+                                        cont_s[:, :min_len, :].float(), dim=-1
+                                    )
+                                    nll_per_pos = -s_log_p_full.gather(
+                                        -1, target_ids.unsqueeze(-1)
+                                    ).squeeze(-1)
+                                    teacher_trace_nll_mean = float(
+                                        nll_per_pos.mean().item()
+                                    )
+                                    del s_log_p_full, nll_per_pos
+                            except Exception:
+                                teacher_trace_nll_mean = None
 
                             # ── v30 — Top-K token overlap axis ──
                             # Per the 2026 'Rethinking OPD' paper, top-K agreement
@@ -15911,18 +16087,22 @@ def main():
                         math.isnan(top_k_overlap_val) or math.isinf(top_k_overlap_val)
                     ):
                         prompt_result["top_k_overlap"] = round(top_k_overlap_val, 6)
-                    # v30 — EOPD shadow metrics. Persisted only when
-                    # sparse-path computation succeeded; the dense path
-                    # keeps these as None.
-                    for eopd_key, eopd_val in (
+                    # v30 — EOPD + research-paper shadow metrics.
+                    # Persisted only when sparse-path computation
+                    # succeeded; the dense path keeps these as None.
+                    for shadow_key, shadow_val in (
                         ("eopd_adaptive", eopd_adaptive_mean),
                         ("eopd_rkl", eopd_rkl_mean),
                         ("teacher_entropy", eopd_h_mean),
+                        ("forking_rkl", forking_rkl_mean),
+                        ("kl_is", kl_is_mean),
+                        ("topk_mass", topk_mass_mean),
+                        ("teacher_trace_nll", teacher_trace_nll_mean),
                     ):
-                        if eopd_val is not None and not (
-                            math.isnan(eopd_val) or math.isinf(eopd_val)
+                        if shadow_val is not None and not (
+                            math.isnan(shadow_val) or math.isinf(shadow_val)
                         ):
-                            prompt_result[eopd_key] = round(eopd_val, 6)
+                            prompt_result[shadow_key] = round(shadow_val, 6)
                     kl_per_prompt.append(prompt_result)
                     prompt_kl_means.append(kl_mean)
 
@@ -16085,17 +16265,22 @@ def main():
                     flush=True,
                 )
 
-            # v30 — EOPD shadow aggregations. Same pattern as top_k_overlap
-            # but for adaptive/RKL/teacher-entropy. Stored on the student
-            # record so the composite axis function can read it.
-            for eopd_key, agg_key, agg_n in (
+            # v30 — Shadow-axis aggregations. Same pattern as
+            # top_k_overlap but for the EOPD + research-paper metrics.
+            # Stored on the student record so the composite axis
+            # functions can read them.
+            for shadow_key, agg_key, agg_n in (
                 ("eopd_adaptive", "eopd_adaptive_mean", "eopd_adaptive_n"),
                 ("eopd_rkl", "eopd_rkl_mean", "eopd_rkl_n"),
                 ("teacher_entropy", "teacher_entropy_mean", "teacher_entropy_n"),
+                ("forking_rkl", "forking_rkl_mean", "forking_rkl_n"),
+                ("kl_is", "kl_is_mean", "kl_is_n"),
+                ("topk_mass", "topk_mass_mean", "topk_mass_n"),
+                ("teacher_trace_nll", "teacher_trace_nll_mean", "teacher_trace_nll_n"),
             ):
                 vals = [
-                    d.get(eopd_key) for d in kl_per_prompt
-                    if d.get(eopd_key) is not None
+                    d.get(shadow_key) for d in kl_per_prompt
+                    if d.get(shadow_key) is not None
                 ]
                 if vals:
                     student_result[agg_key] = round(sum(vals) / len(vals), 6)
@@ -16105,6 +16290,14 @@ def main():
                     f"  → EOPD-adaptive: {student_result['eopd_adaptive_mean']:.6f} "
                     f"(rkl={student_result.get('eopd_rkl_mean', 'n/a')}, "
                     f"H_t={student_result.get('teacher_entropy_mean', 'n/a')})",
+                    flush=True,
+                )
+            if "kl_is_mean" in student_result:
+                print(
+                    f"  → IS-KL: {student_result['kl_is_mean']:.6f} "
+                    f"(topk_mass={student_result.get('topk_mass_mean', 'n/a')}, "
+                    f"forking_rkl={student_result.get('forking_rkl_mean', 'n/a')}, "
+                    f"trace_nll={student_result.get('teacher_trace_nll_mean', 'n/a')})",
                     flush=True,
                 )
 

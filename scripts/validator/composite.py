@@ -118,6 +118,29 @@ AXIS_WEIGHTS = {
     # Operators can flip in via ``ENTROPY_AWARE_KL_WEIGHT=0.05`` once
     # the shadow window concludes.
     "entropy_aware_kl": float(os.environ.get("ENTROPY_AWARE_KL_WEIGHT", "0.0")),
+    # 2026-04-29 (v30) — three additional research-paper shadow axes,
+    # all default weight 0 until 48h of correlation telemetry against
+    # the held-out canary validates them. Computed from the existing
+    # top-128 sparse cache so wall-time impact is negligible.
+    #
+    #   * kl_is — Anshumann ACL 2025 importance-sampled KL. Unbiased
+    #     full-vocab KL contribution from top-K support, replacing the
+    #     biased renormalised KL on shared support. See
+    #     ``compute_kl_is_from_sparse``.
+    #   * forking_rkl — Wang et al. 2025 forking-token RKL. Average
+    #     reverse-KL at positions in the top quartile of teacher
+    #     entropy ("decision points" with most informative teacher
+    #     feedback).
+    #   * teacher_trace_plausibility — average NLL the student
+    #     assigns to the teacher's actually-emitted tokens. Distinct
+    #     from FKL (full-distribution match) and RKL (student-policy
+    #     match); catches LIMO/s1 SFT-only "place mass everywhere
+    #     except where the teacher goes" failure modes.
+    "kl_is":          float(os.environ.get("KL_IS_AXIS_WEIGHT", "0.0")),
+    "forking_rkl":    float(os.environ.get("FORKING_RKL_AXIS_WEIGHT", "0.0")),
+    "teacher_trace_plausibility": float(
+        os.environ.get("TEACHER_TRACE_PLAUSIBILITY_WEIGHT", "0.0")
+    ),
     "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.25")),
     "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.10")),
     "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.15")),
@@ -591,6 +614,90 @@ def _axis_kl(student: dict, king_kl: float | None) -> float | None:
     return max(0.0, min(1.0, king_kl / kl))
 
 
+def _axis_kl_is(student: dict, king_kl_is: float | None) -> float | None:
+    """v30 — Importance-sampled KL axis (SHADOW until 48h telemetry).
+
+    Reads ``student.kl_is_mean`` (full-vocab KL contribution from top-K
+    support, computed via ``compute_kl_is_from_sparse``). Normalised
+    against the round's best (lowest) IS-KL using the same king/student
+    ratio shape as ``_axis_kl``.
+
+    Per the synthesis report (§4.2 #2) and Anshumann et al. ACL 2025,
+    this estimator is unbiased where the renormalised KL on shared
+    support is biased by the teacher's top-K mass coverage. Useful both
+    as a sanity-check on the existing ``kl`` axis (the ratio
+    kl_is_mean / kl_global_avg should be ~ ``topk_mass_mean``) and as
+    a SHADOW signal we can promote once 48h of correlation telemetry
+    against the canary confirms the bias matters in practice.
+    """
+    val = student.get("kl_is_mean")
+    if val is None or king_kl_is is None or king_kl_is <= 0:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_kl_is) / v))
+
+
+def _axis_forking_rkl(student: dict, king_forking_rkl: float | None) -> float | None:
+    """v30 — Forking-token RKL axis (SHADOW until 48h telemetry).
+
+    Reads ``student.forking_rkl_mean``: average reverse-KL at positions
+    in the top quartile of teacher entropy. Per Wang et al. 2025 (cited
+    in the Thinking Machines OPD blog and our synthesis report §4.2
+    #5), high-entropy positions are the "decision points" where the
+    teacher's feedback is most informative; the RKL there is a stronger
+    predictor of downstream OPD success than the mean RKL across all
+    positions.
+
+    Same king/student normalisation shape as ``_axis_kl`` and
+    ``_axis_kl_is``.
+    """
+    val = student.get("forking_rkl_mean")
+    if val is None or king_forking_rkl is None or king_forking_rkl <= 0:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_forking_rkl) / v))
+
+
+def _axis_teacher_trace_plausibility(student: dict,
+                                      king_trace_nll: float | None) -> float | None:
+    """v30 — Teacher-trace plausibility axis (SHADOW until 48h telemetry).
+
+    Reads ``student.teacher_trace_nll_mean``: average NLL the student
+    assigns to the teacher's actually-emitted tokens (greedy
+    continuation). Captures "support coverage" — does the student
+    place any mass on the teacher's chosen path? This is distinct
+    from FKL, which weights the FULL teacher distribution (not the
+    sampled tokens), and from RKL, which weights the student's own
+    rollout (not the teacher's).
+
+    Synthesis §4.2 #4: a model with high FKL but low plausibility is
+    placing mass everywhere except where the teacher actually goes —
+    a known LIMO/s1 SFT-only failure mode.
+
+    Same king/student normalisation shape as ``_axis_kl``.
+    """
+    val = student.get("teacher_trace_nll_mean")
+    if val is None or king_trace_nll is None or king_trace_nll <= 0:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_trace_nll) / v))
+
+
 def _axis_entropy_aware_kl(student: dict, king_eopd: float | None) -> float | None:
     """v30 — Entropy-Aware adaptive KL axis (SHADOW until 48h telemetry).
 
@@ -1055,7 +1162,10 @@ def _axis_on_policy_rkl(student: dict, king_rkl: float | None) -> float:
 
 def compute_axes(student: dict, king_kl: float | None = None,
                  king_rkl: float | None = None,
-                 king_eopd: float | None = None) -> dict[str, float | None]:
+                 king_eopd: float | None = None,
+                 king_kl_is: float | None = None,
+                 king_forking_rkl: float | None = None,
+                 king_trace_nll: float | None = None) -> dict[str, float | None]:
     """Compute the raw per-axis values for one student dict.
 
     Pulled out of ``compute_composite`` so that the teacher sanity gate
@@ -1074,6 +1184,11 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "kl": _axis_kl(student, king_kl),
         "top_k_overlap": _axis_top_k_overlap(student),
         "entropy_aware_kl": _axis_entropy_aware_kl(student, king_eopd),
+        "kl_is": _axis_kl_is(student, king_kl_is),
+        "forking_rkl": _axis_forking_rkl(student, king_forking_rkl),
+        "teacher_trace_plausibility": _axis_teacher_trace_plausibility(
+            student, king_trace_nll
+        ),
         "capability": _axis_capability(student),
         "length": _axis_length(student),
         "degeneracy": _axis_degeneracy(student),
@@ -1258,7 +1373,10 @@ def compute_composite(student: dict, king_kl: float | None = None,
                       king_rkl: float | None = None,
                       broken_axes: set[str] | None = None,
                       reference_axes: dict[str, float | None] | None = None,
-                      king_eopd: float | None = None) -> dict:
+                      king_eopd: float | None = None,
+                      king_kl_is: float | None = None,
+                      king_forking_rkl: float | None = None,
+                      king_trace_nll: float | None = None) -> dict:
     """Return per-axis and composite (worst-case + weighted mean) scores.
 
     We emit *both* aggregations so the validator can A/B them offline
@@ -1302,7 +1420,13 @@ def compute_composite(student: dict, king_kl: float | None = None,
     ``axes_raw`` for telemetry; ``axes`` reflects the docked values that
     flow into ``worst`` / ``weighted`` and downstream gates.
     """
-    raw_axes = compute_axes(student, king_kl, king_rkl, king_eopd=king_eopd)
+    raw_axes = compute_axes(
+        student, king_kl, king_rkl,
+        king_eopd=king_eopd,
+        king_kl_is=king_kl_is,
+        king_forking_rkl=king_forking_rkl,
+        king_trace_nll=king_trace_nll,
+    )
     if reference_axes:
         axes = {
             k: _apply_baseline_relative_penalty(k, v, reference_axes.get(k))
@@ -1403,6 +1527,7 @@ def compute_composite(student: dict, king_kl: float | None = None,
         axis_spread = var ** 0.5
 
     rel_keys = ("kl", "on_policy_rkl", "top_k_overlap", "entropy_aware_kl",
+                "kl_is", "forking_rkl", "teacher_trace_plausibility",
                 "capability", "judge_probe", "long_form_judge",
                 "chat_turns_probe", "length", "degeneracy")
     bench_keys = tuple(BENCH_AXIS_WEIGHTS.keys()) + tuple(ARENA_V3_AXIS_WEIGHTS.keys())
@@ -1594,6 +1719,34 @@ def _resolve_king_rkl(king_kl: float | None,
     if best is not None:
         return best
     return None
+
+
+def _resolve_king_metric_min(students_data: dict[Any, dict],
+                              key: str,
+                              skip_floor: float = 1e-4) -> float | None:
+    """Generic helper: round-wide MINIMUM of a numeric per-student field
+    (lower-is-better metric like KL / RKL / NLL).
+
+    Skips values <= ``skip_floor`` to avoid the teacher-vs-itself row
+    pinning the reference to ~0 (every challenger would then receive
+    None on the axis).
+
+    Returns None if no qualifying row has the field.
+    """
+    best = None
+    for _model_name, data in students_data.items():
+        v = (data or {}).get(key)
+        if v is None:
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if v != v or v <= skip_floor:
+            continue
+        if best is None or v < best:
+            best = v
+    return best
 
 
 def _resolve_king_eopd(students_data: dict[Any, dict],
@@ -1791,6 +1944,13 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     """
     king_rkl = _resolve_king_rkl(king_kl, students_data, h2h_results)
     king_eopd = _resolve_king_eopd(students_data, h2h_results)
+    # v30 — three additional research-paper shadow-axis king references.
+    # Resolved via the same min-with-floor pattern as king_eopd.
+    king_kl_is = _resolve_king_metric_min(students_data, "kl_is_mean")
+    king_forking_rkl = _resolve_king_metric_min(students_data, "forking_rkl_mean")
+    king_trace_nll = _resolve_king_metric_min(
+        students_data, "teacher_trace_nll_mean"
+    )
     broken = resolve_teacher_broken_axes(teacher_student_row, king_kl, king_rkl)
     # Layer 2 (2026-04-26): reference-broken axes. The reference base model
     # (REFERENCE_UID = -1, Qwen3.5-4B) runs the same bench probes as
@@ -1824,7 +1984,11 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     if reference_row is not None:
         try:
             reference_axes_raw = compute_axes(
-                reference_row, king_kl, king_rkl, king_eopd=king_eopd,
+                reference_row, king_kl, king_rkl,
+                king_eopd=king_eopd,
+                king_kl_is=king_kl_is,
+                king_forking_rkl=king_forking_rkl,
+                king_trace_nll=king_trace_nll,
             )
         except Exception as exc:
             logger.warning(
@@ -1840,7 +2004,11 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     king_raw_axes = None
     if king_model and king_model in students_data:
         king_raw_axes = compute_axes(
-            students_data[king_model], king_kl, king_rkl, king_eopd=king_eopd,
+            students_data[king_model], king_kl, king_rkl,
+            king_eopd=king_eopd,
+            king_kl_is=king_kl_is,
+            king_forking_rkl=king_forking_rkl,
+            king_trace_nll=king_trace_nll,
         )
 
     # 2026-04-29 (v29.3): which bench axes carry per-template breakdown.
@@ -1878,6 +2046,9 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
             students_data[model], king_kl, king_rkl,
             broken, ref_axes_for_call,
             king_eopd=king_eopd,
+            king_kl_is=king_kl_is,
+            king_forking_rkl=king_forking_rkl,
+            king_trace_nll=king_trace_nll,
         )
         if entry.get("disqualified") and not entry.get("is_king"):
             comp = {**comp, "worst": 0.0, "weighted": 0.0,
@@ -1886,7 +2057,11 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         # score against itself is definitionally the trivial tie case).
         if king_raw_axes is not None and not entry.get("is_king"):
             challenger_raw_axes = compute_axes(
-                students_data[model], king_kl, king_rkl, king_eopd=king_eopd,
+                students_data[model], king_kl, king_rkl,
+                king_eopd=king_eopd,
+                king_kl_is=king_kl_is,
+                king_forking_rkl=king_forking_rkl,
+                king_trace_nll=king_trace_nll,
             )
             comp["pareto"] = compute_pareto_dominance(
                 challenger_raw_axes, king_raw_axes, include_shadow=True,
