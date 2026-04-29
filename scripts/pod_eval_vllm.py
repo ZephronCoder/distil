@@ -2277,33 +2277,227 @@ CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", 
 # unmemorizable) items: 12 static (down from 24) + 24 procedural (up from
 # 12) per round, swapping the old 2:1 static-favoured ratio for a 1:2
 # procedural-favoured ratio. See COMPOSITE_SHADOW_VERSION==19 docstring.
-# 2026-04-29 (v29.4) — capability mix rebalance after saturation audit.
-# 53 % of records were saturated at 1.0 with the 12 static + 24 procedural
-# split; the static trivia pool was the bottleneck (small, easy, public).
-# Drop static 12 → 4 (kept as a difficulty floor / format diversity) and
-# bump procedural 24 → 32, which now also mixes 7 new harder kinds
-# (multi_step_arithmetic, seq_next, string_chain, list_chain,
-# counterfactual, nested_logic, two_step_compare) — see
-# ``_procedural_capability_prompts`` for the full list.
-CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "4"))
-CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "32"))
+# 2026-04-29 (v29.5) — capability mix: full procedural switch.
+# v29.4 dropped static trivia from 12 → 4. v29.5 drops the remaining 4
+# to 0: every capability item is now procedurally synthesised (mix of
+# arithmetic, number theory, string ops, list ops, multi-step
+# reasoning kinds — see ``_procedural_capability_prompts`` for the
+# full list of kinds, and ``_synthetic_word`` for the procedural
+# pseudo-word generator that replaces the legacy static word pool).
+# Override via env if a regression in procedural calibration forces
+# rollback to the v29.4 mix.
+CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "0"))
+CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "36"))
 LENGTH_PENALTY_RATIO = float(os.environ.get("LENGTH_PENALTY_RATIO", "2.0"))
 
-# Pool of common simple words used as random subjects for procedural
-# string-operation items (count_chars / count_vowels). Public but the
-# *combination* of (word, op) is per-round-block-seeded so a miner cannot
-# pre-cache the exact tuples.
-_PROC_CAPABILITY_WORD_POOL: tuple[str, ...] = (
-    "apple", "banana", "cherry", "delta", "elephant", "garden",
-    "harbor", "island", "jungle", "kitten", "lemon", "morning",
-    "ocean", "puzzle", "river", "summer", "table", "umbrella",
-    "valley", "winter", "yellow", "zebra", "candle", "dinner",
-    "engine", "forest", "guitar", "hammer", "jacket", "knight",
-    "ladder", "magnet", "needle", "orange", "panda", "quilt",
-    "rabbit", "shadow", "thunder", "violet", "window", "yogurt",
-    "anchor", "basket", "circle", "diamond", "eagle", "feather",
-    "glacier", "horizon", "iguana", "journey", "kangaroo", "lighthouse",
-)
+# ── 2026-04-29 (v29.5) — Procedural lexicon synthesisers ──────────────
+#
+# Every fixed lexicon (names, words, topic strings, distractor
+# sentences, needle entities) used to be a static tuple baked into
+# this file. That meant the SURFACE FORM of each item was a fixed
+# member of a small pool, even when the COMPOSITIONAL parameters
+# rotated per round. A determined miner could enumerate every
+# pool entry from the open-source code and pre-train against the
+# union — Goodhart vector closed with this section.
+#
+# v29.5 replaces all of those with procedural synthesisers. The
+# building blocks are CV (consonant-vowel) syllables drawn from a
+# small inventory; combining them produces effectively-infinite
+# unique pronounceable strings (90 syllable choices ⇒ ~8k 2-syllable
+# names, ~730k 3-syllable, etc.). The COMPOSITION GRAMMAR is fixed
+# (we still pick adjective + noun + org-type for topics, etc.) but
+# the resulting tokens do not appear anywhere on disk.
+#
+# Why pseudo-words instead of real words: real-word pools are
+# bounded (~50k common English words); a determined attacker can
+# train against the entire pool. Pseudo-words have unbounded
+# combinatorial space AND look natural enough that the model treats
+# them as named entities (which is what we want — the GRADING never
+# depends on real-world meaning of these tokens, only on the
+# arithmetic / structural property tested).
+#
+# All synthesisers take a ``random.Random`` parameter so they're
+# deterministic on the round's block_seed-derived RNG. Use the same
+# pattern as ``_procedural_capability_prompts``.
+
+# Phoneme inventory. Excludes ``q`` and ``x`` (rare in English so they
+# read as foreign), and excludes ``y`` as vowel to keep CV pattern
+# unambiguous. Vowels include common diphthongs to add variety
+# without confusing the model.
+_LEX_CONS = (
+    "b", "c", "d", "f", "g", "h", "j", "k", "l", "m",
+    "n", "p", "r", "s", "t", "v", "w", "z",
+    "br", "cl", "cr", "dr", "fl", "fr", "gl", "gr",
+    "pl", "pr", "sk", "sl", "sm", "sn", "sp", "st", "sw", "tr",
+    "th", "sh", "ch",
+)  # 37 onsets
+_LEX_VOWELS = ("a", "e", "i", "o", "u", "ai", "ea", "ee", "ie", "oa", "ou", "ay")  # 12 nuclei
+_LEX_CODAS = ("", "n", "r", "l", "s", "t", "ck", "rd", "rt", "ng", "st", "ld")  # 12 codas (including empty)
+
+
+def _synthetic_syllable(rng: "random.Random") -> str:
+    """Return a single CVC-pattern syllable (consonant-vowel-coda).
+
+    Coda may be empty (open syllable). Output is always 2-5 chars,
+    pronounceable, and never identical across calls except by
+    coincidence (rare given 37×12×12 ≈ 5300 distinct syllables).
+    """
+    return rng.choice(_LEX_CONS) + rng.choice(_LEX_VOWELS) + rng.choice(_LEX_CODAS)
+
+
+def _synthetic_word(rng: "random.Random", n_syll: int = 2) -> str:
+    """Return a procedural pseudo-word of ``n_syll`` syllables.
+
+    Default 2 syllables ≈ 4-8 chars, similar to the average length of
+    the legacy ``_PROC_CAPABILITY_WORD_POOL`` entries (5.4 chars). The
+    word is suitable for any operation that depends only on character
+    properties (count_chars, count_vowels) since the rules are
+    universal across pseudo and real words.
+    """
+    if n_syll < 1:
+        n_syll = 1
+    return "".join(_synthetic_syllable(rng) for _ in range(n_syll))
+
+
+def _synthetic_name(rng: "random.Random") -> str:
+    """Return a procedural Capitalised name (2-3 syllables).
+
+    Used wherever the legacy ``_PROC_NAMES`` / ``_NAMES`` tuples were:
+    procedural narrative items in math_bench, capability counterfactual
+    items, calibration_bench, etc. Per-call procedurally drawn from
+    the lex inventory ⇒ effectively-infinite unique names.
+    """
+    n_syll = rng.choice([2, 2, 3])  # mostly 2-syllable, occasional 3
+    word = _synthetic_word(rng, n_syll)
+    return word.capitalize()
+
+
+def _synthetic_names(rng: "random.Random", n: int) -> list[str]:
+    """Return ``n`` distinct procedural names (helper for callers that
+    used to do ``_synthetic_names(r, n)``)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    attempts = 0
+    while len(out) < n and attempts < n * 16:
+        attempts += 1
+        name = _synthetic_name(rng)
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _synthetic_org_topic(rng: "random.Random") -> str:
+    """Return a procedural organisation-style topic string used by
+    ``multi_doc_synthesis_bench``.
+
+    Shape: ``"the {Adj} {NounStem}{Suffix} {OrgType}"`` where every
+    slot is procedurally synthesised. The adjective is a procedural
+    pseudo-word with an English-style suffix (``-ish`` / ``-ese`` /
+    ``-ian``); the noun is two procedural syllables; the org-type
+    is drawn from a small lexicon of organisation common-nouns
+    (Society / Guild / Festival / etc.) — the only semi-static
+    component, kept because these category labels carry meaning the
+    model needs to interpret the question correctly.
+    """
+    adj = _synthetic_word(rng, 2) + rng.choice(["ish", "ese", "ian", "ese", "ic", "an"])
+    noun_stem = _synthetic_word(rng, 2)
+    suffix = rng.choice(
+        ["thorne", "wood", "field", "haven", "moor", "watch",
+         "crest", "ridge", "vale", "burn", "marsh", "spire"]
+    )
+    org_type = rng.choice([
+        "Society", "Guild", "Festival", "Workshop", "Conservancy",
+        "Foundation", "Trust", "Academy", "Collective", "Studio",
+        "Mill", "Atelier", "Hall", "Co-op", "Lodge", "Brotherhood",
+    ])
+    # Capitalise the adj + noun-suffix block.
+    return f"the {adj.capitalize()} {noun_stem.capitalize()}{suffix} {org_type}"
+
+
+def _synthetic_entity(rng: "random.Random") -> tuple[str, str, str]:
+    """Return a procedural (entity_phrase, possessive_phrase,
+    question_subject) triple for ``long_context_bench`` needle templates.
+
+    All three slots are procedurally generated from the lex inventory:
+
+      * ``entity_phrase``: ``"the {Capitalised} {role}"`` — used as
+        the noun phrase that owns the secret value
+      * ``possessive_phrase``: ``"{entity_phrase}'s"``
+      * ``question_subject``: phrase used in the question, distinct
+        enough that the model can parse "what is the X of {subject}"
+        cleanly
+
+    Using procedurally-synthesised entity names means a memoriser
+    cannot pre-cache "archive code = 7-char string" attacks because
+    the names rotate per round.
+    """
+    name = _synthetic_name(rng)
+    role = rng.choice([
+        "archivist", "vault keeper", "treasurer", "harbormaster",
+        "librarian", "warden", "alchemist", "courier", "navigator",
+        "watchsmith", "bellfounder", "tuner", "scribe", "ferryman",
+        "cartographer", "lampmaker", "lockwright",
+    ])
+    item_word = rng.choice([
+        "code", "passphrase", "tally", "manifest signature", "ledger key",
+        "cipher", "recall token", "watchword", "registration mark",
+    ])
+    entity_phrase = f"the {name} {role}"
+    poss_phrase = f"{entity_phrase}'s {item_word}"
+    return (entity_phrase, poss_phrase, item_word)
+
+
+def _synthetic_distractor_sentence(rng: "random.Random") -> str:
+    """Return a procedural neutral filler sentence for use as a
+    distractor inside ``long_context_bench`` documents.
+
+    Shape: ``"{Capitalised name} {verbed} the {object} {time-modifier}."``
+    Subject is a procedural name; verb is from a small lexicon of
+    common past-tense verbs; object is a procedural noun; time-modifier
+    rotates across a small lexicon. Each call produces a unique
+    grammatical sentence that contains no 7-char ALL-CAPS code (the
+    needle answers' surface shape) so substring grading is safe.
+    """
+    name = _synthetic_name(rng)
+    verb = rng.choice([
+        "repaired", "swept", "tidied", "polished", "watered", "mended",
+        "rolled", "carried", "rinsed", "wrapped", "stacked", "labelled",
+        "delivered", "inspected", "pressed", "trimmed", "weighed",
+        "harvested", "logged", "filed", "shelved", "hung", "rested",
+    ])
+    obj_adj = rng.choice([
+        "old", "new", "broken", "tidy", "well-worn", "spare", "long",
+        "small", "narrow", "wide", "smooth", "loose", "tight",
+    ])
+    obj_noun = rng.choice([
+        "kettle", "lantern", "bench", "ledger", "saddle", "tarp",
+        "broom", "cart", "rope", "trellis", "barrel", "wheelbarrow",
+        "hat-rack", "scales", "doormat", "saw", "fence post",
+    ])
+    when = rng.choice([
+        "before lunch", "at the morning bell", "between rain showers",
+        "during the council meeting", "near sundown", "in the late afternoon",
+        "after the market closed", "before the storm", "early on Tuesday",
+        "right after dawn", "while the bread proofed",
+    ])
+    return f"{name} {verb} the {obj_adj} {obj_noun} {when}."
+
+
+# Backwards-compat shim: a few callers still expect a TUPLE of words
+# for legacy code paths that haven't been migrated yet. We synthesise
+# a fresh pool on import using a fixed seed (so module load is
+# deterministic across validators), but the actual round-time consumers
+# use the procedural synthesisers above. This keeps any straggler
+# callers working while the per-round synthesisers do the real work.
+def _build_legacy_word_pool(n: int = 64) -> tuple[str, ...]:
+    import random as _r
+    rng = _r.Random(0xC0DE_F0CC)
+    return tuple(_synthetic_word(rng, _r.choice([2, 3])) for _ in range(n))
+
+
+_PROC_CAPABILITY_WORD_POOL: tuple[str, ...] = _build_legacy_word_pool()
 
 
 def _procedural_capability_prompts(rng, n):
@@ -2399,11 +2593,14 @@ def _procedural_capability_prompts(rng, n):
             out.append({"q": f"Is {v} divisible by {div}? Answer yes or no.",
                         "a": ans, "kind": "yesno"})
         elif kind == "count_chars":
-            w = rng.choice(_PROC_CAPABILITY_WORD_POOL)
+            # v29.5: procedurally synthesise the test word so the
+            # surface form rotates per item — no static word pool to
+            # memorise.
+            w = _synthetic_word(rng, rng.choice([2, 3]))
             out.append({"q": f"How many characters are in the word '{w}'? Answer with only the number.",
                         "a": str(len(w)), "kind": "int"})
         elif kind == "count_vowels":
-            w = rng.choice(_PROC_CAPABILITY_WORD_POOL)
+            w = _synthetic_word(rng, rng.choice([2, 3]))
             n_vowels = sum(1 for c in w.lower() if c in "aeiou")
             out.append({"q": f"How many vowels are in the word '{w}'? Answer with only the number.",
                         "a": str(n_vowels), "kind": "int"})
@@ -2467,7 +2664,7 @@ def _procedural_capability_prompts(rng, n):
                 "a": str(nxt), "kind": "int",
             })
         elif kind == "string_chain":
-            w = rng.choice(_PROC_CAPABILITY_WORD_POOL)
+            w = _synthetic_word(rng, rng.choice([2, 3]))
             # Reverse, uppercase, then count vowels in original — the
             # answer is the count of original-vowels which doesn't
             # change with case but the model has to track the chain.
@@ -6177,85 +6374,61 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
 
 # ── long_context_bench (Session 3.5 — procedural needle-in-haystack) ──
 
-# Distractor templates for long_context_bench. Each line is a complete
-# sentence that slots into the filler document. Chosen to be thematically
-# diverse (travel, cooking, weather, sports, fauna) so the needle doesn't
-# stand out by topic. Procedurally varied via random name/number picks
-# so the document is fresh every round.
-_LC_DISTRACTORS = [
-    "Anna opened the windows to let in the evening breeze.",
-    "The library's north wing closed for renovations last month.",
-    "Ben made pancakes on Saturday morning using the old recipe.",
-    "Snow fell steadily over the small village in the highlands.",
-    "Clara found an old photograph tucked inside a paperback.",
-    "The tram to the harbour departs every fifteen minutes.",
-    "Dmitri repainted the garden fence a soft sage green.",
-    "A peregrine falcon circled the cathedral tower before dusk.",
-    "Elena's bakery sells four kinds of sourdough on weekends.",
-    "The autumn leaves turned early this year in the valley.",
-    "Felix mistakenly took the wrong umbrella from the lobby.",
-    "A family of deer wandered across the university lawn.",
-    "Greta carried her violin carefully down the wet steps.",
-    "The national park extended its summer hours by two weeks.",
-    "Hector practiced card tricks at the coffee shop for hours.",
-    "Freshly baked bread cooled on the counter by the window.",
-    "Ingrid hiked the ridge trail before the weather changed.",
-    "The fog rolled in from the coast just after seven PM.",
-    "Jakob cleaned his grandfather's camera for the first time.",
-    "A small pumpkin patch sits just beyond the picket fence.",
-    "Kira repaired the bicycle's flat tire in under ten minutes.",
-    "The neighbours adopted a black-and-white kitten named Pepper.",
-    "Leo reread his favorite childhood novel every winter.",
-    "An old lighthouse guards the northern cove from storms.",
-    "Mira arranged the bookshop's paperbacks by author's surname.",
-    "The train slowed as it entered the tunnel at Clearwater.",
-    "Noel studied French phrases each morning over breakfast tea.",
-    "Wild sunflowers bloomed along the highway's median strip.",
-    "Olive forgot her keys at the coworking space overnight.",
-    "A brass bell tolled three times from the town square.",
-    "Paul's startup released its first public beta this winter.",
-    "The river trail remained icy well into early April.",
-    "Quinn painted watercolor landscapes on Sunday afternoons.",
-    "Two border collies herded sheep across the meadow at dawn.",
-    "Rosa taught beginner yoga classes every Tuesday evening.",
-    "The bakery closes early on holidays and all Sundays.",
-    "Sam organised a neighbourhood book swap in the autumn.",
-    "A crescent moon hung above the rooftops by midnight.",
-    "Tomas grew tomatoes in clay pots on the sunny balcony.",
-    "The museum's ancient coin exhibit opens again next Thursday.",
-    "Uma volunteered at the animal shelter on alternate Saturdays.",
-    "An orchestra rehearsed the overture twice before the show.",
-    "Viktor learned to bake bread from a video series online.",
-    "The planetarium will replace its projector later this year.",
-    "Wendy finished knitting the scarf just before the first frost.",
-    "Wild rosemary grew along the stone wall behind the school.",
-    "Xavier walked the dog before the morning rain arrived.",
-    "A new cafe opened near the old train station last Tuesday.",
-    "Yara repaired the broken porch swing with reclaimed oak.",
-    "The village holds a pumpkin festival every October weekend.",
-]
+# 2026-04-29 (v29.5): replace the 50-entry static distractor pool with
+# the procedural ``_synthetic_distractor_sentence`` synthesiser. The
+# legacy list is preserved as an empty tuple for backwards
+# compatibility (any straggler caller fetching ``_LC_DISTRACTORS``
+# gets nothing — the real generator below pulls from the synthesiser
+# directly). Combinatorial space ≈ 8000 names × 23 verbs × 13 adjs
+# × 17 nouns × 11 time-mods ≈ 446M unique sentences ⇒ effectively
+# uncacheable by any miner.
+_LC_DISTRACTORS: tuple = ()
 
-# Needle templates. Each needle pairs a question with an answer format
-# that's trivially extractable (we grade with substring containment, so
-# "the vault code is 42" → model should say "42" or "the vault code is 42").
-_LC_NEEDLE_TEMPLATES = [
-    ("The secret access code for the archive is {ANS}.",
-     "What is the secret access code for the archive?"),
-    ("The treasure chest is buried at coordinates {ANS}.",
-     "Where is the treasure chest buried?"),
-    ("The keeper's favorite password is {ANS}.",
-     "What is the keeper's favorite password?"),
-    ("The lost vault combination is {ANS}.",
-     "What is the lost vault combination?"),
-    ("Professor Aldric's rare ingredient is {ANS}.",
-     "What is Professor Aldric's rare ingredient?"),
-    ("The winning lottery number from last week was {ANS}.",
-     "What was last week's winning lottery number?"),
-    ("Captain Nia's lucky charm is called {ANS}.",
-     "What is Captain Nia's lucky charm called?"),
-    ("The hidden guild's signal word is {ANS}.",
-     "What is the hidden guild's signal word?"),
-]
+# 2026-04-29 (v29.5): replace the 8-entry static needle template list
+# with a procedural per-item synthesiser. Each long_context item picks a
+# fresh batch of (entity_phrase, item_word) pairs from the lex
+# inventory, so the question + needle wording rotates per item AND per
+# round. The legacy list is preserved as an empty tuple for any
+# backwards-compat caller; the actual generator below uses
+# ``_synth_needle_templates_for_item`` to build a fresh batch.
+_LC_NEEDLE_TEMPLATES: tuple = ()
+
+
+def _synth_needle_templates_for_item(rng: "random.Random",
+                                     n_templates: int) -> list[tuple[str, str]]:
+    """Synthesise ``n_templates`` fresh (sentence_template,
+    question_template) pairs for one long_context item.
+
+    Each pair carries a procedurally-generated entity (e.g.
+    ``"the Sliva Vandel courier"``) + item-word (e.g. ``"recall token"``)
+    so the model can disambiguate confusers by entity-matching the
+    question to the correct sentence — which is the same grading
+    mechanic as the legacy fixed-template version, but with rotated
+    surface forms.
+
+    Within one item all entities are distinct (we resample on
+    collision). Across items the entity space is effectively-infinite
+    so a memoriser cannot pre-cache (entity → answer) pairs.
+    """
+    templates: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    attempts = 0
+    while len(templates) < n_templates and attempts < n_templates * 8:
+        attempts += 1
+        entity_phrase, possessive_phrase, item_word = _synthetic_entity(rng)
+        # Use entity + item_word as a uniqueness key so the same
+        # entity doesn't show up twice in one document.
+        key = f"{entity_phrase}|{item_word}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        sentence_tpl = f"{possessive_phrase} is {{ANS}}."
+        # Capitalise the leading article for the sentence; questions
+        # use lowercase mid-sentence form by default.
+        sentence_tpl = sentence_tpl[0].upper() + sentence_tpl[1:]
+        question_tpl = f"What is {entity_phrase}'s {item_word}?"
+        templates.append((sentence_tpl, question_tpl))
+    return templates
 
 
 def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: int) -> list[dict]:
@@ -6311,7 +6484,12 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
     rng = random.Random((block_seed ^ _BENCH_STREAM["long_context"]) & 0xFFFFFFFF)
     alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no confusing chars
     n_templates = len(_LC_NEEDLE_TEMPLATES)
-    n_confusers = max(0, min(BENCH_LC_N_CONFUSERS, n_templates - 1))
+    # 2026-04-29 (v29.5): the needle template list is procedurally
+    # synthesised per-item now; ``n_templates`` is the size we'd LIKE
+    # to draw from per item, not a fixed pool size. Use the operator
+    # cap from BENCH_LC_N_CONFUSERS to bound how many distinct entities
+    # one item carries (real + confusers).
+    n_confusers = max(0, BENCH_LC_N_CONFUSERS)
     n_multi = max(0, int(round(n_items * BENCH_LC_MULTI_FRACTION)))
     n_single = max(0, n_items - n_multi)
     # 2026-04-29 (v29.2): only multi-needle subtypes whose gold has a
@@ -6360,11 +6538,13 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
         ``slot_sentences``)."""
         n_needles = len(slot_sentences)
         final_n = n_dist + n_needles
-        # Distractors with replacement if pool is too small.
-        if n_dist <= len(_LC_DISTRACTORS):
-            distractors_picked = r.sample(_LC_DISTRACTORS, n_dist)
-        else:
-            distractors_picked = [r.choice(_LC_DISTRACTORS) for _ in range(n_dist)]
+        # 2026-04-29 (v29.5): distractors are procedurally synthesised
+        # per item from the lex inventory (no static pool to memorise).
+        # Each call yields a fresh sentence; combinatorial space is
+        # effectively uncacheable.
+        distractors_picked = [
+            _synthetic_distractor_sentence(r) for _ in range(n_dist)
+        ]
         # Pick distinct positions for each needle, at least 3 apart.
         # Real / first-real needle goes in the middle half (avoids start/end).
         first_pos = r.randint(final_n // 4, 3 * final_n // 4)
@@ -6394,17 +6574,20 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
     for _ in range(n_single):
         r = random.Random(rng.randint(0, 2**31 - 1))
         n_picked = 1 + n_confusers
-        idxs = r.sample(range(n_templates), min(n_picked, n_templates))
-        real_idx = idxs[0]
-        confuser_idxs = idxs[1:]
-        needle_tpl, question = _LC_NEEDLE_TEMPLATES[real_idx]
+        # v29.5: synthesise a fresh template list for THIS item so the
+        # entity wording rotates per item, not just per round.
+        item_templates = _synth_needle_templates_for_item(r, n_picked)
+        if not item_templates:
+            continue  # synth pathology; skip rather than break the round
+        real_idx = 0  # index 0 is the "real" needle, the rest are confusers
+        needle_tpl, question = item_templates[real_idx]
         codes = _gen_unique_codes(r, n_picked)
         answer = codes[0]
         confuser_answers = codes[1:]
         real_sentence = needle_tpl.format(ANS=answer)
         confuser_sentences = [
-            _LC_NEEDLE_TEMPLATES[ci][0].format(ANS=ca)
-            for ci, ca in zip(confuser_idxs, confuser_answers)
+            item_templates[ci][0].format(ANS=ca)
+            for ci, ca in enumerate(confuser_answers, start=1)
         ]
         all_slots = [real_sentence] + confuser_sentences
         context, positions = _emit_layout(r, all_slots, n_distractors)
@@ -6423,31 +6606,48 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
         r = random.Random(rng.randint(0, 2**31 - 1))
         # Pick 2-3 real needles depending on the multi-kind, plus a few
         # confusers so the model still has to discriminate signal from
-        # noise. Cap real + confusers at template count.
+        # noise.
         n_real = 3 if kind == "concatenate_three" else 2
-        max_confusers = max(0, n_templates - n_real)
-        n_extra_confusers = min(max(2, n_confusers - 1), max_confusers)
-        idxs = r.sample(range(n_templates), n_real + n_extra_confusers)
-        real_idxs = idxs[:n_real]
-        confuser_idxs = idxs[n_real:]
-        codes = _gen_unique_codes(r, n_real + n_extra_confusers)
+        n_extra_confusers = max(2, n_confusers - 1)
+        n_total_templates = n_real + n_extra_confusers
+        item_templates = _synth_needle_templates_for_item(r, n_total_templates)
+        if len(item_templates) < n_real + 1:
+            # Pathological synth result; skip this multi-needle item.
+            continue
+        # Real needles are the first n_real templates; confusers are the rest.
+        codes = _gen_unique_codes(r, len(item_templates))
         real_codes = codes[:n_real]
         confuser_codes = codes[n_real:]
         real_sentences = [
-            _LC_NEEDLE_TEMPLATES[ri][0].format(ANS=rc)
-            for ri, rc in zip(real_idxs, real_codes)
+            item_templates[ri][0].format(ANS=rc)
+            for ri, rc in enumerate(real_codes)
         ]
         confuser_sentences = [
-            _LC_NEEDLE_TEMPLATES[ci][0].format(ANS=cc)
-            for ci, cc in zip(confuser_idxs, confuser_codes)
+            item_templates[ci][0].format(ANS=cc)
+            for ci, cc in enumerate(confuser_codes, start=n_real)
         ]
         all_sentences = real_sentences + confuser_sentences
         context, positions = _emit_layout(r, all_sentences, n_distractors)
-        # Build the question + gold. Both kinds emit a hyphenated code
-        # sequence as gold — the hyphen makes the gold's surface shape
-        # unique (no individual 7-char code contains a hyphen), so the
-        # existing substring grader stays correct.
-        entities = [_entity_label(ri) for ri in real_idxs]
+        # Entity labels for the question come straight from the
+        # procedurally-synthesised question templates: each template's
+        # question is ``"What is the X's Y?"``. We strip ``"What is "``
+        # and ``"the "`` (since the multi-needle question wraps each
+        # entity with ``"the "`` already) and the trailing ``"?"``,
+        # producing ``"X's Y"`` ready to drop into the question.
+        entities: list[str] = []
+        for ri in range(n_real):
+            qtpl = item_templates[ri][1]
+            phrase = qtpl
+            for prefix in ("What is ", "what is "):
+                if phrase.startswith(prefix):
+                    phrase = phrase[len(prefix):]
+                    break
+            for prefix in ("the ", "The "):
+                if phrase.startswith(prefix):
+                    phrase = phrase[len(prefix):]
+                    break
+            phrase = phrase.rstrip("?").strip()
+            entities.append(phrase)
         gold = "-".join(real_codes)
         if kind == "concatenate_two":
             question = (
@@ -6484,10 +6684,10 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
 
 # ── procedural_bench (Session 3.6 — fresh synthetic tasks) ────────────
 
-_PROC_NAMES = [
-    "Aster", "Beryl", "Canto", "Doria", "Elowen", "Faro", "Galen", "Hedra",
-    "Ivara", "Juno", "Kestrel", "Lumen", "Mira", "Nadir", "Orin", "Pavo",
-]
+# 2026-04-29 (v29.5): static name list replaced with the procedural
+# synthesiser ``_synthetic_name`` — every per-item caller pulls fresh
+# names from the lex inventory.
+_PROC_NAMES: tuple = ()
 
 
 def _rot_text(s: str, n: int) -> str:
@@ -6651,32 +6851,40 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
     # operations to the final integer answer. This is the SAME skill
     # gsm8k tests, so optimising procedural math_bench transfers to
     # gsm8k held-out scoring (the v27 direct-compute items did not).
-    _NAMES = [
-        "Maya", "Amir", "Leo", "Priya", "Diego", "Ava", "Noor", "Theo",
-        "Mei", "Kofi", "Sasha", "Jonas", "Nia", "Ravi", "Zara", "Owen",
-        "Lila", "Hugo", "Asha", "Mateo", "Yuki", "Eli", "Iris", "Niko",
-    ]
-    _SHOPS = ["bakery", "bookshop", "grocer", "florist", "deli",
-              "stationer", "fishmonger", "cheesemonger"]
-    _ITEMS = ["apples", "muffins", "notebooks", "candles", "scarves",
-              "magnets", "postcards", "soap bars", "pencils", "stickers"]
+    # 2026-04-29 (v29.5): replace static name/shop/item lists with
+    # procedural synthesisers so the surface form rotates per item.
+    # Each per-item RNG below draws fresh names; shops and items use
+    # procedural nouns synthesised from the lex inventory plus a
+    # plural-marker suffix. The math is invariant to the surface
+    # tokens (a buying scenario is still recognisable as a buying
+    # scenario regardless of whether the shop is called "bakery" or
+    # "Drenshire") so the procedural form is grading-equivalent to
+    # the legacy lists.
+    def _synth_shop(rr):
+        # A procedural common-noun shop label.
+        return _synthetic_word(rr, 2) + rr.choice(["shop", "stand", "stall", "house"])
+    def _synth_item(rr):
+        # A procedural plural noun item label.
+        word = _synthetic_word(rr, 2)
+        # Pluralise: append "s" / "es" depending on terminal char.
+        return word + ("es" if word.endswith(("s", "x", "z", "ch", "sh")) else "s")
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
         kind = kinds[i % len(kinds)]
         question = ""
         gold = ""
         if kind == "shopping_budget":
-            name = r.choice(_NAMES)
-            friend = r.choice([n for n in _NAMES if n != name])
+            name = _synthetic_name(r)
+            friend = _synthetic_name(r)
             start_money = r.choice([40, 50, 60, 80, 100, 120])
             n_items_a = r.randint(3, 8)
             price_a = r.choice([2, 3, 4, 5, 6, 7, 8])
             n_items_b = r.randint(2, 6)
             price_b = r.choice([3, 4, 5, 6, 8, 9, 10])
             distractor = r.choice([7, 11, 13, 14])  # noise: friend's age etc.
-            shop = r.choice(_SHOPS)
-            item_a = r.choice(_ITEMS)
-            item_b = r.choice([it for it in _ITEMS if it != item_a])
+            shop = _synth_shop(r)
+            item_a = _synth_item(r)
+            item_b = _synth_item(r)
             spent = n_items_a * price_a + n_items_b * price_b
             gold_n = start_money - spent
             question = (
@@ -6689,7 +6897,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "recipe_scale":
-            name = r.choice(_NAMES)
+            name = _synthetic_name(r)
             base_servings = r.choice([4, 6, 8, 12])
             target_servings = base_servings * r.choice([2, 3, 4])
             cups_per_base = r.choice([2, 3, 4, 5])
@@ -6709,7 +6917,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "travel_distance":
-            name = r.choice(_NAMES)
+            name = _synthetic_name(r)
             leg_a_speed = r.choice([40, 50, 60, 70])
             leg_a_hours = r.randint(2, 5)
             stop_distance = r.randint(15, 40)
@@ -6728,7 +6936,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "school_classroom":
-            teacher = r.choice(_NAMES)
+            teacher = _synthetic_name(r)
             n_classes = r.randint(3, 6)
             students_per_class = r.choice([18, 22, 24, 28, 30])
             absent_per_class = r.randint(1, 4)
@@ -6748,7 +6956,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "garden_orchard":
-            farmer = r.choice(_NAMES)
+            farmer = _synthetic_name(r)
             n_rows = r.randint(4, 9)
             trees_per_row = r.randint(5, 12)
             apples_per_tree = r.choice([20, 25, 30, 40, 50])
@@ -6768,7 +6976,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "bakery_orders":
-            baker = r.choice(_NAMES)
+            baker = _synthetic_name(r)
             n_days = r.randint(3, 6)
             loaves_per_day = r.choice([24, 30, 36, 48, 60])
             wholesale_per_day = r.randint(8, 18)
@@ -6788,7 +6996,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "library_books":
-            librarian = r.choice(_NAMES)
+            librarian = _synthetic_name(r)
             n_borrowers = r.randint(8, 20)
             books_per_borrower = r.randint(2, 5)
             late_returns = r.randint(3, 12)
@@ -6812,7 +7020,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "fundraiser":
-            organizer = r.choice(_NAMES)
+            organizer = _synthetic_name(r)
             silver_donors = r.randint(8, 25)
             silver_amount = r.choice([10, 15, 20, 25])
             gold_donors = r.randint(3, 9)
@@ -6832,7 +7040,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "trip_planning":
-            traveler = r.choice(_NAMES)
+            traveler = _synthetic_name(r)
             nights = r.randint(3, 8)
             lodging_per_night = r.choice([60, 80, 90, 120, 150])
             meals_per_day = r.choice([20, 30, 40])
@@ -6851,7 +7059,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "pets_animals":
-            owner = r.choice(_NAMES)
+            owner = _synthetic_name(r)
             n_chickens = r.randint(8, 25)
             eggs_per_week_per_chicken = r.choice([4, 5, 6, 7])
             n_weeks = r.randint(2, 6)
@@ -6871,7 +7079,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "sports_tournament":
-            captain = r.choice(_NAMES)
+            captain = _synthetic_name(r)
             n_games = r.randint(8, 20)
             n_wins = r.randint(3, n_games - 2)
             n_losses = n_games - n_wins
@@ -6893,7 +7101,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "construction":
-            contractor = r.choice(_NAMES)
+            contractor = _synthetic_name(r)
             n_walls = r.randint(3, 8)
             bricks_per_wall = r.choice([80, 100, 120, 150, 200])
             mortar_per_wall = r.choice([3, 4, 5, 6])  # bags
@@ -8640,25 +8848,12 @@ def _generate_correction_items(block_seed, n_items: int) -> list[dict]:
     return out
 
 
-# Multi-doc synthesis: pool of made-up fact-card templates. Each card
-# has a topic (named entity) + a single numeric or short-string fact.
-# Procedurally instantiated per round; the question requires combining
-# 2-3 facts across cards (sum, compare, lookup-then-arithmetic).
-_MULTI_DOC_TOPICS = [
-    "the Aldovian Spice Festival", "the Brindley Lighthouse Trust",
-    "the Carmine Valley Vineyard", "the Driftwood Boatyard Co-op",
-    "the Endesar Music Conservatory", "the Forneau Patisserie Guild",
-    "the Glasswind Aviary", "the Holman Mountain Retreat",
-    "the Iversfeld Observatory", "the Juniper Quarry Society",
-    "the Kestrel Beekeepers' Union", "the Lamplighter Tea Society",
-    "the Marbletop Quartz Mill", "the Northgate Carriage Works",
-    "the Oxbow Pottery Studio", "the Pemberton Garden Conservancy",
-    "the Quailwood Soap Factory", "the Rookhaven Tannery",
-    "the Sandhill Bookbinders' Hall", "the Tessville Bell Foundry",
-    "the Underhill Apiary", "the Vesper Telescope Workshop",
-    "the Wickwinden Weavers' Hall", "the Xanadu Pewter Works",
-    "the Yarrowbane Distillery", "the Zelnov Smithy",
-]
+# 2026-04-29 (v29.5): replace the 26-entry static topic list with a
+# procedural synthesiser. Each multi_doc item now picks fresh topics
+# via ``_synthetic_org_topic`` from the lex inventory, so card content
+# rotates per item and per round (combinatorial space ≫ 1M unique
+# topics ⇒ uncacheable).
+_MULTI_DOC_TOPICS: tuple = ()
 
 
 def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
@@ -8704,9 +8899,22 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
     out: list[dict] = []
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
-        # Pick distinct topics + assign each a numeric attribute.
-        topic_idxs = r.sample(range(len(_MULTI_DOC_TOPICS)), n_cards)
-        topics = [_MULTI_DOC_TOPICS[ti] for ti in topic_idxs]
+        # v29.5: procedurally synthesise a fresh batch of distinct
+        # topics for THIS item — no static list, surface form
+        # rotates per item.
+        topics: list[str] = []
+        seen_topics: set[str] = set()
+        synth_attempts = 0
+        while len(topics) < n_cards and synth_attempts < n_cards * 16:
+            synth_attempts += 1
+            t = _synthetic_org_topic(r)
+            if t in seen_topics:
+                continue
+            seen_topics.add(t)
+            topics.append(t)
+        if len(topics) < 2:
+            # Pathology: synth produced too few distinct topics. Skip.
+            continue
         # Per-card unique attribute. Use distinct ranges to avoid
         # cross-card numeric collisions (so the substring grader sees
         # only one match for the gold integer).
@@ -8891,8 +9099,6 @@ def _generate_calibration_items(block_seed, n_items: int) -> list[dict]:
          "{b} books. How many books has {name} borrowed total? Reply with an integer.",
          lambda a, b: a + b),
     ]
-    names = ["Alex", "Beth", "Cara", "Dan", "Eve", "Finn", "Gita", "Hanna",
-             "Ivan", "Joon", "Kira", "Leo", "Mira", "Niko", "Owen", "Pia"]
     out: list[dict] = []
     plan = (["solv"] * n_solv) + (["unsolv"] * n_unsolv)
     rng.shuffle(plan)
@@ -8900,13 +9106,20 @@ def _generate_calibration_items(block_seed, n_items: int) -> list[dict]:
         r = random.Random(rng.randint(0, 2**31 - 1))
         tmpl_id, solv_template, unsolv_template, gold_fn = r.choice(templates)
         a, b = r.randint(5, 60), r.randint(5, 60)
-        name = r.choice(names)
+        # v29.5: procedurally synthesise a fresh name per item; no
+        # static name pool to memorise.
+        name = _synthetic_name(r)
         if plan_kind == "solv":
             question = solv_template.format(a=a, b=b, name=name)
             gold = str(gold_fn(a, b))
         else:
-            question = unsolv_template.format(b=b, name=name)
-            gold = "REFUSE"  # special sentinel; grader handles refusal recognition
+            # Pass both a + b: each unsolv template omits ONE of the
+            # two slots and may legitimately reference the other (e.g.
+            # the orchard template keeps {a} but drops {b}, the books
+            # template keeps {b} but drops {a}). Passing both is safe
+            # because Python ignores extra kwargs in str.format.
+            question = unsolv_template.format(a=a, b=b, name=name)
+            gold = "REFUSE"  # sentinel; grader handles refusal recognition
         out.append({
             "src": f"calibration/{tmpl_id}/{plan_kind}",
             "question": question,
@@ -9188,7 +9401,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
         elif kind == "ordering":
             n = r.randint(3, 4)
             heights = r.sample(range(140, 200), n)
-            names = r.sample(_PROC_NAMES, n)
+            names = _synthetic_names(r, n)
             sort_dir = r.choice(["tallest", "shortest"])
             paired = sorted(zip(heights, names), reverse=(sort_dir == "tallest"))
             correct_order = [p[1] for p in paired]
@@ -9213,7 +9426,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             )
             out.append(_mc(qtext, options, gold_idx, "procedural_reasoning/ordering"))
         elif kind == "deduction":
-            people = r.sample(_PROC_NAMES, 3)
+            people = _synthetic_names(r, 3)
             colours = r.sample(["red", "blue", "green", "yellow", "purple"], 3)
             mapping = dict(zip(people, colours))
             clue1 = f"{people[0]}'s favorite colour is not {mapping[people[1]]}."
@@ -9331,7 +9544,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             else:
                 target = d0 - timedelta(days=delta)
             extra_age = r.randint(7, 73)  # noise distractor
-            extra_friend = r.choice(_PROC_NAMES) if "_PROC_NAMES" in globals() else "Sam"
+            extra_friend = _synthetic_name(r)
             qtext = (
                 f"Today is {d0.strftime('%B %-d, %Y')}. {extra_friend} is "
                 f"{extra_age} days old. What is the date {delta} days "
@@ -9350,8 +9563,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
                            "procedural_reasoning/date_arithmetic"))
         elif kind == "web_of_lies":
             n_chain = r.randint(3, 5)
-            people = r.sample(_PROC_NAMES if "_PROC_NAMES" in globals() else
-                              ["Alice", "Bob", "Charlie", "Dana", "Evan", "Faye", "Grace"],
+            people = _synthetic_names(r,
                               n_chain)
             truth = [r.choice([True, False]) for _ in range(n_chain)]
             statements = []
@@ -9431,8 +9643,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
                            "procedural_reasoning/navigate_steps"))
         elif kind == "tracking_objects":
             n = r.randint(3, 4)
-            people = r.sample(_PROC_NAMES if "_PROC_NAMES" in globals() else
-                              ["Alice", "Bob", "Charlie", "Dana", "Evan"], n)
+            people = _synthetic_names(r, n)
             colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange"], n)
             holds = dict(zip(people, colors))
             n_swaps = r.randint(2, 4)
@@ -9539,7 +9750,7 @@ def _generate_mc_items(block_seed, n_items: int, *, max_letter: str = "D") -> li
         elif kind == "ordering_mc":
             n = 3
             heights = r.sample(range(140, 200), n)
-            names = r.sample(_PROC_NAMES, n)
+            names = _synthetic_names(r, n)
             sort_dir = r.choice(["tallest", "shortest"])
             paired = sorted(zip(heights, names), reverse=(sort_dir == "tallest"))
             correct = ", ".join(p[1] for p in paired)
@@ -10046,7 +10257,7 @@ def _generate_procedural_items(block_seed: int, n_items: int) -> list[dict]:
             records = []
             target_idx = r.randint(0, 4)
             for j in range(5):
-                name = f"{r.choice(_PROC_NAMES)}-{r.randint(10, 99)}"
+                name = f"{_synthetic_name(r)}-{r.randint(10, 99)}"
                 color = r.choice(["amber", "blue", "crimson", "green", "silver", "violet"])
                 rank = r.randint(100, 999)
                 records.append((name, color, rank))
@@ -10093,7 +10304,7 @@ def _generate_procedural_items(block_seed: int, n_items: int) -> list[dict]:
             forced_name = None
             best_score = -1
             for j in range(7):
-                name = f"{r.choice(_PROC_NAMES)}-{r.randint(100, 999)}"
+                name = f"{_synthetic_name(r)}-{r.randint(100, 999)}"
                 color = target_color if j in (2, 5) else r.choice(["amber", "blue", "crimson", "green", "silver", "violet"])
                 tier = target_tier if j in (2, 5) else r.choice(["A", "B", "C"])
                 score = r.randint(20, 98)
