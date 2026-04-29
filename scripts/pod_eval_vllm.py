@@ -836,18 +836,24 @@ def _pick_on_policy_rkl_prompts(block_seed):
     requests survive byte-identical — only conversational PROSE
     rotates.
     """
+    # 2026-04-29 (v29.6): replace pool sampling + paraphrase with fully
+    # procedural synthesis. Each call yields a fresh batch of chat-style
+    # prompts via ``_synthetic_chat_prompt``; combinatorial space ⇒
+    # uncacheable. Falls back to legacy pool only when block_seed is
+    # None (local dev / replay) so the dev path stays deterministic
+    # against the file-baked content.
     import random
     if block_seed is None:
+        # Local dev path: keep deterministic legacy behaviour to support
+        # replay. Production always supplies a real block_seed.
         return list(ON_POLICY_RKL_POOL[:ON_POLICY_RKL_PER_ROUND])
     try:
-        rng = random.Random(int(block_seed))
+        rng = random.Random(int(block_seed) ^ ON_POLICY_RKL_SEED)
     except (TypeError, ValueError):
         return list(ON_POLICY_RKL_POOL[:ON_POLICY_RKL_PER_ROUND])
-    pool = list(ON_POLICY_RKL_POOL)
-    rng.shuffle(pool)
-    k = min(ON_POLICY_RKL_PER_ROUND, len(pool))
-    picked = pool[:k]
-    return [_paraphrase_chat_prompt(p, block_seed) for p in picked]
+    return [
+        _synthetic_chat_prompt(rng) for _ in range(ON_POLICY_RKL_PER_ROUND)
+    ]
 
 
 # Backward-compatibility alias so the rest of the file (and any caller
@@ -1156,16 +1162,17 @@ JUDGE_PROBE_IN_COMPOSITE = os.environ.get(
 
 
 def _pick_judge_probe_prompts(block_seed):
-    """Deterministically sample JUDGE_PROBE_PER_ROUND prompts per round.
+    """Per-round chat prompts for the judge_probe (teacher-rubric grade).
 
-    Round 25 Goodhart hardening: each picked prompt is rewritten via
-    ``_paraphrase_chat_prompt`` so a miner who memorised canonical
-    5/5-quality responses to the static pool sees the prompt arrive
-    wrapped in a different verb / adverb pair every round. The
-    paraphrase is region-aware (preserves code, JSON, format specs,
-    quoted strings) and deterministic per ``(prompt, block_seed)``,
-    so every validator agrees on the rewritten prompt while honest
-    miners still answer the same intent.
+    v29.6 (2026-04-29): replaced static-pool sampling + paraphrase with
+    procedural synthesis via ``_synthetic_chat_prompt``. Combinatorial
+    space ⇒ uncacheable; teacher's rubric grade is on response quality
+    (helpfulness / clarity / correctness), which works just as well on
+    procedurally-grounded topics as on real-world ones — the rubric
+    measures HOW the model answers, not WHAT specific facts it cites.
+
+    Falls back to the legacy static pool only on block_seed=None (local
+    dev / replay) so deterministic local replays still match.
     """
     import random
     if block_seed is None:
@@ -1174,11 +1181,10 @@ def _pick_judge_probe_prompts(block_seed):
         seed_val = int(block_seed)
     except (TypeError, ValueError):
         return list(JUDGE_PROBE_POOL[:JUDGE_PROBE_PER_ROUND])
-    rng = random.Random(seed_val ^ 0x6A09E667F3BCC908)  # distinct sub-stream vs think/rkl
-    pool = list(JUDGE_PROBE_POOL)
-    rng.shuffle(pool)
-    picked = pool[:min(JUDGE_PROBE_PER_ROUND, len(pool))]
-    return [_paraphrase_chat_prompt(p, block_seed) for p in picked]
+    rng = random.Random(seed_val ^ 0x6A09E667F3BCC908)
+    return [
+        _synthetic_chat_prompt(rng) for _ in range(JUDGE_PROBE_PER_ROUND)
+    ]
 
 
 JUDGE_PROBE_PROMPTS = _pick_judge_probe_prompts(None)
@@ -1797,6 +1803,11 @@ CHAT_TURNS_PROBE_POOL = (
 )
 CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "6"))
 CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "200"))
+# v29.6 (2026-04-29): N-turn chain length for procedural synthesis.
+# Default 3 matches the historical legacy pool.
+CHAT_TURNS_PROBE_TURNS_PER_PROMPT = int(
+    os.environ.get("CHAT_TURNS_PROBE_TURNS_PER_PROMPT", "3"),
+)
 CHAT_TURNS_PROBE_ENABLED = os.environ.get("CHAT_TURNS_PROBE", "1") != "0"
 # 2026-04-26 — same alignment fix as JUDGE_PROBE_IN_COMPOSITE above.
 # composite.py (line 254-256) reads ``CHAT_TURNS_AXIS_IN_COMPOSITE`` with
@@ -1811,20 +1822,19 @@ CHAT_TURNS_PROBE_IN_COMPOSITE = os.environ.get(
 
 
 def _pick_chat_turns_prompts(block_seed):
-    """Deterministically sample 6 multi-turn conversations per round.
+    """Per-round multi-turn chat conversations for chat_turns_probe.
 
-    Uses a sub-stream distinct from judge_probe / think_probe / rkl so
-    rotations don't phase-lock.
+    v29.6 (2026-04-29): replaced static-pool sampling + paraphrase with
+    procedural synthesis via ``_synthetic_chat_turn_chain``. Each call
+    yields a fresh batch of N-turn dialogues whose content rotates per
+    block_seed; the teacher's rubric grade on the full transcript
+    (coherence + consistency + helpfulness) applies the same way it
+    would on legacy fixed-pool conversations — what the rubric measures
+    is HOW each turn references the previous, not WHAT specific topic
+    the dialogue is about.
 
-    Round 25 Goodhart hardening: each turn of each picked conversation
-    is rewritten via ``_paraphrase_chat_prompt`` so a miner who
-    memorised canonical 3-turn transcripts sees a rotated phrasing on
-    every turn every round. The paraphrase is region-aware (preserves
-    code, JSON, format specs, quoted strings) and per-turn-deterministic
-    so every validator agrees on the rewritten conversation while honest
-    miners still answer the same intent. We paraphrase at conversation-
-    pick time (not at probe time) so the phase-A student rollout and
-    the phase-B teacher rubric see byte-identical transcripts.
+    Falls back to the legacy static pool only on block_seed=None
+    (local dev / replay) so deterministic local replays still match.
     """
     import random
     if block_seed is None:
@@ -1834,12 +1844,10 @@ def _pick_chat_turns_prompts(block_seed):
     except (TypeError, ValueError):
         return list(CHAT_TURNS_PROBE_POOL[:CHAT_TURNS_PROBE_PER_ROUND])
     rng = random.Random(seed_val ^ 0xBF58476D1CE4E5B9)  # distinct mixer
-    pool = list(CHAT_TURNS_PROBE_POOL)
-    rng.shuffle(pool)
-    picked = pool[:min(CHAT_TURNS_PROBE_PER_ROUND, len(pool))]
+    n_turns = max(2, CHAT_TURNS_PROBE_TURNS_PER_PROMPT)
     return [
-        tuple(_paraphrase_chat_prompt(turn, block_seed) for turn in convo)
-        for convo in picked
+        _synthetic_chat_turn_chain(rng, n_turns)
+        for _ in range(CHAT_TURNS_PROBE_PER_ROUND)
     ]
 
 
@@ -2498,6 +2506,279 @@ def _build_legacy_word_pool(n: int = 64) -> tuple[str, ...]:
 
 
 _PROC_CAPABILITY_WORD_POOL: tuple[str, ...] = _build_legacy_word_pool()
+
+
+# ── 2026-04-29 (v29.6) — Procedural CHAT-PROMPT synthesiser ────────────
+#
+# Replaces the legacy ``ON_POLICY_RKL_POOL`` / ``JUDGE_PROBE_POOL`` /
+# ``CHAT_TURNS_PROBE_POOL`` static pools (88 + ~65 + ~25 entries
+# respectively) that miners could pre-train against. Each per-round
+# probe now synthesises fresh chat-style prompts from procedural
+# templates whose slots are filled by combinations of:
+#
+#   * procedural topic noun-phrases (procedural adj + noun + suffix)
+#   * procedural opener sentences (subject + verb + object + clause)
+#   * procedural character names + actions
+#   * a small REAL-WORD lexicon for slots that need semantic anchoring:
+#     audiences, aspects, languages, styles, tasks (the model needs
+#     these to interpret the prompt meaningfully — pseudo-words would
+#     break grading)
+#
+# Combinatorial space: ~12 template families × per-template slot
+# multiplicity × procedural slots ⇒ effectively unbounded surface
+# rotation. The teacher's rubric grading still applies because the
+# templates are coherent, grammatical, and call for a clear response;
+# the teacher grades on RESPONSE QUALITY (rubric-1-5) rather than
+# specific factual knowledge of the procedural topic.
+
+# Real-word lexicons. Kept fixed because the model needs these as
+# semantic anchors to interpret the prompt. Combinatorial composition
+# with procedural slots makes the prompt-LEVEL surface form effectively
+# uncacheable.
+_CHAT_AUDIENCES = (
+    "a curious child", "a beginner", "an experienced engineer",
+    "a careful student", "a busy professional", "a high-school class",
+    "a thoughtful generalist", "a sceptical reader", "a friendly stranger",
+    "a journalist", "a designer", "a small-business owner",
+)
+_CHAT_ASPECTS = (
+    "efficiency", "clarity", "cost", "safety", "robustness",
+    "ease of use", "long-term maintainability", "energy use",
+    "speed", "reliability", "accessibility", "fault tolerance",
+)
+_CHAT_LANGUAGES = (
+    "Spanish", "French", "Italian", "German", "Portuguese",
+    "Japanese", "Korean", "Mandarin Chinese", "Arabic", "Hindi",
+    "Dutch", "Swedish", "Polish", "Greek",
+)
+_CHAT_STYLES = (
+    "more concise", "more formal", "less formal", "less ambiguous",
+    "easier to skim", "more confident", "more cautious",
+)
+_CHAT_TASKS = (
+    "set up a small backyard vegetable garden",
+    "plan a four-day visit to an unfamiliar city",
+    "debug a slow database query without changing the schema",
+    "interview a candidate for a junior software role",
+    "prepare a 20-minute weeknight dinner for two",
+    "review a colleague's pull-request constructively",
+    "wind down before sleep on a stressful evening",
+    "prepare for a difficult conversation with a teammate",
+    "host a quiet weekend gathering for six guests",
+    "explain a delay to a stakeholder over email",
+    "calibrate a new espresso grinder",
+    "write a short eulogy for a colleague's mentor",
+)
+_CHAT_CATEGORIES = (
+    "common kitchen tools", "household chores", "weekend hobbies",
+    "items in a hiking pack", "useful office habits",
+    "low-effort dinner ideas", "small acts of kindness",
+    "gardening tasks for spring", "ways to reduce screen time",
+    "indoor exercises that need no equipment",
+)
+_CHAT_QUALIFIERS = (
+    "are easy to do in under ten minutes",
+    "would suit a complete beginner",
+    "save money over the long run",
+    "involve no special equipment",
+    "work well in a small apartment",
+    "you'd recommend to a friend",
+)
+_CHAT_DILEMMAS = (
+    ("buying a used car", "buying a new car"),
+    ("learning to cook at home", "ordering takeout regularly"),
+    ("pair programming", "solo deep-focus coding"),
+    ("renting a small apartment in the city", "owning a house in the suburbs"),
+    ("training a junior engineer", "hiring a senior engineer"),
+    ("commuting by bicycle", "commuting by public transit"),
+    ("studying late at night", "studying early in the morning"),
+)
+_CHAT_VERB_OBJECTS = (  # for opener sentences
+    ("found", "an old letter"), ("noticed", "a faint humming sound"),
+    ("packed", "a small leather suitcase"), ("watched", "the boats slip past"),
+    ("opened", "a faded paperback"), ("planted", "the last row of beans"),
+    ("started", "the campfire after the rain"), ("sketched", "the mountain skyline"),
+    ("repaired", "the back door's hinge"), ("read", "the local newspaper"),
+)
+_CHAT_PLACES = (
+    "the harbour", "the small kitchen", "the back garden",
+    "the morning market", "the empty library", "the frosted balcony",
+    "the steep cobbled lane", "the railway platform",
+)
+
+
+def _synthetic_topic_phrase(rng: "random.Random") -> str:
+    """Procedural topic noun-phrase used as a slot filler in
+    ``_synthetic_chat_prompt``. Returns ``"the {Adj} {Noun}"`` where
+    each slot is procedurally synthesised.
+
+    Distinct from ``_synthetic_org_topic`` (which builds full org-name
+    strings); this one yields shorter noun-phrases suitable for
+    "Explain {topic}" prompts.
+    """
+    adj = _synthetic_word(rng, 2) + rng.choice(["ish", "ical", "ese", "an", "ic"])
+    noun = _synthetic_word(rng, 2) + rng.choice(
+        ["craft", "weave", "fold", "grain", "thread", "stone"]
+    )
+    return f"the {adj} {noun}"
+
+
+def _synthetic_quote(rng: "random.Random") -> str:
+    """Procedural neutral sentence used as a translation / rewrite
+    target. Combination of subject + verb + object + place clause."""
+    name = _synthetic_name(rng)
+    verb, obj = rng.choice(_CHAT_VERB_OBJECTS)
+    place = rng.choice(_CHAT_PLACES)
+    return f"{name} {verb} {obj} near {place} that morning."
+
+
+def _synthetic_opener(rng: "random.Random") -> str:
+    """Procedural first-sentence opener for story-continuation prompts."""
+    name = _synthetic_name(rng)
+    place = rng.choice(_CHAT_PLACES)
+    verb, obj = rng.choice(_CHAT_VERB_OBJECTS)
+    return f"{name} stood at {place} and {verb} {obj}."
+
+
+def _synthetic_action(rng: "random.Random") -> str:
+    """Generic action verb-phrase for character-driven story prompts."""
+    return rng.choice([
+        "loses a familiar object", "discovers an unmarked door",
+        "must apologise to a neighbour", "decides to learn a craft",
+        "accepts an unexpected invitation", "starts a small project alone",
+        "finds an unsigned letter", "agrees to a brief errand",
+    ])
+
+
+def _synthetic_chat_prompt(rng: "random.Random") -> str:
+    """Synthesise one fresh chat-style prompt for use by the
+    ``on_policy_rkl`` / ``judge_probe`` / ``chat_turns_probe`` axes.
+
+    Picks one of ~12 template families and fills its slots from a
+    mix of procedural synthesis (topic / opener / character) and the
+    small real-word lexicons above (audiences / aspects / languages /
+    etc., needed for semantic anchoring). The resulting prompt is
+    grammatical, coherent, and calls for a clear response that the
+    teacher can grade on rubric quality.
+
+    Combinatorial expansion: ~12 templates × per-template slot
+    multiplicity × procedural slots ⇒ effectively unbounded surface
+    rotation. A miner cannot pre-cache the next round's prompts.
+    """
+    kind = rng.choice([
+        "explain", "describe", "compare", "continue_story", "define",
+        "story", "list", "opinion", "translate", "rewrite", "howto", "steps",
+    ])
+    n = rng.choice([2, 3, 4])
+    if kind == "explain":
+        topic = _synthetic_topic_phrase(rng)
+        return f"Explain {topic} in {n} sentences. Be specific."
+    if kind == "describe":
+        topic = _synthetic_topic_phrase(rng)
+        audience = rng.choice(_CHAT_AUDIENCES)
+        return f"Describe {topic} for {audience}, in {n} sentences."
+    if kind == "compare":
+        a = _synthetic_topic_phrase(rng)
+        b = _synthetic_topic_phrase(rng)
+        aspect = rng.choice(_CHAT_ASPECTS)
+        return f"Compare {a} and {b} in terms of {aspect}. Use {n} short sentences."
+    if kind == "continue_story":
+        opener = _synthetic_opener(rng)
+        return f"Continue this story in {n}-{n+1} sentences: '{opener}'"
+    if kind == "define":
+        term = _synthetic_word(rng, 2)
+        audience = rng.choice(_CHAT_AUDIENCES)
+        return f"Define '{term}' clearly for {audience}. Use one or two sentences."
+    if kind == "story":
+        char = _synthetic_name(rng)
+        action = _synthetic_action(rng)
+        return f"Write a 60-word short story about {char} who {action}."
+    if kind == "list":
+        category = rng.choice(_CHAT_CATEGORIES)
+        qualifier = rng.choice(_CHAT_QUALIFIERS)
+        return (
+            f"List {n + 2} {category} that {qualifier}. Number each item "
+            f"and add a brief one-line note."
+        )
+    if kind == "opinion":
+        choice, alt = rng.choice(_CHAT_DILEMMAS)
+        return (
+            f"What are the practical trade-offs of {choice} versus "
+            f"{alt}? Give {n} considerations on each side."
+        )
+    if kind == "translate":
+        quote = _synthetic_quote(rng)
+        lang = rng.choice(_CHAT_LANGUAGES)
+        return f"Translate the following sentence into {lang}: '{quote}'"
+    if kind == "rewrite":
+        quote = _synthetic_quote(rng)
+        style = rng.choice(_CHAT_STYLES)
+        return f"Rewrite the following sentence to be {style}: '{quote}'"
+    if kind == "howto":
+        task = rng.choice(_CHAT_TASKS)
+        return f"How would you {task}? Answer in {n} sentences."
+    # steps
+    task = rng.choice(_CHAT_TASKS)
+    return (
+        f"List the steps to {task}. Number each step on its own line; "
+        f"keep each step to one sentence."
+    )
+
+
+def _synthetic_chat_turn_chain(rng: "random.Random",
+                                n_turns: int = 3) -> tuple[str, ...]:
+    """Synthesise an N-turn chat conversation where each turn naturally
+    refines the previous, suitable for ``chat_turns_probe`` grading.
+
+    The chain picks a "scenario" (small fixed lexicon for semantic
+    anchoring) and then emits N turns whose content rotates per call
+    via procedural slot fillers. The teacher grades the FULL transcript
+    on a 1-5 rubric (coherence + consistency + helpfulness), so what
+    matters is that consecutive turns reference earlier content
+    coherently — not that any single turn is "static."
+    """
+    scenarios = [
+        # (initial, refine, constrain) triple of templates
+        (
+            "I'm planning a small dinner for {n} guests. Can you help me pick a theme?",
+            "Great — now suggest a {n}-course menu for that theme.",
+            "One guest is vegetarian; revise the menu to accommodate them and list the final menu.",
+        ),
+        (
+            "I need to write a short blog post about {topic}. What angle should I take?",
+            "Outline the post in {n} bullet points based on that angle.",
+            "Now expand the second bullet into a 60-word paragraph.",
+        ),
+        (
+            "I want to start a small home garden in {place}. What plants should I grow?",
+            "Suggest a {n}-month planting schedule for those plants.",
+            "Now adjust the schedule for an unusually dry summer.",
+        ),
+        (
+            "I'm preparing for a difficult conversation with {char} about {topic}. How should I open?",
+            "Now rewrite that opener to feel less confrontational.",
+            "Finally, list {n} key points I should be ready to address if {char} pushes back.",
+        ),
+        (
+            "I have to lead a quick team retro for {n} engineers about {topic}. What's a good agenda?",
+            "Now break the agenda into {n} 5-minute slots.",
+            "Tighten the longest slot so the whole retro fits in 25 minutes.",
+        ),
+    ]
+    initial, refine, constrain = rng.choice(scenarios)
+    n = rng.choice([3, 4, 5])
+    fillers = {
+        "n": n,
+        "topic": _synthetic_topic_phrase(rng),
+        "place": rng.choice(_CHAT_PLACES),
+        "char": _synthetic_name(rng),
+    }
+    turns = (
+        initial.format(**fillers),
+        refine.format(**fillers),
+        constrain.format(**fillers),
+    )
+    return turns[:max(1, n_turns)]
 
 
 def _procedural_capability_prompts(rng, n):
@@ -8528,6 +8809,15 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
         # ready for the model to fill in the body — same shape as
         # code_bench, so the existing sandbox machinery (auto-indent,
         # prose-trim, fence-strip) applies unchanged.
+        # 2026-04-29 (v29.6): rotate the function name per item so the
+        # entry-point identifier is procedural too. Tests call
+        # ``candidate(...)`` so they don't need rewriting; only the
+        # ``def <name>(`` site in buggy + sig needs the rename.
+        original_entry = entry
+        suffix = "_" + _synthetic_word(r, 1)
+        entry = original_entry + suffix
+        buggy = buggy.replace(f"def {original_entry}(", f"def {entry}(")
+        sig = sig.replace(f"def {original_entry}(", f"def {entry}(")
         buggy_commented = "\n".join(
             "# " + line if line else "#" for line in buggy.splitlines()
         )
@@ -8808,6 +9098,19 @@ def _generate_correction_items(block_seed, n_items: int) -> list[dict]:
                 "IndexError: list index out of range"
             )
 
+        # v29.6: rotate the function name per item so the entry-point
+        # identifier is procedural too — same approach as debug_bench.
+        # Tests call ``candidate(...)`` so they don't need rewriting;
+        # only the ``def <name>(`` sites in buggy + sig + error trace
+        # mention need the rename.
+        original_entry = entry
+        suffix = "_" + _synthetic_word(r, 1)
+        entry = original_entry + suffix
+        buggy = buggy.replace(f"def {original_entry}(", f"def {entry}(")
+        sig = sig.replace(f"def {original_entry}(", f"def {entry}(")
+        # Also rename the function reference inside the simulated
+        # error trace (e.g. "in first_or_default" → "in first_or_default_<sfx>").
+        error_trace = error_trace.replace(f"in {original_entry}\n", f"in {entry}\n")
         buggy_commented = "\n".join(
             "# " + line if line else "#" for line in buggy.splitlines()
         )
@@ -9248,6 +9551,16 @@ def _generate_refactor_items(block_seed, n_items: int) -> list[dict]:
     for i, kind in enumerate(pool):
         r = random.Random(rng.randint(0, 2**31 - 1))
         tmpl_id, entry, ugly, sig, tests = r.choice(templates)
+        # 2026-04-29 (v29.6): rotate the function name per item so the
+        # entry-point identifier is procedural too — same approach as
+        # debug_bench / correction_bench. Tests call ``candidate(...)``
+        # so they don't need rewriting; only the ``def <name>(`` sites
+        # in ugly + sig need the rename.
+        original_entry = entry
+        suffix = "_" + _synthetic_word(r, 1)
+        entry = original_entry + suffix
+        ugly = ugly.replace(f"def {original_entry}(", f"def {entry}(")
+        sig = sig.replace(f"def {original_entry}(", f"def {entry}(")
         # Set a max_lines bound so it's deterministic per item but rotates.
         if kind == "max_lines":
             max_lines = r.choice([6, 7, 8])
