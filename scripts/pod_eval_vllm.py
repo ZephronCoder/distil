@@ -12598,6 +12598,15 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         "--no-enable-log-requests",
         "--reasoning-parser", "qwen3",
         "--max-logprobs", "128",
+        # 2026-04-29 (v29.7): Qwen3.6+ ships with a vision encoder
+        # (multimodal MoE). We only ever use the teacher for text-only
+        # logit extraction, so disable mm completely — this also
+        # skips the preprocessor_config.json load that fails under
+        # HF_HUB_OFFLINE when it isn't pre-cached. Same flags the
+        # chat-king server uses; harmless on text-only models like
+        # Qwen3.5.
+        "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
+        "--skip-mm-profiling",
     ]
     if tensor_parallel_size and tensor_parallel_size > 1:
         cmd.extend(["--tensor-parallel-size", str(tensor_parallel_size)])
