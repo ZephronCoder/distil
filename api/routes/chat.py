@@ -146,21 +146,20 @@ def _normalize_chat_payload(payload: dict) -> dict:
             pass
     else:
         payload.setdefault("top_p", 0.92)
-    # 2026-05-01 (v30.4 patch): hard-cap max_tokens at 1200 here too,
-    # so the OpenAI-compat ``/v1/chat/completions`` endpoint inherits
-    # the same protection as ``/api/chat``. Open WebUI clients
-    # commonly pass max_tokens=4096 by default — without the cap
-    # they hit the derail every time.
+    # 2026-05-01 (v30.4 patch v2): hard cap raised 1200 → 6144 (the
+    # context window). Derail detection at the proxy now truncates
+    # at the last coherent point, so we can let models generate
+    # long responses safely.
     if "max_tokens" in payload:
         try:
             mt = int(payload["max_tokens"])
             if mt < 1:
-                mt = 800
-            payload["max_tokens"] = min(mt, 1200)
+                mt = 1500
+            payload["max_tokens"] = min(mt, 6144)
         except (TypeError, ValueError):
-            payload["max_tokens"] = 800
+            payload["max_tokens"] = 1500
     else:
-        payload["max_tokens"] = 800
+        payload["max_tokens"] = 1500
     return payload
 
 
@@ -196,6 +195,144 @@ def stream_remote_chat(payload: dict):
             proc.kill()
 
 
+# ── Derail detection (chat-side) ──────────────────────────────────────────────
+# 2026-05-01 (v30.4 patch v2): the king models in current rotation
+# derail past ~500-800 generated tokens — multilingual word salad,
+# Latin word lists, long-compound coinage, glossary mode. This was
+# reproduced with king UID 107 across temperatures 0.5..1.2 on
+# chat.arbos.life. The eval-side fixes (long_form_judge max_tokens
+# 6144 + coherence multiplier + dedicated long_gen_coherence axis)
+# will dethrone broken kings, but until that propagates we have to
+# defend at the chat proxy: detect derail in the response text and
+# truncate at the last coherent point so users see clean prefix
+# instead of the gibberish tail.
+
+
+def _coherence_factor_chat(text: str) -> float:
+    """Six-signal statistical coherence detector — copy of the one in
+    pod_eval_vllm.py, kept here so the chat proxy can run it without
+    importing the eval module. See the original for full docstring.
+
+    Returns coherence in [0.05, 1.0]. 1.0 = clean prose. <0.3 = derail.
+    """
+    if not text:
+        return 1.0
+    text_len = len(text)
+    if text_len < 50:
+        return 1.0
+    non_ascii = sum(1 for c in text if ord(c) > 127)
+    non_ascii_frac = non_ascii / text_len
+    non_ascii_factor = max(0.0, 1.0 - min(1.0, non_ascii_frac * 4.0))
+    seen = set()
+    repeats = 0
+    for i in range(0, text_len - 50, 25):
+        s = text[i:i + 50]
+        if s in seen:
+            repeats += 1
+        seen.add(s)
+    repeats_factor = max(0.0, 1.0 - min(1.0, repeats * 0.05))
+    words = text.split()
+    n_words = len(words)
+    if n_words == 0:
+        return 0.0
+    long_words = sum(1 for w in words if len(w) > 50)
+    word_list_factor = max(
+        0.0, 1.0 - min(1.0, (long_words / n_words) * 1.5),
+    )
+    word_lens = [len(w) for w in words[:1000]]
+    mean_word_len = sum(word_lens) / max(1, len(word_lens))
+    meaningful_factor = max(
+        0.0, 1.0 - max(0.0, (mean_word_len - 10.0) * 0.2),
+    )
+    punct_chars = sum(1 for c in text if c in ".,;:?!\"'()[]{}—–-")
+    punct_frac = punct_chars / max(1, text_len)
+    if text_len < 400:
+        punctuation_factor = 1.0
+    elif punct_frac >= 0.03:
+        punctuation_factor = 1.0
+    else:
+        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.03))
+    norm_words = [w.strip(".,;:?!\"'()[]{}").lower() for w in words]
+    norm_words = [
+        w for w in norm_words
+        if w and w.replace("-", "").isalpha()
+    ]
+    if len(norm_words) >= 150:
+        unique_frac = len(set(norm_words)) / len(norm_words)
+        if unique_frac < 0.85:
+            unique_word_factor = 1.0
+        else:
+            unique_word_factor = max(
+                0.0, 1.0 - (unique_frac - 0.85) / 0.10,
+            )
+    else:
+        unique_word_factor = 1.0
+    coh = (
+        non_ascii_factor * repeats_factor * word_list_factor
+        * meaningful_factor * punctuation_factor * unique_word_factor
+    )
+    return max(0.05, min(1.0, coh))
+
+
+def _truncate_at_derail(
+    text: str,
+    window: int = 400,
+    threshold: float = 0.4,
+) -> tuple[str, bool]:
+    """Find the last coherent prefix of ``text`` and truncate there.
+
+    Returns ``(truncated_text, was_truncated)``. The algorithm slides
+    a ``window``-char detector across the text in ``window // 2`` steps
+    and finds the FIRST window whose coherence drops below
+    ``threshold``. The cut is placed at the last sentence boundary
+    before the derail starts (period, question mark, exclamation
+    point, or newline), with a graceful "[truncated]" tail so the
+    user knows the rest was discarded.
+
+    Cheap O(N): each window's coherence is computed on a 400-char
+    slice and the loop stops at the first bad window. For a clean
+    coherent response the loop runs through every window once
+    (typical 5000 chars → 25 windows × ~1ms each = 25ms).
+    """
+    if not text or len(text) < window * 2:
+        return text, False
+    text_len = len(text)
+    step = max(1, window // 2)
+    derail_start = None
+    for end in range(window, text_len + step, step):
+        end = min(end, text_len)
+        chunk = text[max(0, end - window):end]
+        if _coherence_factor_chat(chunk) < threshold:
+            derail_start = end - window
+            break
+    if derail_start is None:
+        return text, False
+    cutoff = max(0, derail_start)
+    sentence_breaks = ".?!"
+    paragraph_breaks = "\n"
+    for i in range(cutoff, max(0, cutoff - 600), -1):
+        if i < text_len and (
+            text[i] in paragraph_breaks
+            or (
+                text[i] in sentence_breaks
+                and (i + 1 >= text_len or text[i + 1] in " \n\t")
+            )
+        ):
+            return (
+                text[:i + 1]
+                + "\n\n"
+                + "_[Response truncated — the model began producing "
+                + "incoherent text past this point. This is a known "
+                + "failure mode of the current king on long generations; "
+                + "the next eval round should dethrone this model.]_"
+            ), True
+    return (
+        text[:cutoff]
+        + "\n\n"
+        + "_[Response truncated — incoherent text past this point.]_"
+    ), True
+
+
 # ── Chat helpers ──────────────────────────────────────────────────────────────
 
 def _extract_message_content(message: dict) -> tuple[str, str | None]:
@@ -224,18 +361,26 @@ def _sync_chat(payload, king_uid, king_model):
         if "choices" in data:
             message = data["choices"][0].get("message") or {}
             content, thinking = _extract_message_content(message)
+            # 2026-05-01 (v30.4 patch): truncate at derail.
+            truncated_content, was_truncated = _truncate_at_derail(content)
             resp = {
-                "response": content,
+                "response": truncated_content,
                 "model": king_model,
                 "king_uid": king_uid,
             }
+            if was_truncated:
+                resp["truncated_at_derail"] = True
+                resp["original_length"] = len(content)
+                resp["truncated_length"] = len(truncated_content)
             if thinking:
                 resp["thinking"] = thinking
             if "usage" in data:
                 resp["usage"] = data["usage"]
             # Log the *normalized* payload (with anti-derail defaults
             # applied) so derail audits show what the model actually
-            # received, not what the client supplied.
+            # received, not what the client supplied. Log the
+            # ORIGINAL (untruncated) content so derail incidents are
+            # auditable in chat_turns.jsonl.
             _log_chat_turn(
                 _normalize_chat_payload(payload),
                 content, king_uid, king_model, data,
@@ -250,6 +395,18 @@ def _stream_chat(payload, king_uid, king_model):
     payload["stream"] = True
 
     def generate():
+        # 2026-05-01 (v30.4 patch): incremental derail detection while
+        # streaming. We accumulate every delta into ``acc`` and re-run
+        # the coherence detector every ``CHECK_EVERY_CHARS`` of new
+        # text. As soon as the recent window goes below threshold we
+        # stop forwarding deltas, send a final stop+truncation marker,
+        # and break.
+        CHECK_EVERY_CHARS = 400
+        WINDOW = 400
+        THRESHOLD = 0.4
+        acc = ""
+        last_check_at = 0
+        derailed = False
         try:
             for line in stream_remote_chat(payload):
                 line = line.strip()
@@ -261,16 +418,69 @@ def _stream_chat(payload, king_uid, king_model):
                     break
                 try:
                     parsed = json.loads(raw)
-                    parsed["king_uid"] = king_uid
-                    parsed["king_model"] = king_model
-                    yield f"data: {json.dumps(parsed)}\n\n"
                 except json.JSONDecodeError:
                     yield f"data: {raw}\n\n"
+                    continue
+                # Extract delta content if any.
+                delta_content = ""
+                choices = parsed.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    msg = choices[0].get("message") or {}
+                    delta_content = (
+                        delta.get("content")
+                        or msg.get("content")
+                        or ""
+                    )
+                if delta_content:
+                    acc += delta_content
+                if not derailed and len(acc) - last_check_at >= CHECK_EVERY_CHARS:
+                    last_check_at = len(acc)
+                    if len(acc) >= WINDOW * 2:
+                        recent = acc[-WINDOW:]
+                        coh = _coherence_factor_chat(recent)
+                        if coh < THRESHOLD:
+                            derailed = True
+                if derailed:
+                    # Send a final delta with the truncation notice
+                    # plus a stop signal, then break.
+                    notice = (
+                        "\n\n_[Response truncated — the model began "
+                        "producing incoherent text past this point. "
+                        "This is a known failure mode of the current "
+                        "king on long generations; the next eval "
+                        "round should dethrone this model.]_"
+                    )
+                    final_chunk = {
+                        "choices": [{
+                            "delta": {"content": notice},
+                            "finish_reason": "stop",
+                            "index": 0,
+                        }],
+                        "king_uid": king_uid,
+                        "king_model": king_model,
+                        "truncated_at_derail": True,
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+                parsed["king_uid"] = king_uid
+                parsed["king_model"] = king_model
+                yield f"data: {json.dumps(parsed)}\n\n"
         except Exception as e:
             err = str(e)
             if "ssh" in err.lower() or "root@" in err or ".ssh/" in err:
                 err = "chat server connection failed"
             yield f"data: {json.dumps({'error': err[:200]})}\n\n"
+        # Best-effort log of the accumulated response so derail
+        # incidents are auditable in chat_turns.jsonl.
+        try:
+            _log_chat_turn(
+                _normalize_chat_payload(payload),
+                acc, king_uid, king_model, None,
+            )
+        except Exception:
+            pass
 
     return StreamingResponse(
         generate(),
@@ -436,23 +646,19 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    # 2026-05-01 (v30.4 patch): default 800, hard cap 1200. Live
-    # repro on king UID 107 (best26/sn97-m-v4) showed the derail
-    # starts around the 500-800 token mark even at temperature 0.5,
-    # AND is not fully suppressible by sampling caps — even at
-    # temp 0.7 / top_p 0.92 / top_k 50 / repetition_penalty 1.20,
-    # max_tokens=2000 still produced 2000 tokens of word-list. The
-    # model is fundamentally not able to sustain coherent generation
-    # past ~1k tokens until a better-trained king is crowned. Hard
-    # cap 1200 prevents users from being served gibberish tails
-    # regardless of what they request. The new long_form_judge
-    # coherence multiplier (eval side) will catch this in the next
-    # round and dethrone the broken king.
-    max_tokens = body.get("max_tokens", 800)
+    # 2026-05-01 (v30.4 patch v2): default 1500, hard cap 6144. The
+    # earlier 800/1200 cap was hiding the derail by just truncating
+    # the response. The proxy now does INCREMENTAL derail detection
+    # while streaming (and post-hoc truncation on the sync path),
+    # so we can let the model generate as long as it wants —
+    # the derail-detector will cut at the last coherent point. Cap
+    # is 6144 because that's the model's effective context window;
+    # past that vLLM rejects.
+    max_tokens = body.get("max_tokens", 1500)
     try:
-        max_tokens = min(int(max_tokens), 1200)
+        max_tokens = min(int(max_tokens), 6144)
     except (TypeError, ValueError):
-        max_tokens = 800
+        max_tokens = 1500
     stream = body.get("stream", False)
 
     if not messages:
@@ -603,14 +809,78 @@ async def openai_chat_completions(request: Request):
     # _normalize_chat_payload (called inside _curl_cmd) rewrites model + thinking.
     try:
         if stream:
+            # 2026-05-01 (v30.4 patch): incremental derail detection on
+            # the OpenAI-compat streaming path too. Same algorithm as
+            # ``_stream_chat`` — accumulate deltas, check coherence on
+            # the trailing window every 400 chars, stop+notice on
+            # derail.
             def generate():
+                CHECK_EVERY_CHARS = 400
+                WINDOW = 400
+                THRESHOLD = 0.4
+                acc = ""
+                last_check_at = 0
+                derailed = False
                 try:
                     for line in stream_remote_chat(body):
                         line = line.strip()
-                        if line.startswith("data: "):
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:]
+                        if raw == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            break
+                        try:
+                            parsed = json.loads(raw)
+                        except json.JSONDecodeError:
                             yield f"{line}\n\n"
-                            if line == "data: [DONE]":
-                                break
+                            continue
+                        delta_content = ""
+                        choices = parsed.get("choices") or []
+                        if choices:
+                            delta = choices[0].get("delta") or {}
+                            msg = choices[0].get("message") or {}
+                            delta_content = (
+                                delta.get("content")
+                                or msg.get("content")
+                                or ""
+                            )
+                        if delta_content:
+                            acc += delta_content
+                        if (
+                            not derailed
+                            and len(acc) - last_check_at >= CHECK_EVERY_CHARS
+                        ):
+                            last_check_at = len(acc)
+                            if len(acc) >= WINDOW * 2:
+                                if (
+                                    _coherence_factor_chat(acc[-WINDOW:])
+                                    < THRESHOLD
+                                ):
+                                    derailed = True
+                        if derailed:
+                            notice = (
+                                "\n\n_[Response truncated — model "
+                                "began producing incoherent text past "
+                                "this point.]_"
+                            )
+                            final = {
+                                "choices": [{
+                                    "delta": {"content": notice},
+                                    "finish_reason": "stop",
+                                    "index": 0,
+                                }],
+                                "model": king_model or "sn97-king",
+                                "king_uid": king_uid,
+                                "truncated_at_derail": True,
+                            }
+                            yield f"data: {json.dumps(final)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            break
+                        if king_model:
+                            parsed["model"] = king_model
+                            parsed["king_uid"] = king_uid
+                        yield f"data: {json.dumps(parsed)}\n\n"
                 except Exception:
                     yield 'data: {"error": "stream interrupted"}\n\n'
 
@@ -626,12 +896,26 @@ async def openai_chat_completions(request: Request):
         stdout = run_remote_chat(body, stream=False, timeout=120)
         try:
             data = json.loads(stdout)
-            # Stamp the response with the live king's HF repo id so OpenAI
-            # clients (Open WebUI etc.) display the correct lineage even
-            # though vLLM serves under the stable "sn97-king" name.
-            if isinstance(data, dict) and king_model:
-                data["model"] = king_model
-                data["king_uid"] = king_uid
+            # 2026-05-01 (v30.4 patch): apply derail truncation to
+            # the assistant message so users never see the gibberish
+            # tail. Same code path as ``_sync_chat``.
+            if isinstance(data, dict):
+                choices = data.get("choices") or []
+                if choices:
+                    msg = choices[0].get("message") or {}
+                    content = msg.get("content") or ""
+                    if content:
+                        truncated, was_truncated = _truncate_at_derail(content)
+                        if was_truncated:
+                            msg["content"] = truncated
+                            choices[0]["message"] = msg
+                            data["truncated_at_derail"] = True
+                # Stamp the response with the live king's HF repo id so OpenAI
+                # clients (Open WebUI etc.) display the correct lineage even
+                # though vLLM serves under the stable "sn97-king" name.
+                if king_model:
+                    data["model"] = king_model
+                    data["king_uid"] = king_uid
             return JSONResponse(content=data)
         except json.JSONDecodeError:
             return JSONResponse(
