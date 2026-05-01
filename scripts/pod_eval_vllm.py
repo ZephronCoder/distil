@@ -9995,11 +9995,19 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
     without breaking other behaviour).
     """
     import random
+    # 2026-05-02 (v30.5): added 4 more subtle bug kinds to push debug
+    # difficulty up. The new kinds are subtler than the original 8:
+    #   - mutable_default_arg: classic Python footgun (def f(xs=[]):)
+    #   - shallow_vs_deep_copy: list copy doesn't recurse into nested
+    #   - integer_division_drift: int / int when float is needed
+    #   - aliased_loop_var: late binding in closure / lambda
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["debug"]) & 0xFFFFFFFF)
     bug_kinds = [
         "off_by_one_range", "swap_subtract", "wrong_comparator",
         "wrong_init", "early_break", "wrong_index", "wrong_modulo",
         "missing_edge_case",
+        "mutable_default_arg", "shallow_vs_deep_copy",
+        "integer_division_drift", "aliased_loop_var",
     ]
     pool = (bug_kinds * ((n_items // len(bug_kinds)) + 1))[:n_items]
     rng.shuffle(pool)
@@ -10167,7 +10175,7 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
                 f"    assert candidate(0, modulus={mod}) == 0",
                 f"    assert candidate({mod-1}, modulus={mod}) == {2 * (mod-1)}",
             ]
-        else:  # missing_edge_case
+        elif kind == "missing_edge_case":
             entry = "first_or_default"
             buggy = (
                 "def first_or_default(arr, default=None):\n"
@@ -10187,6 +10195,111 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
                 "    assert candidate([], default=-1) == -1",
                 "    assert candidate(['a']) == 'a'",
                 "    assert candidate([], default=[]) == []",
+            ]
+        elif kind == "mutable_default_arg":
+            entry = "append_to_history"
+            buggy = (
+                "def append_to_history(item, history=[]):\n"
+                '    """Append item to history (list); return updated history."""\n'
+                "    history.append(item)\n"
+                "    return history\n"
+            )
+            sig = (
+                "def append_to_history(item, history=None):\n"
+                '    """Append item to history and return it. If no history\n'
+                "    is given, start a FRESH new list (not a shared default).\n"
+                "    Each call with no history must start independent.\n"
+                "    Example: a = append_to_history(1); b = append_to_history(2);\n"
+                "    then a == [1] and b == [2] (NOT b == [1, 2])."
+                '\n    """\n'
+            )
+            tests = [
+                "    a = candidate(1); b = candidate(2)",
+                "    assert a == [1]",
+                "    assert b == [2]",
+                "    assert candidate(5, [3, 4]) == [3, 4, 5]",
+                "    assert candidate('x') == ['x']",
+            ]
+        elif kind == "shallow_vs_deep_copy":
+            entry = "duplicate_grid"
+            buggy = (
+                "def duplicate_grid(grid):\n"
+                '    """Return an independent copy of a 2D grid (list of lists)."""\n'
+                "    return list(grid)\n"
+            )
+            sig = (
+                "def duplicate_grid(grid: list) -> list:\n"
+                '    """Return an INDEPENDENT copy of a 2D grid (list of lists)\n'
+                "    such that mutating the returned copy does NOT affect the\n"
+                "    original. The grid is a list of integer lists.\n"
+                "    Example: g = [[1, 2], [3]]; d = duplicate_grid(g);\n"
+                "             d[0].append(99); g still equals [[1, 2], [3]]."
+                '\n    """\n'
+            )
+            tests = [
+                "    g = [[1, 2], [3, 4]]",
+                "    d = candidate(g)",
+                "    d[0].append(99)",
+                "    assert g == [[1, 2], [3, 4]]",
+                "    assert d == [[1, 2, 99], [3, 4]]",
+                "    g2 = [[5]]; d2 = candidate(g2); d2[0][0] = 7; assert g2 == [[5]]",
+            ]
+        elif kind == "integer_division_drift":
+            entry = "average_of"
+            buggy = (
+                "def average_of(xs):\n"
+                '    """Return the arithmetic mean of xs as a float."""\n'
+                "    if not xs: return 0.0\n"
+                "    total = 0\n"
+                "    for x in xs: total += x\n"
+                "    return total // len(xs)\n"
+            )
+            sig = (
+                "def average_of(xs: list) -> float:\n"
+                '    """Return the arithmetic mean of xs as a FLOAT (not an\n'
+                "    integer). Empty list returns 0.0.\n"
+                "    Example: average_of([1, 2, 3]) returns 2.0;\n"
+                "             average_of([1, 2, 4]) returns 2.333... (a float)."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert abs(candidate([1, 2, 3]) - 2.0) < 1e-9",
+                "    assert abs(candidate([1, 2, 4]) - 7/3) < 1e-9",
+                "    assert candidate([]) == 0.0",
+                "    assert abs(candidate([5, 5, 5]) - 5.0) < 1e-9",
+                "    assert abs(candidate([2, 4, 6, 8]) - 5.0) < 1e-9",
+                "    assert isinstance(candidate([1, 2]), float)",
+            ]
+        else:  # aliased_loop_var
+            entry = "make_adders"
+            buggy = (
+                "def make_adders(ks):\n"
+                '    """Return list of fns where fn[i](x) returns x + ks[i]."""\n'
+                "    fns = []\n"
+                "    for k in ks:\n"
+                "        fns.append(lambda x: x + k)\n"
+                "    return fns\n"
+            )
+            sig = (
+                "def make_adders(ks: list) -> list:\n"
+                '    """Return a list of functions, where the i-th function\n'
+                "    takes x and returns x + ks[i]. The returned functions\n"
+                "    must each capture their own ks[i] independently — calling\n"
+                "    the first function should not be affected by later\n"
+                "    iterations of the loop.\n"
+                "    Example: fns = make_adders([1, 2, 5]);\n"
+                "             [f(10) for f in fns] returns [11, 12, 15]."
+                '\n    """\n'
+            )
+            tests = [
+                "    fns = candidate([1, 2, 5])",
+                "    assert [f(10) for f in fns] == [11, 12, 15]",
+                "    fns2 = candidate([7])",
+                "    assert fns2[0](100) == 107",
+                "    fns3 = candidate([])",
+                "    assert fns3 == []",
+                "    fns4 = candidate([0, 0])",
+                "    assert [f(5) for f in fns4] == [5, 5]",
             ]
 
         # The buggy version goes in the prompt as a comment block so it
@@ -11844,13 +11957,18 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
                            "procedural_reasoning/analogy_letter"))
         # ── v29 hard tier (BBH-distribution-similar) ────────────────────
         elif kind == "date_arithmetic":
+            # 2026-05-02 (v30.5): expand year range to include leap years
+            # (2020, 2024, 2028) and bump delta range 7-95 → 30-450 days
+            # so a non-trivial fraction of items cross a leap-day or
+            # year boundary, exposing models that estimate via "30 days
+            # per month" shortcuts.
             from datetime import date, timedelta
-            year = r.choice([2023, 2024])
+            year = r.choice([2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028])
             month = r.randint(1, 12)
             day = r.randint(1, 28)
             d0 = date(year, month, day)
             direction = r.choice(["after", "before"])
-            delta = r.randint(7, 95)
+            delta = r.randint(30, 450)
             if direction == "after":
                 target = d0 + timedelta(days=delta)
             else:
@@ -11874,9 +11992,13 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/date_arithmetic"))
         elif kind == "web_of_lies":
-            n_chain = r.randint(3, 5)
-            people = _synthetic_names(r,
-                              n_chain)
+            # 2026-05-02 (v30.5): chain length 3-5 → 5-7 actors + real
+            # names. Hand-test confirms a 5+ actor chain is solvable but
+            # exposes any model that "guesses true if mostly true" —
+            # the parity flips are non-trivial. Real names also let
+            # the prompt read like a logic puzzle textbook item.
+            n_chain = r.randint(5, 7)
+            people = _realistic_names(r, n_chain)
             truth = [r.choice([True, False]) for _ in range(n_chain)]
             statements = []
             for i in range(1, n_chain):
@@ -11901,12 +12023,15 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/web_of_lies"))
         elif kind == "navigate_steps":
+            # 2026-05-02 (v30.5): step count 3-6 → 6-10 to deepen
+            # state-tracking demand. Each step requires updating
+            # heading + position; longer chains compound errors.
             cardinals = ["north", "east", "south", "west"]
             initial = r.choice(cardinals)
             heading_idx = cardinals.index(initial)
             x, y = 0, 0
             steps_log = []
-            for _ in range(r.randint(3, 6)):
+            for _ in range(r.randint(6, 10)):
                 kind2 = r.choice(["walk", "turn_left", "turn_right", "turn_around"])
                 if kind2 == "walk":
                     n = r.randint(1, 7)
@@ -11954,11 +12079,16 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/navigate_steps"))
         elif kind == "tracking_objects":
-            n = r.randint(3, 4)
-            people = _synthetic_names(r, n)
-            colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange"], n)
+            # 2026-05-02 (v30.5): 3-4 actors → 4-6 actors, 2-4 swaps
+            # → 4-7 swaps. Larger swap chain forces the model to
+            # actually track each ball's location across more steps,
+            # not just guess by recency.
+            n = r.randint(4, 6)
+            people = _realistic_names(r, n)
+            colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange",
+                               "white", "black"], n)
             holds = dict(zip(people, colors))
-            n_swaps = r.randint(2, 4)
+            n_swaps = r.randint(4, 7)
             ops = []
             for _ in range(n_swaps):
                 a, b = r.sample(people, 2)
@@ -12218,38 +12348,76 @@ def _generate_mc_items(block_seed, n_items: int, *, max_letter: str = "D") -> li
         gold = ""
         category = "general"
         if kind == "arithmetic_mc":
-            arith_kind = r.choice(["multi_op", "percent", "fraction", "exponent"])
+            # 2026-05-02 (v30.5): harder. Was 4 sub-kinds (multi_op,
+            # percent, fraction, exponent), distractors at ±3-25.
+            # Now 6 sub-kinds adding chained_percent (compound) and
+            # weighted_avg, and distractors are tighter (±1-7) so
+            # near-correct answers don't count for free.
+            arith_kind = r.choice([
+                "multi_op", "percent", "fraction", "exponent",
+                "chained_percent", "weighted_avg",
+            ])
             if arith_kind == "multi_op":
                 a, b, c = r.randint(15, 90), r.randint(15, 90), r.randint(2, 19)
                 offset = r.randint(1, 99)
-                ans = (a + b) * c - offset
-                question = f"Compute ({a} + {b}) * {c} - {offset}."
+                d = r.randint(2, 9)
+                ans = ((a + b) * c - offset) // d
+                question = f"Compute (({a} + {b}) * {c} - {offset}) // {d} (integer division)."
             elif arith_kind == "percent":
-                base = r.choice([120, 150, 200, 240, 300, 400, 500])
-                pct = r.choice([15, 18, 22, 35, 45, 55, 65, 75])
+                base = r.choice([240, 300, 350, 420, 500, 640, 720, 800])
+                pct = r.choice([12, 17, 23, 27, 33, 41, 47, 58, 67])
                 ans = base * pct // 100
-                question = f"What is {pct}% of {base}? (Answer is an integer.)"
+                question = f"What is {pct}% of {base}? (Round down to an integer.)"
             elif arith_kind == "fraction":
                 num = r.randint(2, 9)
-                denom = r.choice([4, 5, 6, 8, 10])
-                whole = r.choice([60, 72, 80, 90, 120, 180])
+                denom = r.choice([3, 4, 5, 6, 7, 8, 9, 11])
+                whole = r.choice([60, 72, 84, 90, 120, 180, 252, 360])
                 while whole % denom != 0:
                     whole += 1
                 ans = (whole // denom) * num
                 question = f"Compute {num}/{denom} of {whole}."
-            else:  # exponent
-                base = r.randint(2, 6)
-                power = r.randint(3, 5)
-                add = r.randint(7, 41)
-                ans = base ** power + add
-                question = f"Compute {base}^{power} + {add}."
-            distractors = {ans + r.choice([-7, -3, 3, 7]),
-                           ans + r.randint(10, 25),
-                           ans - r.randint(10, 25)}
-            distractors.discard(ans)
-            distractors = list(distractors)[:3]
+            elif arith_kind == "exponent":
+                base = r.randint(2, 7)
+                power = r.randint(3, 6)
+                add = r.randint(7, 99)
+                mul = r.randint(2, 5)
+                ans = (base ** power + add) * mul
+                question = f"Compute ({base}^{power} + {add}) * {mul}."
+            elif arith_kind == "chained_percent":
+                base = r.choice([200, 300, 500, 800, 1000])
+                pct1 = r.choice([10, 20, 25, 30])
+                pct2 = r.choice([10, 15, 20, 25])
+                # Increase by pct1, then decrease by pct2.
+                after_inc = base + base * pct1 // 100
+                ans = after_inc - after_inc * pct2 // 100
+                question = (
+                    f"A value of {base} is increased by {pct1}%, then the "
+                    f"NEW value is decreased by {pct2}%. What is the final "
+                    f"integer value?"
+                )
+            else:  # weighted_avg
+                w1 = r.randint(2, 7)
+                v1 = r.randint(20, 80)
+                w2 = r.randint(3, 9)
+                v2 = r.randint(20, 80)
+                w3 = r.randint(2, 6)
+                v3 = r.randint(20, 80)
+                ans = (w1 * v1 + w2 * v2 + w3 * v3) // (w1 + w2 + w3)
+                question = (
+                    f"Compute the weighted average of {v1}, {v2}, and {v3} "
+                    f"with weights {w1}, {w2}, and {w3} respectively. "
+                    f"(Round down to an integer.)"
+                )
+            # Tighter distractors (±1-7) so near-correct answers don't pass.
+            distractors_set = set()
+            for off in r.sample([-1, 1, -2, 2, -3, 3, -5, 5, -7, 7], 6):
+                if ans + off != ans:
+                    distractors_set.add(ans + off)
+                if len(distractors_set) >= 3:
+                    break
+            distractors = list(distractors_set)[:3]
             while len(distractors) < 3:
-                distractors.append(ans + r.randint(30, 80))
+                distractors.append(ans + r.randint(8, 15))
             opts = [str(ans)] + [str(d) for d in distractors]
             r.shuffle(opts)
             gold = str(ans)
@@ -12480,14 +12648,26 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
         "title_format",
         "bullet_list",
     ]
-    # v29: ~30 % compound items. We replace `compound` placeholders in
-    # the per-item loop below with two stacked constraints (chosen from
-    # a curated whitelist of non-conflicting pairs).
-    n_compound = max(0, (n_items * 30 + 50) // 100)
-    n_single = n_items - n_compound
+    # 2026-05-02 (v30.5): hardening. Was 30% compound (2-stack), now
+    # 60% compound split: 35% compound2 (2-stack) + 25% compound3
+    # (3-stack). Single-constraint tier drops to 40%. Held-out IFEval
+    # pass-rate already saturated at 0.85+ on v29; the 3-stack tier
+    # matches IFEval's "very compound" tail (4 % of items in the
+    # public set are 4-stack, but they're rare; 3-stack at 25 % is
+    # appropriately aggressive for a tightening pass).
+    n_compound3 = max(0, (n_items * 25 + 50) // 100)
+    n_compound2 = max(0, (n_items * 35 + 50) // 100)
+    n_single = max(1, n_items - n_compound2 - n_compound3)
+    # Re-balance if rounding cost us items
+    extra = n_items - (n_single + n_compound2 + n_compound3)
+    n_compound2 += extra
     single_pool = (kinds * ((n_single // len(kinds)) + 1))[:n_single]
     rng.shuffle(single_pool)
-    item_kinds = single_pool + ["compound"] * n_compound
+    item_kinds = (
+        single_pool
+        + ["compound"] * n_compound2
+        + ["compound3"] * n_compound3
+    )
     rng.shuffle(item_kinds)
     kinds = item_kinds  # consumed below as kinds[i % len(kinds)]
     rng.shuffle(kinds)
@@ -12702,6 +12882,94 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
             instruction_ids = ii_a + ii_b
             kwargs_list = kk_a + kk_b
             kind = f"compound:{a}+{b}"
+        elif kind == "compound3":
+            # 2026-05-02 (v30.5): 3-stack compound. Curated triples
+            # of non-conflicting constraints across distinct verifier
+            # families (length / case / format / keyword / phrase) so
+            # no two constraints fight each other. The model must
+            # satisfy ALL three for the item to grade as ``ok``.
+            triple_options = [
+                ("min_words", "include_keyword", "ends_with_phrase"),
+                ("max_words", "no_comma", "all_lowercase"),
+                ("exact_sentences", "include_keyword", "title_format"),
+                ("min_words", "forbid_keyword", "ends_with_phrase"),
+                ("bullet_list", "include_keyword", "no_comma"),
+                ("title_format", "exact_sentences", "include_keyword"),
+                ("all_lowercase", "include_keyword", "no_comma"),
+                ("min_words", "all_lowercase", "ends_with_phrase"),
+                ("bullet_list", "min_words", "ends_with_phrase"),
+                ("title_format", "exact_sentences", "ends_with_phrase"),
+            ]
+            a, b, c = r.choice(triple_options)
+
+            def _build3(k_local: str):
+                ii: list[str] = []
+                kk: list[dict] = []
+                pp: str = ""
+                if k_local == "min_words":
+                    n_w = r.choice([40, 60, 80])
+                    pp = f"contain at least {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at least"}]
+                elif k_local == "max_words":
+                    n_w = r.choice([25, 35, 50])
+                    pp = f"contain no more than {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at most"}]
+                elif k_local == "exact_sentences":
+                    n_s = r.choice([3, 4, 5])
+                    pp = f"contain exactly {n_s} sentences"
+                    ii = ["length_constraints:number_sentences"]
+                    kk = [{"num_sentences": n_s, "relation": "exactly"}]
+                elif k_local == "all_lowercase":
+                    pp = "use only lowercase letters"
+                    ii = ["change_case:english_lowercase"]
+                    kk = [{}]
+                elif k_local == "no_comma":
+                    pp = "contain no commas"
+                    ii = ["punctuation:no_comma"]
+                    kk = [{}]
+                elif k_local == "ends_with_phrase":
+                    phrase = r.choice([
+                        "Is there anything else I can help with?",
+                        "Thank you for reading.",
+                        "End of report.",
+                    ])
+                    pp = f"end with the exact phrase {phrase!r}"
+                    ii = ["startend:end_checker"]
+                    kk = [{"end_phrase": phrase}]
+                elif k_local == "include_keyword":
+                    n_k = r.randint(2, 4)
+                    pp = f"include the word {keyword!r} at least {n_k} times"
+                    ii = ["keywords:frequency"]
+                    kk = [{"keyword": keyword, "relation": "at least", "frequency": n_k}]
+                elif k_local == "forbid_keyword":
+                    forbidden = r.choice([n_ for n_ in nouns if n_ != keyword])
+                    pp = f"never use the word {forbidden!r}"
+                    ii = ["keywords:forbidden_words"]
+                    kk = [{"forbidden_words": [forbidden]}]
+                elif k_local == "bullet_list":
+                    n_b = r.randint(3, 5)
+                    pp = f"include exactly {n_b} markdown bullet points (lines starting with `* ` or `- `)"
+                    ii = ["detectable_format:number_bullet_lists"]
+                    kk = [{"num_bullets": n_b}]
+                elif k_local == "title_format":
+                    pp = "begin with a title wrapped in double angle brackets like ``<<Title Goes Here>>`` on the first line"
+                    ii = ["detectable_format:title"]
+                    kk = [{}]
+                return ii, kk, pp
+
+            ii_a, kk_a, pp_a = _build3(a)
+            ii_b, kk_b, pp_b = _build3(b)
+            ii_c, kk_c, pp_c = _build3(c)
+            prompt = (
+                f"Write a short response about {topic}. Your response must "
+                f"satisfy ALL of the following constraints simultaneously: "
+                f"(1) {pp_a}; (2) {pp_b}; (3) {pp_c}."
+            )
+            instruction_ids = ii_a + ii_b + ii_c
+            kwargs_list = kk_a + kk_b + kk_c
+            kind = f"compound3:{a}+{b}+{c}"
         out.append({
             "src": f"procedural_ifeval/{kind}",
             "prompt": prompt,
