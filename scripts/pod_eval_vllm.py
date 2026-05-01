@@ -1257,6 +1257,40 @@ _LONG_FORM_JUDGE_TEMPLATES = (
     "Write a 350-500 word advice piece on {topic}. Open with a clear "
     "statement of the situation, give two-three concrete steps in the "
     "body, and close with a short summary.",
+    # ─────────────────────────────────────────────────────────────────
+    # 2026-05-01 (v30.4 patch v4): four longer-stretch coherence-stress
+    # templates that match common chat patterns where derailment shows
+    # up most often. These ask for 600-1000 words across 4-6 distinct
+    # sections so the model must maintain coherence well past the
+    # ~500-word threshold where small distilled models tend to break
+    # down. The dedicated long_gen_coherence axis treats output below
+    # ~0.30 coherence as a hard DQ; these templates SURFACE that
+    # failure mode every round, so a model that derails on chat users
+    # also derails on the eval and gets DQ'd accordingly.
+    "Write a comprehensive 600-900 word essay on {topic} structured "
+    "as four distinct sections: (1) a one-paragraph introduction "
+    "stating the central question, (2) two body paragraphs developing "
+    "the main argument, (3) one paragraph examining a counter-view, "
+    "(4) a closing paragraph synthesising the discussion. Use clear "
+    "topic sentences and natural transitions between sections.",
+    "Provide a step-by-step reasoning piece (700-1000 words, 5-6 "
+    "paragraphs) that walks through {topic} from first principles. "
+    "Open with definitions, then build up the core argument over "
+    "three body paragraphs (each making one distinct point with a "
+    "concrete example), then close with implications. Maintain a "
+    "consistent register and avoid restating the same point twice.",
+    "Write a 600-800 word narrative reflection on {topic}. Begin "
+    "with a specific scene (one paragraph), develop the central "
+    "tension over two body paragraphs, introduce a complicating "
+    "perspective in a fourth paragraph, and close with a takeaway. "
+    "Keep the voice consistent throughout and use natural prose "
+    "rather than bullet points.",
+    "Compose a Fermi-style estimation answer to a quantitative "
+    "question about {topic} in 500-700 words and 4-5 paragraphs. "
+    "State the question clearly, list assumptions in one paragraph, "
+    "show two-three estimation steps in separate paragraphs (with "
+    "intermediate numerical reasoning), and close with the final "
+    "estimate plus a sentence on how confident you are.",
 )
 
 # Topic phrases procedurally rotated. Mostly content-domain neutral so
