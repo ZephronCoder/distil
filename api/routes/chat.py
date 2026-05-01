@@ -106,8 +106,28 @@ def _normalize_chat_payload(payload: dict) -> dict:
     kwargs = dict(payload.get("chat_template_kwargs") or {})
     kwargs.setdefault("enable_thinking", False)
     payload["chat_template_kwargs"] = kwargs
-    payload.setdefault("repetition_penalty", 1.05)
+    # 2026-05-01 (v30.4): tighter anti-derail defaults after a Discord
+    # report from the operator that the chat king sometimes "starts
+    # talking in multiple languages and characters". Symptoms:
+    #   • Latin → CJK/Cyrillic mid-sentence (high non_ascii_frac)
+    #   • Verbatim phrase loops at ~50-token boundaries (repeats_50char>0)
+    # Both are classic 4B-distilled-student narrow-attractor failure
+    # modes, especially under defaults of temp=0.7, top_p=0.9, no
+    # presence/frequency penalty. Raised repetition_penalty 1.05 → 1.10
+    # (the "robotic" 1.15 break-point we found earlier still gives
+    # plenty of headroom), added presence_penalty 0.6 (suppresses
+    # repeated topics across the response), and capped temperature at
+    # 0.6 (still creative, but well below the Mamba/MoE chaos
+    # threshold the king's hybrid arch hits at temp ≥ 0.85). Clients
+    # that need the old behaviour can pass an explicit value.
+    payload.setdefault("repetition_penalty", 1.10)
     payload.setdefault("frequency_penalty", 0.3)
+    payload.setdefault("presence_penalty", 0.6)
+    if "temperature" in payload:
+        try:
+            payload["temperature"] = min(float(payload["temperature"]), 0.85)
+        except (TypeError, ValueError):
+            pass
     return payload
 
 
@@ -180,7 +200,13 @@ def _sync_chat(payload, king_uid, king_model):
                 resp["thinking"] = thinking
             if "usage" in data:
                 resp["usage"] = data["usage"]
-            _log_chat_turn(payload, content, king_uid, king_model, data)
+            # Log the *normalized* payload (with anti-derail defaults
+            # applied) so derail audits show what the model actually
+            # received, not what the client supplied.
+            _log_chat_turn(
+                _normalize_chat_payload(payload),
+                content, king_uid, king_model, data,
+            )
             return resp
         return {"error": "unexpected response from chat server"}
     except json.JSONDecodeError:
@@ -377,7 +403,13 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    max_tokens = body.get("max_tokens", 8192)
+    # 2026-05-01 (v30.4): default cap reduced 8192 → 4096. Long
+    # generations on 4B distilled students drift into tail-mode
+    # repetition / language-switching the longer they run; capping at
+    # 4k keeps essay-length answers usable while sharply reducing
+    # the multi-language derail miners reported on Discord. Clients
+    # that need longer can opt-in via explicit max_tokens.
+    max_tokens = body.get("max_tokens", 4096)
     stream = body.get("stream", False)
 
     if not messages:

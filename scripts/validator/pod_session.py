@@ -515,6 +515,21 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # 500MB/s = 160s). Tunable via DISTIL_HF_TRANSFER=0 to disable.
     if os.environ.get("DISTIL_HF_TRANSFER", "1") == "1":
         eval_env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    # 2026-05-01 (v30.4): enable hf_xet HIGH_PERFORMANCE mode. The
+    # Rust-based XET (Content-Addressable Storage) downloader is the
+    # default for huggingface_hub 1.12+ on XET-enabled repos (all
+    # current Qwen models). HIGH_PERFORMANCE=1 uses more RAM and CPU
+    # cores per download but pushes throughput closer to the link
+    # ceiling. The eval pod (256GB RAM, 24+ cores) has the slack —
+    # tunable via DISTIL_HF_XET_HIPERF=0 to disable.
+    if os.environ.get("DISTIL_HF_XET_HIPERF", "1") == "1":
+        eval_env["HF_XET_HIGH_PERFORMANCE"] = "1"
+    # Bump default 10s timeout — fine for tiny config.json fetches
+    # but flaky on multi-GB safetensors when the link is saturated
+    # by parallel requests. 300s gives slow miners a chance without
+    # hanging forever (the per-round timeout is the outer cap).
+    eval_env.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+    eval_env.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
     # 2026-04-24 (distil-97, leeroyjkin): the heavy bench battery (Session 3
     # shadow axes: aime/mbpp/tool_use/self_consistency/arc/truthful/long_context)
     # adds ~6 min/student (~84 min/round for 14 students). Propagate the
