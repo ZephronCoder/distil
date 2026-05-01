@@ -427,22 +427,48 @@ WORST_3_MEAN_K = int(os.environ.get("WORST_3_MEAN_K", "3"))
 # floor convention. Operators bumping ``LONG_FORM_JUDGE_PER_ROUND`` on
 # the eval side can raise this floor accordingly.
 LONG_FORM_JUDGE_MIN_VALID = int(os.environ.get("LONG_FORM_JUDGE_MIN_VALID", "2"))
-LONG_FORM_JUDGE_AXIS_WEIGHT = float(os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.05"))
-# 2026-05-01 (v30.4): pure-statistical long-generation coherence axis.
-# Reads the coherence_factor that ``long_form_judge_teacher_score``
-# already computes per response. Default weight 0.04 — meaningful
-# enough to dethrone a fully-derailed king (a derailed response
-# scores ~0.05 here, vs a coherent 0.95+; on a 0.04 weight that's
-# a 0.036 hit to the composite, ample to flip the gate). Toggle
-# via ``LONG_GEN_COHERENCE_WEIGHT`` and ``LONG_GEN_COHERENCE_IN_COMPOSITE``.
+# 2026-05-01 (v30.4 patch v3): long-form weights raised to make
+# long-generation coherence dominant. The chat.arbos.life screenshots
+# show kings still producing pure multilingual word salad past 800
+# tokens; the only way that's compatible with composite ≥0.55 is if
+# long-form axes are too small a slice of the composite. Bumping
+# both the rubric-graded ``long_form_judge`` AND the pure-statistical
+# ``long_gen_coherence`` so:
+#   • combined long-form weight = 0.25 (was 0.09)
+#   • a derailed king (coh ~0.05) loses ~0.20 on weighted
+#   • coh = 0.05 lands as a worst-3 axis pulling worst_3_mean toward 0
+#   • on composite.final = 0.7·worst_3_mean + 0.3·weighted, that's
+#     ~0.15 hit on final — ample to flip the dethrone gate
+# The pure-statistical axis can't be cheated by rubric leniency.
+LONG_FORM_JUDGE_AXIS_WEIGHT = float(
+    os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.10")
+)
 LONG_GEN_COHERENCE_AXIS_WEIGHT = float(
-    os.environ.get("LONG_GEN_COHERENCE_WEIGHT", "0.04")
+    os.environ.get("LONG_GEN_COHERENCE_WEIGHT", "0.15")
 )
 LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE = bool(
     int(os.environ.get("LONG_GEN_COHERENCE_IN_COMPOSITE", "1") or 1)
 )
 LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = (
     os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
+)
+# 2026-05-01 (v30.4 patch v3): hard-DQ floor on long-form coherence.
+# When >LONG_FORM_DERAIL_DQ_RATIO of the round's responses score below
+# LONG_FORM_DERAIL_DQ_THRESHOLD coherence, the model is permanently
+# DQ'd at this commit-block. Soft-weight degradation alone wasn't
+# enough — we kept seeing kings retain at composite ≥0.5 because
+# their bench scores compensated for the coherence hit. Hard DQ is
+# justified because long-form word salad is not a partial failure;
+# the model cannot sustain coherent generation, which is a core
+# deployment capability. Re-eval requires a fresh hotkey.
+LONG_FORM_DERAIL_DQ_RATIO = float(
+    os.environ.get("LONG_FORM_DERAIL_DQ_RATIO", "0.5")
+)
+LONG_FORM_DERAIL_DQ_THRESHOLD = float(
+    os.environ.get("LONG_FORM_DERAIL_DQ_THRESHOLD", "0.30")
+)
+LONG_FORM_DERAIL_DQ_ENABLED = bool(
+    int(os.environ.get("LONG_FORM_DERAIL_DQ_ENABLED", "1") or 1)
 )
 
 # Per-axis minimum valid-item count below which the axis drops as

@@ -106,60 +106,18 @@ def _normalize_chat_payload(payload: dict) -> dict:
     kwargs = dict(payload.get("chat_template_kwargs") or {})
     kwargs.setdefault("enable_thinking", False)
     payload["chat_template_kwargs"] = kwargs
-    # 2026-05-01 (v30.4 patch): SEVERE derail reproduced at every
-    # temperature 0.5–1.2 with max_tokens=1200. Tail mode at T=0.5:
-    #   "low puff breathe exhale inhale swallow chew bite lick taste
-    #    smell hear see look watch observe examine inspect analyze..."
-    # …i.e. even at low temperature the 4B distilled student falls
-    # into a word-list attractor past ~500-800 tokens. Higher temp +
-    # longer generations push it into multilingual word salad like
-    # the @sn97-king screenshot reported by the operator.
+    # 2026-05-01 (v30.4 patch v3): chat.arbos.life is a transparent
+    # window into the king's behaviour. We do NOT mask poor model
+    # quality. No sampling caps, no max_tokens caps, no derail
+    # truncation — clients see exactly what the model produces.
+    # If the king derails, the chat exposes it. The eval-side
+    # ``long_gen_coherence`` axis will dethrone broken kings.
     #
-    # The eval doesn't penalize this strongly enough yet
-    # (long_form_judge only probes at 1024 tokens × 4 prompts), so
-    # the chat-king proxy has to defend with hard sampling caps:
-    #   • repetition_penalty 1.10 → 1.20 (aggressive — the 1.15
-    #     "robotic" break-point applies to short answers; in chat
-    #     mode the derail risk dominates)
-    #   • presence_penalty   0.6  → 1.0 (max non-derail; suppresses
-    #     repeated topics across long generations)
-    #   • frequency_penalty  0.3  → 0.5 (suppresses recent-token
-    #     reuse without penalising domain vocabulary)
-    #   • temperature cap    0.85 → 0.7  (matches the headroom the
-    #     model can actually sustain coherently)
-    #   • top_p cap          n/a  → 0.92 (clip the chaos tail)
-    #   • top_k floor        n/a  → 50   (drop low-prob noise tokens)
-    # Clients can pass explicit values to opt out.
-    payload.setdefault("repetition_penalty", 1.20)
-    payload.setdefault("frequency_penalty", 0.5)
-    payload.setdefault("presence_penalty", 1.0)
-    payload.setdefault("top_k", 50)
-    if "temperature" in payload:
-        try:
-            payload["temperature"] = min(float(payload["temperature"]), 0.7)
-        except (TypeError, ValueError):
-            pass
-    if "top_p" in payload:
-        try:
-            payload["top_p"] = min(float(payload["top_p"]), 0.92)
-        except (TypeError, ValueError):
-            pass
-    else:
-        payload.setdefault("top_p", 0.92)
-    # 2026-05-01 (v30.4 patch v2): hard cap raised 1200 → 6144 (the
-    # context window). Derail detection at the proxy now truncates
-    # at the last coherent point, so we can let models generate
-    # long responses safely.
-    if "max_tokens" in payload:
-        try:
-            mt = int(payload["max_tokens"])
-            if mt < 1:
-                mt = 1500
-            payload["max_tokens"] = min(mt, 6144)
-        except (TypeError, ValueError):
-            payload["max_tokens"] = 1500
-    else:
-        payload["max_tokens"] = 1500
+    # The only normalisation we still do is rewriting ``model`` to
+    # the stable ``sn97-king`` served name (vLLM rejects anything
+    # else) and defaulting ``enable_thinking`` to False so reasoner
+    # models don't blow their token budget on a hidden trace before
+    # producing visible content.
     return payload
 
 
@@ -195,17 +153,16 @@ def stream_remote_chat(payload: dict):
             proc.kill()
 
 
-# ── Derail detection (chat-side) ──────────────────────────────────────────────
-# 2026-05-01 (v30.4 patch v2): the king models in current rotation
-# derail past ~500-800 generated tokens — multilingual word salad,
-# Latin word lists, long-compound coinage, glossary mode. This was
-# reproduced with king UID 107 across temperatures 0.5..1.2 on
-# chat.arbos.life. The eval-side fixes (long_form_judge max_tokens
-# 6144 + coherence multiplier + dedicated long_gen_coherence axis)
-# will dethrone broken kings, but until that propagates we have to
-# defend at the chat proxy: detect derail in the response text and
-# truncate at the last coherent point so users see clean prefix
-# instead of the gibberish tail.
+# ── Chat-side derail detection (REMOVED 2026-05-01) ───────────────────────────
+# Earlier in this session we added an aggressive proxy-side
+# truncator that hid the king's long-form derail from users.
+# That was the wrong call — chat.arbos.life is the operator's
+# transparent window into model quality and should NEVER mask
+# poor performance. The derail belongs in the eval, where it
+# will dethrone the broken king. Helpers below are kept (unused
+# by chat) as reference implementation for the eval-side
+# detector in scripts/pod_eval_vllm.py — both share the same
+# six-signal heuristic so signal tuning stays in sync.
 
 
 def _coherence_factor_chat(text: str) -> float:
@@ -379,26 +336,17 @@ def _sync_chat(payload, king_uid, king_model):
         if "choices" in data:
             message = data["choices"][0].get("message") or {}
             content, thinking = _extract_message_content(message)
-            # 2026-05-01 (v30.4 patch): truncate at derail.
-            truncated_content, was_truncated = _truncate_at_derail(content)
             resp = {
-                "response": truncated_content,
+                "response": content,
                 "model": king_model,
                 "king_uid": king_uid,
             }
-            if was_truncated:
-                resp["truncated_at_derail"] = True
-                resp["original_length"] = len(content)
-                resp["truncated_length"] = len(truncated_content)
             if thinking:
                 resp["thinking"] = thinking
             if "usage" in data:
                 resp["usage"] = data["usage"]
-            # Log the *normalized* payload (with anti-derail defaults
-            # applied) so derail audits show what the model actually
-            # received, not what the client supplied. Log the
-            # ORIGINAL (untruncated) content so derail incidents are
-            # auditable in chat_turns.jsonl.
+            # Log the chat turn for derail audits in chat_turns.jsonl
+            # (raw content, no truncation).
             _log_chat_turn(
                 _normalize_chat_payload(payload),
                 content, king_uid, king_model, data,
@@ -413,19 +361,11 @@ def _stream_chat(payload, king_uid, king_model):
     payload["stream"] = True
 
     def generate():
-        # 2026-05-01 (v30.4 patch v2): incremental derail detection while
-        # streaming. We accumulate every delta into ``acc`` and re-run
-        # the coherence detector every ``CHECK_EVERY_CHARS`` of new
-        # text. As soon as the recent window goes below threshold we
-        # stop forwarding deltas, send a final stop+truncation marker,
-        # and break. Window 800 / threshold 0.5 matches
-        # ``_truncate_at_derail``.
-        CHECK_EVERY_CHARS = 400
-        WINDOW = 800
-        THRESHOLD = 0.5
+        # 2026-05-01 (v30.4 patch v3): no proxy-side truncation. We
+        # forward every delta as-is and accumulate in ``acc`` only
+        # for the chat_turns.jsonl audit log at the end. Derail is
+        # caught by the eval, not hidden by the chat.
         acc = ""
-        last_check_at = 0
-        derailed = False
         try:
             for line in stream_remote_chat(payload):
                 line = line.strip()
@@ -440,8 +380,6 @@ def _stream_chat(payload, king_uid, king_model):
                 except json.JSONDecodeError:
                     yield f"data: {raw}\n\n"
                     continue
-                # Extract delta content if any.
-                delta_content = ""
                 choices = parsed.get("choices") or []
                 if choices:
                     delta = choices[0].get("delta") or {}
@@ -451,38 +389,8 @@ def _stream_chat(payload, king_uid, king_model):
                         or msg.get("content")
                         or ""
                     )
-                if delta_content:
-                    acc += delta_content
-                if not derailed and len(acc) - last_check_at >= CHECK_EVERY_CHARS:
-                    last_check_at = len(acc)
-                    if len(acc) >= WINDOW * 2:
-                        recent = acc[-WINDOW:]
-                        coh = _coherence_factor_chat(recent)
-                        if coh < THRESHOLD:
-                            derailed = True
-                if derailed:
-                    # Send a final delta with the truncation notice
-                    # plus a stop signal, then break.
-                    notice = (
-                        "\n\n_[Response truncated — the model began "
-                        "producing incoherent text past this point. "
-                        "This is a known failure mode of the current "
-                        "king on long generations; the next eval "
-                        "round should dethrone this model.]_"
-                    )
-                    final_chunk = {
-                        "choices": [{
-                            "delta": {"content": notice},
-                            "finish_reason": "stop",
-                            "index": 0,
-                        }],
-                        "king_uid": king_uid,
-                        "king_model": king_model,
-                        "truncated_at_derail": True,
-                    }
-                    yield f"data: {json.dumps(final_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    break
+                    if delta_content:
+                        acc += delta_content
                 parsed["king_uid"] = king_uid
                 parsed["king_model"] = king_model
                 yield f"data: {json.dumps(parsed)}\n\n"
@@ -491,8 +399,6 @@ def _stream_chat(payload, king_uid, king_model):
             if "ssh" in err.lower() or "root@" in err or ".ssh/" in err:
                 err = "chat server connection failed"
             yield f"data: {json.dumps({'error': err[:200]})}\n\n"
-        # Best-effort log of the accumulated response so derail
-        # incidents are auditable in chat_turns.jsonl.
         try:
             _log_chat_turn(
                 _normalize_chat_payload(payload),
@@ -665,19 +571,15 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    # 2026-05-01 (v30.4 patch v2): default 1500, hard cap 6144. The
-    # earlier 800/1200 cap was hiding the derail by just truncating
-    # the response. The proxy now does INCREMENTAL derail detection
-    # while streaming (and post-hoc truncation on the sync path),
-    # so we can let the model generate as long as it wants —
-    # the derail-detector will cut at the last coherent point. Cap
-    # is 6144 because that's the model's effective context window;
-    # past that vLLM rejects.
-    max_tokens = body.get("max_tokens", 1500)
+    # 2026-05-01 (v30.4 patch v3): no masking. Default max_tokens is
+    # 4096 (a typical assistant default), bounded only by the model's
+    # context window (6144 hard cap = 8192 max_model_len minus prompt
+    # headroom). If the king derails, the chat exposes it.
+    max_tokens = body.get("max_tokens", 4096)
     try:
         max_tokens = min(int(max_tokens), 6144)
     except (TypeError, ValueError):
-        max_tokens = 1500
+        max_tokens = 4096
     stream = body.get("stream", False)
 
     if not messages:
@@ -696,16 +598,12 @@ async def chat_with_king(request: Request):
                 content={"error": "message content too long (max 10000 chars)"},
             )
     if not isinstance(max_tokens, (int, float)) or max_tokens < 1:
-        max_tokens = 800
-    # 2026-05-01 (v30.4 patch): default temperature lowered 0.7 → 0.3.
-    # Greedy/low-temp generation produces coherent output on the
-    # current king (UID 107). Higher temperature + max_tokens >
-    # 500-800 triggers the word-list derail. Default to safe.
-    # Operator-facing dashboards that explicitly want creative
-    # output can pass an explicit temperature value.
-    temperature = body.get("temperature", 0.3)
+        max_tokens = 4096
+    # 2026-05-01 (v30.4 patch v3): standard assistant defaults — no
+    # anti-derail bias. Chat exposes model behaviour as-is.
+    temperature = body.get("temperature", 0.7)
     if not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2:
-        temperature = 0.3
+        temperature = 0.7
     top_p = body.get("top_p", 0.9)
     if not isinstance(top_p, (int, float)) or top_p < 0 or top_p > 1:
         top_p = 0.9
@@ -825,81 +723,19 @@ async def openai_chat_completions(request: Request):
         return JSONResponse(status_code=503, content={"error": {"message": "no king model available"}})
 
     stream = body.get("stream", False)
-    # _normalize_chat_payload (called inside _curl_cmd) rewrites model + thinking.
+    # 2026-05-01 (v30.4 patch v3): no truncation. Pass through the
+    # model's response as-is. Chat is a transparent surface; if the
+    # king derails, we expose it.
     try:
         if stream:
-            # 2026-05-01 (v30.4 patch): incremental derail detection on
-            # the OpenAI-compat streaming path too. Same algorithm as
-            # ``_stream_chat`` — accumulate deltas, check coherence on
-            # the trailing window every 400 chars, stop+notice on
-            # derail.
             def generate():
-                CHECK_EVERY_CHARS = 400
-                WINDOW = 800
-                THRESHOLD = 0.5
-                acc = ""
-                last_check_at = 0
-                derailed = False
                 try:
                     for line in stream_remote_chat(body):
                         line = line.strip()
-                        if not line.startswith("data: "):
-                            continue
-                        raw = line[6:]
-                        if raw == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            break
-                        try:
-                            parsed = json.loads(raw)
-                        except json.JSONDecodeError:
+                        if line.startswith("data: "):
                             yield f"{line}\n\n"
-                            continue
-                        delta_content = ""
-                        choices = parsed.get("choices") or []
-                        if choices:
-                            delta = choices[0].get("delta") or {}
-                            msg = choices[0].get("message") or {}
-                            delta_content = (
-                                delta.get("content")
-                                or msg.get("content")
-                                or ""
-                            )
-                        if delta_content:
-                            acc += delta_content
-                        if (
-                            not derailed
-                            and len(acc) - last_check_at >= CHECK_EVERY_CHARS
-                        ):
-                            last_check_at = len(acc)
-                            if len(acc) >= WINDOW * 2:
-                                if (
-                                    _coherence_factor_chat(acc[-WINDOW:])
-                                    < THRESHOLD
-                                ):
-                                    derailed = True
-                        if derailed:
-                            notice = (
-                                "\n\n_[Response truncated — model "
-                                "began producing incoherent text past "
-                                "this point.]_"
-                            )
-                            final = {
-                                "choices": [{
-                                    "delta": {"content": notice},
-                                    "finish_reason": "stop",
-                                    "index": 0,
-                                }],
-                                "model": king_model or "sn97-king",
-                                "king_uid": king_uid,
-                                "truncated_at_derail": True,
-                            }
-                            yield f"data: {json.dumps(final)}\n\n"
-                            yield "data: [DONE]\n\n"
-                            break
-                        if king_model:
-                            parsed["model"] = king_model
-                            parsed["king_uid"] = king_uid
-                        yield f"data: {json.dumps(parsed)}\n\n"
+                            if line == "data: [DONE]":
+                                break
                 except Exception:
                     yield 'data: {"error": "stream interrupted"}\n\n'
 
@@ -915,26 +751,12 @@ async def openai_chat_completions(request: Request):
         stdout = run_remote_chat(body, stream=False, timeout=120)
         try:
             data = json.loads(stdout)
-            # 2026-05-01 (v30.4 patch): apply derail truncation to
-            # the assistant message so users never see the gibberish
-            # tail. Same code path as ``_sync_chat``.
-            if isinstance(data, dict):
-                choices = data.get("choices") or []
-                if choices:
-                    msg = choices[0].get("message") or {}
-                    content = msg.get("content") or ""
-                    if content:
-                        truncated, was_truncated = _truncate_at_derail(content)
-                        if was_truncated:
-                            msg["content"] = truncated
-                            choices[0]["message"] = msg
-                            data["truncated_at_derail"] = True
-                # Stamp the response with the live king's HF repo id so OpenAI
-                # clients (Open WebUI etc.) display the correct lineage even
-                # though vLLM serves under the stable "sn97-king" name.
-                if king_model:
-                    data["model"] = king_model
-                    data["king_uid"] = king_uid
+            # Stamp the response with the live king's HF repo id so OpenAI
+            # clients (Open WebUI etc.) display the correct lineage even
+            # though vLLM serves under the stable "sn97-king" name.
+            if isinstance(data, dict) and king_model:
+                data["model"] = king_model
+                data["king_uid"] = king_uid
             return JSONResponse(content=data)
         except json.JSONDecodeError:
             return JSONResponse(

@@ -1142,7 +1142,13 @@ JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
 # answers; nothing in the validator currently measures whether a model
 # can sustain a coherent multi-paragraph response, which is one of the
 # user-visible SOTA capabilities for assistant deployment.
-LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "4"))
+# 2026-05-01 (v30.4 patch v3): bumped 4 → 8 prompts per round. With
+# only 4 prompts a derail on 1-2 of them only lowers coherence_factor
+# to ~0.5 (could still pass the 0.5 threshold). 8 prompts gives
+# tighter mean and exposes intermittent derailers (the king fails on
+# only some long-form prompts depending on topic). Doubles long-form
+# judge wall-clock per round (~30s → ~60s phase B), worth it.
+LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "8"))
 # 2026-05-01 (v30.4 patch v2): raised 2048 → 6144 — essentially the
 # model's full usable context window minus prompt headroom. The
 # cap is asymmetric in cost:
@@ -1933,9 +1939,45 @@ def _coherence_factor(text: str) -> float:
     text_len = len(text)
     if text_len < 50:
         return 1.0
+    # 2026-05-01 (v30.4 patch v3): non-ASCII detection is now MUCH
+    # stricter. The chat.arbos.life screenshot showed ~10 percent
+    # non-ASCII chars (CJK + Cyrillic + Hebrew + Arabic words mixed
+    # into English prose) and still scored 0.6 with the old
+    # multiplier. That's a clear derail; should score <0.1. Multiplier
+    # raised 4× → 12×: at 8 percent non-ASCII the factor is now 0,
+    # at 4 percent it's 0.5. Coherent English-prompted responses
+    # should be 0 percent non-ASCII; even latex math symbols rarely
+    # exceed 1 percent.
     non_ascii = sum(1 for c in text if ord(c) > 127)
     non_ascii_frac = non_ascii / text_len
-    non_ascii_factor = max(0.0, 1.0 - min(1.0, non_ascii_frac * 4.0))
+    non_ascii_factor = max(0.0, 1.0 - min(1.0, non_ascii_frac * 12.0))
+    # CJK / Cyrillic / Arabic / Hebrew script-bleed: SPECIFIC counter
+    # for non-Latin script chars (excludes things like emoji + accents
+    # which are common in coherent multilingual prose). Catches the
+    # multi-language derail mode (chat screenshot showed Chinese,
+    # Korean, Cyrillic, Hebrew letters mixed in random places).
+    non_latin_script = sum(
+        1 for c in text
+        if (
+            0x0400 <= ord(c) <= 0x04FF or  # Cyrillic
+            0x0590 <= ord(c) <= 0x05FF or  # Hebrew
+            0x0600 <= ord(c) <= 0x06FF or  # Arabic
+            0x0900 <= ord(c) <= 0x097F or  # Devanagari
+            0x3040 <= ord(c) <= 0x309F or  # Hiragana
+            0x30A0 <= ord(c) <= 0x30FF or  # Katakana
+            0x3400 <= ord(c) <= 0x4DBF or  # CJK Ext A
+            0x4E00 <= ord(c) <= 0x9FFF or  # CJK Unified
+            0xAC00 <= ord(c) <= 0xD7AF     # Hangul
+        )
+    )
+    non_latin_frac = non_latin_script / text_len
+    # ANY non-Latin script in an English-prompted response is a
+    # strong derail signal. Even 1 percent (a single sentence's
+    # worth in a 5000-char response) flips this factor to 0.
+    if non_latin_frac >= 0.01:
+        non_latin_factor = 0.0
+    else:
+        non_latin_factor = max(0.0, 1.0 - non_latin_frac * 100.0)
     seen = set()
     repeats = 0
     win = 50
@@ -1996,13 +2038,50 @@ def _coherence_factor(text: str) -> float:
             )
     else:
         unique_word_factor = 1.0
+    # 2026-05-01 (v30.4 patch v3): English stop-word ratio. Real
+    # English prose is 30-40 percent function words ("the", "and",
+    # "of", "to", "a", "in", "is", "that"). Word-list derail mode
+    # ("low puff breathe exhale inhale swallow chew bite lick taste
+    # smell hear see look watch...") has near-zero stop words because
+    # it's all content words. We measure the ratio on samples ≥80
+    # words. If ≥12 percent stop-words, full credit; if ≤2 percent,
+    # zero credit; linear in between. This is the killer signal for
+    # the word-list derail mode where every other detector signal
+    # leaves an opening.
+    if len(norm_words) >= 80:
+        _STOP_WORDS = {
+            "the", "and", "of", "to", "a", "in", "is", "that", "it",
+            "for", "on", "with", "as", "by", "this", "are", "or",
+            "be", "an", "at", "from", "but", "not", "have", "has",
+            "had", "was", "were", "we", "you", "they", "their", "its",
+            "his", "her", "she", "he", "i", "me", "my", "our", "us",
+            "would", "could", "should", "will", "can", "may", "if",
+            "then", "than", "so", "such", "no", "all", "more", "most",
+            "some", "any", "other", "these", "those", "there", "what",
+            "which", "who", "when", "where", "while", "about", "into",
+            "through", "between", "after", "before", "during",
+            "because", "however", "thus", "also", "yet", "though",
+            "do", "does", "did", "been", "being", "am",
+        }
+        stop_count = sum(1 for w in norm_words if w in _STOP_WORDS)
+        stop_ratio = stop_count / len(norm_words)
+        if stop_ratio >= 0.12:
+            stop_word_factor = 1.0
+        elif stop_ratio <= 0.02:
+            stop_word_factor = 0.0
+        else:
+            stop_word_factor = (stop_ratio - 0.02) / (0.12 - 0.02)
+    else:
+        stop_word_factor = 1.0
     coherence = (
         non_ascii_factor
+        * non_latin_factor
         * repeats_factor
         * word_list_factor
         * meaningful_factor
         * punctuation_factor
         * unique_word_factor
+        * stop_word_factor
     )
     return max(0.05, min(1.0, coherence))
 
