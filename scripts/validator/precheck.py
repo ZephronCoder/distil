@@ -342,42 +342,76 @@ def _one_eval_per_registration_enabled() -> bool:
 def _check_registration_already_used(
     hotkey: str, model_repo: str, revision: str,
     state: ValidatorState,
+    coldkey: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Has this hotkey already used its one-eval-per-registration slot?
+    """Has this hotkey/coldkey already used its one-eval-per-registration slot?
 
     Returns ``(already_used, reason)``. ``already_used=True`` means the
     incoming commit must be rejected. ``already_used=False`` means it's
     safe to evaluate (either fresh hotkey or same-model replay).
 
-    Behaviour:
-      • Hotkey not in tracker → fresh registration → eligible.
-      • Hotkey in tracker, same (model, revision) → replay of the
-        already-evaluated commit. Eligible (no-op; downstream will
-        skip eval since it's in ``evaluated_uids``).
-      • Hotkey in tracker, different (model, revision) → recommit
-        spam. Reject.
+    Two-layer enforcement:
 
-    The tracker is populated by ``state_manager`` after each successful
-    eval. Re-registration of a deregistered slot installs a brand new
-    hotkey on Bittensor (the old hotkey can't be re-used by the new
-    owner), so a fresh hotkey naturally bypasses this check.
+      1. Hotkey-level: if THIS hotkey has already been evaluated on a
+         different (model, revision), reject the new commit.
+      2. Coldkey-level (Sybil-mitigation, 2026-05-01): if ANY hotkey
+         under this coldkey has been evaluated, reject commits from
+         OTHER hotkeys under the same coldkey. Without this layer a
+         Sybil farm (e.g. coldkey 5E1Zen…NLxrKnd, reported on
+         Discord with 24 UIDs in the best26 cluster) can register
+         24 hotkeys and get 24× the eval throughput by treating each
+         hotkey as a "fresh" registration. With this layer the
+         coldkey gets exactly one shot regardless of how many
+         hotkeys it funds — the second hotkey to commit gets DQ'd.
+         A miner who genuinely wants more slots needs to register
+         under a different coldkey (which costs TAO).
+
+    Same (model, revision) replay is ALWAYS allowed (no-op) regardless
+    of the layer that matched, so legitimate re-validations of an
+    already-stored eval do not error.
     """
     if not hotkey or not _one_eval_per_registration_enabled():
         return False, None
-    rec = (state.evaluated_hotkeys or {}).get(hotkey)
-    if not rec:
+    evaluated_hotkeys = state.evaluated_hotkeys or {}
+    rec = evaluated_hotkeys.get(hotkey)
+    if rec:
+        prev_model = rec.get("model")
+        prev_revision = rec.get("revision", "main")
+        if prev_model == model_repo and prev_revision == revision:
+            return False, None
+        return True, (
+            f"one_eval_per_registration: hotkey {hotkey[:12]}… already "
+            f"evaluated {prev_model}@{prev_revision[:8]} at block "
+            f"{rec.get('evaluated_at_block')}; new commit "
+            f"{model_repo}@{revision[:8]} rejected. To get another eval, "
+            f"register a new hotkey on chain."
+        )
+    # Coldkey-level Sybil check.
+    if not coldkey:
         return False, None
-    prev_model = rec.get("model")
-    prev_revision = rec.get("revision", "main")
-    if prev_model == model_repo and prev_revision == revision:
-        return False, None
-    return True, (
-        f"one_eval_per_registration: hotkey {hotkey[:12]}… already "
-        f"evaluated {prev_model}@{prev_revision[:8]} at block "
-        f"{rec.get('evaluated_at_block')}; new commit "
-        f"{model_repo}@{revision[:8]} rejected. To get another eval, "
-        f"register a new hotkey on chain."
-    )
+    for other_hk, other_rec in evaluated_hotkeys.items():
+        if other_hk == hotkey:
+            continue
+        if not isinstance(other_rec, dict):
+            continue
+        other_ck = other_rec.get("coldkey")
+        if not other_ck or other_ck != coldkey:
+            continue
+        # Same coldkey already used its eval slot via a different hotkey.
+        prev_model = other_rec.get("model")
+        prev_revision = other_rec.get("revision", "main")
+        if prev_model == model_repo and prev_revision == revision:
+            return False, None
+        return True, (
+            f"one_eval_per_coldkey: coldkey {coldkey[:12]}… already "
+            f"evaluated {prev_model}@{prev_revision[:8]} via hotkey "
+            f"{other_hk[:12]}… at block {other_rec.get('evaluated_at_block')}; "
+            f"new commit from sibling hotkey {hotkey[:12]}… "
+            f"({model_repo}@{revision[:8]}) rejected as Sybil-class "
+            f"recommit. To get another eval, register under a different "
+            f"coldkey on chain."
+        )
+    return False, None
 
 
 def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: ValidatorState, max_params_b: float):
@@ -395,11 +429,13 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             continue
         # 2026-05-01 (v30.4): one-eval-per-registration policy. Reject
         # any commit from a hotkey that has already used its eval slot
-        # on a different (model, revision). The commitment is permanent
-        # but the hotkey only gets one shot — to try again miners must
-        # register a new hotkey.
+        # on a different (model, revision). 2026-05-01 (v30.4 patch):
+        # ALSO rejects commits from OTHER hotkeys under the same
+        # coldkey (Sybil-mitigation — coldkey 5E1Zen…NLxrKnd was
+        # reported running 24 UIDs in the best26 cluster).
+        coldkey = uid_to_coldkey.get(uid) if uid_to_coldkey else None
         already_used, reason = _check_registration_already_used(
-            hotkey, model_repo, revision, state,
+            hotkey, model_repo, revision, state, coldkey=coldkey,
         )
         if already_used:
             logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
@@ -495,6 +531,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                     "revision": revision,
                     "params_b": None,
                     "hotkey": hotkey,
+                    "coldkey": coldkey,
                     "commit_block": this_commit_block if this_commit_block is not None else float("inf"),
                 }
                 continue
@@ -730,6 +767,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             "params_b": check.get("params_b", 0),
             "commit_block": commit.get("block", float("inf")),
             "hotkey": hotkey,
+            "coldkey": coldkey,
             "vllm_compatible": check.get("vllm_compatible"),
             "vllm_reason": check.get("vllm_reason"),
         }

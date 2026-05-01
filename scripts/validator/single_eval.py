@@ -246,6 +246,8 @@ def merge_composite_scores(
         # commit must have produced a real composite (we already
         # filtered DQ + reference rows above), so this is a "real"
         # eval that should consume the registration's one shot.
+        # 2026-05-01 (v30.4 patch): also persist coldkey for the
+        # Sybil-mitigation check on cross-hotkey re-eval attempts.
         hotkey = info.get("hotkey") or ""
         if hotkey:
             if not isinstance(getattr(state, "evaluated_hotkeys", None), dict):
@@ -254,6 +256,7 @@ def merge_composite_scores(
                 "uid": int(uid),
                 "model": record["model"],
                 "revision": record["revision"],
+                "coldkey": info.get("coldkey"),
                 "evaluated_at_block": record["block"],
                 "evaluated_at_ts": record["ts"],
                 "composite_final": record["final"],

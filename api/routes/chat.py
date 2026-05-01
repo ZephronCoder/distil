@@ -146,6 +146,21 @@ def _normalize_chat_payload(payload: dict) -> dict:
             pass
     else:
         payload.setdefault("top_p", 0.92)
+    # 2026-05-01 (v30.4 patch): hard-cap max_tokens at 1200 here too,
+    # so the OpenAI-compat ``/v1/chat/completions`` endpoint inherits
+    # the same protection as ``/api/chat``. Open WebUI clients
+    # commonly pass max_tokens=4096 by default — without the cap
+    # they hit the derail every time.
+    if "max_tokens" in payload:
+        try:
+            mt = int(payload["max_tokens"])
+            if mt < 1:
+                mt = 800
+            payload["max_tokens"] = min(mt, 1200)
+        except (TypeError, ValueError):
+            payload["max_tokens"] = 800
+    else:
+        payload["max_tokens"] = 800
     return payload
 
 
@@ -421,18 +436,21 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    # 2026-05-01 (v30.4 patch): default cap reduced 4096 → 800. Live
+    # 2026-05-01 (v30.4 patch): default 800, hard cap 1200. Live
     # repro on king UID 107 (best26/sn97-m-v4) showed the derail
     # starts around the 500-800 token mark even at temperature 0.5,
-    # not just at high temp / 1200+ tokens. 800 is well below the
-    # observed cliff while still sufficient for a normal essay-length
-    # answer. Clients that explicitly need longer can pass max_tokens
-    # — but they should not expect coherent output past ~1000 tokens
-    # until the underlying student improves. Hard-cap of 4096 to
-    # prevent client-supplied 16k requests from drift-trapping.
+    # AND is not fully suppressible by sampling caps — even at
+    # temp 0.7 / top_p 0.92 / top_k 50 / repetition_penalty 1.20,
+    # max_tokens=2000 still produced 2000 tokens of word-list. The
+    # model is fundamentally not able to sustain coherent generation
+    # past ~1k tokens until a better-trained king is crowned. Hard
+    # cap 1200 prevents users from being served gibberish tails
+    # regardless of what they request. The new long_form_judge
+    # coherence multiplier (eval side) will catch this in the next
+    # round and dethrone the broken king.
     max_tokens = body.get("max_tokens", 800)
     try:
-        max_tokens = min(int(max_tokens), 4096)
+        max_tokens = min(int(max_tokens), 1200)
     except (TypeError, ValueError):
         max_tokens = 800
     stream = body.get("stream", False)
@@ -453,10 +471,16 @@ async def chat_with_king(request: Request):
                 content={"error": "message content too long (max 10000 chars)"},
             )
     if not isinstance(max_tokens, (int, float)) or max_tokens < 1:
-        max_tokens = 8192
-    temperature = body.get("temperature", 0.7)
+        max_tokens = 800
+    # 2026-05-01 (v30.4 patch): default temperature lowered 0.7 → 0.3.
+    # Greedy/low-temp generation produces coherent output on the
+    # current king (UID 107). Higher temperature + max_tokens >
+    # 500-800 triggers the word-list derail. Default to safe.
+    # Operator-facing dashboards that explicitly want creative
+    # output can pass an explicit temperature value.
+    temperature = body.get("temperature", 0.3)
     if not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2:
-        temperature = 0.7
+        temperature = 0.3
     top_p = body.get("top_p", 0.9)
     if not isinstance(top_p, (int, float)) or top_p < 0 or top_p > 1:
         top_p = 0.9
