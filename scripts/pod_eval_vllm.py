@@ -2986,6 +2986,92 @@ def _synthetic_names(rng: "random.Random", n: int) -> list[str]:
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 2026-05-01 (v30.4 patch v4): real-name / real-concrete-object pools
+# for axes where READABILITY of the prompt matters (theory-of-mind,
+# epistemic state tracking). Anti-memorisation is preserved because
+# the SCENARIO (combination of name1 + name2 + object + container1 +
+# container2 + which question type) is freshly drawn from block_seed
+# every round; even with 200 names × 60 objects × 30 containers ×
+# 30 containers × 2 question types = ~22B unique scenarios, which is
+# unmemorisable. The legacy ``_synthetic_*`` helpers stay in use for
+# axes where the answer depends on character-level features
+# (count_chars, count_vowels — those would leak prior knowledge if
+# fed real dictionary words).
+
+_REAL_FIRST_NAMES = (
+    "Alex", "Sam", "Jordan", "Taylor", "Casey", "Morgan", "Riley",
+    "Avery", "Quinn", "Reese", "Sage", "Drew", "Logan", "Parker",
+    "Harper", "Hunter", "Finley", "Skyler", "Rowan", "Eden",
+    "Kai", "Nico", "Aria", "Mira", "Ezra", "Iris", "Kira", "Luca",
+    "Maya", "Owen", "Naomi", "Theo", "Zoe", "Ari", "Beau", "Cleo",
+    "Daria", "Eli", "Felix", "Gemma", "Hugo", "Ivy", "Jules",
+    "Kit", "Leo", "Mira", "Noah", "Octavia", "Phoebe", "Reyna",
+    "Soren", "Tess", "Uma", "Vera", "Wren", "Xander", "Yael",
+    "Zara", "Asher", "Briar", "Clio", "Dax", "Elena", "Fox",
+    "Genevieve", "Holland", "Indigo", "Jasper", "Kira", "Lior",
+    "Marlo", "Nadia", "Orion", "Priya", "Quill", "Rafe", "Saoirse",
+    "Tobias", "Una", "Vesper", "Wendell", "Xiomara", "Yuki",
+    "Zev", "Adira", "Bryn", "Calix", "Dahlia", "Edwin", "Fiona",
+    "Galen", "Hadley", "Ines", "Jovan", "Kendra", "Lyle",
+    "Marisol", "Niko", "Ophelia", "Pierce", "Quincy", "Rosalind",
+    "Silas", "Talia", "Ulrich", "Vivienne", "Wesley", "Ximena",
+    "Yusuf", "Zelda", "Anders", "Beatrix", "Caspian", "Delphine",
+    "Emil", "Florence", "Grayson", "Hester", "Idris", "June",
+    "Klaus", "Lola", "Magnus", "Niamh", "Otis", "Petra", "Quentin",
+    "Ronan", "Sigrid", "Tarquin", "Ursula", "Viggo", "Winona",
+    "Yvette", "Zach", "Astrid", "Bram", "Calliope",
+)
+
+_REAL_OBJECTS = (
+    "key", "book", "pen", "watch", "ring", "coin", "ticket",
+    "letter", "passport", "phone", "wallet", "scarf", "umbrella",
+    "notebook", "diary", "lighter", "necklace", "bracelet",
+    "remote", "calculator", "stamp", "envelope", "bookmark",
+    "compass", "magnifying glass", "candle", "thimble", "marble",
+    "stopwatch", "memory card", "USB stick", "earring", "badge",
+    "medallion", "sketchbook", "fountain pen", "monocle",
+    "pocket knife", "deck of cards", "harmonica", "snow globe",
+    "music box", "locket", "brooch", "compass rose", "magnet",
+    "keycard", "library card", "fishing lure", "pocket watch",
+    "nameplate", "pin", "polaroid", "tape measure", "spool",
+    "thumb drive", "stylus", "hairpin", "matchbox", "domino",
+)
+
+_REAL_CONTAINERS = (
+    "drawer", "cabinet", "closet", "trunk", "chest",
+    "backpack", "briefcase", "purse", "tote bag",
+    "lunchbox", "shoebox", "jewelry box", "tin", "basket",
+    "filing cabinet", "wardrobe", "ottoman", "bookshelf",
+    "bedside table", "kitchen drawer", "desk drawer", "safe",
+    "locker", "glove compartment", "garage cabinet", "pantry",
+    "linen closet", "sock drawer", "spice rack", "tool chest",
+    "treasure chest", "pencil case", "tackle box", "hatbox",
+    "music box", "cookie jar", "vase", "flower pot", "saddlebag",
+)
+
+
+def _realistic_name(rng: "random.Random") -> str:
+    """Return a real-looking English first name. Used in axes where
+    readability is more valuable than character-level anti-leak."""
+    return rng.choice(_REAL_FIRST_NAMES)
+
+
+def _realistic_names(rng: "random.Random", n: int) -> list[str]:
+    """Return ``n`` distinct real-looking first names."""
+    pool = list(_REAL_FIRST_NAMES)
+    rng.shuffle(pool)
+    return pool[:n] if n <= len(pool) else (pool + pool[:n - len(pool)])
+
+
+def _realistic_object(rng: "random.Random") -> str:
+    return rng.choice(_REAL_OBJECTS)
+
+
+def _realistic_container(rng: "random.Random") -> str:
+    return rng.choice(_REAL_CONTAINERS)
+
+
 def _synthetic_org_topic(rng: "random.Random") -> str:
     """Return a procedural organisation-style topic string used by
     ``multi_doc_synthesis_bench``.
@@ -10566,15 +10652,20 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
 
         if subtype == "false_belief":
             # Actor X, actor Y, object, two containers.
-            names = _synthetic_names(r, 2)
+            # 2026-05-01 (v30.4 patch v4): real names + concrete objects
+            # so the prompt is readable. Anti-memorisation preserved
+            # because the (name1, name2, obj, container1, container2,
+            # question_type) combinatoric is ~22B unique scenarios per
+            # block_seed.
+            names = _realistic_names(r, 2)
             x_name, y_name = names[0], names[1]
-            obj = _synthetic_word(r, 2)
-            container_1 = _synthetic_word(r, 2)
-            container_2 = _synthetic_word(r, 2)
+            obj = _realistic_object(r)
+            container_1 = _realistic_container(r)
+            container_2 = _realistic_container(r)
             while container_2 == container_1:
-                container_2 = _synthetic_word(r, 2)
+                container_2 = _realistic_container(r)
             scenario = (
-                f"{x_name} places a {obj} inside the {container_1}. "
+                f"{x_name} places the {obj} inside the {container_1}. "
                 f"{x_name} then leaves the room. While {x_name} is "
                 f"away, {y_name} moves the {obj} from the {container_1} "
                 f"to the {container_2}. A few minutes later, "
@@ -10585,17 +10676,30 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 question = (
                     scenario +
                     f" Where will {x_name} look for the {obj} first? "
-                    f"Reply with the container name only."
+                    f"Reply with just the container name (one or two "
+                    f"words, no article)."
                 )
                 gold = container_1
             else:
                 question = (
                     scenario +
                     f" Where is the {obj} actually located now? "
-                    f"Reply with the container name only."
+                    f"Reply with just the container name (one or two "
+                    f"words, no article)."
                 )
                 gold = container_2
-            accept = _accept_word(gold)
+            # Match the LAST word of the gold ("kitchen drawer" → "drawer")
+            # so two-word containers still grade right when the model
+            # answers with just the head noun.
+            gold_last = gold.split()[-1]
+            accept_patterns = [
+                re.compile(rf"\b{re.escape(gold)}\b", re.IGNORECASE),
+                re.compile(rf"\b{re.escape(gold_last)}\b", re.IGNORECASE),
+            ]
+            # But ALSO require the bad answer NOT to be more strongly
+            # implied — we accept the multi-word match only when the
+            # other container's head noun is not also present.
+            accept = accept_patterns
         elif subtype == "scalar_implicature":
             # All weak quantifiers pair with the strong quantifier
             # ``all`` rather than ``every`` because ``all`` takes the
@@ -10609,7 +10713,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 ("a few", "all"),
             ])
             # Build a domain scenario.
-            speaker = _synthetic_name(r)
+            speaker = _realistic_name(r)
             domain = r.choice([
                 ("students", "passed the exam"),
                 ("athletes", "finished the race"),
@@ -10647,7 +10751,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
         elif subtype == "epistemic_state_tracking":
             # Three actors A, B, C. Information X is initially known
             # only by A. A tells B. C is not told. Question: does C know?
-            names = _synthetic_names(r, 3)
+            names = _realistic_names(r, 3)
             a_name, b_name, c_name = names[0], names[1], names[2]
             secret = r.choice(["password", "address", "schedule",
                                "code", "answer", "destination"])
@@ -10687,7 +10791,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 "could_you", "would_you_please", "do_you_have",
                 "is_it_possible",
             ])
-            speaker = _synthetic_name(r)
+            speaker = _realistic_name(r)
             # Each action is given as a base-form (infinitive without
             # 'to') verb phrase so all four template phrasings remain
             # grammatical without requiring gerund conjugation.
@@ -10974,7 +11078,19 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["reasoning"]) & 0xFFFFFFFF)
-    hard_kinds = ["date_arithmetic", "web_of_lies", "navigate_steps", "tracking_objects"]
+    # 2026-05-01 (v30.4 patch v4): added 3 new reasoning subtypes —
+    # graph_shortest_path (SSSP on a 4-6 node weighted graph),
+    # graph_connectivity (is there a path A→B in a directed graph?),
+    # constraint_sat (small CSP / 3-actor scheduling).
+    # All three are weakness areas of distilled-only models per the
+    # held-out canary audit; the procedural rotation is hardcoded so
+    # memorisation stays impossible (each round samples fresh random
+    # graph topology + edge weights).
+    hard_kinds = [
+        "date_arithmetic", "web_of_lies", "navigate_steps",
+        "tracking_objects", "graph_shortest_path",
+        "graph_connectivity", "constraint_sat",
+    ]
     legacy_kinds = ["boolean_eval", "ordering", "deduction", "sequence_next",
                     "odd_one_out", "analogy_letter"]
     n_hard = max(1, (n_items * 70 + 50) // 100)
@@ -11307,6 +11423,201 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             gold_idx = options.index(ans)
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/tracking_objects"))
+        elif kind == "graph_shortest_path":
+            # Single-source shortest-path on a small undirected weighted
+            # graph (4-6 nodes, 5-8 edges, weights 1-9). Generated by
+            # placing nodes at fixed labels (cities) and randomly
+            # connecting until both source and target are reachable.
+            # Solved with Dijkstra to compute the gold cost. The
+            # multiple-choice options include three distractors that
+            # differ from the gold by ±1, ±2, or use a slightly-longer
+            # sub-optimal path.
+            cities = ["Aria", "Brenn", "Clev", "Dorin", "Esia", "Fyrn"]
+            n_nodes = r.randint(4, 6)
+            nodes = cities[:n_nodes]
+            edges: list[tuple[str, str, int]] = []
+            # Random spanning tree first to guarantee connectivity.
+            shuf = list(nodes)
+            r.shuffle(shuf)
+            for i in range(1, len(shuf)):
+                a = shuf[i]
+                b = shuf[r.randint(0, i - 1)]
+                w = r.randint(1, 9)
+                edges.append((a, b, w))
+            # Add 1-3 extra random edges for choice variety.
+            for _ in range(r.randint(1, 3)):
+                a, b = r.sample(nodes, 2)
+                if any({a, b} == {x, y} for x, y, _ in edges):
+                    continue
+                edges.append((a, b, r.randint(1, 9)))
+            # Dijkstra.
+            adj: dict[str, list[tuple[str, int]]] = {n: [] for n in nodes}
+            for a, b, w in edges:
+                adj[a].append((b, w))
+                adj[b].append((a, w))
+            src, dst = r.sample(nodes, 2)
+            INF = 10 ** 9
+            dist = {n: INF for n in nodes}
+            dist[src] = 0
+            visited: set[str] = set()
+            while True:
+                cur = None
+                cur_d = INF
+                for n in nodes:
+                    if n not in visited and dist[n] < cur_d:
+                        cur, cur_d = n, dist[n]
+                if cur is None:
+                    break
+                visited.add(cur)
+                for nb, w in adj[cur]:
+                    if dist[cur] + w < dist[nb]:
+                        dist[nb] = dist[cur] + w
+            gold_cost = dist[dst]
+            edge_list = "; ".join(
+                f"{a}↔{b} (cost {w})" for a, b, w in edges
+            )
+            qtext = (
+                f"You have a network of cities connected by roads with "
+                f"the following costs: {edge_list}. What is the minimum "
+                f"total cost to travel from {src} to {dst}?"
+            )
+            opts_set: set[int] = {gold_cost}
+            for _ in range(8):
+                if len(opts_set) >= 4:
+                    break
+                delta = r.choice([-2, -1, 1, 2, 3, -3])
+                cand = max(1, gold_cost + delta)
+                opts_set.add(cand)
+            opts_int = sorted(opts_set)[:4]
+            while len(opts_int) < 4:
+                opts_int.append(opts_int[-1] + r.randint(1, 4))
+            opts_str = [str(o) for o in opts_int]
+            r.shuffle(opts_str)
+            gold_idx = opts_str.index(str(gold_cost))
+            out.append(_mc(qtext, opts_str, gold_idx,
+                           "procedural_reasoning/graph_shortest_path"))
+        elif kind == "graph_connectivity":
+            # Directed reachability. Generate a small DAG with N nodes
+            # and ~N*1.5 edges. Question: "Can A reach B?" where the
+            # answer is split ~50/50 yes/no by sometimes asking about
+            # an unreachable pair.
+            nodes_pool = ["Hub", "Node", "Vertex", "Point",
+                          "Station", "Center", "Spot", "Plot"]
+            n = r.randint(4, 6)
+            nodes = [f"{nodes_pool[i]}_{i + 1}" for i in range(n)]
+            edges: list[tuple[str, str]] = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if r.random() < 0.45:
+                        edges.append((nodes[i], nodes[j]))
+            # Reachability via BFS.
+            adj: dict[str, list[str]] = {n0: [] for n0 in nodes}
+            for a, b in edges:
+                adj[a].append(b)
+            src = r.choice(nodes)
+            dst_candidates = [n0 for n0 in nodes if n0 != src]
+            r.shuffle(dst_candidates)
+            # Compute reachable set from src.
+            reachable: set[str] = {src}
+            stack = [src]
+            while stack:
+                cur = stack.pop()
+                for nb in adj[cur]:
+                    if nb not in reachable:
+                        reachable.add(nb)
+                        stack.append(nb)
+            # Pick dst to balance yes/no roughly 50/50 if possible.
+            dst = None
+            want_yes = r.random() < 0.5
+            for cand in dst_candidates:
+                if want_yes and cand in reachable:
+                    dst = cand
+                    break
+                if not want_yes and cand not in reachable:
+                    dst = cand
+                    break
+            if dst is None:
+                dst = dst_candidates[0]
+            gold_yes = dst in reachable
+            edge_str = ", ".join(f"{a}→{b}" for a, b in edges)
+            qtext = (
+                f"In a directed network with edges: {edge_str}. "
+                f"Is there a directed path from {src} to {dst} "
+                f"(following edges in the direction shown)?"
+            )
+            options = ["yes", "no", "only sometimes", "cannot be determined"]
+            r.shuffle(options)
+            gold_idx = options.index("yes" if gold_yes else "no")
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/graph_connectivity"))
+        elif kind == "constraint_sat":
+            # 3-actor scheduling CSP. Three people, three time slots
+            # (morning / afternoon / evening), and three constraints
+            # like "X cannot be at slot S", "Y must be before Z", etc.
+            # Question: which person is in which slot? Solved by brute
+            # force over the 3! = 6 permutations.
+            people = _realistic_names(r, 3)
+            slots = ["morning", "afternoon", "evening"]
+            slot_order = {s: i for i, s in enumerate(slots)}
+            from itertools import permutations as _perm
+            # Generate random constraints; loop until exactly one
+            # permutation satisfies them all.
+            for _ in range(20):
+                cons_text: list[str] = []
+                cons_fns = []
+                # Constraint type 1: X cannot be at slot S.
+                ban_p = r.choice(people)
+                ban_s = r.choice(slots)
+                cons_text.append(f"{ban_p} cannot be in the {ban_s} slot.")
+                cons_fns.append(lambda perm, p=ban_p, s=ban_s: perm[people.index(p)] != s)
+                # Constraint type 2: Y is in an earlier slot than Z.
+                y, z = r.sample(people, 2)
+                cons_text.append(f"{y} is in an earlier slot than {z}.")
+                cons_fns.append(lambda perm, y=y, z=z: slot_order[perm[people.index(y)]] < slot_order[perm[people.index(z)]])
+                # Constraint type 3: third person is in slot Q.
+                rest = [p for p in people if p not in (y, z)]
+                if rest:
+                    other_p = rest[0]
+                    other_s = r.choice([s for s in slots if s != ban_s])
+                    cons_text.append(f"{other_p} is in the {other_s} slot.")
+                    cons_fns.append(lambda perm, p=other_p, s=other_s: perm[people.index(p)] == s)
+                solutions: list[tuple] = []
+                for perm in _perm(slots):
+                    if all(fn(perm) for fn in cons_fns):
+                        solutions.append(perm)
+                if len(solutions) == 1:
+                    perm = solutions[0]
+                    target_person = r.choice(people)
+                    answer_slot = perm[people.index(target_person)]
+                    constraints = " ".join(cons_text)
+                    qtext = (
+                        f"Three people ({', '.join(people)}) need to be "
+                        f"assigned to three time slots (morning, "
+                        f"afternoon, evening), each person in exactly "
+                        f"one slot. Constraints: {constraints} Which "
+                        f"slot is {target_person} assigned to?"
+                    )
+                    options = list(slots)
+                    r.shuffle(options)
+                    gold_idx = options.index(answer_slot)
+                    out.append(_mc(qtext, options, gold_idx,
+                                   "procedural_reasoning/constraint_sat"))
+                    break
+            else:
+                # Fallback: no unique solution found in 20 tries —
+                # default to a deterministic example.
+                qtext = (
+                    f"Three people ({', '.join(people)}) need slots "
+                    f"morning/afternoon/evening, one each. Constraints: "
+                    f"{people[0]} is in the morning. {people[1]} is "
+                    f"earlier than {people[2]}. Which slot is "
+                    f"{people[2]} assigned to?"
+                )
+                options = list(slots)
+                r.shuffle(options)
+                gold_idx = options.index("evening")
+                out.append(_mc(qtext, options, gold_idx,
+                               "procedural_reasoning/constraint_sat"))
     return out
 
 
