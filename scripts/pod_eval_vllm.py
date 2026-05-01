@@ -1143,16 +1143,23 @@ JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
 # can sustain a coherent multi-paragraph response, which is one of the
 # user-visible SOTA capabilities for assistant deployment.
 LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "4"))
-# 2026-05-01 (v30.4 patch): raised 1024 → 2048. Live repro on king
-# UID 107 (best26/sn97-m-v4) on chat.arbos.life showed the derail
-# starts in the 500-800 token window even at temperature 0.5 — the
-# 4B distilled student loses coherence and falls into a word-list
-# attractor past the first paragraph. At max_tokens=1024 the probe
-# cuts off BEFORE this derail surfaces in most prompts (the rubric
-# scored UID 107 at 0.875 even though chat output was pure gibberish
-# at 1500+ tokens). 2048 forces the model to keep going past the
-# cliff so the rubric can grade the derail.
-LONG_FORM_JUDGE_MAX_TOKENS = int(os.environ.get("LONG_FORM_JUDGE_MAX_TOKENS", "2048"))
+# 2026-05-01 (v30.4 patch v2): raised 2048 → 6144 — essentially the
+# model's full usable context window minus prompt headroom. The
+# cap is asymmetric in cost:
+#   • Coherent models emit EOS at ~500-1000 tokens. Cost ≈ unchanged.
+#   • Derailed models never emit EOS and fill the full 6144 budget.
+#     They PAY for their derail in eval compute, which is exactly
+#     the right cost distribution.
+#   • Infinite-loop models hit the hard wall at 6144 instead of
+#     wasting an entire round budget.
+# The chat.arbos.life screenshot showed king UID 107 happily
+# generating word salad through 2000+ tokens even at temp=0.5,
+# so 2048 was still cutting most of the derail off. 6144 gives the
+# coherence detector a much longer signal window to work with —
+# a model that derails at 800 tokens scores ~0.05 across the
+# 5300-token derailed tail, vs maybe 0.4 on just the 1240-token
+# tail at the old 2048 cap.
+LONG_FORM_JUDGE_MAX_TOKENS = int(os.environ.get("LONG_FORM_JUDGE_MAX_TOKENS", "6144"))
 LONG_FORM_JUDGE_ENABLED = os.environ.get("LONG_FORM_JUDGE_PROBE", "1") != "0"
 LONG_FORM_JUDGE_IN_COMPOSITE = os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
 # Env gate: off by default would hide the shadow data, which defeats the
@@ -1829,17 +1836,52 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
     #     dense single-word lines, no sentences)
     #   • mean word length (penalises meaningless compound coinage
     #     like "boblynberry-vogesters")
+    gen_tokens_list = collected.get("gen_tokens") or []
     derail_factors = []
+    term_factors = []
     for i, response in enumerate(responses):
         if i >= len(scores) or scores[i] is None:
             continue
         coh = _coherence_factor(response or "")
-        derail_factors.append(coh)
+        # Natural-termination factor: did the model emit EOS before
+        # filling the budget? Models that fill max_tokens are either
+        # derailed or didn't know when to stop. Threshold at 95 percent
+        # of the budget — emitting EOS at e.g. 5800/6144 still counts
+        # as "natural termination" while filling 6144/6144 does not.
+        max_tokens = LONG_FORM_JUDGE_MAX_TOKENS
+        gen_len = (
+            int(gen_tokens_list[i])
+            if i < len(gen_tokens_list) and gen_tokens_list[i] is not None
+            else max_tokens
+        )
+        if max_tokens <= 0:
+            term = 1.0
+        elif gen_len < int(max_tokens * 0.95):
+            term = 1.0
+        elif gen_len >= max_tokens:
+            term = 0.5
+        else:
+            term = 1.0 - (gen_len - int(max_tokens * 0.95)) / max(1, int(max_tokens * 0.05)) * 0.5
+        term = max(0.5, min(1.0, term))
+        term_factors.append(term)
+        # Combined factor: coherence × termination. A coherent response
+        # that filled the budget gets 1.0 × 0.5 = 0.5 (mild penalty for
+        # not knowing when to stop). A derailed budget-filler gets
+        # 0.05 × 0.5 = 0.025 (compounded). A coherent response that
+        # emitted EOS naturally gets 1.0 × 1.0 = 1.0.
+        combined = coh * term
+        derail_factors.append(combined)
         if i < len(agg["per_prompt"]):
             agg["per_prompt"][i]["coherence"] = round(coh, 3)
+            agg["per_prompt"][i]["termination"] = round(term, 3)
+            agg["per_prompt"][i]["gen_tokens"] = gen_len
     if derail_factors:
         coh_mean = sum(derail_factors) / len(derail_factors)
         agg["coherence_factor"] = round(coh_mean, 3)
+        if term_factors:
+            agg["termination_factor"] = round(
+                sum(term_factors) / len(term_factors), 3,
+            )
         if agg.get("normalized") is not None:
             penalised = agg["normalized"] * coh_mean
             agg["normalized_pre_coherence"] = agg["normalized"]
