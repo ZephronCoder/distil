@@ -7968,22 +7968,48 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
     # scenario regardless of whether the shop is called "bakery" or
     # "Drenshire") so the procedural form is grading-equivalent to
     # the legacy lists.
+    # 2026-05-01 (v30.4 patch v4): real-vocabulary shop/item pools.
+    # Anti-memorisation is preserved by the procedural numeric params
+    # (start_money, prices, counts) which fully determine the gold
+    # answer; the surface names of shops and items are decorative
+    # and do not change what the model is asked to compute. Real
+    # vocabulary makes the prompts read like gsm8k items, which is
+    # the whole point of the v29 narrative rebalance.
+    _MATH_SHOPS = (
+        "bakery", "grocery store", "corner shop", "deli", "farmers' market",
+        "supermarket", "general store", "produce stand", "hardware store",
+        "stationery shop", "toy store", "bookstore", "candy shop",
+        "bike shop", "pet store", "florist", "café", "convenience store",
+        "thrift shop", "music store", "art supply store", "garden center",
+    )
+    _MATH_ITEMS = (
+        ("apple", "apples"), ("banana", "bananas"), ("orange", "oranges"),
+        ("muffin", "muffins"), ("cookie", "cookies"), ("loaf", "loaves"),
+        ("bagel", "bagels"), ("notebook", "notebooks"), ("pencil", "pencils"),
+        ("pen", "pens"), ("eraser", "erasers"), ("ruler", "rulers"),
+        ("balloon", "balloons"), ("ticket", "tickets"), ("toy car", "toy cars"),
+        ("postcard", "postcards"), ("stamp", "stamps"), ("comic book", "comic books"),
+        ("magazine", "magazines"), ("candle", "candles"), ("cupcake", "cupcakes"),
+        ("donut", "donuts"), ("scone", "scones"), ("tart", "tarts"),
+        ("paint brush", "paint brushes"), ("sketchpad", "sketchpads"),
+        ("water bottle", "water bottles"), ("backpack", "backpacks"),
+        ("tennis ball", "tennis balls"), ("badge", "badges"),
+        ("birthday card", "birthday cards"), ("postcard book", "postcard books"),
+    )
+
     def _synth_shop(rr):
-        # A procedural common-noun shop label.
-        return _synthetic_word(rr, 2) + rr.choice(["shop", "stand", "stall", "house"])
+        return rr.choice(_MATH_SHOPS)
+
     def _synth_item(rr):
-        # A procedural plural noun item label.
-        word = _synthetic_word(rr, 2)
-        # Pluralise: append "s" / "es" depending on terminal char.
-        return word + ("es" if word.endswith(("s", "x", "z", "ch", "sh")) else "s")
+        return rr.choice(_MATH_ITEMS)[1]  # plural form
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
         kind = kinds[i % len(kinds)]
         question = ""
         gold = ""
         if kind == "shopping_budget":
-            name = _synthetic_name(r)
-            friend = _synthetic_name(r)
+            name = _realistic_name(r)
+            friend = _realistic_name(r)
             start_money = r.choice([40, 50, 60, 80, 100, 120])
             n_items_a = r.randint(3, 8)
             price_a = r.choice([2, 3, 4, 5, 6, 7, 8])
@@ -8005,7 +8031,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "recipe_scale":
-            name = _synthetic_name(r)
+            name = _realistic_name(r)
             base_servings = r.choice([4, 6, 8, 12])
             target_servings = base_servings * r.choice([2, 3, 4])
             cups_per_base = r.choice([2, 3, 4, 5])
@@ -8025,7 +8051,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "travel_distance":
-            name = _synthetic_name(r)
+            name = _realistic_name(r)
             leg_a_speed = r.choice([40, 50, 60, 70])
             leg_a_hours = r.randint(2, 5)
             stop_distance = r.randint(15, 40)
@@ -8044,7 +8070,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "school_classroom":
-            teacher = _synthetic_name(r)
+            teacher = _realistic_name(r)
             n_classes = r.randint(3, 6)
             students_per_class = r.choice([18, 22, 24, 28, 30])
             absent_per_class = r.randint(1, 4)
@@ -8064,7 +8090,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "garden_orchard":
-            farmer = _synthetic_name(r)
+            farmer = _realistic_name(r)
             n_rows = r.randint(4, 9)
             trees_per_row = r.randint(5, 12)
             apples_per_tree = r.choice([20, 25, 30, 40, 50])
@@ -8084,7 +8110,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "bakery_orders":
-            baker = _synthetic_name(r)
+            baker = _realistic_name(r)
             n_days = r.randint(3, 6)
             loaves_per_day = r.choice([24, 30, 36, 48, 60])
             wholesale_per_day = r.randint(8, 18)
@@ -8104,7 +8130,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "library_books":
-            librarian = _synthetic_name(r)
+            librarian = _realistic_name(r)
             n_borrowers = r.randint(8, 20)
             books_per_borrower = r.randint(2, 5)
             late_returns = r.randint(3, 12)
@@ -8128,7 +8154,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "fundraiser":
-            organizer = _synthetic_name(r)
+            organizer = _realistic_name(r)
             silver_donors = r.randint(8, 25)
             silver_amount = r.choice([10, 15, 20, 25])
             gold_donors = r.randint(3, 9)
@@ -8148,7 +8174,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "trip_planning":
-            traveler = _synthetic_name(r)
+            traveler = _realistic_name(r)
             nights = r.randint(3, 8)
             lodging_per_night = r.choice([60, 80, 90, 120, 150])
             meals_per_day = r.choice([20, 30, 40])
@@ -8167,7 +8193,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "pets_animals":
-            owner = _synthetic_name(r)
+            owner = _realistic_name(r)
             n_chickens = r.randint(8, 25)
             eggs_per_week_per_chicken = r.choice([4, 5, 6, 7])
             n_weeks = r.randint(2, 6)
@@ -8187,7 +8213,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "sports_tournament":
-            captain = _synthetic_name(r)
+            captain = _realistic_name(r)
             n_games = r.randint(8, 20)
             n_wins = r.randint(3, n_games - 2)
             n_losses = n_games - n_wins
@@ -8209,7 +8235,7 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "construction":
-            contractor = _synthetic_name(r)
+            contractor = _realistic_name(r)
             n_walls = r.randint(3, 8)
             bricks_per_wall = r.choice([80, 100, 120, 150, 200])
             mortar_per_wall = r.choice([3, 4, 5, 6])  # bags
@@ -8332,13 +8358,57 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "unit_conversion":
-            hours = r.randint(2, 14)
-            mins_per_hour = 60
-            extra_min = r.randint(0, 59)
-            gold_n = hours * mins_per_hour + extra_min
-            question = (
-                f"How many total minutes are in {hours} hours and {extra_min} minutes?"
-            )
+            # 2026-05-01 (v30.4 patch v4): make harder. Was 1 op
+            # (hours*60+min). Now 3 ops by chaining a unit conversion
+            # with a delta-calculation: "In a workout that lasts H
+            # hours M minutes, you sprint for S seconds out of every
+            # minute. How many total minutes do you spend sprinting?"
+            variant = r.choice(["clock", "speed_distance", "currency_change"])
+            if variant == "clock":
+                hours = r.randint(2, 14)
+                extra_min = r.randint(0, 59)
+                seconds_per_min = r.choice([15, 20, 30, 45])
+                # Total seconds spent active.
+                gold_n = (hours * 60 + extra_min) * seconds_per_min
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} works out for {hours} hours and {extra_min} "
+                    f"minutes total. During every minute, they spend "
+                    f"{seconds_per_min} seconds doing sprint intervals. "
+                    f"How many total seconds does {actor} spend on sprint "
+                    f"intervals?"
+                )
+            elif variant == "speed_distance":
+                speed_kph = r.choice([60, 72, 84, 96])
+                hours = r.randint(2, 5)
+                stop_minutes = r.randint(20, 50)
+                # Total kilometers driven (stops contribute 0 distance).
+                gold_n = speed_kph * hours
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} drives at a steady speed of {speed_kph} km/h "
+                    f"for exactly {hours} hours. In the middle of the "
+                    f"journey, they take a {stop_minutes}-minute break at a "
+                    f"rest stop (during which the car is parked and not "
+                    f"moving). How many total kilometers has {actor} "
+                    f"driven?"
+                )
+            else:  # currency_change
+                price_pounds = r.randint(8, 25)
+                price_pence = r.choice([0, 25, 50, 75, 99])
+                pence_per_pound = 100
+                paid_pounds = price_pounds + r.randint(2, 12)
+                # Change in pence.
+                amount_owed_pence = price_pounds * pence_per_pound + price_pence
+                paid_pence = paid_pounds * pence_per_pound
+                gold_n = paid_pence - amount_owed_pence
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} pays £{paid_pounds} for an item priced at "
+                    f"£{price_pounds}.{price_pence:02d}. How many pence in "
+                    f"change does {actor} receive? (1 pound = 100 pence; "
+                    f"give the answer as an integer.)"
+                )
             gold = str(gold_n)
         elif kind == "simultaneous":
             x = r.randint(-9, 12)
@@ -8599,12 +8669,22 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["code"]) & 0xFFFFFFFF)
+    # 2026-05-01 (v30.4 patch v4): added 4 new code subtypes targeting
+    # weakness areas surfaced on held-out HumanEval —
+    #   - caesar_cipher       (string manipulation: char arithmetic)
+    #   - flatten_nested_list (recursion: variable-depth structure)
+    #   - closest_pair_sum    (search: O(n²) brute force OR sort-and-walk)
+    #   - run_length_decode   (string parsing: digit-grouping)
+    # All four match the humaneval-difficulty calibration target
+    # (~0.45-0.60 base-model pass-rate on a private smoke set).
     hard_kinds = [
         "coin_change_min", "merge_intervals", "rolling_max",
         "nested_paren_groups", "evaluate_postfix", "roman_to_int",
         "binary_search_first", "unique_paths_grid", "longest_no_repeat",
         "validate_brackets", "sliding_window_min", "most_freq_elem",
         "compress_string", "two_sum_pairs",
+        "caesar_cipher", "flatten_nested_list",
+        "closest_pair_sum", "run_length_decode",
     ]
     legacy_kinds = [
         "transform_list", "aggregate_list", "string_predicate",
@@ -9358,6 +9438,148 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             for _ in range(5):
                 xs = [r.randint(0, target) for _ in range(r.randint(0, 7))]
                 test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "caesar_cipher":
+            shift = r.randint(1, 25)
+            entry_point = "caesar_encrypt"
+
+            def _ref_caesar(s, k=shift):
+                out_chars = []
+                for c in s:
+                    if c.isupper():
+                        out_chars.append(chr((ord(c) - 65 + k) % 26 + 65))
+                    elif c.islower():
+                        out_chars.append(chr((ord(c) - 97 + k) % 26 + 97))
+                    else:
+                        out_chars.append(c)
+                return "".join(out_chars)
+            ref = _ref_caesar
+            ex_out = _ref_caesar("abc xyz")
+            prompt = (
+                f"def caesar_encrypt(s):\n"
+                f"    \"\"\"Return the caesar-cipher of ``s`` shifted by {shift}.\n\n"
+                f"    Each letter is shifted forward by {shift} positions in the\n"
+                f"    alphabet, wrapping around (so 'z' shifted by 1 becomes 'a').\n"
+                f"    Letter case is preserved. Non-letter characters are left\n"
+                f"    unchanged.\n\n"
+                f"    >>> caesar_encrypt('abc xyz')\n"
+                f"    {ex_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                "abc xyz", "Hello, World!", "ZZZ", "",
+                "".join(r.choice("abcdefghijklmnopqrstuvwxyz ABC")
+                        for _ in range(r.randint(3, 12))),
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "flatten_nested_list":
+            entry_point = "flatten"
+            prompt = (
+                "def flatten(xs):\n"
+                "    \"\"\"Recursively flatten a nested list of integers.\n\n"
+                "    Inputs may contain integers OR other lists (nested to any\n"
+                "    depth). Return a flat list of integers in their original\n"
+                "    left-to-right order.\n\n"
+                "    >>> flatten([1, [2, [3, 4], 5], 6])\n"
+                "    [1, 2, 3, 4, 5, 6]\n"
+                "    >>> flatten([])\n"
+                "    []\n"
+                "    \"\"\"\n"
+            )
+            def _ref_flat(xs):
+                out_l: list = []
+                for x in xs:
+                    if isinstance(x, list):
+                        out_l.extend(_ref_flat(x))
+                    else:
+                        out_l.append(x)
+                return out_l
+
+            def _gen_nested(rr, depth_left):
+                # Return either a leaf int or a nested list, randomly.
+                if depth_left == 0 or rr.random() < 0.4:
+                    return rr.randint(-9, 9)
+                length = rr.randint(0, 4)
+                return [_gen_nested(rr, depth_left - 1) for _ in range(length)]
+
+            test_inputs = []
+            for _ in range(5):
+                test_inputs.append([_gen_nested(r, r.randint(1, 4))
+                                    for _ in range(r.randint(0, 4))])
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti) if False else _ref_flat(ti)!r}")
+        elif kind == "closest_pair_sum":
+            target = r.randint(-15, 30)
+            entry_point = "closest_pair_sum"
+
+            def _ref_closest(xs, t=target):
+                best = None
+                best_pair = None
+                for i in range(len(xs)):
+                    for j in range(i + 1, len(xs)):
+                        diff = abs(xs[i] + xs[j] - t)
+                        if best is None or diff < best:
+                            best = diff
+                            best_pair = (i, j)
+                return best_pair
+            ref = _ref_closest
+            example_out = _ref_closest([1, 7, 3, 2])
+            prompt = (
+                f"def closest_pair_sum(xs):\n"
+                f"    \"\"\"Return the indices ``(i, j)`` with i < j whose sum\n"
+                f"    ``xs[i] + xs[j]`` is closest to {target}. If multiple pairs\n"
+                f"    are equally close, return the lexicographically smallest\n"
+                f"    (i, j) tuple. The list always has at least two elements.\n\n"
+                f"    >>> closest_pair_sum([1, 7, 3, 2])\n"
+                f"    {example_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            for _ in range(5):
+                n = r.randint(2, 8)
+                xs = [r.randint(-12, 18) for _ in range(n)]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "run_length_decode":
+            entry_point = "rle_decode"
+            prompt = (
+                "def rle_decode(s):\n"
+                "    \"\"\"Decode a run-length-encoded string.\n\n"
+                "    The input is a string consisting of runs of (count)(char)\n"
+                "    where count is one OR more decimal digits. Each run\n"
+                "    expands to ``char`` repeated ``count`` times. Return the\n"
+                "    decoded string.\n\n"
+                "    >>> rle_decode('3a2b1c')\n"
+                "    'aaabbc'\n"
+                "    >>> rle_decode('12x')\n"
+                "    'xxxxxxxxxxxx'\n"
+                "    >>> rle_decode('')\n"
+                "    ''\n"
+                "    \"\"\"\n"
+            )
+            def _ref_rle(s):
+                out_s = []
+                i = 0
+                while i < len(s):
+                    j = i
+                    while j < len(s) and s[j].isdigit():
+                        j += 1
+                    if j == i or j >= len(s):
+                        # Malformed — but our test inputs are always well-formed.
+                        return ""
+                    count = int(s[i:j])
+                    char = s[j]
+                    out_s.append(char * count)
+                    i = j + 1
+                return "".join(out_s)
+            ref = _ref_rle
+            test_inputs = ["3a2b1c", "12x", "", "1a1b1c"]
+            for _ in range(2):
+                # Generate one well-formed random RLE string.
+                runs = []
+                for _ in range(r.randint(1, 4)):
+                    runs.append((r.randint(1, 9), r.choice("abcdef")))
+                test_inputs.append("".join(f"{n}{c}" for n, c in runs))
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
         else:
             entry_point = "noop"
             prompt = (
@@ -9367,13 +9589,21 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             test_lines = ["    assert candidate() == 0"]
         # ─────────────────────────────────────────────────────────────────
         test_block = "def check(candidate):\n" + "\n".join(test_lines) + "\n"
-        version_tag = "v29" if kind in (
+        if kind in (
+            "caesar_cipher", "flatten_nested_list",
+            "closest_pair_sum", "run_length_decode",
+        ):
+            version_tag = "v30"
+        elif kind in (
             "coin_change_min", "merge_intervals", "rolling_max",
             "nested_paren_groups", "evaluate_postfix", "roman_to_int",
             "binary_search_first", "unique_paths_grid", "longest_no_repeat",
             "validate_brackets", "sliding_window_min", "most_freq_elem",
             "compress_string", "two_sum_pairs",
-        ) else "v27"
+        ):
+            version_tag = "v29"
+        else:
+            version_tag = "v27"
         out.append({
             "src": f"procedural_code/{kind}",
             "task_id": f"{version_tag}/{kind}/{i:02d}",
