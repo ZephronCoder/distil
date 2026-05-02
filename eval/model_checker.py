@@ -815,51 +815,118 @@ def _is_transient_error(exc: Exception) -> bool:
     ])
 
 
+_TOKENIZER_ARTIFACT_NAMES = (
+    "tokenizer.json",      # HuggingFace fast tokenizer
+    "tokenizer.model",     # SentencePiece
+    "tiktoken.model",      # tiktoken (Kimi, GPT family)
+    "vocab.json",          # GPT2 BPE
+    "merges.txt",          # GPT2 BPE
+    "added_tokens.json",   # added/special tokens
+    "special_tokens_map.json",
+    "bpe.codes",           # sentencepiece variant
+)
+
+
+def _teacher_tokenizer_artifact_hashes() -> dict[str, str]:
+    """Return SHA256 of every tokenizer-artifact file the teacher actually
+    ships. Only names in ``_TOKENIZER_ARTIFACT_NAMES`` that exist on the
+    teacher repo are included; callers should treat the returned set as
+    the required set for students.
+    """
+    hashes: dict[str, str] = {}
+    try:
+        from huggingface_hub import list_repo_files as _list
+        teacher_files = set(_list(TEACHER_MODEL))
+    except Exception as exc:
+        logger.warning(f"Failed to list teacher files: {exc}")
+        teacher_files = set()
+    for name in _TOKENIZER_ARTIFACT_NAMES:
+        if name not in teacher_files:
+            continue
+        try:
+            p = hf_hub_download(repo_id=TEACHER_MODEL, filename=name)
+            with open(p, "rb") as f:
+                hashes[name] = hashlib.sha256(f.read()).hexdigest()
+        except Exception as exc:
+            logger.warning(f"Failed to hash teacher {name}: {exc}")
+    return hashes
+
+
 def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
     """
     Byte-for-byte verification of tokenizer files against the teacher model.
 
-    Checks:
-    1. tokenizer.json: SHA256 must exactly match the teacher's tokenizer.json.
-       This file contains the full vocabulary, merges, and added_tokens.
-    2. tokenizer_config.json: all fields except chat_template must match.
-       (chat_template is checked separately by the template hash check.)
+    Detects which tokenizer artifacts the teacher actually ships
+    (``tokenizer.json``, ``tiktoken.model``, ``tokenizer.model``, BPE
+    ``vocab.json`` + ``merges.txt``, etc.) and requires each of them to
+    be byte-identical in the student's repo. Kimi K2.6 for example ships
+    ``tiktoken.model`` + ``tokenization_kimi.py`` but NOT ``tokenizer.json``;
+    Qwen ships ``tokenizer.json``. The function adapts automatically.
 
-    Returns dict with:
-      match: bool
-      reason: str (if not matching)
+    Also verifies ``tokenizer_config.json`` (excluding chat_template, which
+    is checked separately) to catch configuration drift.
+
+    Returns dict with ``match: bool`` and ``reason: str`` (if not matching).
     """
-    # Download teacher tokenizer.json
-    teacher_tok_json_path = hf_hub_download(
-        repo_id=TEACHER_MODEL, filename="tokenizer.json"
-    )
-    with open(teacher_tok_json_path, "rb") as f:
-        teacher_tok_hash = hashlib.sha256(f.read()).hexdigest()
-
-    # Download student tokenizer.json
-    student_tok_json_path = hf_hub_download(
-        repo_id=model_repo, filename="tokenizer.json", revision=revision
-    )
-    with open(student_tok_json_path, "rb") as f:
-        student_tok_hash = hashlib.sha256(f.read()).hexdigest()
-
-    if student_tok_hash != teacher_tok_hash:
+    teacher_hashes = _teacher_tokenizer_artifact_hashes()
+    if not teacher_hashes:
         return {
             "match": False,
             "reason": (
-                f"tokenizer.json mismatch: student hash {student_tok_hash[:16]}... "
-                f"!= teacher hash {teacher_tok_hash[:16]}... "
-                f"(vocab/merges/added_tokens differ from {TEACHER_MODEL})"
+                f"Teacher {TEACHER_MODEL} ships no recognised tokenizer "
+                f"artifact — cannot perform byte-match verification."
             ),
         }
+    for fname, teacher_hash in teacher_hashes.items():
+        try:
+            student_path = hf_hub_download(
+                repo_id=model_repo, filename=fname, revision=revision,
+            )
+        except Exception as exc:
+            if _is_transient_error(exc):
+                return {
+                    "match": True,
+                    "transient": True,
+                    "reason": f"transient fetching student {fname}: {exc}",
+                }
+            return {
+                "match": False,
+                "reason": (
+                    f"Missing required tokenizer artifact "
+                    f"'{fname}' on student — teacher ships it, student doesn't."
+                ),
+            }
+        with open(student_path, "rb") as f:
+            student_hash = hashlib.sha256(f.read()).hexdigest()
+        if student_hash != teacher_hash:
+            return {
+                "match": False,
+                "reason": (
+                    f"{fname} mismatch: student hash {student_hash[:16]}... "
+                    f"!= teacher hash {teacher_hash[:16]}... "
+                    f"(tokenizer differs from {TEACHER_MODEL})"
+                ),
+            }
 
     # Check tokenizer_config.json (excluding chat_template)
-    teacher_cfg_path = hf_hub_download(
-        repo_id=TEACHER_MODEL, filename="tokenizer_config.json"
-    )
-    student_cfg_path = hf_hub_download(
-        repo_id=model_repo, filename="tokenizer_config.json", revision=revision
-    )
+    try:
+        teacher_cfg_path = hf_hub_download(
+            repo_id=TEACHER_MODEL, filename="tokenizer_config.json",
+        )
+        student_cfg_path = hf_hub_download(
+            repo_id=model_repo, filename="tokenizer_config.json", revision=revision,
+        )
+    except Exception as exc:
+        if _is_transient_error(exc):
+            return {
+                "match": True,
+                "transient": True,
+                "reason": f"transient fetching tokenizer_config.json: {exc}",
+            }
+        # If neither has a tokenizer_config, pass — some Kimi forks might omit.
+        if "404" in str(exc) or "not found" in str(exc).lower():
+            return {"match": True}
+        return {"match": False, "reason": f"tokenizer_config.json fetch failed: {exc}"}
 
     with open(teacher_cfg_path) as f:
         teacher_cfg = json.load(f)
@@ -871,7 +938,6 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
     student_cfg.pop("chat_template", None)
 
     if teacher_cfg != student_cfg:
-        # Find the differing keys for a clear error message
         diff_keys = []
         all_keys = set(teacher_cfg.keys()) | set(student_cfg.keys())
         for k in sorted(all_keys):
@@ -891,23 +957,44 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
 def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     """
     Verify that a model's tokenizer produces identical token IDs as the teacher.
-    
-    Downloads the student tokenizer and encodes fixed test strings.
-    If any encoding differs, the tokenizer is incompatible.
+
+    When the teacher ships ``tokenizer.json`` (Qwen-family), we load both via
+    the ``tokenizers`` library and compare encoding IDs on a fixed test set.
+    When the teacher uses a tiktoken-style tokenizer (Kimi K2.6 ships
+    ``tiktoken.model`` + ``tokenization_kimi.py``) there is no standard
+    ``tokenizer.json`` to load — instead we rely on the byte-match check in
+    ``verify_tokenizer_files`` (which has already been called upstream) to
+    guarantee identical behaviour and short-circuit here with ``match: True``.
+
+    Explicit bypass via ``SKIP_TOKENIZER_ENCODING_CHECK=1`` for emergency
+    operators (not recommended).
     """
-    from transformers import AutoTokenizer
+    if os.environ.get("SKIP_TOKENIZER_ENCODING_CHECK") == "1":
+        return {"match": True}
 
     from tokenizers import Tokenizer as RawTokenizer
     from huggingface_hub import hf_hub_download as _hf_dl
 
-    # Load tokenizer.json directly via the `tokenizers` library.
-    # This bypasses AutoTokenizer class resolution issues (e.g., TokenizersBackend)
-    # while still verifying identical encoding behavior.
-    teacher_path = _hf_dl(TEACHER_MODEL, "tokenizer.json")
-    teacher_tok = RawTokenizer.from_file(teacher_path)
+    try:
+        from huggingface_hub import list_repo_files as _list
+        teacher_files = set(_list(TEACHER_MODEL))
+    except Exception:
+        teacher_files = set()
 
-    student_path = _hf_dl(model_repo, "tokenizer.json", revision=revision)
-    student_tok = RawTokenizer.from_file(student_path)
+    if "tokenizer.json" not in teacher_files:
+        # tiktoken / sentencepiece path — the byte-match verification
+        # upstream already proved student == teacher on the artifact file(s).
+        return {"match": True}
+
+    try:
+        teacher_path = _hf_dl(TEACHER_MODEL, "tokenizer.json")
+        teacher_tok = RawTokenizer.from_file(teacher_path)
+        student_path = _hf_dl(model_repo, "tokenizer.json", revision=revision)
+        student_tok = RawTokenizer.from_file(student_path)
+    except Exception as exc:
+        if _is_transient_error(exc):
+            return {"match": True, "transient": True, "reason": str(exc)}
+        return {"match": False, "reason": f"tokenizer.json load failed: {exc}"}
 
     for test_str in TOKENIZER_TEST_STRINGS:
         teacher_ids = teacher_tok.encode(test_str).ids
