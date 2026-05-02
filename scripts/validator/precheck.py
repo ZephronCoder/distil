@@ -343,6 +343,7 @@ def _check_registration_already_used(
     hotkey: str, model_repo: str, revision: str,
     state: ValidatorState,
     coldkey: str | None = None,
+    commit_block: int | None = None,
 ) -> tuple[bool, str | None]:
     """Has this hotkey already used its one-eval-per-registration slot?
 
@@ -372,6 +373,18 @@ def _check_registration_already_used(
     rec = (state.evaluated_hotkeys or {}).get(hotkey)
     if not rec:
         return False, None
+    # Guard: skip backfilled entries that predate this commit's block
+    # (recycled UID carried over a stale record from previous occupant).
+    if rec.get("backfilled") and commit_block:
+        eval_block = rec.get("evaluated_at_block", 0)
+        if eval_block and eval_block < commit_block:
+            logger.warning(
+                f"one_eval_per_reg: ignoring stale backfilled entry for "
+                f"{hotkey[:12]}… (eval block {eval_block} < commit block "
+                f"{commit_block}), clearing it"
+            )
+            (state.evaluated_hotkeys or {}).pop(hotkey, None)
+            return False, None
     prev_model = rec.get("model")
     prev_revision = rec.get("revision", "main")
     if prev_model == model_repo and prev_revision == revision:
@@ -407,6 +420,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         coldkey = uid_to_coldkey.get(uid) if uid_to_coldkey else None
         already_used, reason = _check_registration_already_used(
             hotkey, model_repo, revision, state, coldkey=coldkey,
+            commit_block=this_commit_block,
         )
         if already_used:
             logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
