@@ -250,10 +250,14 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     # vision tower (MoonViT3dPretrainedModel) does not support
     # flash_attention_2. transformers>=5.0 raises ValueError at __init__
     # time (not load time) when any sub-module of the wrapper is missing
-    # FA2 support, so the cascade ``flash_attention_2 → default`` doesn't
-    # save us. Force ``eager`` for the Kimi family up front; neither FA2
-    # nor SDPA is supported by KimiK25ForConditionalGeneration or its
-    # MoonViT3d vision tower in transformers >=5.0.
+    # FA2 support. Passing attn_implementation="eager" to from_pretrained
+    # only sets it on the *top-level* config; the Kimi model constructs
+    # MoonViT3dPretrainedModel(vt_config) with a separate config object
+    # that still defaults to FA2 on FA2-capable hardware.
+    #
+    # Fix: load the config first, force eager on ALL nested sub-configs
+    # (vision_config, text_config, etc.), then pass the patched config
+    # to from_pretrained so the vision tower init never attempts FA2.
     lname = (name or "").lower()
     is_kimi_family = (
         ("moonshotai" in lname and "kimi" in lname)
@@ -264,8 +268,32 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     for attempt in range(max_retries):
         try:
             if is_kimi_family:
+                from transformers import AutoConfig
+                _cfg_kwargs = {"trust_remote_code": True}
+                if "revision" in kwargs:
+                    _cfg_kwargs["revision"] = kwargs["revision"]
+                config = AutoConfig.from_pretrained(
+                    name, attn_implementation="eager", **_cfg_kwargs
+                )
+                # Propagate eager to all nested sub-configs so
+                # MoonViT3dPretrainedModel.__init__ doesn't dispatch FA2.
+                def _force_eager(cfg):
+                    for attr in (
+                        "_attn_implementation",
+                        "_attn_implementation_internal",
+                        "_attn_implementation_autoset",
+                    ):
+                        try:
+                            setattr(cfg, attr, "eager")
+                        except Exception:
+                            pass
+                    for key in list(vars(cfg)):
+                        child = getattr(cfg, key, None)
+                        if child is not None and hasattr(child, "_attn_implementation"):
+                            _force_eager(child)
+                _force_eager(config)
                 m = AutoModelForCausalLM.from_pretrained(
-                    name, attn_implementation="eager", **kwargs
+                    name, config=config, attn_implementation="eager", **kwargs
                 )
                 print(f"  [model] Loaded with eager (Kimi-family: FA2/SDPA not supported by vision tower)", flush=True)
                 return m
