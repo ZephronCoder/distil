@@ -837,9 +837,24 @@ try:
     _prev = (_cfg.get("teacher", {}).get("previousTeacher")
              or _cfg.get("previousTeacher", {}).get("model")
              or "(none recorded)")
+    # 2026-05-03: how the validator currently fetches teacher logprobs.
+    # ``api`` = OpenAI-compatible cloud inference (no local Kimi K2.6 weights);
+    # ``vllm`` = local vLLM server (legacy / fallback). Read straight from
+    # the validator's process env so the bot reflects reality, not config.
+    _teacher_mode = os.environ.get("DISTIL_TEACHER_MODE", "vllm").lower()
+    _teacher_api_provider = os.environ.get("DISTIL_TEACHER_API_PROVIDERS") or "Inceptron"
+    _teacher_api_model = os.environ.get("DISTIL_TEACHER_API_MODEL") or _model
+    if _teacher_mode == "api":
+        _teacher_path_str = (
+            f"cloud-API (OpenRouter → `{_teacher_api_provider}` → `{_teacher_api_model}`); "
+            f"top-20 logprobs; no local 1T-param load"
+        )
+    else:
+        _teacher_path_str = "local vLLM (Lium pod, 8×H200, ~6 min cold start)"
     lines.append("## Live Subnet Config (live from `frontend/src/lib/subnet-config.json` — quote these for cap/teacher/vocab/arch questions)")
     lines.append("")
     lines.append(f"- **Teacher:** `{_model}`")
+    lines.append(f"- **Teacher inference path:** {_teacher_path_str}")
     lines.append(f"- **Max student total params:** `{_msp}` (= **{_msp_b}B**)")
     lines.append(f"- **Required vocab size:** `{_vocab}` (Kimi BPE; not 248,320, not 152,064)")
     lines.append(f"- **Allowed model_type / architecture:** {_arch_str}")
