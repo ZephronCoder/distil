@@ -246,9 +246,29 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
         kwargs["revision"] = revision
         print(f"  [model] Pinning to revision {revision[:12]}", flush=True)
 
+    # 2026-05-03 (Kimi K2.6 cutover): KimiK25ForConditionalGeneration's
+    # vision tower (MoonViT3dPretrainedModel) does not support
+    # flash_attention_2. transformers>=5.0 raises ValueError at __init__
+    # time (not load time) when any sub-module of the wrapper is missing
+    # FA2 support, so the cascade ``flash_attention_2 → default`` doesn't
+    # save us. Force ``eager`` for the Kimi family up front; neither FA2
+    # nor SDPA is supported by KimiK25ForConditionalGeneration or its
+    # MoonViT3d vision tower in transformers >=5.0.
+    lname = (name or "").lower()
+    is_kimi_family = (
+        ("moonshotai" in lname and "kimi" in lname)
+        or "kimi-k2" in lname
+        or "kimi_k2" in lname
+    )
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            if is_kimi_family:
+                m = AutoModelForCausalLM.from_pretrained(
+                    name, attn_implementation="eager", **kwargs
+                )
+                print(f"  [model] Loaded with eager (Kimi-family: FA2/SDPA not supported by vision tower)", flush=True)
+                return m
             try:
                 m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
                 print(f"  [model] Loaded with flash_attention_2", flush=True)
@@ -15949,6 +15969,19 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
         "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
         "--skip-mm-profiling",
     ]
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): vLLM 0.20.0's Kimi
+    # multimodal wrapper crashes during encoder-budget profiling on
+    # transformers >=5.0 because Kimi's bundled processor can't be loaded
+    # (preprocessor_config falls back to Qwen2VLImageProcessor which
+    # lacks Kimi-specific attrs). ``--enforce-eager`` skips the cuda-graph
+    # capture path that triggers some of that profiling, and combined
+    # with the in-place patches in eval/pod.py:ensure_dependencies()
+    # (``_distil_mm_tolerant`` + ``_distil_dummy_mm_tolerant``) lets
+    # Kimi K2.6 boot under vLLM. Harmless on text-only teachers (Qwen3.5
+    # / DeepSeek V3) — eager mode is ~5% slower than cuda-graph but our
+    # round wall-clock budget already absorbs that.
+    if "kimi" in (model_name or "").lower():
+        cmd.append("--enforce-eager")
     # Teacher-family-specific reasoning parser. Qwen 3.x uses the ``qwen3``
     # parser; Kimi K2.x has no dedicated reasoning parser in vLLM yet (its
     # chat template emits tool tokens directly, no <think> blocks to
