@@ -318,7 +318,14 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     revision_list = ",".join(models_to_eval[uid].get("revision", "main") for uid in ordered_uids)
     king_flag = ""
     vllm_flag = " --no-vllm"
-    if use_vllm:
+    # 2026-05-03: cloud-API teacher path takes precedence over the local
+    # vLLM startup. ``pod_eval_vllm.py``'s API branch runs before the
+    # vLLM branch and sets ``teacher_cache_loaded = True``, so the local
+    # vLLM server never spins up — but pinning ``--no-vllm`` here keeps
+    # the inner_eval command self-documenting and prevents any future
+    # regression where the vLLM startup races with the API generation.
+    _api_mode = os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+    if use_vllm and not _api_mode:
         # Eval shares the GPU with the chat-king vLLM. Two regimes:
         #
         #   1. Co-located chat-king (default today): chat-king *targets*
