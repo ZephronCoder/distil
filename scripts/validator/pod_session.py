@@ -346,7 +346,14 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         # teacher_generation timings on 5/1 morning). 0.78 leaves ~10
         # GiB of headroom; KV cache usage is <5% in practice so we
         # aren't losing throughput.
-        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.78")
+        #
+        # 2026-05-03 (v30.3.6): lowered default 0.78 → 0.65. Chat-king
+        # grew to ~44 GiB (was ~21 GiB at 0.15 util — likely KV cache
+        # growth or leaked EngineCore). 0.78 * 139.8 = 109 GiB but only
+        # 95.5 GiB free → teacher crash on init. 0.65 * 139.8 = 90.9 GiB
+        # fits with ~4.6 GiB headroom. Eval throughput is barely affected
+        # since KV cache is <5% in practice.
+        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.65")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"

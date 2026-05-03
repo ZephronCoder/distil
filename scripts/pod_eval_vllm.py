@@ -15840,8 +15840,11 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
     # for the rest of the round. 0.78 leaves ~10 GiB of headroom and
     # has not impacted KV-cache size in observed rounds (KV cache
     # usage stays <5% during teacher gen).
-    if gpu_memory_utilization is None or gpu_memory_utilization < 0.7:
-        gpu_memory_utilization = 0.78
+    #
+    # 2026-05-03 (v30.3.6): lowered 0.78 → 0.65. Chat-king grew to
+    # ~44 GiB; 0.78 * 139.8 = 109 GiB > 95.5 GiB free → crash.
+    if gpu_memory_utilization is None or gpu_memory_utilization < 0.5:
+        gpu_memory_utilization = 0.65
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_name,
