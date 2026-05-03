@@ -389,11 +389,24 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"done; "
         f"echo DISTIL_PID:$(cat {shlex.quote(pid_remote)} 2>/dev/null)"
     )
+    # 2026-05-03: zombie-aware status check.
+    # ``kill -0 PID`` returns 0 for zombies (defunct processes whose entry is
+    # still in the process table because no parent has reaped them), so the
+    # previous check reported DISTIL_STATUS:running on a dead worker and the
+    # validator polled forever. Workaround: also inspect ``ps -o stat=`` and
+    # treat 'Z'/'X' (zombie / dying) as DISTIL_STATUS:dead. Falls through to
+    # the cheap ``kill -0`` path when ``ps`` isn't available, which keeps
+    # the legacy behaviour for hosts where /proc isn't mounted.
     status_inner = (
         f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DISTIL_STATUS:done; "
         f"elif [ ! -f {shlex.quote(pid_remote)} ]; then echo DISTIL_STATUS:starting; "
-        f"elif kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo DISTIL_STATUS:running; "
-        "else echo DISTIL_STATUS:dead; fi"
+        f"elif ! kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo DISTIL_STATUS:dead; "
+        f"else _stat=$(ps -p \"$(cat {shlex.quote(pid_remote)})\" -o stat= 2>/dev/null | tr -d ' '); "
+        f"  case \"$_stat\" in "
+        f"    Z*|X*) echo DISTIL_STATUS:dead ;; "
+        f"    *) echo DISTIL_STATUS:running ;; "
+        f"  esac; "
+        f"fi"
     )
     status_cmd = f"bash -lc {shlex.quote(status_inner)}"
     poll_stop = threading.Event()
