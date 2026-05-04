@@ -280,36 +280,50 @@ def exec_vllm():
         "--served-model-name", SERVED_NAME,
         "--gpu-memory-utilization", str(gpu_util),
         "--enforce-eager",
-        "--enable-auto-tool-choice",
     ]
+    # 2026-05-04 (Sebastian's "chat doesn't work with current king" report):
+    # the ``kimi_k2`` / ``kimi_k25`` branches deliberately omit
+    # ``--tool-call-parser`` because vLLM doesn't ship a Kimi parser yet,
+    # but ``--enable-auto-tool-choice`` was being added unconditionally —
+    # vLLM 0.19+ rejects that combo with
+    # ``TypeError: --enable-auto-tool-choice requires --tool-call-parser``
+    # and the chat server fails before binding port 8100. So we attach
+    # ``--enable-auto-tool-choice`` ONLY in the families where we can
+    # actually pair it with a parser (``qwen35``). Kimi-family kings still
+    # get tool calling through the model's own template tokens — clients
+    # that need structured ``tool_calls`` parse them client-side.
     if family == "qwen35":
         # Qwen 3.5 / 3.6 emit ``<tool_call><function=name><parameter=k>v
         # </parameter></function></tool_call>`` XML — the ``qwen3_xml``
         # parser ships with vLLM 0.19+ and matches the family natively.
         cmd += [
+            "--enable-auto-tool-choice",
             "--tool-call-parser", "qwen3_xml",
             "--reasoning-parser", "qwen3",
             "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
             "--skip-mm-profiling",
         ]
     elif family == "kimi_k25":
-        # Kimi K2.5/K2.6 vision wrapper — disable vision path for text chat,
-        # use the Kimi-native tool-call tokens (``<|tool_calls_section_begin|>``
-        # ... ``<|tool_call_begin|>``). vLLM doesn't ship a dedicated
-        # kimi tool parser yet, so leave ``--tool-call-parser`` off and let
-        # the model emit raw tokens; clients that parse structured tool
-        # calls on the Kimi chat template will still work.
+        # Kimi K2.5/K2.6 vision wrapper — disable vision path for text chat.
+        # vLLM doesn't ship a dedicated kimi tool parser yet, so we cannot
+        # enable auto-tool-choice. Clients that parse structured tool
+        # calls on the Kimi chat template will still work; they just
+        # receive the raw ``<|tool_calls_section_begin|>`` … tokens
+        # instead of OpenAI ``tool_calls`` JSON.
         cmd += [
             "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
             "--skip-mm-profiling",
         ]
     elif family == "kimi_k2":
         # Text-only DeepSeek V3 inner of Kimi K2 — vanilla causal LM path.
-        # No tool parser flag so clients parse Kimi tool tokens directly.
+        # No auto-tool-choice (no Kimi parser); clients parse Kimi
+        # tool tokens directly off the assistant content.
         pass
     else:
-        # Unknown architecture — pass no family-specific flags; vLLM may
-        # succeed on simple architectures (Llama-family) without them.
+        # Unknown architecture — pass no family-specific flags. We also
+        # leave auto-tool-choice off because we can't guess the right
+        # parser. vLLM may succeed on simple architectures (Llama-family)
+        # without them.
         log(f"warning: unknown architecture family, falling back to minimal vLLM args")
     log(f"exec vLLM (family={family}, gpu_util={gpu_util}, max_model_len={max_model_len})")
     os.execvp(cmd[0], cmd)
