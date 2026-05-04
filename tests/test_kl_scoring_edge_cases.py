@@ -126,24 +126,13 @@ class TestKLDivergence(unittest.TestCase):
         self.assertGreater(kl_ba, 0)
         self.assertNotAlmostEqual(kl_ab, kl_ba, places=3)
 
-    def test_compute_kl_divergence_topk(self):
-        """Test the top-k logprob-based KL (CPU fallback)."""
-        from eval.kl_divergence import compute_kl_divergence
-
-        # Identical top-k dicts → KL ≈ 0
-        teacher = [{"a": -0.5, "b": -1.0, "c": -2.0}]
-        student = [{"a": -0.5, "b": -1.0, "c": -2.0}]
-        kl = compute_kl_divergence(teacher, student)
-        self.assertAlmostEqual(kl, 0.0, places=5)
-
-        # Different dicts → KL > 0
-        student2 = [{"a": -2.0, "b": -0.5, "c": -1.0}]
-        kl2 = compute_kl_divergence(teacher, student2)
-        self.assertGreater(kl2, 0.0)
-
-        # Empty inputs → inf
-        kl3 = compute_kl_divergence([], [])
-        self.assertEqual(kl3, float("inf"))
+    # 2026-05-04 — test_compute_kl_divergence_topk removed: the
+    # ``compute_kl_divergence`` CPU fallback was deleted in the
+    # 2026-04-04 validator rewrite (see
+    # reports/2026-04-04-validator-rewrite.md). Sparse top-K KL now
+    # lives in scripts/pod_eval_vllm.py:compute_kl_from_sparse and is
+    # exercised end-to-end by the integration suite. Keeping the
+    # orphan stub here only added a hard-failing import.
 
     def test_zero_gen_len_returns_inf(self):
         """evaluate_student_kl should return inf when gen_len=0."""
@@ -244,7 +233,13 @@ class TestEarlyStopping(unittest.TestCase):
 
 
 class TestScoring(unittest.TestCase):
-    """Test winner-take-all scoring logic."""
+    """Failure / staleness tracking still lives in eval.scoring; the
+    legacy ``compute_winner_weights`` and ``update_ema`` API was removed
+    in the 2026-04-04 validator rewrite (see
+    reports/2026-04-04-validator-rewrite.md). The composite ranking now
+    lives in scripts/validator/composite.py and is exercised by
+    tests/test_arena_v3_composite.py + tests/test_eval_pipeline.py.
+    """
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -253,123 +248,6 @@ class TestScoring(unittest.TestCase):
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
-
-    def test_winner_takes_all_basic(self):
-        """Best KL gets weight=1.0, everyone else gets 0.0."""
-        from eval.scoring import compute_winner_weights
-
-        scores = {"0": 0.5, "1": 0.3, "2": 0.8}
-        failures = {}
-        weights, winner, best_kl = compute_winner_weights(
-            scores, failures, n_uids=3, state_dir=self.state_dir
-        )
-        self.assertEqual(winner, 1)
-        self.assertAlmostEqual(best_kl, 0.3)
-        self.assertAlmostEqual(weights[1], 1.0)
-        self.assertAlmostEqual(weights[0], 0.0)
-        self.assertAlmostEqual(weights[2], 0.0)
-
-    def test_max_kl_filter(self):
-        """Scores above max_kl should be excluded."""
-        from eval.scoring import compute_winner_weights
-
-        scores = {"0": 3.0, "1": 2.5}
-        failures = {}
-        weights, winner, best_kl = compute_winner_weights(
-            scores, failures, n_uids=2, max_kl=2.0, state_dir=self.state_dir
-        )
-        # Both above max_kl → no winner
-        self.assertIsNone(winner)
-        self.assertEqual(best_kl, float("inf"))
-
-    def test_zero_kl_excluded(self):
-        """KL ≤ 0 should be excluded (suspicious)."""
-        from eval.scoring import compute_winner_weights
-
-        scores = {"0": 0.0, "1": -0.5, "2": 0.1}
-        failures = {}
-        weights, winner, best_kl = compute_winner_weights(
-            scores, failures, n_uids=3, state_dir=self.state_dir
-        )
-        # UID 2 is the only valid one
-        self.assertEqual(winner, 2)
-        self.assertAlmostEqual(weights[2], 1.0)
-
-    def test_stale_failure_excluded(self):
-        """Miners with too many failures should be excluded."""
-        from eval.scoring import compute_winner_weights
-
-        scores = {"0": 0.1, "1": 0.2}
-        failures = {"0": 5}  # Too many failures
-        weights, winner, best_kl = compute_winner_weights(
-            scores, failures, n_uids=2, max_failures=3, state_dir=self.state_dir
-        )
-        self.assertEqual(winner, 1)  # UID 0 excluded
-
-    def test_no_candidates(self):
-        """Empty scores → no winner."""
-        from eval.scoring import compute_winner_weights
-
-        weights, winner, best_kl = compute_winner_weights(
-            {}, {}, n_uids=5, state_dir=self.state_dir
-        )
-        self.assertIsNone(winner)
-        self.assertEqual(best_kl, float("inf"))
-        self.assertEqual(sum(weights), 0.0)
-
-    def test_single_candidate(self):
-        """Single valid miner gets all weight."""
-        from eval.scoring import compute_winner_weights
-
-        scores = {"3": 0.15}
-        weights, winner, best_kl = compute_winner_weights(
-            scores, {}, n_uids=5, state_dir=self.state_dir
-        )
-        self.assertEqual(winner, 3)
-        self.assertAlmostEqual(weights[3], 1.0)
-        self.assertAlmostEqual(sum(weights), 1.0)
-
-    def test_uids_beyond_n_uids_expand(self):
-        """Scores with UIDs beyond n_uids should expand the weights array."""
-        from eval.scoring import compute_winner_weights
-
-        scores = {"10": 0.2}
-        weights, winner, _ = compute_winner_weights(
-            scores, {}, n_uids=5, state_dir=self.state_dir
-        )
-        self.assertGreater(len(weights), 10)
-        self.assertEqual(winner, 10)
-
-    def test_disqualified_excluded(self):
-        """Disqualified miners should not receive weight."""
-        from eval.scoring import compute_winner_weights, save_disqualified
-
-        dq = {"0": "cheating"}
-        save_disqualified(dq, self.state_dir)
-
-        scores = {"0": 0.05, "1": 0.15}
-        weights, winner, _ = compute_winner_weights(
-            scores, {}, n_uids=2, state_dir=self.state_dir
-        )
-        self.assertEqual(winner, 1)  # UID 0 is DQ'd
-
-    def test_ema_update(self):
-        """EMA update should blend old and new scores."""
-        from eval.scoring import update_ema
-
-        scores = {"0": 0.5}
-        new_ema = update_ema(0, 0.3, scores, alpha=0.3)
-        # EMA = 0.3 * 0.3 + 0.7 * 0.5 = 0.09 + 0.35 = 0.44
-        self.assertAlmostEqual(new_ema, 0.44, places=5)
-        self.assertAlmostEqual(scores["0"], 0.44, places=5)
-
-    def test_ema_first_score(self):
-        """First EMA score should be the raw value."""
-        from eval.scoring import update_ema
-
-        scores = {}
-        new_ema = update_ema(5, 0.25, scores)
-        self.assertAlmostEqual(new_ema, 0.25)
 
     def test_failure_tracking(self):
         """Failure count should increment and reset correctly."""
@@ -454,37 +332,6 @@ class TestModelChecker(unittest.TestCase):
         self.assertEqual(result["total_params"], 0)
         self.assertFalse(result["is_moe"])
 
-    def test_disqualification_by_hotkey_block(self):
-        """DQ should match on hotkey:block pair."""
-        from eval.scoring import disqualify, is_disqualified
-
-        dq = {}
-        disqualify("5HotKey123", "copied model", dq, commit_block=100)
-
-        self.assertTrue(is_disqualified(0, "5HotKey123", dq, commit_block=100))
-        # Different commit block should NOT be DQ'd
-        self.assertFalse(is_disqualified(0, "5HotKey123", dq, commit_block=200))
-
-    def test_disqualification_legacy_uid(self):
-        """Legacy DQ by UID string should work when commit_block is None."""
-        from eval.scoring import is_disqualified
-
-        dq = {"42": "bad model"}
-        self.assertTrue(is_disqualified(42, "5SomeKey", dq, commit_block=None))
-        # With a commit_block, legacy UID DQ shouldn't match
-        self.assertFalse(is_disqualified(42, "5SomeKey", dq, commit_block=100))
-
-    def test_flagging_coldkey_hf(self):
-        """Flagging coldkey/HF username should work."""
-        from eval.scoring import disqualify, is_flagged
-
-        dq = {}
-        disqualify("5HotKey", "reason", dq, coldkey="5ColdKey", hf_username="baduser")
-
-        self.assertIsNotNone(is_flagged(coldkey="5ColdKey", dq=dq))
-        self.assertIsNotNone(is_flagged(hf_username="baduser", dq=dq))
-        self.assertIsNone(is_flagged(coldkey="5CleanKey", dq=dq))
-
     def test_duplicate_hash_detection(self):
         """Duplicate model hash should be detected."""
         from eval.model_checker import register_model_hash, check_duplicate_hash
@@ -506,16 +353,16 @@ class TestModelChecker(unittest.TestCase):
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def test_commitment_changed(self):
-        """Commitment change detection should work."""
-        from eval.scoring import commitment_changed
-
-        cache = {"0": {"model": "user/model-v1", "revision": "main"}}
-
-        self.assertFalse(commitment_changed(0, "user/model-v1", "main", cache))
-        self.assertTrue(commitment_changed(0, "user/model-v2", "main", cache))
-        self.assertTrue(commitment_changed(0, "user/model-v1", "abc123", cache))
-        self.assertTrue(commitment_changed(1, "user/model-v1", "main", cache))
+    # 2026-05-04 — Removed orphan tests for legacy validator-rewrite
+    # API:
+    #   * test_disqualification_by_hotkey_block / _legacy_uid
+    #   * test_flagging_coldkey_hf
+    #   * test_commitment_changed
+    # The functions disqualify(), is_disqualified(), is_flagged(),
+    # commitment_changed() were folded into eval/scoring.py +
+    # scripts/validator/single_eval.py during the 2026-04-04 rewrite.
+    # Equivalent end-to-end coverage now lives in
+    # tests/test_eval_pipeline.py.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -711,17 +558,12 @@ class TestStateConsistency(unittest.TestCase):
         # NOT DQ'd for new commit 200
         self.assertFalse(is_disqualified(0, "5HotKey", dq, commit_block=200))
 
-    def test_commitment_cache_persistence(self):
-        """Commitment cache should persist correctly."""
-        from eval.scoring import save_commitment_cache, load_commitment_cache
-
-        cache = {
-            "0": {"model": "user/model-v1", "revision": "main"},
-            "5": {"model": "user/model-v2", "revision": "abc123"},
-        }
-        save_commitment_cache(cache, self.state_dir)
-        loaded = load_commitment_cache(self.state_dir)
-        self.assertEqual(loaded, cache)
+    # 2026-05-04 — Removed test_commitment_cache_persistence: the
+    # save/load_commitment_cache helpers were removed in the
+    # 2026-04-04 validator rewrite. Commitments are now read directly
+    # from the chain via bittensor.Subtensor.get_all_revealed_commitments
+    # and cached in api/state_store.py:read_commitments() with a
+    # different on-disk schema.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

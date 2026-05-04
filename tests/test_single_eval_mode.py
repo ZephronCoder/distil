@@ -218,7 +218,13 @@ class SelectChallengersSingleEvalTests(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("SINGLE_EVAL_MODE", None)
 
-    def test_returns_only_never_composite_scored(self):
+    def test_returns_never_scored_plus_king(self):
+        """Single-eval planner returns: (a) all UIDs that have NEVER
+        been composite-scored, plus (b) the current king (always
+        force-eligible since 2026-04-27 — Discord coffieex/crypsick
+        flagged variance across procedural shards). Test renamed
+        from ``test_returns_only_never_composite_scored`` to reflect
+        the new contract."""
         from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
         state = _FakeState()
         state.composite_scores = {
@@ -236,7 +242,8 @@ class SelectChallengersSingleEvalTests(unittest.TestCase):
         challengers = ch_mod.select_challengers(
             valid_models, state, king_uid=1, king_kl=0.1, epoch_count=1,
         )
-        self.assertEqual(set(challengers.keys()), {2, 3})
+        # King (1) re-evaled + never-scored (2, 3).
+        self.assertEqual(set(challengers.keys()), {1, 2, 3})
 
     def test_forces_king_when_composite_version_stale(self):
         """v27: when the king's stored composite is from an older schema

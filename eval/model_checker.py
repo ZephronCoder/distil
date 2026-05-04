@@ -175,21 +175,64 @@ def get_safetensors_param_count(model_repo: str, revision: str = None) -> float:
     return -1.0
 
 
-def get_embed_weight_shape(model_repo: str, revision: str = None) -> Optional[tuple[int, int]]:
-    """Read the actual shape of ``model.embed_tokens.weight`` from the safetensors
-    headers without downloading any tensor data.
+_EMBED_KEYS = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+    "language_model.model.embed_tokens.weight",
+    "transformer.wte.weight",
+)
+_FLOAT_DTYPES = ("BF16", "F16", "F32", "F64", "F8_E4M3", "F8_E5M2")
+_QUANT_TENSOR_MARKERS = (
+    ".absmax",
+    ".quant_map",
+    ".nested_absmax",
+    ".nested_quant_map",
+    ".quant_state.",
+    ".SCB",
+    ".weight_format",
+    ".g_idx",
+    "qweight",
+    "qzeros",
+    "scales",
+)
 
-    Used to catch the precheck-bypass pattern where a miner ships a config
+
+def _read_safetensors_header(session, url: str) -> Optional[dict]:
+    """Fetch the JSON header of a safetensors file via HTTP range requests."""
+    import struct
+    pr = session.get(url, headers={'Range': 'bytes=0-7'}, timeout=30,
+                     stream=True, allow_redirects=True)
+    pr.raise_for_status()
+    prefix = pr.raw.read(8)
+    pr.close()
+    if len(prefix) != 8:
+        return None
+    header_size = struct.unpack('<Q', prefix)[0]
+    if header_size <= 0 or header_size > 8_000_000:
+        return None
+    header_len = 8 + header_size
+    hr = session.get(url, headers={'Range': f'bytes=0-{header_len - 1}'},
+                     timeout=60, stream=True, allow_redirects=True)
+    hr.raise_for_status()
+    blob = hr.raw.read(header_len)
+    hr.close()
+    return json.loads(blob[8:header_len].decode('utf-8'))
+
+
+def get_embed_weight_shape(model_repo: str, revision: str = None) -> Optional[tuple[int, int, str]]:
+    """Read the actual shape + dtype of ``model.embed_tokens.weight`` from the
+    safetensors headers without downloading any tensor data.
+
+    Used to catch precheck-bypass patterns where a miner ships a config
     that *claims* the teacher's vocab_size (passes the config-only check)
     but the actual checkpoint weights are an older/smaller vocab and so
     the model fails to load on the eval pod (Reinit due to size mismatch
     → silent DQ at load time, wasting an eval slot).
 
-    Returns ``(vocab_size, hidden_dim)`` from the embed table, or None if
-    the tensor cannot be located (e.g. non-standard architecture or only
-    pytorch_model.bin shards).
+    Returns ``(vocab_size, hidden_dim, dtype)`` from the embed table, or
+    None if the tensor cannot be located (e.g. non-standard architecture
+    or only pytorch_model.bin shards).
     """
-    import struct
     try:
         from huggingface_hub import hf_hub_url
         info = model_info(model_repo, revision=revision, files_metadata=True)
@@ -198,39 +241,72 @@ def get_embed_weight_shape(model_repo: str, revision: str = None) -> Optional[tu
         )
         if not st_files:
             return None
-        embed_keys = (
-            "model.embed_tokens.weight",
-            "model.language_model.embed_tokens.weight",
-            "language_model.model.embed_tokens.weight",
-            "transformer.wte.weight",
-        )
         with _requests.Session() as session:
             session.headers.update({'Accept-Encoding': 'identity'})
             for fname in st_files:
                 url = hf_hub_url(repo_id=model_repo, filename=fname, revision=revision)
-                pr = session.get(url, headers={'Range': 'bytes=0-7'}, timeout=30,
-                                 stream=True, allow_redirects=True)
-                pr.raise_for_status()
-                prefix = pr.raw.read(8); pr.close()
-                if len(prefix) != 8:
+                hj = _read_safetensors_header(session, url)
+                if hj is None:
                     continue
-                header_size = struct.unpack('<Q', prefix)[0]
-                if header_size <= 0 or header_size > 8_000_000:
-                    continue
-                header_len = 8 + header_size
-                hr = session.get(url, headers={'Range': f'bytes=0-{header_len - 1}'},
-                                 timeout=60, stream=True, allow_redirects=True)
-                hr.raise_for_status()
-                blob = hr.raw.read(header_len); hr.close()
-                hj = json.loads(blob[8:header_len].decode('utf-8'))
-                for key in embed_keys:
+                for key in _EMBED_KEYS:
                     if key in hj:
                         shape = hj[key].get("shape") or []
+                        dtype = hj[key].get("dtype") or "?"
                         if len(shape) >= 2:
-                            return int(shape[0]), int(shape[1])
+                            return int(shape[0]), int(shape[1]), dtype
         return None
     except Exception as e:
         logger.warning(f"Embed shape probe failed for {model_repo}: {e}")
+        return None
+
+
+def detect_safetensors_quantization(model_repo: str, revision: str = None) -> Optional[dict]:
+    """Detect quantized weights via tensor-name signatures in safetensors headers.
+
+    Catches the bypass pattern where a miner strips ``quantization_config``
+    from ``config.json`` (so step 5 of arch precheck sees an unquantized
+    config) while shipping the actual safetensors as bitsandbytes-NF4 /
+    GPTQ / AWQ packed tensors. The eval pod tries to load these as bf16
+    and dies with "ignore_mismatched_sizes=False" or similar — wasting a
+    slot per fraudulent UID.
+
+    Returns ``{"quantized": True, "scheme": <label>, "marker": <name>}``
+    when the first shard contains a known quantization marker tensor, or
+    ``None`` when the model appears unquantized. We only inspect the
+    first shard for speed (quantization is uniform across shards).
+    """
+    try:
+        from huggingface_hub import hf_hub_url
+        info = model_info(model_repo, revision=revision, files_metadata=True)
+        st_files = sorted(
+            [s.rfilename for s in (info.siblings or []) if s.rfilename.endswith('.safetensors')]
+        )
+        if not st_files:
+            return None
+        with _requests.Session() as session:
+            session.headers.update({'Accept-Encoding': 'identity'})
+            url = hf_hub_url(repo_id=model_repo, filename=st_files[0], revision=revision)
+            hj = _read_safetensors_header(session, url)
+            if hj is None:
+                return None
+            for key in hj:
+                if key == "__metadata__":
+                    continue
+                lower = key.lower()
+                for marker in _QUANT_TENSOR_MARKERS:
+                    if marker in lower:
+                        if "absmax" in marker or "quant_map" in marker:
+                            scheme = "bitsandbytes"
+                        elif "qweight" in marker or "qzeros" in marker:
+                            scheme = "gptq/awq"
+                        elif "scb" in marker:
+                            scheme = "bitsandbytes-int8"
+                        else:
+                            scheme = "unknown_quant"
+                        return {"quantized": True, "scheme": scheme, "marker": key}
+        return None
+    except Exception as e:
+        logger.warning(f"Quantization probe failed for {model_repo}: {e}")
         return None
 
 
@@ -1283,33 +1359,98 @@ def check_model_architecture(
                 "vocab_size": vocab_size,
             }
 
-        # 6b. Cross-check the actual embed_tokens weight shape against
-        # config.vocab_size. Catches the bypass where a miner publishes
-        # a config claiming the teacher's vocab (passes 6) but the
-        # underlying safetensors hold an older / smaller embed table —
-        # those models fail to load with a Reinit-mismatch error on the
-        # eval pod (~50s of pod time wasted per slot before the silent
-        # DQ). Reading the header is just a few KB per shard, so this
-        # is essentially free at precheck time.
+        # 6b. Cross-check the actual ``model.embed_tokens.weight`` shape +
+        # dtype against the config. Catches three bypass patterns that
+        # all silently DQ on the eval pod (~50s of pod time wasted each):
+        #
+        #   (a) Wrong vocab — config claims teacher vocab_size but weights
+        #       are an older/smaller embed table (e.g. Llama-3 128256 or
+        #       Qwen2.5 152064). Triggers Reinit-mismatch at load time.
+        #
+        #   (b) Wrong hidden_size — config claims hidden_size=2048 but
+        #       embed table is (vocab, 256) because the miner shipped a
+        #       4-bit-packed table without disclosing it. Triggers the
+        #       same load-time error.
+        #
+        #   (c) Quantized embed dtype — embed dtype is U8/U16/U32 (not
+        #       F16/BF16/F32). bf16 student loaders can't reinterpret a
+        #       packed integer embed table.
+        #
+        # All three are detectable from the safetensors header (a few KB
+        # per shard), so the check is essentially free at precheck time.
         try:
-            embed_shape = get_embed_weight_shape(model_repo, revision)
-            if embed_shape is not None:
-                embed_vocab, _embed_hidden = embed_shape
+            embed_info = get_embed_weight_shape(model_repo, revision)
+            if embed_info is not None:
+                embed_vocab, embed_hidden, embed_dtype = embed_info
                 if embed_vocab != BASELINE_VOCAB_SIZE:
                     return {
                         "pass": False,
                         "reason": (
                             f"Embed table size {embed_vocab} ≠ {BASELINE_VOCAB_SIZE} "
-                            f"(teacher). Config claims {vocab_size} but actual "
-                            f"weights are an older vocab — model would fail to "
-                            f"load on the eval pod."
+                            f"(teacher). Config claims vocab_size={vocab_size} but "
+                            f"actual weights are an older vocab — model would fail "
+                            f"to load on the eval pod."
                         ),
                         "params_b": total_params_b,
                         "vocab_size": vocab_size,
                         "embed_vocab": embed_vocab,
                     }
+                cfg_hidden = config.get("hidden_size") or config.get(
+                    "text_config", {}
+                ).get("hidden_size")
+                if cfg_hidden and embed_hidden != int(cfg_hidden):
+                    return {
+                        "pass": False,
+                        "reason": (
+                            f"Embed hidden_size {embed_hidden} ≠ {int(cfg_hidden)} "
+                            f"(declared in config). Mismatched packed/quantized "
+                            f"embed table — would fail to load on the eval pod."
+                        ),
+                        "params_b": total_params_b,
+                        "vocab_size": vocab_size,
+                        "embed_hidden": embed_hidden,
+                        "config_hidden": int(cfg_hidden),
+                    }
+                if embed_dtype.upper() not in _FLOAT_DTYPES:
+                    return {
+                        "pass": False,
+                        "reason": (
+                            f"Embed table dtype {embed_dtype} is not a valid float "
+                            f"format (must be one of {','.join(_FLOAT_DTYPES)}). "
+                            f"Looks like a packed/quantized embed without disclosed "
+                            f"quantization_config — would fail to load on the eval pod."
+                        ),
+                        "params_b": total_params_b,
+                        "embed_dtype": embed_dtype,
+                    }
         except Exception as embed_err:
             logger.warning(f"Embed shape precheck error for {model_repo}: {embed_err}")
+
+        # 6c. Detect quantized weights even when ``quantization_config``
+        # is absent from config.json. Step 5 already catches honest
+        # quantized models (config.quantization_config set); this step
+        # covers the bypass where the miner strips that field but the
+        # safetensors still contain bitsandbytes / GPTQ / AWQ marker
+        # tensors (.absmax, .quant_map, qweight, qzeros, etc.). Eval-pod
+        # bf16 loader rejects these with "ignore_mismatched_sizes=False"
+        # — wasting an eval slot per fraudulent UID. We probe only the
+        # first shard since quantization is uniform across shards.
+        try:
+            quant_info = detect_safetensors_quantization(model_repo, revision)
+            if quant_info is not None:
+                return {
+                    "pass": False,
+                    "reason": (
+                        f"FRAUD: Quantized weights detected ({quant_info['scheme']} "
+                        f"via tensor '{quant_info['marker']}') but config.json "
+                        f"has no quantization_config. Subnet requires bf16/fp16 "
+                        f"weights — strip quantization before re-uploading."
+                    ),
+                    "params_b": total_params_b,
+                    "quant_scheme": quant_info["scheme"],
+                }
+        except Exception as quant_err:
+            logger.warning(f"Quantization precheck error for {model_repo}: {quant_err}")
 
         # 7a. Tokenizer file hash check REMOVED — different transformers versions
         # materialize extra_special_tokens into tokenizer.json differently (cosmetic).

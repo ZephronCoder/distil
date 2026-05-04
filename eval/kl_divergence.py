@@ -89,12 +89,16 @@ def compute_kl_from_logits(
             teacher_logits[i:j].float(), student_logits[i:j].float()
         )
 
+    n_positions = int(kl_per_pos.shape[0])
+    kl_std = (
+        float(kl_per_pos.std().item()) if n_positions >= 2 else 0.0
+    )
     return {
         "kl_mean": kl_per_pos.mean().item(),
-        "kl_std": kl_per_pos.std().item(),
+        "kl_std": kl_std,
         "kl_max": kl_per_pos.max().item(),
         "kl_min": kl_per_pos.min().item(),
-        "n_positions": int(kl_per_pos.shape[0]),
+        "n_positions": n_positions,
     }
 
 

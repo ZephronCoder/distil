@@ -9,11 +9,9 @@
     "configVocabSize": 163840,
     "maxStudentParams": 33000000000,
     "studentArchAllowlist": [
-      {"model_type": "kimi_k2", "architecture": "DeepseekV3ForCausalLM"},
-      {"model_type": "deepseek_v3", "architecture": "DeepseekV3ForCausalLM"},
-      {"model_type": "kimi_k25", "architecture": "KimiK25ForConditionalGeneration"}
+      {"model_type": "deepseek_v3", "architecture": "DeepseekV3ForCausalLM"}
     ],
-    "rolloutNotes": "Hard cutover from Qwen3.6-35B-A3B to Kimi K2.6 on 2026-05-02. Teacher is the multimodal wrapper (model_type=kimi_k25) whose text inner is DeepSeek V3 MoE (61 layers, 384 experts, 8 active, ~32B active / ~1T total). Students must match the Kimi tokenizer (BPE vocab 163,840) and use one of the allowed Kimi-family architectures \u2014 typically the text-only DeepseekV3ForCausalLM. Student size cap is 33B total params (was 40B). Teacher-side cross-tokenizer (Path A) is disabled because student and teacher now share the Kimi tokenizer."
+    "rolloutNotes": "Hard cutover from Qwen3.6-35B-A3B to Kimi K2.6 on 2026-05-02. Teacher is the multimodal wrapper (model_type=kimi_k25) whose text inner is DeepSeek V3 MoE (61 layers, 384 experts, 8 active, ~32B active / ~1T total). Students must match the Kimi tokenizer (BPE vocab 163,840) and use the text-only DeepseekV3ForCausalLM architecture with model_type=deepseek_v3 (transformers built-in, no custom code required). Student size cap is 33B total params (was 40B). 2026-05-04: removed model_type=kimi_k2 and KimiK25ForConditionalGeneration from the student allowlist \u2014 both require shipping custom modeling code which our trust_remote_code policy forbids; students kept getting silently DQ\u2019d on the eval pod with \"Transformers does not recognize this architecture\". Teacher-side cross-tokenizer (Path A) is disabled because student and teacher now share the Kimi tokenizer."
   },
   "previousTeacher": {
     "model": "Qwen/Qwen3.6-35B-A3B",
