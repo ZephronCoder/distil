@@ -175,6 +175,65 @@ def get_safetensors_param_count(model_repo: str, revision: str = None) -> float:
     return -1.0
 
 
+def get_embed_weight_shape(model_repo: str, revision: str = None) -> Optional[tuple[int, int]]:
+    """Read the actual shape of ``model.embed_tokens.weight`` from the safetensors
+    headers without downloading any tensor data.
+
+    Used to catch the precheck-bypass pattern where a miner ships a config
+    that *claims* the teacher's vocab_size (passes the config-only check)
+    but the actual checkpoint weights are an older/smaller vocab and so
+    the model fails to load on the eval pod (Reinit due to size mismatch
+    → silent DQ at load time, wasting an eval slot).
+
+    Returns ``(vocab_size, hidden_dim)`` from the embed table, or None if
+    the tensor cannot be located (e.g. non-standard architecture or only
+    pytorch_model.bin shards).
+    """
+    import struct
+    try:
+        from huggingface_hub import hf_hub_url
+        info = model_info(model_repo, revision=revision, files_metadata=True)
+        st_files = sorted(
+            [s.rfilename for s in (info.siblings or []) if s.rfilename.endswith('.safetensors')]
+        )
+        if not st_files:
+            return None
+        embed_keys = (
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.model.embed_tokens.weight",
+            "transformer.wte.weight",
+        )
+        with _requests.Session() as session:
+            session.headers.update({'Accept-Encoding': 'identity'})
+            for fname in st_files:
+                url = hf_hub_url(repo_id=model_repo, filename=fname, revision=revision)
+                pr = session.get(url, headers={'Range': 'bytes=0-7'}, timeout=30,
+                                 stream=True, allow_redirects=True)
+                pr.raise_for_status()
+                prefix = pr.raw.read(8); pr.close()
+                if len(prefix) != 8:
+                    continue
+                header_size = struct.unpack('<Q', prefix)[0]
+                if header_size <= 0 or header_size > 8_000_000:
+                    continue
+                header_len = 8 + header_size
+                hr = session.get(url, headers={'Range': f'bytes=0-{header_len - 1}'},
+                                 timeout=60, stream=True, allow_redirects=True)
+                hr.raise_for_status()
+                blob = hr.raw.read(header_len); hr.close()
+                hj = json.loads(blob[8:header_len].decode('utf-8'))
+                for key in embed_keys:
+                    if key in hj:
+                        shape = hj[key].get("shape") or []
+                        if len(shape) >= 2:
+                            return int(shape[0]), int(shape[1])
+        return None
+    except Exception as e:
+        logger.warning(f"Embed shape probe failed for {model_repo}: {e}")
+        return None
+
+
 def compute_model_hash(model_repo: str, revision: str = None) -> Optional[str]:
     """
     Get a stable identity hash for a model using HuggingFace API metadata.
@@ -1223,6 +1282,34 @@ def check_model_architecture(
                 "params_b": total_params_b,
                 "vocab_size": vocab_size,
             }
+
+        # 6b. Cross-check the actual embed_tokens weight shape against
+        # config.vocab_size. Catches the bypass where a miner publishes
+        # a config claiming the teacher's vocab (passes 6) but the
+        # underlying safetensors hold an older / smaller embed table —
+        # those models fail to load with a Reinit-mismatch error on the
+        # eval pod (~50s of pod time wasted per slot before the silent
+        # DQ). Reading the header is just a few KB per shard, so this
+        # is essentially free at precheck time.
+        try:
+            embed_shape = get_embed_weight_shape(model_repo, revision)
+            if embed_shape is not None:
+                embed_vocab, _embed_hidden = embed_shape
+                if embed_vocab != BASELINE_VOCAB_SIZE:
+                    return {
+                        "pass": False,
+                        "reason": (
+                            f"Embed table size {embed_vocab} ≠ {BASELINE_VOCAB_SIZE} "
+                            f"(teacher). Config claims {vocab_size} but actual "
+                            f"weights are an older vocab — model would fail to "
+                            f"load on the eval pod."
+                        ),
+                        "params_b": total_params_b,
+                        "vocab_size": vocab_size,
+                        "embed_vocab": embed_vocab,
+                    }
+        except Exception as embed_err:
+            logger.warning(f"Embed shape precheck error for {model_repo}: {embed_err}")
 
         # 7a. Tokenizer file hash check REMOVED — different transformers versions
         # materialize extra_special_tokens into tokenizer.json differently (cosmetic).

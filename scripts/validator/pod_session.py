@@ -534,12 +534,25 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                         "current_se": current.get("kl_running_se"),
                         "current_ci": current.get("ci_95"),
                         "current_best": current.get("best_kl_so_far"),
+                        # 2026-05-04: per-stage progress so the dashboard shows
+                        # "running bench: aime_bench (6/17)" instead of a
+                        # static "0/60 prompts" while probes/bench run for
+                        # ~25 min. The pod writes these via _set_stage().
+                        "current_stage": current.get("stage"),
+                        "bench_axis_idx": current.get("bench_axis_idx"),
+                        "bench_axis_total": current.get("bench_axis_total"),
                     })
                 else:
-                    for key in ("current_student", "current_prompt", "current_kl"):
+                    for key in (
+                        "current_student", "current_prompt", "current_kl",
+                        "current_stage", "bench_axis_idx", "bench_axis_total",
+                    ):
                         progress.pop(key, None)
-                if pod_phase in ("teacher_generation", "teacher_logits", "teacher_loading", "vllm_starting", "vllm_generating", "gpu_precompute", "loading_student"):
-                    progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
+                # Always propagate teacher_prompts_done so the dashboard's
+                # Phase A progress bar fills correctly even after we transition
+                # into student loading (the previous gate dropped the value
+                # the moment loading_student began, leaving the bar at 0).
+                progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
                 pod_completed = pod_progress.get("completed", [])
                 progress["completed"] = pod_completed
                 progress["students_done"] = len(pod_completed)

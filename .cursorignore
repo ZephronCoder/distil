@@ -1,0 +1,44 @@
+# Cursor / Codex hide bloat from agent context.
+# (.gitignore already covers commit-tracking; this file controls what the
+# editor and AI assistant *see*.) Keep this list minimal and accurate.
+
+# Frontend deps — 665MB, never edited
+frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+
+# Vendored example frameworks — explored on demand only
+examples/flue/
+
+# Build / cache artifacts
+**/__pycache__/
+**/*.pyc
+*.egg-info/
+distillation.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python virtual environments
+.venv/
+venv/
+**/.venv/
+**/venv/
+
+# Local validator state — large + churns constantly, agent rarely needs it
+state/api_cache/
+state/scoring_cache/
+state/teacher_cache*/
+state/eval_progress*.json
+benchmark_results/
+
+# Old archived state directories that were moved out of the repo
+state.bak.*/
+state.qwen.*/
+
+# Lock files (large, low-signal)
+frontend/package-lock.json
+
+# Generated transcripts / logs
+*.log
+*.log.gz
