@@ -68,6 +68,29 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+# 2026-05-04: Suppress the spammy ``GenerationMixin`` warning that
+# transformers emits on EVERY ``model.generate()`` call when both
+# ``max_new_tokens`` and ``max_length`` are present in the merged
+# ``GenerationConfig``. We always pass ``max_new_tokens`` explicitly
+# (which takes precedence) and don't care about the ``max_length``
+# inherited from ``config.json``. Without this filter every probe
+# floods the eval log with ~50 identical lines per student, drowning
+# out the actual progress markers that the dashboard parses. The
+# filter is scoped tightly so any *new* generation warning still
+# surfaces.
+import logging
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=r"Both `max_new_tokens`.*and `max_length`.*seem to have been set",
+    module=r"transformers\.generation\.utils",
+)
+try:
+    import transformers.generation.utils as _hf_genutils
+    _hf_genutils.logger.setLevel(logging.ERROR)
+except Exception:
+    pass
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # §2  Constants
 # ═══════════════════════════════════════════════════════════════════════════════

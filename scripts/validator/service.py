@@ -408,11 +408,21 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
     current_block_hash = cr.get("block_hash")
     n_prompts = len(prompt_texts) or (EVAL_PROMPTS_FULL if is_full_eval else EVAL_PROMPTS_H2H)
 
-    if not models_to_eval or king_uid is None or not prompt_texts or current_block is None:
+    # 2026-05-04: ``king_uid`` is allowed to be None for legitimate
+    # "no-king" rounds (e.g. the Kimi cutover dethroned the previous
+    # king; until a Kimi-era model is crowned, every round has
+    # king=None). The previous gate treated king=None as "missing
+    # required fields" and DELETED the in-flight pod eval on every
+    # validator restart — the eval would die after ~10 minutes of GPU
+    # work and the next epoch would re-pay the teacher API cost
+    # ($1+/round on OpenRouter) from scratch. We now only abort if the
+    # more fundamental fields are missing (no models, no prompts, no
+    # block) and let the resume path attach with king_uid=None.
+    if not models_to_eval or not prompt_texts or current_block is None:
         logger.warning(
             "Resume: persisted current_round missing required fields "
-            "(models=%d, king=%s, prompts=%d) — clearing and letting epoch plan fresh.",
-            len(models_to_eval), king_uid, len(prompt_texts),
+            "(models=%d, king=%s, prompts=%d, block=%s) — clearing and letting epoch plan fresh.",
+            len(models_to_eval), king_uid, len(prompt_texts), current_block,
         )
         pe = cr.get("pod_eval") or {}
         run_dir = pe.get("run_dir")

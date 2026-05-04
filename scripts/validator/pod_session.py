@@ -648,6 +648,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         "DISTIL_TEACHER_API_DISABLE_REASONING",
         "DISTIL_OPENROUTER_REFERER",
         "DISTIL_OPENROUTER_TITLE",
+        # 2026-05-04: Student-side knobs propagated through to the pod.
+        # ``DISTIL_STUDENT_BATCH_SIZE`` activates the v30.4 batched-forward
+        # path (currently dormant unless set) which gives a 2-3x wall-time
+        # win on the per-prompt KL loop. Without propagation the pod env
+        # never sees it and the pod falls back to single-prompt forwards.
+        "DISTIL_STUDENT_BATCH_SIZE",
     ):
         _v = os.environ.get(_propagate)
         if _v is not None:

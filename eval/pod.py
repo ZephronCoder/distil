@@ -195,12 +195,24 @@ class PodManager:
         """
         try:
             logger.info("Ensuring pod dependencies...")
+            # 2026-05-04: ``datasets`` was previously omitted, which made
+            # ``pod_eval_vllm._bench_load_pools`` log "datasets import
+            # failed: No module named 'datasets'" on every fresh pod. The
+            # round itself doesn't depend on it (v27+ generates bench
+            # items procedurally from block_seed) but several adjacent
+            # tools do — ``scripts/verify_round.py``,
+            # ``eval/dataset.py``, ``examples/distil_kl_train.py``, and
+            # the ``auto_benchmark.sh`` post-hoc evalscope verifier — so
+            # installing it removes a permanent log smell and unbreaks
+            # those paths if they're ever invoked from the pod. Pinning
+            # ``>=2.20`` matches what the rest of the repo expects.
             dep_result = self.exec(
                 "pip install --break-system-packages 'vllm>=0.19' accelerate -q 2>&1 | tail -1 && "
                 "pip install --break-system-packages 'transformers>=5.0' -q 2>&1 | tail -1 && "
-                "python3 -c 'import torch; import transformers; import vllm; "
+                "pip install --break-system-packages 'datasets>=2.20' -q 2>&1 | tail -1 && "
+                "python3 -c 'import torch; import transformers; import vllm; import datasets; "
                 "print(f\"torch={torch.__version__} transformers={transformers.__version__} "
-                "vllm={vllm.__version__} cuda={torch.cuda.is_available()}\")'"
+                "vllm={vllm.__version__} datasets={datasets.__version__} cuda={torch.cuda.is_available()}\")'"
             )
             logger.info(f"Pod deps: {dep_result.get('stdout', '').strip()}")
 
