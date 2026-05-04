@@ -382,6 +382,54 @@ def _pareto_dethrone_veto(
     }
 
 
+def _student_id(
+    models_to_eval: dict, uid: int, uid_to_hotkey: dict,
+) -> tuple[str, int | None]:
+    """(hotkey, commit_block) lookup with the canonical fallback chain.
+
+    The pattern ``models_to_eval[uid].get("hotkey", uid_to_hotkey[uid])``
+    + ``models_to_eval[uid].get("commit_block")`` was inlined ~14 times
+    in process_results before this helper. Centralising avoids "uid X
+    DQ'd against the wrong hotkey" bugs when models_to_eval is missing
+    a key (which happens during the cross-round king fallback path
+    where models_to_eval may not contain the prior king).
+    """
+    info = models_to_eval.get(uid, {}) or {}
+    hotkey = info.get("hotkey") or uid_to_hotkey.get(uid, str(uid))
+    commit_block = info.get("commit_block")
+    return hotkey, commit_block
+
+
+def _dq_student(
+    *,
+    state, uid: int, model_name: str, hotkey: str, commit_block: int | None,
+    reason: str, label: str,
+    log_event_msg: str | None = None, log_event_level: str = "warning",
+    mark_evaluated: bool = True,
+) -> None:
+    """Centralised "DQ this student now" cascade.
+
+    Standardises the four side-effects every per-student DQ branch in
+    ``process_results`` performs: emit a structured log line, optionally
+    persist a state-event entry, call ``disqualify``, push the student
+    to the MAX_KL_THRESHOLD+1 sentinel score, and add it to
+    ``evaluated_uids`` so the round-loop bookkeeping is consistent.
+
+    ``label`` is the human-readable failure category that goes into the
+    log (``ANTI-FINETUNE``, ``COPY``, ``LONG_FORM_INCOHERENCE``, ...).
+    Pass ``mark_evaluated=False`` to skip the evaluated-uids add — only
+    used by paths that intentionally want the student retried next
+    round (none currently, but kept for future use).
+    """
+    logger.info(f"UID {uid} ({model_name}): {label} — {reason}")
+    if log_event_msg:
+        log_event(log_event_msg, level=log_event_level, state_dir=str(state.state_dir))
+    disqualify(hotkey, reason, state.dq_reasons, commit_block=commit_block)
+    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+    if mark_evaluated:
+        state.evaluated_uids.add(str(uid))
+
+
 def _run_dethrone_vetos(
     *,
     challenger_uid: int,
@@ -764,12 +812,12 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             copy_of = student_result.get("copy_of", "unknown")
             copy_uid = next((u for u, info in models_to_eval.items() if info["model"] == copy_of), None)
             reason = f"copy: functional copy of {copy_of}" + (f" (UID {copy_uid})" if copy_uid else "") + " — identical logit distribution"
-            logger.info(f"UID {uid} ({model_name}): FUNCTIONAL COPY — {reason}")
-            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-            hotkey = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-            commit_block = models_to_eval.get(uid, {}).get("commit_block")
-            disqualify(hotkey, reason, state.dq_reasons, commit_block=commit_block)
-            state.evaluated_uids.add(str(uid))
+            hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
+            _dq_student(
+                state=state, uid=uid, model_name=model_name,
+                hotkey=hotkey, commit_block=commit_block,
+                reason=reason, label="FUNCTIONAL COPY",
+            )
             continue
         fingerprint = student_result.get("activation_fingerprint")
         if fingerprint and fingerprint.get("layer_fingerprints"):
@@ -805,15 +853,16 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                         f"copy: activation-space duplicate of UID {orig_uid} ({orig_model}) — "
                         f"cosine similarity {sim:.6f} > {ACTIVATION_COPY_THRESHOLD}, committed later"
                     )
-                    logger.info(f"UID {uid} ({model_name}): ACTIVATION COPY — {reason}")
-                    log_event(
-                        f"Activation copy detected: UID {uid} is later-committed copy of UID {orig_uid} (sim={sim:.6f})",
-                        level="warning", state_dir=str(state.state_dir),
+                    hotkey, _ = _student_id(models_to_eval, uid, uid_to_hotkey)
+                    _dq_student(
+                        state=state, uid=uid, model_name=model_name,
+                        hotkey=hotkey, commit_block=this_commit_block,
+                        reason=reason, label="ACTIVATION COPY",
+                        log_event_msg=(
+                            f"Activation copy detected: UID {uid} is later-committed "
+                            f"copy of UID {orig_uid} (sim={sim:.6f})"
+                        ),
                     )
-                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    hotkey = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                    disqualify(hotkey, reason, state.dq_reasons, commit_block=this_commit_block)
-                    state.evaluated_uids.add(str(uid))
                     continue
                 logger.info(
                     f"UID {uid} ({model_name}): activation match with UID {copy_uid} ({copy_model}) "
@@ -822,12 +871,12 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 )
         if student_result.get("status") == "fraud_vram":
             reason = student_result.get("reason", "VRAM fraud detected")
-            logger.info(f"UID {uid} ({model_name}): {reason}")
-            hotkey = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-            commit_block = models_to_eval.get(uid, {}).get("commit_block")
-            disqualify(hotkey, reason, state.dq_reasons, commit_block=commit_block)
-            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-            state.evaluated_uids.add(str(uid))
+            hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
+            _dq_student(
+                state=state, uid=uid, model_name=model_name,
+                hotkey=hotkey, commit_block=commit_block,
+                reason=reason, label="FRAUD",
+            )
             continue
         if student_result.get("status") == "anti_finetune":
             probe = student_result.get("finetune_probe", {}) or {}
@@ -842,16 +891,13 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 f"Model cannot be continued-pretrained — see "
                 f"https://distil.arbos.life/docs#anti-finetune"
             )
-            logger.info(f"UID {uid} ({model_name}): {reason}")
-            log_event(
-                f"UID {uid} ({model_name}) DQ: anti-finetune ({detail})",
-                level="warning", state_dir=str(state.state_dir),
+            hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
+            _dq_student(
+                state=state, uid=uid, model_name=model_name,
+                hotkey=hotkey, commit_block=commit_block,
+                reason=reason, label="ANTI-FINETUNE",
+                log_event_msg=f"UID {uid} ({model_name}) DQ: anti-finetune ({detail})",
             )
-            hotkey = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-            commit_block = models_to_eval.get(uid, {}).get("commit_block")
-            disqualify(hotkey, reason, state.dq_reasons, commit_block=commit_block)
-            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-            state.evaluated_uids.add(str(uid))
             continue
         # 2026-05-01 (v30.4 patch v3): hard-DQ on long-form derail.
         # If the long_form_judge probe found that >50 percent of the
@@ -904,24 +950,18 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                         f"fresh hotkey on chain with a model that "
                         f"doesn't derail."
                     )
-                    logger.info(f"UID {uid} ({model_name}): {reason}")
-                    log_event(
-                        f"UID {uid} ({model_name}) DQ: long_form_incoherence "
-                        f"({derailed}/{len(per_prompt)} derailed)",
-                        level="warning", state_dir=str(state.state_dir),
+                    hotkey, commit_block = _student_id(
+                        models_to_eval, uid, uid_to_hotkey,
                     )
-                    hotkey = models_to_eval.get(uid, {}).get(
-                        "hotkey", uid_to_hotkey.get(uid, str(uid)),
+                    _dq_student(
+                        state=state, uid=uid, model_name=model_name,
+                        hotkey=hotkey, commit_block=commit_block,
+                        reason=reason, label="LONG_FORM_INCOHERENCE",
+                        log_event_msg=(
+                            f"UID {uid} ({model_name}) DQ: long_form_incoherence "
+                            f"({derailed}/{len(per_prompt)} derailed)"
+                        ),
                     )
-                    commit_block = models_to_eval.get(uid, {}).get(
-                        "commit_block",
-                    )
-                    disqualify(
-                        hotkey, reason, state.dq_reasons,
-                        commit_block=commit_block,
-                    )
-                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    state.evaluated_uids.add(str(uid))
                     continue
         speed_flag = student_result.get("speed_flag")
         if speed_flag:
@@ -929,12 +969,12 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         kl = student_result.get("kl_global_avg", float("inf"))
         if kl <= 1e-6:
             reason = f"FRAUD: KL={kl:.10f} — model produces identical outputs to teacher"
-            logger.info(f"UID {uid} ({model_name}): {reason}")
-            hotkey = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-            commit_block = models_to_eval.get(uid, {}).get("commit_block")
-            disqualify(hotkey, reason, state.dq_reasons, commit_block=commit_block)
-            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-            state.evaluated_uids.add(str(uid))
+            hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
+            _dq_student(
+                state=state, uid=uid, model_name=model_name,
+                hotkey=hotkey, commit_block=commit_block,
+                reason=reason, label="FRAUD",
+            )
             continue
         if kl == float("inf") or kl < 0:
             logger.warning(f"UID {uid}: invalid KL={kl}")
