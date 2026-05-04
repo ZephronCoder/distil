@@ -20321,7 +20321,20 @@ def main():
                             "per_prompt": judged_lf.get("per_prompt", []),
                             "scoring_time": round(dur, 1),
                             "in_composite": LONG_FORM_JUDGE_IN_COMPOSITE,
-                            "version": 1,
+                            # 2026-05-04 — propagate the per-axis derail
+                            # diagnostics so the validator-side derail-DQ
+                            # message can quote a real coherence_factor
+                            # instead of "None". Both fields are computed
+                            # in long_form_judge_teacher_score{,_api} but
+                            # were dropped from the payload pre-2026-05-04,
+                            # leading to misleading `aggregate factor=None`
+                            # text in disqualified.json entries.
+                            "coherence_factor": judged_lf.get("coherence_factor"),
+                            "termination_factor": judged_lf.get("termination_factor"),
+                            "normalized_pre_coherence": judged_lf.get(
+                                "normalized_pre_coherence"
+                            ),
+                            "version": 2,
                         }
                         if sn in results["students"]:
                             results["students"][sn]["long_form_judge_probe"] = payload

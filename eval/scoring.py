@@ -74,49 +74,80 @@ def save_disqualified(dq: dict[str, str], state_dir: Path = STATE_DIR):
 def disqualify(hotkey: str, reason: str, dq: dict[str, str],
                coldkey: str = None, hf_username: str = None,
                commit_block: int = None):
-    """Record a disqualification by hotkey + commit_block.
+    """Record a disqualification keyed on the bare hotkey.
 
-    DQ is per-commitment: if a miner re-registers with a new commit,
-    the old DQ doesn't carry over (they get a fresh chance).
+    2026-05-04 — DQ scope changed from per-(hotkey, commit_block) to
+    per-hotkey. Rationale: a miner whose model definitively misbehaved
+    (cheating, gibberish output, prohibited custom-code config, identical-
+    to-teacher fraud, etc.) should not be able to bypass the DQ by
+    pushing a new on-chain commit on the same hotkey. The new policy:
+    once a hotkey is DQ'd, the miner needs a fresh on-chain registration
+    (= new hotkey) to be re-evaluated. This burns ~0.5 TAO so it's a
+    real cost, but it caps validator pod time wasted on repeat-offender
+    hotkeys and pushes the cost of bad submissions onto the submitter.
 
-    Key format: "hotkey:block" when commit_block is provided.
-    Falls back to bare hotkey for legacy compatibility.
+    The ``commit_block`` parameter is kept on the signature for
+    backward-compat with existing callers but is no longer part of the
+    storage key — it's accepted and ignored. Existing entries that use
+    the legacy ``hotkey:block`` key format are honoured by
+    :func:`is_disqualified` via prefix-stripping; we don't migrate them
+    on disk to keep the historical record auditable.
 
     Optionally flags the coldkey and HF username as suspicious.
     These flags don't auto-DQ (to avoid false positives on shared orgs)
     but trigger enhanced scrutiny on future submissions.
     """
-    if commit_block is not None:
-        dq_key = f"{hotkey}:{commit_block}"
-    else:
-        dq_key = hotkey
-    dq[dq_key] = reason
-    # NOTE: No coldkey or HF username flags — policy is per-hotkey per-submission ONLY.
-    # Miners must be able to re-register on a fresh hotkey without inheriting bans.
-    # HF username flags removed — anyone can commit any HF account name,
-    # so flagging by HF username punishes innocent people. Only hotkey and
-    # coldkey are cryptographically tied to the committer.
+    # commit_block intentionally ignored — kept on signature for
+    # caller-side backward-compat; the storage key is the bare hotkey.
+    del commit_block
+    dq[hotkey] = reason
+    # NOTE: No coldkey or HF username flags — policy is per-hotkey ONLY.
+    # Miners can register a NEW hotkey to retry; the DQ does not propagate
+    # across coldkeys. HF username flags removed — anyone can commit any
+    # HF account name, so flagging by HF username punishes innocent people.
+    # Only hotkey is cryptographically tied to the on-chain committer.
+
+
+def _legacy_hotkey_dq_keys(hotkey: str, dq: dict[str, str]):
+    """Yield any legacy ``hotkey:<commit_block>`` entries in ``dq``.
+
+    Pre-2026-05-04 the DQ store keyed on ``hotkey:block`` so the same
+    hotkey could carry multiple entries (one per misbehaving commit).
+    The new per-hotkey policy uses the bare hotkey as the key, but we
+    must still recognise legacy entries during lookup so historical
+    DQ'd hotkeys remain DQ'd. Iterating once over ``dq`` is fine —
+    typical ``disqualified.json`` has <500 entries.
+    """
+    prefix = f"{hotkey}:"
+    for k in dq:
+        if k.startswith(prefix):
+            yield k
 
 
 def is_disqualified(uid: int, hotkey: str, dq: dict[str, str],
                     commit_block: int = None, **kwargs) -> bool:
-    """Check if a miner is disqualified for their current commitment.
+    """Check if a hotkey is disqualified.
 
-    DQ is per-hotkey per-submission only. We do NOT ban at the coldkey or
-    HF account level — miners should be able to participate fairly on
-    other keys even if one submission was DQ'd.
+    2026-05-04 — DQ scope is now per-hotkey (see :func:`disqualify`).
+    A new on-chain commit on the same hotkey does NOT clear the DQ;
+    the miner must register a new hotkey to be re-evaluated.
 
-    Checks:
-    1. hotkey:block (current commitment — precise match)
-    2. bare hotkey (legacy entries)
-    3. UID string (legacy entries from before hotkey migration)
+    Lookup order:
+      1. Bare hotkey (current per-hotkey policy).
+      2. Any legacy ``hotkey:<block>`` entry (pre-2026-05-04 stores).
+      3. UID string (very-legacy entries from before hotkey migration).
+
+    The ``commit_block`` parameter is kept on the signature for
+    backward-compat but no longer affects the lookup result — once a
+    hotkey is in ``dq`` for any reason at any commit, it stays DQ'd.
     """
-    if commit_block is not None and f"{hotkey}:{commit_block}" in dq:
+    del commit_block, kwargs
+    if hotkey and hotkey in dq:
         return True
-    if hotkey in dq:
-        return commit_block is None
+    if hotkey and any(True for _ in _legacy_hotkey_dq_keys(hotkey, dq)):
+        return True
     if str(uid) in dq:
-        return commit_block is None
+        return True
     return False
 
 
@@ -135,13 +166,23 @@ def is_flagged(coldkey: str = None, hf_username: str = None,
 
 def get_dq_reason(uid: int, hotkey: str, dq: dict[str, str],
                   commit_block: int = None, **kwargs) -> str:
-    """Get disqualification reason by hotkey:block, hotkey, or legacy UID."""
-    if commit_block is not None:
-        key = f"{hotkey}:{commit_block}"
-        if key in dq:
-            return dq[key]
-    if hotkey in dq:
+    """Resolve the DQ reason for a hotkey.
+
+    2026-05-04 — Mirrors :func:`is_disqualified` lookup order. The
+    ``commit_block`` parameter is kept on the signature but ignored.
+    Legacy ``hotkey:<block>`` entries are honoured; if multiple legacy
+    entries exist for the same hotkey, the most recently inserted one
+    wins (Python dict insertion order).
+    """
+    del commit_block, kwargs
+    if hotkey and hotkey in dq:
         return dq[hotkey]
+    if hotkey:
+        last_legacy = ""
+        for k in _legacy_hotkey_dq_keys(hotkey, dq):
+            last_legacy = dq[k]
+        if last_legacy:
+            return last_legacy
     return dq.get(str(uid), "")
 
 

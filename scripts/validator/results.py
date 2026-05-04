@@ -835,16 +835,24 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                         ):
                             sample_tail = r["response_preview"][-120:]
                             break
+                    coh_factor_str = (
+                        f"{coh_factor:.3f}"
+                        if isinstance(coh_factor, (int, float))
+                        else "n/a"
+                    )
                     reason = (
                         f"long_form_incoherence: {derailed}/"
                         f"{len(per_prompt)} long-form responses derailed "
                         f"(coherence<{_LF_DQ.THRESHOLD:.2f}; aggregate "
-                        f"factor={coh_factor}). Model cannot sustain "
-                        f"coherent generation past ~500 tokens — produces "
-                        f"word salad / multilingual mode / glossary "
-                        f"loops. Sample tail: …{sample_tail!r}. To get "
-                        f"another eval, register a new hotkey on chain "
-                        f"with a model that doesn't derail."
+                        f"coherence_factor={coh_factor_str}). Model "
+                        f"cannot sustain coherent generation past ~500 "
+                        f"tokens — produces word salad / multilingual "
+                        f"mode / glossary loops. Sample tail: "
+                        f"…{sample_tail!r}. DQ scope is per-hotkey: "
+                        f"a new on-chain commit on the SAME hotkey will "
+                        f"NOT clear this DQ. To re-eval, register a "
+                        f"fresh hotkey on chain with a model that "
+                        f"doesn't derail."
                     )
                     logger.info(f"UID {uid} ({model_name}): {reason}")
                     log_event(

@@ -43,23 +43,32 @@ def _failure_matches_commitment(fail_entry: str, commitment: dict) -> bool:
 
 
 def _dq_reason_for_commitment(uid: int, hotkey: str | None, commitment: dict | None, dq: dict):
-    """Resolve DQ using the same per-commit precedence everywhere.
+    """Resolve the DQ reason shown to API consumers for a UID's current commitment.
 
-    Most validator DQs are keyed as ``hotkey:commit_block``. Some older API
-    endpoints only checked UID or bare hotkey, which incorrectly showed
-    current-commit DQs as clean in compare/batch/eval-status views.
+    2026-05-04 — DQ scope changed from per-(hotkey, commit_block) to
+    per-hotkey: once a hotkey is DQ'd, a new on-chain commit on the same
+    hotkey does NOT clear the DQ. The miner needs a fresh registration
+    to be re-evaluated. The ``commitment`` arg is no longer consulted
+    for keying — kept on the signature so callers don't have to plumb
+    it out. Lookup order:
+      1. Bare hotkey (current policy).
+      2. Any legacy ``hotkey:<block>`` entry (pre-2026-05-04 stores).
+      3. UID string (very-legacy pre-hotkey-migration entries).
     """
+    del commitment
     uid_str = str(uid)
-    commit_block = commitment.get("block") if isinstance(commitment, dict) else None
-    if commit_block is not None and hotkey:
-        reason = dq.get(f"{hotkey}:{commit_block}")
-        if reason is not None:
-            return reason
-    if commit_block is None:
-        if uid_str in dq:
-            return dq.get(uid_str)
-        if hotkey and hotkey in dq:
-            return dq.get(hotkey)
+    if hotkey and hotkey in dq:
+        return dq.get(hotkey)
+    if hotkey:
+        prefix = f"{hotkey}:"
+        legacy_reason = None
+        for k, v in dq.items():
+            if k.startswith(prefix):
+                legacy_reason = v
+        if legacy_reason is not None:
+            return legacy_reason
+    if uid_str in dq:
+        return dq.get(uid_str)
     return None
 
 

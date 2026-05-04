@@ -546,17 +546,50 @@ class TestStateConsistency(unittest.TestCase):
         self.assertEqual(history[0]["block"], 1005)
         self.assertEqual(history[-1]["block"], 1009)
 
-    def test_disqualification_per_commitment(self):
-        """DQ should be per-commitment (hotkey:block), not permanent."""
+    def test_disqualification_is_per_hotkey(self):
+        """DQ is per-hotkey: a new commit_block on the same hotkey
+        does NOT clear the DQ. The miner must register a new hotkey
+        to be re-evaluated.
+
+        Policy change 2026-05-04 — see eval/scoring.py:disqualify.
+        Pre-2026-05-04 the DQ was per-(hotkey, commit_block) so a new
+        commit cleared the DQ; that let repeat-offender hotkeys waste
+        validator pod time round after round (e.g. UID 73 cascading
+        CUDA asserts across three rounds before stale-skip kicked in,
+        each time requiring a fresh load attempt). New scope: once a
+        hotkey is DQ'd it stays DQ'd until a new hotkey re-registers.
+        """
         from eval.scoring import disqualify, is_disqualified
 
         dq = {}
         disqualify("5HotKey", "bad model v1", dq, commit_block=100)
 
-        # DQ'd for commit 100
         self.assertTrue(is_disqualified(0, "5HotKey", dq, commit_block=100))
-        # NOT DQ'd for new commit 200
-        self.assertFalse(is_disqualified(0, "5HotKey", dq, commit_block=200))
+        self.assertTrue(is_disqualified(0, "5HotKey", dq, commit_block=200))
+        self.assertTrue(is_disqualified(0, "5HotKey", dq))
+        self.assertFalse(is_disqualified(0, "5OtherKey", dq, commit_block=100))
+
+    def test_disqualification_legacy_keys_recognised(self):
+        """Pre-2026-05-04 DQ entries used ``hotkey:<commit_block>`` keys.
+        ``is_disqualified`` and ``get_dq_reason`` must still recognise
+        those entries so historical DQ'd hotkeys remain DQ'd after the
+        per-hotkey policy migration.
+        """
+        from eval.scoring import get_dq_reason, is_disqualified
+
+        dq = {
+            "5HotKey:50": "legacy entry from pre-migration",
+            "5HotKey:75": "another legacy entry",
+        }
+        self.assertTrue(is_disqualified(0, "5HotKey", dq))
+        self.assertTrue(is_disqualified(0, "5HotKey", dq, commit_block=200))
+        # get_dq_reason returns one of the legacy entries (last wins
+        # by dict insertion order).
+        reason = get_dq_reason(0, "5HotKey", dq, commit_block=200)
+        self.assertIn("legacy entry", reason)
+        # An unrelated hotkey is unaffected by another hotkey's
+        # legacy entries.
+        self.assertFalse(is_disqualified(0, "5OtherKey", dq))
 
     # 2026-05-04 — Removed test_commitment_cache_persistence: the
     # save/load_commitment_cache helpers were removed in the
