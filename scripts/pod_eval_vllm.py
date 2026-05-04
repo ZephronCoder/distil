@@ -14396,9 +14396,7 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
         eos_ids = list(set(eos_ids)) or None
         pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
 
-        was_training = teacher.training
-        teacher.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(teacher):
             for prompt in think_prompts:
                 try:
                     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
@@ -14449,8 +14447,6 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
                     chat_gen_lens.append(int(new_ids.shape[0]))
                 except Exception as e:
                     print(f"[eval] Teacher chat-probe prompt failed: {e}", flush=True)
-        if was_training:
-            teacher.train()
     except Exception as e:
         print(f"[eval] prepare_teacher_probe_refs_hf error: {e}", flush=True)
     return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
