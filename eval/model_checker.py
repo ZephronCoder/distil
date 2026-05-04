@@ -1337,6 +1337,35 @@ def check_model_architecture(
         except Exception as e:
             logger.warning(f"Config vs file size cross-validation failed: {e}")
 
+        # 4c. Reject configs that need ``trust_remote_code=True`` to load.
+        # The validator runs students with TRC=False; any ``auto_map`` block
+        # at the top level OR in a nested sub-config (text_config /
+        # vision_config) means Transformers will refuse the load and the
+        # pod wastes ~30s + can crash with weird "NoneType is not iterable"
+        # paths inside the model code. Examples blocked here today:
+        # Godcat252/Besttop979 (text_config.auto_map → kimi_k25),
+        # zdsxc/disti-v1, sangerno63/will_be_top, bodenmaurice/distil-new-v3.
+        for _scope_label, _scope in (
+            ("config", config),
+            ("text_config", config.get("text_config") or {}),
+            ("vision_config", config.get("vision_config") or {}),
+        ):
+            am = _scope.get("auto_map") if isinstance(_scope, dict) else None
+            if am and isinstance(am, dict):
+                return {
+                    "pass": False,
+                    "reason": (
+                        f"{_scope_label}.auto_map is set ({sorted(am.keys())}); "
+                        f"this requires trust_remote_code=True at load time, "
+                        f"which the subnet does not allow for students. Native "
+                        f"loading via model_type={config.get('model_type')} "
+                        f"works without auto_map. Fix: delete the auto_map "
+                        f"block from {_scope_label} in config.json — no weight "
+                        f"or modeling changes are needed."
+                    ),
+                    "params_b": 0,
+                }
+
         # 5. Reject quantized models (GPTQ, AWQ, GGUF, etc.)
         quant_config = config.get("quantization_config", {})
         if quant_config:

@@ -90,6 +90,16 @@ try:
     _hf_genutils.logger.setLevel(logging.ERROR)
 except Exception:
     pass
+warnings.filterwarnings(
+    "ignore",
+    message=r"Using the latest cached version of the dataset since",
+)
+for _noisy_logger in ("datasets", "datasets.builder", "datasets.load",
+                       "huggingface_hub", "huggingface_hub.file_download"):
+    try:
+        logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # §2  Constants
@@ -151,6 +161,131 @@ def gpu_mem_str():
         total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         return f"{alloc:.1f}/{total:.1f}GB"
     return "N/A"
+
+
+_POD_EMBED_KEYS = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+    "language_model.model.embed_tokens.weight",
+    "transformer.wte.weight",
+)
+_POD_FLOAT_DTYPES = ("BF16", "F16", "F32", "F64", "F8_E4M3", "F8_E5M2")
+_POD_QUANT_TENSOR_MARKERS = (
+    ".absmax",
+    ".quant_map",
+    ".nested_absmax",
+    ".nested_quant_map",
+    ".quant_state.",
+    ".SCB",
+    ".weight_format",
+    ".g_idx",
+    "qweight",
+    "qzeros",
+    "scales",
+)
+
+
+def _pod_read_safetensors_header(session, url):
+    """Read a safetensors JSON header without downloading tensor data."""
+    import struct
+
+    pr = session.get(
+        url,
+        headers={"Range": "bytes=0-7"},
+        timeout=30,
+        stream=True,
+        allow_redirects=True,
+    )
+    pr.raise_for_status()
+    prefix = pr.raw.read(8)
+    pr.close()
+    if len(prefix) != 8:
+        return None
+    header_size = struct.unpack("<Q", prefix)[0]
+    if header_size <= 0 or header_size > 8_000_000:
+        return None
+    header_len = 8 + header_size
+    hr = session.get(
+        url,
+        headers={"Range": f"bytes=0-{header_len - 1}"},
+        timeout=60,
+        stream=True,
+        allow_redirects=True,
+    )
+    hr.raise_for_status()
+    blob = hr.raw.read(header_len)
+    hr.close()
+    return json.loads(blob[8:header_len].decode("utf-8"))
+
+
+def _pod_safetensor_files(model_repo, revision=None):
+    from huggingface_hub import HfApi
+
+    token = os.environ.get("HF_TOKEN") or None
+    info = HfApi(token=token).model_info(
+        repo_id=model_repo,
+        revision=revision,
+        files_metadata=True,
+    )
+    return sorted(
+        s.rfilename
+        for s in (info.siblings or [])
+        if getattr(s, "rfilename", "").endswith(".safetensors")
+    )
+
+
+def _pod_get_embed_weight_shape(model_repo, revision=None):
+    from huggingface_hub import hf_hub_url
+    import requests
+
+    st_files = _pod_safetensor_files(model_repo, revision)
+    if not st_files:
+        return None
+    with requests.Session() as session:
+        session.headers.update({"Accept-Encoding": "identity"})
+        for fname in st_files:
+            url = hf_hub_url(repo_id=model_repo, filename=fname, revision=revision)
+            header = _pod_read_safetensors_header(session, url)
+            if not header:
+                continue
+            for key in _POD_EMBED_KEYS:
+                if key in header:
+                    shape = header[key].get("shape") or []
+                    dtype = header[key].get("dtype") or "?"
+                    if len(shape) >= 2:
+                        return int(shape[0]), int(shape[1]), dtype
+    return None
+
+
+def _pod_detect_safetensors_quantization(model_repo, revision=None):
+    from huggingface_hub import hf_hub_url
+    import requests
+
+    st_files = _pod_safetensor_files(model_repo, revision)
+    if not st_files:
+        return None
+    with requests.Session() as session:
+        session.headers.update({"Accept-Encoding": "identity"})
+        url = hf_hub_url(repo_id=model_repo, filename=st_files[0], revision=revision)
+        header = _pod_read_safetensors_header(session, url)
+    if not header:
+        return None
+    for key in header:
+        if key == "__metadata__":
+            continue
+        lower = key.lower()
+        for marker in _POD_QUANT_TENSOR_MARKERS:
+            if marker in lower:
+                if "absmax" in marker or "quant_map" in marker:
+                    scheme = "bitsandbytes"
+                elif "qweight" in marker or "qzeros" in marker:
+                    scheme = "gptq/awq"
+                elif "scb" in marker:
+                    scheme = "bitsandbytes-int8"
+                else:
+                    scheme = "unknown_quant"
+                return {"quantized": True, "scheme": scheme, "marker": key}
+    return None
 
 
 def free_gpu():
@@ -241,70 +376,6 @@ def ensure_disk_space(teacher_name, threshold=85):
 # §4  Model Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _inject_kimi_pyfiles_from_teacher(student_name, student_revision=None):
-    """Copy teacher's modelling .py files into the student's snapshot dir.
-
-    Used when a student declares a Kimi-family auto_map (configuration_deepseek
-    / configuration_kimi_k25 / modeling_*) in config.json but didn't ship the
-    referenced .py files. Without this fix, AutoConfig.from_pretrained with
-    trust_remote_code=True dies with "does not appear to have a file named X".
-
-    Safe-by-construction: we only copy files that already exist in the teacher's
-    own HF cache snapshot, which is the same code we trust on the teacher path.
-    Student's own .py files (if present) are never overwritten.
-    """
-    try:
-        from huggingface_hub import snapshot_download
-        teacher_repo = TEACHER_NAME or "moonshotai/Kimi-K2.6"
-        # Locate teacher snapshot dir from cache
-        cache_root = Path.home() / ".cache" / "huggingface" / "hub"
-        teacher_cache = cache_root / f"models--{teacher_repo.replace('/', '--')}" / "snapshots"
-        if not teacher_cache.exists():
-            return
-        teacher_snap = max(teacher_cache.glob("*"), key=lambda p: p.stat().st_mtime, default=None)
-        if teacher_snap is None or not teacher_snap.is_dir():
-            return
-        # Locate student snapshot dir; ensure it's downloaded first
-        student_cache_root = cache_root / f"models--{student_name.replace('/', '--')}" / "snapshots"
-        if not student_cache_root.exists():
-            try:
-                snapshot_download(
-                    student_name,
-                    revision=student_revision,
-                    allow_patterns=["config.json", "*.py", "tokenizer*", "*.json"],
-                )
-            except Exception:
-                pass
-        # If still missing, give up
-        if not student_cache_root.exists():
-            return
-        snaps = [p for p in student_cache_root.glob("*") if p.is_dir()]
-        if not snaps:
-            return
-        student_snap = max(snaps, key=lambda p: p.stat().st_mtime)
-        copied = []
-        # Walk teacher snapshot for .py files; copy any missing from student.
-        for py_file in teacher_snap.glob("*.py"):
-            target = student_snap / py_file.name
-            if target.exists():
-                continue
-            try:
-                # Resolve symlink to real blob
-                real_src = py_file.resolve()
-                shutil.copy2(real_src, target)
-                copied.append(py_file.name)
-            except Exception as _e:
-                continue
-        if copied:
-            print(f"  [pyfiles] {student_name}: injected {len(copied)} .py from teacher: {copied[:3]}{'...' if len(copied) > 3 else ''}", flush=True)
-    except Exception as _e:
-        # Never let this helper block loading.
-        try:
-            print(f"  [pyfiles] {student_name}: inject failed (non-fatal): {_e}", flush=True)
-        except Exception:
-            pass
-
-
 def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     """Load a HuggingFace model for inference.
 
@@ -324,7 +395,9 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     # ``eval.runtime`` package isn't importable. Order:
     #   1. Module-level TEACHER_NAME (set by main() once args are parsed)
     #   2. eval.runtime import (works inside the validator venv)
-    #   3. Substring heuristic covering Qwen + Kimi + DeepSeek families
+    #   3. Conservative teacher-name heuristic. Never classify generic
+    #      student DeepSeek/Kimi repo names as the teacher, because that
+    #      would enable trust_remote_code for untrusted submissions.
     is_teacher = False
     try:
         global TEACHER_NAME  # noqa: PLW0603
@@ -346,20 +419,11 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
             is_teacher = (
                 ("qwen" in lname and ("35b" in lname or "3.5" in lname or "3.6" in lname))
                 or ("moonshotai" in lname and "kimi" in lname)
-                or ("kimi-k2" in lname or "kimi_k2" in lname)
-                or ("deepseek-v3" in lname or "deepseek_v3" in lname)
             )
-    # 2026-05-03 (Kimi K2.6 cutover): students that declare a Kimi-family
-    # arch in config.architectures (and therefore passed arch-allowlist
-    # precheck) need trust_remote_code=True for the AutoModel loader.
-    # transformers 5.7 has DeepseekV3 natively (no remote code needed) but
-    # KimiK25ForConditionalGeneration is not upstream yet, so loading it
-    # without trust_remote_code raises and the student is wrongly DQ'd
-    # at "load_failed". The arch precheck has already verified the model
-    # type matches the allowlist; we authorise remote code for those
-    # specific arches only. Non-Kimi students still load with
-    # trust_remote_code=False, preserving the security boundary against
-    # arbitrary modeling.py shipped by miners.
+    # Students must load with trust_remote_code=False. The validator
+    # allowlist now requires a native Transformers architecture
+    # (DeepseekV3ForCausalLM/model_type=deepseek_v3); custom Kimi wrapper
+    # code is not part of the student security boundary.
     student_needs_remote_code = False
     student_needs_eager_attn = False
     if not is_teacher:
@@ -371,23 +435,17 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
             _peek_cfg = _ACfg.from_pretrained(name, trust_remote_code=False, **_cfg_kwargs)
             _archs = getattr(_peek_cfg, "architectures", None) or []
             _model_type = getattr(_peek_cfg, "model_type", "")
-            # 2026-05-04: pod-side defensive embed/quant guard. The
-            # validator-side precheck (eval.model_checker) already DQ's
-            # mismatched-vocab and quantized-without-config models, but
-            # we duplicate the cheap header probe here as a safety net
-            # — without it, every UID that slips through (e.g. on a
-            # validator with a stale precheck cache) wastes ~50s of GPU
-            # time AND poisons the CUDA context for the rest of the
-            # round, deferring 5+ honest students per cascade. We bail
-            # with a clean RuntimeError so the eval loop's existing
-            # try/except logs a load-skip without ever touching CUDA.
+            # 2026-05-04: pod-side defensive embed/quant guard. This file
+            # is uploaded as a standalone script, so do not import
+            # eval.model_checker here; use the self-contained helpers above.
+            # A clean PRECHECK_BYPASS happens before AutoModel touches CUDA.
             try:
-                from eval.model_checker import (
-                    detect_safetensors_quantization as _det_q,
-                    get_embed_weight_shape as _emb_shape,
-                    BASELINE_VOCAB_SIZE as _BVOC,
+                _bvoc = int(
+                    os.environ.get("ACTIVATION_FP_VOCAB_SIZE")
+                    or os.environ.get("TEACHER_CONFIG_VOCAB_SIZE")
+                    or ACTIVATION_FP_VOCAB_SIZE
                 )
-                _eshape = _emb_shape(name, revision)
+                _eshape = _pod_get_embed_weight_shape(name, revision)
                 if _eshape is not None:
                     _vsize, _hidden, _edt = _eshape
                     _cfg_v = (
@@ -406,24 +464,22 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
                             else None
                         )
                     )
-                    if _vsize and _vsize != _BVOC:
+                    if _vsize and _vsize != _bvoc:
                         raise RuntimeError(
                             f"PRECHECK_BYPASS: embed vocab {_vsize}"
-                            f" ≠ teacher {_BVOC}"
+                            f" ≠ teacher {_bvoc}"
                         )
                     if _cfg_h and _hidden != int(_cfg_h):
                         raise RuntimeError(
                             f"PRECHECK_BYPASS: embed hidden {_hidden}"
                             f" ≠ config hidden {int(_cfg_h)}"
                         )
-                    if _edt and _edt.upper() not in (
-                        "BF16", "F16", "F32", "F64", "F8_E4M3", "F8_E5M2"
-                    ):
+                    if _edt and _edt.upper() not in _POD_FLOAT_DTYPES:
                         raise RuntimeError(
                             f"PRECHECK_BYPASS: embed dtype {_edt} is "
                             f"not a float type"
                         )
-                _qinfo = _det_q(name, revision)
+                _qinfo = _pod_detect_safetensors_quantization(name, revision)
                 if _qinfo is not None:
                     raise RuntimeError(
                         f"PRECHECK_BYPASS: undisclosed quantization"
@@ -442,10 +498,7 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
                     f"{_safe_err}",
                     flush=True,
                 )
-            student_needs_remote_code = (
-                "KimiK25ForConditionalGeneration" in _archs
-                or _model_type in ("kimi_k25", "kimi_k2")
-            )
+            student_needs_remote_code = False
             # 2026-05-03 (Kimi K2.6 cutover): DeepSeek-V3 / Kimi-family
             # students use Multi-head Latent Attention (signalled by
             # kv_lora_rank). cuDNN's SDPA fused backend has no execution
@@ -465,17 +518,9 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
                 or (_kv_lora is not None and int(_kv_lora) > 0)
             )
         except Exception as _peek_err:
-            # If we can't even read config without TRC, the precheck must
-            # have already let it through, so allow remote code on Kimi-style
-            # repo names as a safety net rather than blocking eval.
-            lname = (name or "").lower()
-            student_needs_remote_code = (
-                "kimi-k2" in lname or "kimi_k2" in lname or "kimi-k25" in lname
-            )
-            # In the safety-net path we also default to eager: the failure
-            # mode (cuDNN MLA crash) is harder to diagnose than the very
-            # small perf cost of eager.
-            student_needs_eager_attn = True
+            raise RuntimeError(
+                f"STUDENT_CONFIG_LOAD_FAILED_WITH_TRC_FALSE: {_peek_err}"
+            ) from _peek_err
     trust_rc = is_teacher or student_needs_remote_code
     kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=trust_rc)
     if revision and revision != "main":
@@ -512,52 +557,30 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
         try:
             if is_kimi_family:
                 from transformers import AutoConfig
-                # 2026-05-03 (Kimi K2.6 student loader fix): trust_remote_code
-                # only when the arch is the multimodal Kimi K2.5 wrapper,
-                # which transformers can't construct natively. Most miner
-                # students declare model_type=deepseek_v3 / arch
-                # DeepseekV3ForCausalLM, which IS upstream in transformers
-                # 5.7. Forcing TRC=True for those students follows the
-                # config's auto_map → tries to import their (missing)
-                # configuration_deepseek.py and dies with
-                # "does not appear to have a file named configuration_deepseek.py".
-                # For text-only DeepSeek-V3 students we mirror trust_rc
-                # (False unless they actually need remote code) so transformers
-                # uses the built-in DeepseekV3Config / DeepseekV3ForCausalLM.
+                # Students are always loaded with trust_remote_code=False.
+                # The validator allowlist only permits native DeepseekV3
+                # students; anything requiring custom Python is a security
+                # failure, not an eval fallback.
                 _cfg_kwargs = {"trust_remote_code": trust_rc}
                 if "revision" in kwargs:
                     _cfg_kwargs["revision"] = kwargs["revision"]
-                try:
-                    config = AutoConfig.from_pretrained(
-                        name, attn_implementation="eager", **_cfg_kwargs
-                    )
-                except Exception as _cfg_err:
-                    # Fallback: if the no-TRC path fails (e.g. exotic
-                    # model_type that transformers doesn't recognise but
-                    # the arch precheck approved), retry with TRC=True
-                    # AFTER injecting any missing .py modules from the
-                    # teacher cache. This covers students who declare a
-                    # Kimi-family auto_map but didn't ship the matching
-                    # modeling/config files.
-                    _err_str = str(_cfg_err)
-                    if (
-                        ("does not appear to have a file named" in _err_str
-                         or "is not a valid Python identifier" in _err_str
-                         or "Could not import" in _err_str)
-                        and not trust_rc
-                    ):
-                        _inject_kimi_pyfiles_from_teacher(name, kwargs.get("revision"))
-                        _cfg_kwargs_retry = {"trust_remote_code": True}
-                        if "revision" in kwargs:
-                            _cfg_kwargs_retry["revision"] = kwargs["revision"]
-                        config = AutoConfig.from_pretrained(
-                            name, attn_implementation="eager", **_cfg_kwargs_retry
-                        )
-                        kwargs = dict(kwargs)
-                        kwargs["trust_remote_code"] = True
-                        print(f"  [model] {name}: injected teacher .py files (no-TRC config load failed: {_err_str[:80]})", flush=True)
-                    else:
-                        raise
+                config = AutoConfig.from_pretrained(
+                    name, attn_implementation="eager", **_cfg_kwargs
+                )
+                if not is_teacher:
+                    # Neutralize stale auto_map metadata so the native
+                    # DeepseekV3 loader is used without executing repo code.
+                    for attr in ("auto_map", "_auto_map"):
+                        try:
+                            if hasattr(config, attr):
+                                setattr(config, attr, None)
+                        except Exception:
+                            pass
+                    try:
+                        if hasattr(config, "text_config") and hasattr(config.text_config, "auto_map"):
+                            config.text_config.auto_map = None
+                    except Exception:
+                        pass
                 # Propagate eager to all nested sub-configs so
                 # MoonViT3dPretrainedModel.__init__ doesn't dispatch FA2.
                 def _force_eager(cfg):
@@ -590,33 +613,6 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
                 return m
         except Exception as e:
             err_str = str(e)
-            # 2026-05-04: students that declare a native arch (e.g.
-            # DeepseekV3ForCausalLM) but ALSO ship an ``auto_map`` pointing
-            # at custom .py files trigger the "contains custom code" hard
-            # error from AutoModel.from_pretrained even though the AutoConfig
-            # peek succeeded with trust_remote_code=False. The arch precheck
-            # already validated that any .py files in the repo are byte-
-            # identical to the teacher's, so it's safe to retry with TRC=True
-            # — the alternative is mass load_failed DQs across the whole
-            # round, which is exactly what we just observed on epoch 2.
-            #
-            # We inject the teacher's .py files first (the auto_map paths
-            # may reference filenames not present in the student snapshot,
-            # and the .py files are guaranteed safe by the precheck).
-            needs_trc_retry = (
-                ("trust_remote_code=True" in err_str or "contains custom code" in err_str)
-                and not kwargs.get("trust_remote_code", False)
-                and not is_teacher
-            )
-            if needs_trc_retry and attempt < max_retries - 1:
-                try:
-                    _inject_kimi_pyfiles_from_teacher(name, kwargs.get("revision"))
-                except Exception as _inj_exc:
-                    print(f"  [model] {name}: pyfile inject for TRC retry failed: {_inj_exc}", flush=True)
-                kwargs = dict(kwargs)
-                kwargs["trust_remote_code"] = True
-                print(f"  [model] {name}: retrying with trust_remote_code=True (auto_map in config requires it)", flush=True)
-                continue
             is_transient = any(s in err_str for s in ["429", "503", "rate limit", "Connection", "Timeout", "HTTPSConnection"])
             if is_transient and attempt < max_retries - 1:
                 wait = (attempt + 1) * 30

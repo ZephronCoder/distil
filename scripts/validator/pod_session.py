@@ -7,6 +7,7 @@ import time
 
 from eval.pod import PodManager, sanitize_gpu_log
 from eval.state import ValidatorState, log_event
+from eval.runtime import TEACHER_CONFIG_VOCAB_SIZE
 from scripts.validator.config import MAX_NEW_TOKENS, TEACHER_MODEL, VLLM_CONCURRENCY
 
 # Opt-in teacher tensor-parallel size. 0 = let pod autodetect from torch.cuda.device_count().
@@ -615,7 +616,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     eval_timeout = 5 * 60 * 60
     logger.info(f"Running eval ({n_eval_models} models, {n_prompts} prompts, timeout={eval_timeout // 60}m)")
     log_event(f"Running eval on pod: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
-    eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", ""), "TOKENIZERS_PARALLELISM": "false"}
+    eval_env = {
+        "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
+        "TOKENIZERS_PARALLELISM": "false",
+        "ACTIVATION_FP_VOCAB_SIZE": str(TEACHER_CONFIG_VOCAB_SIZE),
+        "TEACHER_CONFIG_VOCAB_SIZE": str(TEACHER_CONFIG_VOCAB_SIZE),
+    }
     # 2026-04-30: enable the Rust-based hf_transfer downloader on the pod.
     # Saturates the network link (>500MB/s typical) instead of CPython's
     # 50-100MB/s default. The package was just installed on the pod
