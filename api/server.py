@@ -46,22 +46,70 @@ app.add_middleware(
 
 
 # ── Rate limiting middleware for all endpoints ────────────────────────────────
+#
+# 2026-05-04: every external request lands on uvicorn from 127.0.0.1 because
+# Caddy is the sole upstream client. The previous middleware blanket-exempted
+# 127.0.0.1 to keep the dashboard SSR loose, which inadvertently made the
+# API limiter a no-op for *all* traffic — a single misbehaving scraper was
+# pushing ~1100 /api/eval-data requests/sec through Caddy and starving the
+# uvicorn worker pool, surfacing as 503s on chat (api/routes/chat.py) and
+# every other endpoint.
+#
+# Fix: prefer X-Real-Ip (set by Caddy via ``header_up X-Real-Ip {remote_host}``)
+# and fall back to the leftmost X-Forwarded-For for Cloudflare hops; only
+# treat ``127.0.0.1`` as "internal SSR" when no proxy header is present
+# (the dashboard's local Next.js loop hits us without those headers).
+
+_PROXY_LOCAL = {"127.0.0.1", "::1", "localhost"}
+
+
+def _client_key(request) -> tuple[str, bool]:
+    """Return (key, is_internal) for rate limiting.
+
+    Header preference: ``CF-Connecting-IP`` (Cloudflare's verified
+    original client IP — this is the only way to distinguish the real
+    abuser from a flood across Cloudflare edges) → leftmost
+    ``X-Forwarded-For`` (any RFC 7239-shaped proxy chain) → ``X-Real-Ip``
+    (Caddy fallback for non-CF clients) → socket peer.
+
+    ``is_internal`` is True only when the request came from a process on
+    the same host without traversing Caddy — e.g. the Next.js SSR loop
+    or a local curl probe. Those should not be rate-limited.
+    """
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip(), False
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        first = fwd.split(",", 1)[0].strip()
+        if first:
+            return first, False
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip(), False
+    raw_host = request.client.host if request.client else "unknown"
+    return raw_host, raw_host in _PROXY_LOCAL
+
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        # Skip rate limiting for docs
-        if request.url.path in ("/docs", "/redoc", "/openapi.json"):
+        path = request.url.path
+        if path in ("/docs", "/redoc", "/openapi.json"):
             return await call_next(request)
-        # Chat/OpenAI endpoints have their own stricter limiter applied in the handler
-        if request.url.path in ("/api/chat", "/v1/chat/completions", "/v1/models"):
+        if path in ("/api/chat", "/v1/chat/completions", "/v1/models"):
+            # These endpoints carry their own (stricter) limiter in-handler
             return await call_next(request)
-        client_ip = request.client.host if request.client else "unknown"
-        # Exempt localhost - dashboard SSR makes many internal requests
-        if client_ip in ("127.0.0.1", "::1", "localhost"):
+        key, is_internal = _client_key(request)
+        if is_internal:
             return await call_next(request)
-        if not _rate_limiter.is_allowed(client_ip):
-            return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
+        if not _rate_limiter.is_allowed(key):
+            return JSONResponse(
+                status_code=429,
+                content={"error": "rate limit exceeded"},
+                headers={"Retry-After": "30"},
+            )
         return await call_next(request)
+
 
 app.add_middleware(RateLimitMiddleware)
 
