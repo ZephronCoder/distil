@@ -721,172 +721,93 @@ TEACHER_SANITY_FLOOR = 0.70
 REFERENCE_BROKEN_BENCH_FLOOR = 0.0
 
 
-def _axis_kl(student: dict, king_kl: float | None) -> float | None:
-    """Normalize KL to [0, 1] higher-is-better.
+def _king_ratio_axis(
+    student: dict,
+    student_field: str,
+    king_ref: float | None,
+) -> float | None:
+    """Generic ``king_ref / student_value`` ratio axis, clamped to [0, 1].
 
-    We normalize against the best (lowest) KL of the current king rather
-    than an absolute anchor: anchoring on the king keeps the axis scaled
-    to real, achievable values. A student with ``kl = king_kl`` scores
-    1.0; KL at 2× king → ~0.5; KL at 10× king → ~0.1.
+    Used by every lower-is-better divergence axis (``kl``, ``kl_is``,
+    ``forking_rkl``, ``tail_decoupled_kl``, ``teacher_trace_plausibility``,
+    ``entropy_aware_kl``): a student matching the king scores 1.0;
+    2× the king's value scores ~0.5; 10× scores ~0.1. Anchoring on the
+    king keeps every axis scaled to real, achievable values rather than
+    a hard-coded absolute floor.
 
-    Returns ``None`` when KL data is missing (e.g. the teacher-as-student
-    row, which has no KL vs itself). This lets the teacher sanity gate
-    correctly skip the axis for the teacher rather than marking it
-    "broken" because of absent-by-design data.
+    Returns ``None`` when:
+      * student lacks the field (legacy record / dense-path eval / the
+        teacher-as-student row, which has no KL vs itself);
+      * king reference is None or non-positive;
+      * the student value can't be coerced to a positive finite float.
     """
-    kl = student.get("kl_global_avg")
-    if kl is None or kl <= 0 or king_kl is None or king_kl <= 0:
+    val = student.get(student_field)
+    if val is None or king_ref is None or king_ref <= 0:
         return None
-    return max(0.0, min(1.0, king_kl / kl))
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_ref) / v))
+
+
+def _axis_kl(student: dict, king_kl: float | None) -> float | None:
+    """KL axis — normalises ``kl_global_avg`` against the king's KL."""
+    return _king_ratio_axis(student, "kl_global_avg", king_kl)
 
 
 def _axis_kl_is(student: dict, king_kl_is: float | None) -> float | None:
-    """v30 — Importance-sampled KL axis (SHADOW until 48h telemetry).
-
-    Reads ``student.kl_is_mean`` (full-vocab KL contribution from top-K
-    support, computed via ``compute_kl_is_from_sparse``). Normalised
-    against the round's best (lowest) IS-KL using the same king/student
-    ratio shape as ``_axis_kl``.
-
-    Per the synthesis report (§4.2 #2) and Anshumann et al. ACL 2025,
-    this estimator is unbiased where the renormalised KL on shared
-    support is biased by the teacher's top-K mass coverage. Useful both
-    as a sanity-check on the existing ``kl`` axis (the ratio
-    kl_is_mean / kl_global_avg should be ~ ``topk_mass_mean``) and as
-    a SHADOW signal we can promote once 48h of correlation telemetry
-    against the canary confirms the bias matters in practice.
-    """
-    val = student.get("kl_is_mean")
-    if val is None or king_kl_is is None or king_kl_is <= 0:
-        return None
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return None
-    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
-        return None
-    return max(0.0, min(1.0, float(king_kl_is) / v))
+    """v30 — Importance-sampled KL axis (SHADOW). Reads
+    ``student.kl_is_mean`` (full-vocab KL contribution from top-K
+    support). Per Anshumann et al. ACL 2025, this estimator is unbiased
+    where the renormalised KL on shared support is biased by the
+    teacher's top-K mass coverage."""
+    return _king_ratio_axis(student, "kl_is_mean", king_kl_is)
 
 
-def _axis_forking_rkl(student: dict, king_forking_rkl: float | None) -> float | None:
-    """v30 — Forking-token RKL axis (SHADOW until 48h telemetry).
-
-    Reads ``student.forking_rkl_mean``: average reverse-KL at positions
-    in the top quartile of teacher entropy. Per Wang et al. 2025 (cited
-    in the Thinking Machines OPD blog and our synthesis report §4.2
-    #5), high-entropy positions are the "decision points" where the
-    teacher's feedback is most informative; the RKL there is a stronger
-    predictor of downstream OPD success than the mean RKL across all
-    positions.
-
-    Same king/student normalisation shape as ``_axis_kl`` and
-    ``_axis_kl_is``.
-    """
-    val = student.get("forking_rkl_mean")
-    if val is None or king_forking_rkl is None or king_forking_rkl <= 0:
-        return None
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return None
-    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
-        return None
-    return max(0.0, min(1.0, float(king_forking_rkl) / v))
+def _axis_forking_rkl(student: dict,
+                       king_forking_rkl: float | None) -> float | None:
+    """v30 — Forking-token RKL axis (SHADOW). Reads
+    ``student.forking_rkl_mean``: average reverse-KL at positions in the
+    top quartile of teacher entropy. Per Wang et al. 2025, high-entropy
+    positions are the "decision points" where the teacher's feedback is
+    most informative and a stronger OPD predictor than the mean RKL."""
+    return _king_ratio_axis(student, "forking_rkl_mean", king_forking_rkl)
 
 
 def _axis_tail_decoupled_kl(student: dict,
                              king_kl_tail: float | None) -> float | None:
-    """v30.3 — Tail-decoupled KL axis (SHADOW).
-
-    Reads ``student.kl_tail_mean``: the per-position mean KL
-    contribution from the TAIL of the teacher's top-K cache (positions
-    K_head+1 .. K, default top-32 .. 128). Catches the
-    "match teacher's head but flatten the tail" pathology where the
-    student concentrates probability on the most-likely tokens and
-    misses the broad coverage the teacher places on rarer tokens.
-
-    Per the synthesis report §3.9 / §4.2 #3 and the Tail-Aware
-    Distillation paper, this is a documented SFT-only over-confidence
-    failure mode.
-
-    Same king/student normalisation shape as ``_axis_kl``.
-    Returns None when missing or king ref is missing.
-    """
-    val = student.get("kl_tail_mean")
-    if val is None or king_kl_tail is None or king_kl_tail <= 0:
-        return None
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return None
-    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
-        return None
-    return max(0.0, min(1.0, float(king_kl_tail) / v))
+    """v30.3 — Tail-decoupled KL axis (SHADOW). Reads
+    ``student.kl_tail_mean``: per-position mean KL contribution from
+    the TAIL of the teacher's top-K cache (positions K_head+1 .. K).
+    Catches the "match teacher's head but flatten the tail" pathology —
+    a documented SFT-only over-confidence failure mode."""
+    return _king_ratio_axis(student, "kl_tail_mean", king_kl_tail)
 
 
 def _axis_teacher_trace_plausibility(student: dict,
                                       king_trace_nll: float | None) -> float | None:
-    """v30 — Teacher-trace plausibility axis (SHADOW until 48h telemetry).
-
-    Reads ``student.teacher_trace_nll_mean``: average NLL the student
-    assigns to the teacher's actually-emitted tokens (greedy
-    continuation). Captures "support coverage" — does the student
-    place any mass on the teacher's chosen path? This is distinct
-    from FKL, which weights the FULL teacher distribution (not the
-    sampled tokens), and from RKL, which weights the student's own
-    rollout (not the teacher's).
-
-    Synthesis §4.2 #4: a model with high FKL but low plausibility is
-    placing mass everywhere except where the teacher actually goes —
-    a known LIMO/s1 SFT-only failure mode.
-
-    Same king/student normalisation shape as ``_axis_kl``.
-    """
-    val = student.get("teacher_trace_nll_mean")
-    if val is None or king_trace_nll is None or king_trace_nll <= 0:
-        return None
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return None
-    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
-        return None
-    return max(0.0, min(1.0, float(king_trace_nll) / v))
+    """v30 — Teacher-trace plausibility axis (SHADOW). Reads
+    ``student.teacher_trace_nll_mean``: average NLL the student assigns
+    to the teacher's actually-emitted tokens. Captures support coverage
+    on the teacher's chosen path — distinct from FKL/RKL. A model with
+    high FKL but low plausibility is a known LIMO/s1 SFT failure mode."""
+    return _king_ratio_axis(
+        student, "teacher_trace_nll_mean", king_trace_nll,
+    )
 
 
-def _axis_entropy_aware_kl(student: dict, king_eopd: float | None) -> float | None:
-    """v30 — Entropy-Aware adaptive KL axis (SHADOW until 48h telemetry).
-
-    Reads ``student.eopd_adaptive_mean``, the per-prompt mean of the
-    per-token quantity ``α(H_t) · RKL + (1 − α(H_t)) · FKL`` where
-    ``α = sigmoid((H₀ − H_t) / τ)`` is high when the teacher is
-    confident (low entropy) and low when the teacher is uncertain
-    (high entropy).
-
-    Per the EOPD paper (arXiv 2510.27485), this is a strictly more
-    discriminating distillation signal than vanilla per-token KL on
-    small-model math benchmarks (+1.37 to +5.05 Pass@8 on
-    Qwen3-{0.6B,1.7B,4B}).
-
-    The axis is normalised against the king's adaptive-KL the same
-    way ``_axis_kl`` is normalised against ``king_kl``: a student with
-    ``adaptive == king_adaptive`` scores 1.0; 2× king → ~0.5; etc.
-
-    Returns ``None`` when:
-      * The student lacks the field (legacy record / dense-path eval).
-      * The king lacks the field (round didn't compute EOPD).
-      * Adaptive KL is non-positive (NaN / Inf guard).
-    """
-    val = student.get("eopd_adaptive_mean")
-    if val is None or king_eopd is None or king_eopd <= 0:
-        return None
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return None
-    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
-        return None
-    return max(0.0, min(1.0, float(king_eopd) / v))
+def _axis_entropy_aware_kl(student: dict,
+                            king_eopd: float | None) -> float | None:
+    """v30 — Entropy-Aware adaptive KL axis (SHADOW). Reads
+    ``student.eopd_adaptive_mean``, the per-prompt mean of the per-token
+    quantity ``α(H_t)·RKL + (1−α(H_t))·FKL`` where ``α`` is high when the
+    teacher is confident. Per arXiv 2510.27485, strictly more
+    discriminating than vanilla per-token KL on small-model math benches
+    (+1.37 to +5.05 Pass@8 on Qwen3-{0.6B,1.7B,4B})."""
+    return _king_ratio_axis(student, "eopd_adaptive_mean", king_eopd)
 
 
 def _axis_top_k_overlap(student: dict) -> float | None:
@@ -1025,131 +946,93 @@ def _axis_degeneracy(student: dict) -> float:
     return 0.4 * term_score + 0.4 * degen_score + 0.2 * sb_score
 
 
-def _axis_judge_probe(student: dict) -> float | None:
-    """Teacher-as-judge normalized score in [0, 1]. 2026-04-23 shadow axis.
+def _judge_probe_axis(
+    student: dict,
+    probe_key: str,
+    score_field: str,
+    min_valid: int,
+) -> float | None:
+    """Generic ``probe.<score_field>`` extractor with ``n_valid`` floor.
 
-    Returns the ``normalized`` field from the eval script's judge probe
-    payload: teacher scores N rotated prompts on a 1-5 rubric, valid
-    scores are averaged, mapped via ``(mean - 1) / 4``. If too many
-    prompts failed to parse (``n_valid < JUDGE_PROBE_MIN_VALID``) we
-    drop the axis — that's a rubric/teacher drift signal and the
-    telemetry is more meaningful than a noisy score. ``None`` if the
-    probe didn't run or didn't report.
+    Used by every teacher-rubric axis (``judge_probe``,
+    ``long_form_judge``, ``long_gen_coherence``, ``chat_turns_probe``,
+    and skill-group-specific variants): the eval payload always carries
+    ``{ <score_field>: float in [0,1], n_valid: int, ... }``; we drop
+    the axis when fewer than ``min_valid`` prompts parsed cleanly so a
+    rubric/teacher drift signal doesn't silently bleed into composite
+    rankings.
 
-    Bug fix 2026-04-26: the threshold was hardcoded to 8, but the
-    deployed config uses ``JUDGE_PROBE_PER_ROUND=6`` → max ``n_valid``
-    is 6 < 8 so the axis was silently dropped every round. Made the
-    threshold env-configurable with a default of 4 (half the legacy
-    16-prompt budget) so it scales with whatever budget is set.
+    Returns ``None`` when the probe didn't run, the score field is
+    absent, or ``n_valid`` is below the floor. Otherwise clamps the
+    raw value into [0, 1].
     """
-    jp = student.get("judge_probe") or {}
-    if not jp:
+    payload = student.get(probe_key) or {}
+    if not payload:
         return None
-    norm = jp.get("normalized")
-    if norm is None:
+    raw = payload.get(score_field)
+    if raw is None:
         return None
-    if (jp.get("n_valid") or 0) < JUDGE_PROBE_MIN_VALID:
+    if (payload.get("n_valid") or 0) < min_valid:
         return None
-    return max(0.0, min(1.0, float(norm)))
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _axis_judge_probe(student: dict) -> float | None:
+    """Teacher-as-judge normalized score in [0, 1] (2026-04-23 shadow axis).
+
+    Teacher scores ``JUDGE_PROBE_PER_ROUND`` rotated prompts on a 1-5
+    rubric; valid scores averaged and mapped via ``(mean - 1) / 4``.
+    Drops below ``JUDGE_PROBE_MIN_VALID`` parses (rubric/teacher drift
+    signal — telemetry is more meaningful than a noisy score)."""
+    return _judge_probe_axis(
+        student, "judge_probe", "normalized", JUDGE_PROBE_MIN_VALID,
+    )
 
 
 def _axis_long_form_judge(student: dict) -> float | None:
     """v30 — long-form judge axis.
 
     Teacher rubric grades each student's 300-500 word essay-style
-    response on STRUCTURE / DEPTH / COHERENCE / LENGTH. Returns the
-    normalized [0, 1] score from the per-prompt mean (1-5 → (mean-1)/4).
-    Returns ``None`` if the probe didn't run, or if too few prompts
-    parsed successfully (``n_valid < LONG_FORM_JUDGE_MIN_VALID``,
-    default 2 since the per-round budget is 4).
-
-    Why this axis exists. The short-form ``judge_probe`` measures
-    response quality on 1-2 line answers; nothing else in the
-    composite measures whether the model can sustain a coherent
-    multi-paragraph response — one of the SOTA-distinct deployment
-    capabilities. A model that aces all the bench axes but cannot
-    write a 400-word coherent essay is missing a real capability,
-    and this axis penalises that gap.
-
-    v30.4 (2026-05-01): the per-prompt teacher rubric grade is
-    multiplied by a six-signal statistical coherence factor in
-    ``long_form_judge_teacher_score`` BEFORE this aggregation
-    runs, so a derailed response (multilingual word salad,
-    long-compound coinage, word-list attractor) cannot earn a
-    high rubric grade even if the teacher was lenient.
-    """
-    lf = student.get("long_form_judge_probe") or {}
-    if not lf:
-        return None
-    norm = lf.get("normalized")
-    if norm is None:
-        return None
-    if (lf.get("n_valid") or 0) < LONG_FORM_JUDGE_MIN_VALID:
-        return None
-    return max(0.0, min(1.0, float(norm)))
+    response on STRUCTURE / DEPTH / COHERENCE / LENGTH. Per-prompt
+    score is multiplied by the six-signal statistical coherence factor
+    in ``long_form_judge_teacher_score`` BEFORE aggregation, so a
+    derailed response cannot earn a high rubric grade even if the
+    teacher was lenient (v30.4, 2026-05-01)."""
+    return _judge_probe_axis(
+        student, "long_form_judge_probe", "normalized",
+        LONG_FORM_JUDGE_MIN_VALID,
+    )
 
 
 def _axis_long_gen_coherence(student: dict) -> float | None:
     """v30.4 — long-form-generation coherence axis (zero teacher involvement).
 
     Returns the mean per-prompt coherence factor from the long-form
-    judge probe, in [0, 1]. This is a PURE statistical signal:
-    no teacher rubric, no chat-template considerations, just six
-    surface signals on the 2048-token response.
-
-    The signal is exactly the multiplier already applied to the
-    ``long_form_judge`` axis grade. Exposing it as a separate axis
-    means:
-
-      * The composite directly penalises derail even if a miner
-        learns to game the teacher rubric to score 5/5 on a
-        derailed response.
-      * Operators can grep ``axes.long_gen_coherence`` on the
-        dashboard to find the broken-at-length kings (the
-        chat.arbos.life derail screenshot from king UID 107 on
-        2026-05-01 would have surfaced as 0.05 here while
-        ``long_form_judge`` was still 0.875).
-      * The chat-king proxy can ALSO read this axis to decide
-        whether to throttle a model with hard sampling caps vs
-        let it speak freely.
-
-    Returns ``None`` when the long-form probe didn't run or
-    aggregated zero coherence factors (e.g. all responses errored
-    before scoring).
-    """
-    lf = student.get("long_form_judge_probe") or {}
-    if not lf:
-        return None
-    coh = lf.get("coherence_factor")
-    if coh is None:
-        return None
-    if (lf.get("n_valid") or 0) < LONG_FORM_JUDGE_MIN_VALID:
-        return None
-    return max(0.0, min(1.0, float(coh)))
+    judge probe — exactly the multiplier already applied to the
+    ``long_form_judge`` axis grade. Pure statistical signal (six
+    surface signals on the 2048-token response): the composite
+    directly penalises derail even if a miner gamed the teacher
+    rubric to score 5/5 on a derailed response."""
+    return _judge_probe_axis(
+        student, "long_form_judge_probe", "coherence_factor",
+        LONG_FORM_JUDGE_MIN_VALID,
+    )
 
 
 def _axis_chat_turns_probe(student: dict) -> float | None:
-    """Multi-turn coherence axis. 2026-04-25 Session 3.3 (SHADOW).
+    """Multi-turn coherence axis (2026-04-25 Session 3.3, SHADOW).
 
     Teacher judges 6 rotated 3-turn transcripts on a 1-5 rubric
-    (coherence / consistency / helpfulness). Returns the normalized
-    mean or ``None`` when fewer than ``CHAT_TURNS_MIN_VALID`` convos
-    parsed cleanly (guards against a broken rubric silently scoring).
-
-    Rationale: KL distillation only optimizes against single-turn
-    climbmix-style prompts; a model can ace KL yet fall apart on
-    multi-turn dialogue. This axis forces miners to keep multi-turn
-    coherence in the loss tent.
-    """
-    ct = student.get("chat_turns_probe") or {}
-    if not ct:
-        return None
-    norm = ct.get("normalized")
-    if norm is None:
-        return None
-    if (ct.get("n_valid") or 0) < CHAT_TURNS_MIN_VALID:
-        return None
-    return max(0.0, min(1.0, float(norm)))
+    (coherence / consistency / helpfulness). Forces miners to keep
+    multi-turn coherence in the loss tent — KL distillation only
+    optimises single-turn climbmix-style prompts, so a model can ace
+    KL yet fall apart on multi-turn dialogue."""
+    return _judge_probe_axis(
+        student, "chat_turns_probe", "normalized", CHAT_TURNS_MIN_VALID,
+    )
 
 
 def _axis_bench_pass_frac(student: dict, axis_name: str) -> float | None:
@@ -1639,6 +1522,53 @@ def resolve_reference_broken_axes(reference_student_row: dict | None) -> set[str
     return broken
 
 
+def get_effective_axis_weights() -> dict[str, float]:
+    """Return the weights of all axes currently active in the composite.
+
+    Single source of truth for "which axes gate ranking this round" — the
+    same dict that ``compute_composite`` builds internally and that
+    ``_composite_dethrone_veto`` / ``resolve_teacher_broken_axes`` /
+    h2h backfill all need to filter axis dicts. Centralising here
+    means a new shadow→production promotion only needs to flip the
+    relevant ``*_IN_COMPOSITE`` env gate, with no risk of one caller
+    forgetting an axis (e.g. results.py forgot ``long_form_judge`` and
+    ``long_gen_coherence`` for months, so the worst-axis veto would
+    cite the second-worst axis when those derail axes were active).
+
+    Excludes zero-weight axes — a SHADOW axis with weight 0 is by
+    definition not gating ranking even if its ``*_IN_COMPOSITE`` flag
+    is set.
+    """
+    weights: dict[str, float] = {k: w for k, w in AXIS_WEIGHTS.items() if w > 0}
+    if not TOP_K_OVERLAP_AXIS_IN_COMPOSITE:
+        weights.pop("top_k_overlap", None)
+    if JUDGE_AXIS_IN_COMPOSITE and JUDGE_AXIS_WEIGHT > 0:
+        weights["judge_probe"] = JUDGE_AXIS_WEIGHT
+    if BENCH_AXES_IN_COMPOSITE:
+        weights.update(
+            {k: w for k, w in BENCH_AXIS_WEIGHTS.items() if w > 0},
+        )
+    if ARENA_V3_AXES_IN_COMPOSITE:
+        weights.update(
+            {k: w for k, w in ARENA_V3_AXIS_WEIGHTS.items() if w > 0},
+        )
+    weights.update(
+        {k: w for k, w in BENCH_GROUP_AXIS_WEIGHTS.items() if w > 0},
+    )
+    if REASONING_DENSITY_IN_COMPOSITE and REASONING_DENSITY_WEIGHT > 0:
+        weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
+    if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
+        weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
+    if LONG_FORM_JUDGE_AXIS_IN_COMPOSITE and LONG_FORM_JUDGE_AXIS_WEIGHT > 0:
+        weights["long_form_judge"] = LONG_FORM_JUDGE_AXIS_WEIGHT
+    if (
+        LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE
+        and LONG_GEN_COHERENCE_AXIS_WEIGHT > 0
+    ):
+        weights["long_gen_coherence"] = LONG_GEN_COHERENCE_AXIS_WEIGHT
+    return weights
+
+
 def resolve_teacher_broken_axes(teacher_student_row: dict | None,
                                 king_kl: float | None = None,
                                 king_rkl: float | None = None) -> set[str]:
@@ -1650,27 +1580,23 @@ def resolve_teacher_broken_axes(teacher_student_row: dict | None,
     value < ``TEACHER_SANITY_FLOOR`` we return that axis name so the
     caller can drop it from ranking. Axes where the teacher returns
     None are considered uncalibrated and also dropped defensively.
+
+    The applicable set is broader than ``get_effective_axis_weights``:
+    we also include zero-weight bench sub-axes when their gates are on
+    (``BENCH_AXES_IN_COMPOSITE`` / ``ARENA_V3_AXES_IN_COMPOSITE``).
+    Skill-group axes drop teacher-broken sub-axes from their mean even
+    when the sub-axis itself doesn't directly gate ranking, so we must
+    flag those broken sub-axes here.
     """
     broken: set[str] = set()
     if not teacher_student_row:
         return broken
     teacher_axes = compute_axes(teacher_student_row, king_kl, king_rkl)
-    # Build the set of axes the teacher is actually being scored on this
-    # round: AXIS_WEIGHTS + (judge if promoted) + (Session 2 bench if
-    # promoted) + (Session 3 Arena v3 bench if promoted).
-    applicable = set(AXIS_WEIGHTS.keys())
-    if JUDGE_AXIS_IN_COMPOSITE:
-        applicable.add("judge_probe")
+    applicable = set(get_effective_axis_weights().keys())
     if BENCH_AXES_IN_COMPOSITE:
-        for k in BENCH_AXIS_WEIGHTS:
-            applicable.add(k)
+        applicable.update(BENCH_AXIS_WEIGHTS.keys())
     if ARENA_V3_AXES_IN_COMPOSITE:
-        for k in ARENA_V3_AXIS_WEIGHTS:
-            applicable.add(k)
-    if REASONING_DENSITY_IN_COMPOSITE:
-        applicable.add("reasoning_density")
-    if CHAT_TURNS_AXIS_IN_COMPOSITE:
-        applicable.add("chat_turns_probe")
+        applicable.update(ARENA_V3_AXIS_WEIGHTS.keys())
     for axis, val in teacher_axes.items():
         if axis not in applicable:
             continue
@@ -1793,47 +1719,13 @@ def compute_composite(student: dict, king_kl: float | None = None,
         }
     else:
         axes = dict(raw_axes)
-    # Build effective weights. Shadow-only axes flip in when their
-    # respective gates are set (``JUDGE_AXIS_IN_COMPOSITE`` /
-    # ``BENCH_AXES_IN_COMPOSITE`` / ``ARENA_V3_AXES_IN_COMPOSITE``).
-    # Keeping this local to compute_composite so a single env flip
-    # flows to every caller without touching the weight dicts.
-    effective_weights = dict(AXIS_WEIGHTS)
-    # Drop any zero-weight axis from effective_weights so a SHADOW axis
-    # (declared with default weight 0 — e.g. ``entropy_aware_kl`` until
-    # its 48h telemetry window concludes) cannot gate the worst-axis
-    # ranking. Operators promote a shadow axis by setting its
-    # corresponding env weight > 0.
-    effective_weights = {k: w for k, w in effective_weights.items() if w > 0}
-    if not TOP_K_OVERLAP_AXIS_IN_COMPOSITE:
-        effective_weights.pop("top_k_overlap", None)
-    if JUDGE_AXIS_IN_COMPOSITE:
-        effective_weights["judge_probe"] = JUDGE_AXIS_WEIGHT
-    if BENCH_AXES_IN_COMPOSITE:
-        for k, w in BENCH_AXIS_WEIGHTS.items():
-            if w > 0:
-                effective_weights[k] = w
-    if ARENA_V3_AXES_IN_COMPOSITE:
-        for k, w in ARENA_V3_AXIS_WEIGHTS.items():
-            if w > 0:
-                effective_weights[k] = w
-    # v30.2 — Skill-group axes. Picked up the weight from individual
-    # bench sub-axes (which now default to 0). Always-on by default;
-    # set group weights to 0 via env to opt out.
-    for k, w in BENCH_GROUP_AXIS_WEIGHTS.items():
-        if w > 0:
-            effective_weights[k] = w
-    if REASONING_DENSITY_IN_COMPOSITE and REASONING_DENSITY_WEIGHT > 0:
-        effective_weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
-    if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
-        effective_weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
-    if LONG_FORM_JUDGE_AXIS_IN_COMPOSITE and LONG_FORM_JUDGE_AXIS_WEIGHT > 0:
-        effective_weights["long_form_judge"] = LONG_FORM_JUDGE_AXIS_WEIGHT
-    if (
-        LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE
-        and LONG_GEN_COHERENCE_AXIS_WEIGHT > 0
-    ):
-        effective_weights["long_gen_coherence"] = LONG_GEN_COHERENCE_AXIS_WEIGHT
+    # Effective weights = the canonical "active axes" set. Single source
+    # of truth in ``get_effective_axis_weights``: a SHADOW→production
+    # promotion only needs to flip the relevant ``*_IN_COMPOSITE`` env
+    # gate and (if w > 0) increase the axis weight; every gate downstream
+    # (this function, the composite-floor veto, the teacher sanity gate,
+    # the dashboard backfill) automatically picks up the new axis.
+    effective_weights = get_effective_axis_weights()
     # ``ranked`` = axes used by ``worst()``: drops broken axes so the
     # min is not artificially floored by an axis the eval setup itself
     # can't pass (the dethrone gate degenerates to 0=0=0 otherwise).

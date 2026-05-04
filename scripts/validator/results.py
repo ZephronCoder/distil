@@ -17,6 +17,7 @@ from scripts.validator.composite import (
     _resolve_king_rkl,
     annotate_h2h_with_composite,
     compute_composite,
+    get_effective_axis_weights,
 )
 from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, EPSILON, MAX_KL_THRESHOLD, PAIRED_TEST_ALPHA
 
@@ -303,28 +304,7 @@ def _composite_dethrone_veto(
     # lower than the triggering axis but should not be surfaced as the
     # reason.
     broken_axes = set(comp.get("broken_axes") or [])
-    from scripts.validator.composite import (
-        AXIS_WEIGHTS as _AX,
-        BENCH_AXIS_WEIGHTS as _BX,
-        ARENA_V3_AXIS_WEIGHTS as _V3X,
-        JUDGE_AXIS_IN_COMPOSITE as _JIC,
-        BENCH_AXES_IN_COMPOSITE as _BIC,
-        ARENA_V3_AXES_IN_COMPOSITE as _V3IC,
-        REASONING_DENSITY_IN_COMPOSITE as _RDIC,
-        CHAT_TURNS_AXIS_IN_COMPOSITE as _CTIC,
-    )
-    active = set(_AX.keys())
-    if _JIC:
-        active.add("judge_probe")
-    if _BIC:
-        active.update(_BX.keys())
-    if _V3IC:
-        active.update(_V3X.keys())
-    if _RDIC:
-        active.add("reasoning_density")
-    if _CTIC:
-        active.add("chat_turns_probe")
-    active.difference_update(broken_axes)
+    active = set(get_effective_axis_weights().keys()) - broken_axes
     active_axes = {k: v for k, v in axes.items() if v is not None and k in active}
     worst_axis = min(
         active_axes.items(),
@@ -400,6 +380,96 @@ def _pareto_dethrone_veto(
         ),
         "pareto": pareto,
     }
+
+
+def _run_dethrone_vetos(
+    *,
+    challenger_uid: int,
+    challenger_model: str | None,
+    king_model: str | None,
+    reference_model: str | None,
+    students_data: dict,
+    king_kl_ref: float | None,
+    king_rkl_ref: float | None,
+    king_floor_waived: bool,
+    state_dir: str,
+    path_label: str,
+    extra_context: str,
+) -> bool:
+    """Run composite + baseline + Pareto vetos for one dethroner candidate.
+
+    Centralises the veto cascade that used to be inlined twice in
+    ``process_results`` (paired-t-test path and legacy-epsilon path).
+    Each veto is checked in order; the first one that fires logs a
+    structured ``BLOCKED DETHRONE`` line plus a state-event entry and
+    returns ``True``. The composite-floor veto can be silently waived
+    by the king-regression gate (``king_floor_waived``) — the others
+    cannot.
+
+    Returns True iff the dethrone should be blocked (caller should
+    skip the candidate). Returns False iff every veto cleared.
+
+    ``path_label`` is appended to log messages so it's obvious which
+    code path produced the line (``"t-test"`` or ``"legacy epsilon"``).
+    ``extra_context`` carries per-call diagnostics (KL, p-value, etc.)
+    that vary between paths.
+    """
+    suffix = f"[{path_label}]" if path_label else ""
+    comp_veto = _composite_dethrone_veto(
+        challenger_model, students_data, king_kl_ref, king_rkl_ref,
+    )
+    if comp_veto is not None:
+        if king_floor_waived:
+            logger.warning(
+                f"UID {challenger_uid}: composite floor would block "
+                f"({comp_veto['reason']}) {suffix}, but king regression "
+                f"gate waived the floor"
+            )
+        else:
+            logger.info(
+                f"UID {challenger_uid}: BLOCKED DETHRONE by composite "
+                f"floor — {comp_veto['reason']} {suffix} {extra_context}"
+            )
+            log_event(
+                f"Composite floor blocked dethrone: UID {challenger_uid} "
+                f"axis {comp_veto['worst_axis']}={comp_veto['worst_value']:.3f} "
+                f"< {COMPOSITE_DETHRONE_FLOOR} {suffix}",
+                level="warning", state_dir=state_dir,
+            )
+            return True
+    baseline_veto = _baseline_floor_dethrone_veto(
+        challenger_model, reference_model, students_data,
+    )
+    if baseline_veto is not None:
+        logger.info(
+            f"UID {challenger_uid}: BLOCKED DETHRONE by baseline floor — "
+            f"{baseline_veto['reason']} {suffix} {extra_context}"
+        )
+        log_event(
+            f"Baseline floor blocked dethrone: UID {challenger_uid} "
+            f"axis {baseline_veto['axis']} "
+            f"challenger={baseline_veto['challenger']:.3f} "
+            f"vs reference={baseline_veto['reference']:.3f} "
+            f"(gap={baseline_veto['gap']:+.3f}) {suffix}",
+            level="warning", state_dir=state_dir,
+        )
+        return True
+    pareto_veto = _pareto_dethrone_veto(
+        challenger_model, king_model, students_data,
+        king_kl_ref, king_rkl_ref,
+    )
+    if pareto_veto is not None:
+        logger.info(
+            f"UID {challenger_uid}: BLOCKED DETHRONE by Pareto gate — "
+            f"{pareto_veto['reason']} {suffix} {extra_context}"
+        )
+        log_event(
+            f"Pareto gate blocked dethrone: UID {challenger_uid} "
+            f"{pareto_veto['reason']} {suffix}",
+            level="warning", state_dir=state_dir,
+        )
+        return True
+    return False
 
 
 def _king_regression_floor_waived(state, king_uid) -> bool:
@@ -1036,65 +1106,22 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                     pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
                     passes_epsilon = challenger_kl < epsilon_threshold
                     if p_value < PAIRED_TEST_ALPHA and mean_delta > 0 and passes_epsilon:
-                        comp_veto = _composite_dethrone_veto(
-                            challenger_model, students_data_early, king_h2h_kl, king_rkl_ref_early,
-                        )
-                        if comp_veto is not None and not king_floor_waived:
-                            logger.info(
-                                f"UID {uid}: BLOCKED DETHRONE by composite floor — "
-                                f"{comp_veto['reason']} (KL passed: p={p_value:.4f}, "
+                        if _run_dethrone_vetos(
+                            challenger_uid=uid,
+                            challenger_model=challenger_model,
+                            king_model=king_model_name,
+                            reference_model=_ref_model_name,
+                            students_data=students_data_early,
+                            king_kl_ref=king_h2h_kl,
+                            king_rkl_ref=king_rkl_ref_early,
+                            king_floor_waived=king_floor_waived,
+                            state_dir=str(state.state_dir),
+                            path_label="t-test",
+                            extra_context=(
+                                f"(KL passed: p={p_value:.4f}, "
                                 f"delta={mean_delta:.6f}, KL={challenger_kl:.6f})"
-                            )
-                            log_event(
-                                f"Composite floor blocked dethrone: UID {uid} "
-                                f"axis {comp_veto['worst_axis']}={comp_veto['worst_value']:.3f} "
-                                f"< {COMPOSITE_DETHRONE_FLOOR}",
-                                level="warning", state_dir=str(state.state_dir),
-                            )
-                            continue
-                        elif comp_veto is not None and king_floor_waived:
-                            logger.warning(
-                                f"UID {uid}: composite floor would block ({comp_veto['reason']}), "
-                                "but king regression gate waived the floor"
-                            )
-                        # Baseline-floor gate (2026-04-28): block dethrone
-                        # when challenger regresses below the Qwen 4B base
-                        # on a held-out-transfer axis. Requires reference
-                        # to be in the round (INCLUDE_REFERENCE_IN_ROUND=1).
-                        baseline_veto = _baseline_floor_dethrone_veto(
-                            challenger_model, _ref_model_name, students_data_early,
-                        )
-                        if baseline_veto is not None:
-                            logger.info(
-                                f"UID {uid}: BLOCKED DETHRONE by baseline floor — "
-                                f"{baseline_veto['reason']} (KL passed: p={p_value:.4f}, "
-                                f"delta={mean_delta:.6f}, KL={challenger_kl:.6f})"
-                            )
-                            log_event(
-                                f"Baseline floor blocked dethrone: UID {uid} "
-                                f"axis {baseline_veto['axis']} "
-                                f"challenger={baseline_veto['challenger']:.3f} "
-                                f"vs reference={baseline_veto['reference']:.3f} "
-                                f"(gap={baseline_veto['gap']:+.3f})",
-                                level="warning", state_dir=str(state.state_dir),
-                            )
-                            continue
-                        # Pareto-dominance gate (SHADOW until +48h notice).
-                        pareto_veto = _pareto_dethrone_veto(
-                            challenger_model, king_model_name,
-                            students_data_early, king_h2h_kl, king_rkl_ref_early,
-                        )
-                        if pareto_veto is not None:
-                            logger.info(
-                                f"UID {uid}: BLOCKED DETHRONE by Pareto gate — "
-                                f"{pareto_veto['reason']} (KL passed: p={p_value:.4f}, "
-                                f"delta={mean_delta:.6f}, KL={challenger_kl:.6f})"
-                            )
-                            log_event(
-                                f"Pareto gate blocked dethrone: UID {uid} "
-                                f"{pareto_veto['reason']}",
-                                level="warning", state_dir=str(state.state_dir),
-                            )
+                            ),
+                        ):
                             continue
                         logger.info(f"UID {uid} DETHRONED king UID {king_uid}! p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), t={t_stat:.3f}, n={len(deltas)}, KL={challenger_kl:.6f} < eps={epsilon_threshold:.6f}")
                         dethroners.append({
@@ -1119,58 +1146,19 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 if challenger_n < MIN_PROMPTS_DETHRONE:
                     logger.info(f"UID {uid}: insufficient prompts for legacy epsilon ({challenger_n} < {MIN_PROMPTS_DETHRONE}), KL={challenger_kl:.6f}")
                 elif challenger_kl < epsilon_threshold:
-                    comp_veto = _composite_dethrone_veto(
-                        challenger_model, students_data_early, king_h2h_kl, king_rkl_ref_early,
-                    )
-                    if comp_veto is not None and not king_floor_waived:
-                        logger.info(
-                            f"UID {uid}: BLOCKED DETHRONE by composite floor — "
-                            f"{comp_veto['reason']} [legacy epsilon path, KL={challenger_kl:.6f}]"
-                        )
-                        log_event(
-                            f"Composite floor blocked dethrone: UID {uid} "
-                            f"axis {comp_veto['worst_axis']}={comp_veto['worst_value']:.3f} "
-                            f"< {COMPOSITE_DETHRONE_FLOOR} [legacy path]",
-                            level="warning", state_dir=str(state.state_dir),
-                        )
-                        continue
-                    elif comp_veto is not None and king_floor_waived:
-                        logger.warning(
-                            f"UID {uid}: composite floor would block ({comp_veto['reason']}) "
-                            "[legacy path], but king regression gate waived the floor"
-                        )
-                    # Baseline-floor gate (legacy path)
-                    baseline_veto = _baseline_floor_dethrone_veto(
-                        challenger_model, _ref_model_name, students_data_early,
-                    )
-                    if baseline_veto is not None:
-                        logger.info(
-                            f"UID {uid}: BLOCKED DETHRONE by baseline floor — "
-                            f"{baseline_veto['reason']} [legacy epsilon path, KL={challenger_kl:.6f}]"
-                        )
-                        log_event(
-                            f"Baseline floor blocked dethrone: UID {uid} "
-                            f"axis {baseline_veto['axis']} "
-                            f"challenger={baseline_veto['challenger']:.3f} "
-                            f"vs reference={baseline_veto['reference']:.3f} "
-                            f"(gap={baseline_veto['gap']:+.3f}) [legacy path]",
-                            level="warning", state_dir=str(state.state_dir),
-                        )
-                        continue
-                    pareto_veto = _pareto_dethrone_veto(
-                        challenger_model, king_model_name,
-                        students_data_early, king_h2h_kl, king_rkl_ref_early,
-                    )
-                    if pareto_veto is not None:
-                        logger.info(
-                            f"UID {uid}: BLOCKED DETHRONE by Pareto gate — "
-                            f"{pareto_veto['reason']} [legacy epsilon path, KL={challenger_kl:.6f}]"
-                        )
-                        log_event(
-                            f"Pareto gate blocked dethrone: UID {uid} "
-                            f"{pareto_veto['reason']} [legacy path]",
-                            level="warning", state_dir=str(state.state_dir),
-                        )
+                    if _run_dethrone_vetos(
+                        challenger_uid=uid,
+                        challenger_model=challenger_model,
+                        king_model=king_model_name,
+                        reference_model=_ref_model_name,
+                        students_data=students_data_early,
+                        king_kl_ref=king_h2h_kl,
+                        king_rkl_ref=king_rkl_ref_early,
+                        king_floor_waived=king_floor_waived,
+                        state_dir=str(state.state_dir),
+                        path_label="legacy epsilon",
+                        extra_context=f"[KL={challenger_kl:.6f}]",
+                    ):
                         continue
                     logger.info(f"UID {uid} DETHRONED king UID {king_uid}! KL={challenger_kl:.6f} < {epsilon_threshold:.6f} [legacy epsilon, n={challenger_n}]")
                     legacy_dethroners.append({
@@ -1440,28 +1428,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 continue
             axes = comp.get("axes") or {}
             broken_axes = set(comp.get("broken_axes") or [])
-            from scripts.validator.composite import (
-                AXIS_WEIGHTS as _AX,
-                BENCH_AXIS_WEIGHTS as _BX,
-                ARENA_V3_AXIS_WEIGHTS as _V3X,
-                JUDGE_AXIS_IN_COMPOSITE as _JIC,
-                BENCH_AXES_IN_COMPOSITE as _BIC,
-                ARENA_V3_AXES_IN_COMPOSITE as _V3IC,
-                REASONING_DENSITY_IN_COMPOSITE as _RDIC,
-                CHAT_TURNS_AXIS_IN_COMPOSITE as _CTIC,
-            )
-            _active = set(_AX.keys())
-            if _JIC:
-                _active.add("judge_probe")
-            if _BIC:
-                _active.update(_BX.keys())
-            if _V3IC:
-                _active.update(_V3X.keys())
-            if _RDIC:
-                _active.add("reasoning_density")
-            if _CTIC:
-                _active.add("chat_turns_probe")
-            _active.difference_update(broken_axes)
+            _active = set(get_effective_axis_weights().keys()) - broken_axes
             bad = min(
                 ((k, v) for k, v in axes.items() if v is not None and k in _active),
                 key=lambda kv: kv[1],
