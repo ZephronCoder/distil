@@ -335,7 +335,12 @@ def _generate_single_prompt_api(
     import requests
 
     last_err: Optional[Exception] = None
-    for attempt in range(3):
+    # 6 attempts with exp backoff covers the worst Inceptron-side rate-limit
+    # bursts we've observed (60 prompts × concurrency=4 occasionally hits a
+    # cluster of 4-8 consecutive 429s when a coincident user spikes the
+    # provider's queue). 1+2+4+8+16+30 = ~61 s of budget per prompt before
+    # we give up; far cheaper than a 5 min vLLM cold-start.
+    for attempt in range(6):
         try:
             if cfg.endpoint == "chat":
                 api_out = _call_api_chat(prompt_text, cfg, max_new_tokens, block_seed, idx, requests)
@@ -360,11 +365,30 @@ def _generate_single_prompt_api(
                     top_lp_list, token_to_id, tokenizer, k=cfg.top_logprobs,
                 )
             return idx, result
+        except requests.HTTPError as e:
+            last_err = e
+            sc = getattr(e.response, "status_code", None)
+            is_rate_limited = sc == 429 or (sc is not None and 500 <= sc < 600)
+            if is_rate_limited and attempt < 5:
+                retry_after_hdr = e.response.headers.get("Retry-After") if e.response is not None else None
+                try:
+                    backoff_s = float(retry_after_hdr) if retry_after_hdr else (2.0 ** attempt)
+                except Exception:
+                    backoff_s = 2.0 ** attempt
+                backoff_s = min(backoff_s, 30.0)
+                # Provider-assigned Retry-After can be 0; force at least 1 s
+                # so we don't immediately retry into the same closed window.
+                backoff_s = max(backoff_s, 1.0)
+                time.sleep(backoff_s)
+                continue
+            if attempt < 5:
+                time.sleep(min(2.0 ** attempt, 30.0))
+                continue
+            raise RuntimeError(f"API generation failed for prompt {idx}: HTTP {sc}") from e
         except Exception as e:
             last_err = e
-            if attempt < 2:
-                # Light backoff; cloud APIs occasionally rate-limit.
-                time.sleep(1.0 * (attempt + 1))
+            if attempt < 5:
+                time.sleep(min(2.0 ** attempt, 30.0))
             else:
                 raise RuntimeError(f"API generation failed for prompt {idx}: {e}") from e
     # unreachable
@@ -583,11 +607,18 @@ def greedy_batch_api(
 # Health check
 # ---------------------------------------------------------------------------
 
-def api_health_check(config: Optional[APIConfig] = None, prompt: str = "Say OK and nothing else.") -> Dict[str, Any]:
+def api_health_check(config: Optional[APIConfig] = None, prompt: str = "Say OK and nothing else.",
+                     max_attempts: int = 6) -> Dict[str, Any]:
     """Quick connectivity + logprobs sanity test. Raises on failure.
 
     Returns ``{"ok": True, "text": "...", "n_logprobs": N, "model": "...", "elapsed_s": ...}``.
     Run this once before committing the eval round to the API path.
+
+    Retries on 429 (rate limit) and 5xx with exponential backoff. The OpenRouter
+    Inceptron route has been observed to bounce 429 in clusters when several
+    workers compete for the same backend; the per-prompt worker uses the same
+    retry logic, so the health check needs to be at least as patient — failing
+    fast here means the round aborts immediately on a transient burst.
     """
     import requests
 
@@ -613,8 +644,35 @@ def api_health_check(config: Optional[APIConfig] = None, prompt: str = "Say OK a
         }
         url = f"{cfg.base_url}/v1/completions"
     payload.update(cfg.extra_body())
-    resp = requests.post(url, headers=cfg.headers(), data=json.dumps(payload), timeout=cfg.timeout_s)
-    resp.raise_for_status()
+
+    last_err: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.post(url, headers=cfg.headers(), data=json.dumps(payload), timeout=cfg.timeout_s)
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                # Honour Retry-After if the provider sets it; otherwise
+                # exponential backoff with full jitter, capped at 30s.
+                retry_after_hdr = resp.headers.get("Retry-After")
+                try:
+                    backoff_s = float(retry_after_hdr) if retry_after_hdr else (2.0 ** attempt)
+                except Exception:
+                    backoff_s = 2.0 ** attempt
+                backoff_s = min(backoff_s, 30.0)
+                last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                if attempt < max_attempts - 1:
+                    time.sleep(backoff_s)
+                    continue
+            resp.raise_for_status()
+            break
+        except requests.RequestException as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                time.sleep(min(2.0 ** attempt, 30.0))
+                continue
+            raise
+    else:
+        raise RuntimeError(f"api_health_check exhausted {max_attempts} attempts: {last_err}")
+
     data = resp.json()
     if "error" in data and not data.get("choices"):
         raise RuntimeError(f"API error: {data['error']}")
