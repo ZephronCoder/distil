@@ -70,9 +70,31 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     #
     # If DISTIL_TEACHER_MODE=api we skip local vLLM bootstrap, so the
     # teacher phase is dominated by API throughput, not GPU load.
+    #
+    # 2026-05-04 follow-up: round 04:15 telemetry showed the ETA was
+    # *still* too low — actual student #1 runtime was ~50 min not the
+    # ~12 min implied by 700s. The 700s figure assumed the LFJ +
+    # bench-battery wall time we're paying with eager-attn Kimi 33B
+    # on the derail-prone student set we currently have. Real cost
+    # for a derail-prone student is:
+    #   load 140s + chat 65s + cap 36s + judge 16s + LFJ 1027s +
+    #   chat-turns 40s + bench 1700s + KL 180s = 3204s = 53 min.
+    # Healthy students still pay the bench (~28 min) but skip the
+    # derailed-LFJ tail, so they land around 45 min.
+    #
+    # The adaptive caps in pod_eval_vllm.py (cd483d0, 2026-05-04)
+    # cut derailed students to ~19 min and DISTIL_STUDENT_BATCH_SIZE=4
+    # shaves ~90s off KL for everyone, so the post-deploy ratio is
+    # roughly 7 derailed × 19 min + 3 healthy × 45 min = ~270 min on
+    # a 10-student round. Bake that into the ETA so miners' "stuck"
+    # complaints stop spiking on every round restart.
     _api_mode = os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
     est_teacher_s = 515 if _api_mode else 180
-    est_per_student_s = 700  # load + probes + KL (median, healthy path)
+    # Mixed-fleet average: weight 70% derailed × 19 min + 30%
+    # healthy × 45 min = ~27 min/student post-cap. Use 1700s as the
+    # honest mid-point so the dashboard ETA doesn't promise anything
+    # the eval cannot deliver.
+    est_per_student_s = 1700
     est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
     eval_order = []
     if king_uid is not None and king_uid in models_to_eval:
