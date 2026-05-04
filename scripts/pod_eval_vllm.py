@@ -371,6 +371,77 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
             _peek_cfg = _ACfg.from_pretrained(name, trust_remote_code=False, **_cfg_kwargs)
             _archs = getattr(_peek_cfg, "architectures", None) or []
             _model_type = getattr(_peek_cfg, "model_type", "")
+            # 2026-05-04: pod-side defensive embed/quant guard. The
+            # validator-side precheck (eval.model_checker) already DQ's
+            # mismatched-vocab and quantized-without-config models, but
+            # we duplicate the cheap header probe here as a safety net
+            # — without it, every UID that slips through (e.g. on a
+            # validator with a stale precheck cache) wastes ~50s of GPU
+            # time AND poisons the CUDA context for the rest of the
+            # round, deferring 5+ honest students per cascade. We bail
+            # with a clean RuntimeError so the eval loop's existing
+            # try/except logs a load-skip without ever touching CUDA.
+            try:
+                from eval.model_checker import (
+                    detect_safetensors_quantization as _det_q,
+                    get_embed_weight_shape as _emb_shape,
+                    BASELINE_VOCAB_SIZE as _BVOC,
+                )
+                _eshape = _emb_shape(name, revision)
+                if _eshape is not None:
+                    _vsize, _hidden, _edt = _eshape
+                    _cfg_v = (
+                        getattr(_peek_cfg, "vocab_size", None)
+                        or (
+                            getattr(getattr(_peek_cfg, "text_config", None), "vocab_size", None)
+                            if hasattr(_peek_cfg, "text_config")
+                            else None
+                        )
+                    )
+                    _cfg_h = (
+                        getattr(_peek_cfg, "hidden_size", None)
+                        or (
+                            getattr(getattr(_peek_cfg, "text_config", None), "hidden_size", None)
+                            if hasattr(_peek_cfg, "text_config")
+                            else None
+                        )
+                    )
+                    if _vsize and _vsize != _BVOC:
+                        raise RuntimeError(
+                            f"PRECHECK_BYPASS: embed vocab {_vsize}"
+                            f" ≠ teacher {_BVOC}"
+                        )
+                    if _cfg_h and _hidden != int(_cfg_h):
+                        raise RuntimeError(
+                            f"PRECHECK_BYPASS: embed hidden {_hidden}"
+                            f" ≠ config hidden {int(_cfg_h)}"
+                        )
+                    if _edt and _edt.upper() not in (
+                        "BF16", "F16", "F32", "F64", "F8_E4M3", "F8_E5M2"
+                    ):
+                        raise RuntimeError(
+                            f"PRECHECK_BYPASS: embed dtype {_edt} is "
+                            f"not a float type"
+                        )
+                _qinfo = _det_q(name, revision)
+                if _qinfo is not None:
+                    raise RuntimeError(
+                        f"PRECHECK_BYPASS: undisclosed quantization"
+                        f" ({_qinfo['scheme']} via {_qinfo['marker']})"
+                    )
+            except RuntimeError:
+                # Re-raise PRECHECK_BYPASS up to the caller so the eval
+                # loop logs it as a load failure (no CUDA touched).
+                raise
+            except Exception as _safe_err:
+                # Probe itself failed (network blip, weird format) — log
+                # but don't block. The validator-side precheck is the
+                # authoritative gate; this is just a fast-fail backstop.
+                print(
+                    f"  [pod-precheck] {name}: probe failed (non-fatal): "
+                    f"{_safe_err}",
+                    flush=True,
+                )
             student_needs_remote_code = (
                 "KimiK25ForConditionalGeneration" in _archs
                 or _model_type in ("kimi_k25", "kimi_k2")
@@ -3548,7 +3619,17 @@ CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", 
 # Override via env if a regression in procedural calibration forces
 # rollback to the v29.4 mix.
 CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "0"))
-CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "36"))
+# 2026-05-04 (v30.5 throughput) — capability probe trim. 36 items was
+# leftover from the v29.5 mix expansion when we still ran the capability
+# axis as the main accuracy signal; bench_battery now provides the
+# heavyweight accuracy measurement (HumanEval, MBPP, AIME, MATH-500,
+# IFEval, GPQA), so capability degenerates into a quick "doesn't
+# trivially derail on multi-step reasoning" sanity check. 24 procedural
+# items keep the SE on the 0–1 pass rate at ~0.10 (binomial), which is
+# tighter than the 0.15 dethrone margin — losing 12 items just trims the
+# probe wall clock by ~33% with no change in scoring decisions. Operators
+# can revert via env if a regression in calibration is observed.
+CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "24"))
 LENGTH_PENALTY_RATIO = float(os.environ.get("LENGTH_PENALTY_RATIO", "2.0"))
 
 # ── 2026-04-29 (v29.5) — Procedural lexicon synthesisers ──────────────
