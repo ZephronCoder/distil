@@ -21,24 +21,6 @@ from scripts.validator.composite import (
 from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, EPSILON, MAX_KL_THRESHOLD, PAIRED_TEST_ALPHA
 
 
-class _LongFormDerailDQConfig:
-    """Light shim so the inline DQ check can read the live composite-side
-    constants without importing them inside a hot loop."""
-
-    @property
-    def ENABLED(self) -> bool:
-        return LONG_FORM_DERAIL_DQ_ENABLED
-
-    @property
-    def THRESHOLD(self) -> float:
-        return LONG_FORM_DERAIL_DQ_THRESHOLD
-
-    @property
-    def RATIO(self) -> float:
-        return LONG_FORM_DERAIL_DQ_RATIO
-
-
-_LF_DQ = _LongFormDerailDQConfig()
 from scripts.validator.precheck import check_activation_fingerprint
 from scripts.validator.single_eval import (
     is_single_eval_mode,
@@ -810,10 +792,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         # because their bench scores compensated. Word-salad output
         # is not a partial failure; the model can't sustain coherent
         # generation, which is core to assistant deployment.
-        if (
-            uid != king_uid
-            and getattr(_LF_DQ, "ENABLED", True)
-        ):
+        if uid != king_uid and LONG_FORM_DERAIL_DQ_ENABLED:
             lf = student_result.get("long_form_judge_probe") or {}
             per_prompt = lf.get("per_prompt") or []
             if per_prompt:
@@ -821,17 +800,17 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                     1 for r in per_prompt
                     if isinstance(r, dict)
                     and isinstance(r.get("coherence"), (int, float))
-                    and r["coherence"] < _LF_DQ.THRESHOLD
+                    and r["coherence"] < LONG_FORM_DERAIL_DQ_THRESHOLD
                 )
                 ratio = derailed / len(per_prompt)
-                if ratio > _LF_DQ.RATIO:
+                if ratio > LONG_FORM_DERAIL_DQ_RATIO:
                     coh_factor = lf.get("coherence_factor")
                     sample_tail = ""
                     for r in per_prompt:
                         if (
                             isinstance(r, dict)
                             and isinstance(r.get("coherence"), (int, float))
-                            and r["coherence"] < _LF_DQ.THRESHOLD
+                            and r["coherence"] < LONG_FORM_DERAIL_DQ_THRESHOLD
                             and r.get("response_preview")
                         ):
                             sample_tail = r["response_preview"][-120:]
@@ -844,7 +823,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                     reason = (
                         f"long_form_incoherence: {derailed}/"
                         f"{len(per_prompt)} long-form responses derailed "
-                        f"(coherence<{_LF_DQ.THRESHOLD:.2f}; aggregate "
+                        f"(coherence<{LONG_FORM_DERAIL_DQ_THRESHOLD:.2f}; aggregate "
                         f"coherence_factor={coh_factor_str}). Model "
                         f"cannot sustain coherent generation past ~500 "
                         f"tokens — produces word salad / multilingual "

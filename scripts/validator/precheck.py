@@ -25,7 +25,7 @@ from eval.scoring import (
     record_failure,
     reset_failures,
 )
-from eval.state import ValidatorState
+from eval.state import ValidatorState, atomic_json_write
 from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, MAX_KL_THRESHOLD
 
 logger = logging.getLogger("distillation.remote_validator")
@@ -319,7 +319,7 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
             "updated": time.time(),
         }
         try:
-            fp_file.write_text(json.dumps(stored, indent=2))
+            atomic_json_write(fp_file, stored, indent=2)
         except Exception as exc:
             logger.warning(f"Failed to save fingerprints: {exc}")
     else:

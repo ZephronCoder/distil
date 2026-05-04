@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from eval.state import atomic_json_write
+
 logger = logging.getLogger("distillation.chat_pod_admin")
 
 # Resolved fresh on every import / call so the CLI works even when STATE_DIR
@@ -77,11 +79,7 @@ def write_chat_pod_state(updates: dict[str, Any], *, source: str = "validator") 
     state.update({k: v for k, v in updates.items() if v is not None})
     state["updated_at"] = time.time()
     state["updated_by"] = source
-    tmp = path.with_suffix(".json.tmp")
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, path)
+    atomic_json_write(path, state, indent=2)
     return state
 
 

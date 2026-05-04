@@ -4441,37 +4441,6 @@ def _procedural_capability_prompts(rng, n):
     return out
 
 
-def _procedural_math_prompts(rng, n):
-    """Backwards-compatible shim: arithmetic-only procedural prompts.
-
-    Existed before round 19 expansion. Internal callers should prefer
-    ``_procedural_capability_prompts``; this name is retained because
-    operators may have set the legacy ``CAPABILITY_PROBE_N_PROC_MATH``
-    env var expecting arithmetic-only behaviour.
-    """
-    out = []
-    for _ in range(n):
-        kind = rng.choice(["add", "sub", "mul", "div", "mod"])
-        if kind == "add":
-            a, b = rng.randint(17, 499), rng.randint(17, 499)
-            out.append({"q": f"What is {a} + {b}? Answer with only the number.", "a": str(a + b), "kind": "int"})
-        elif kind == "sub":
-            a, b = rng.randint(100, 900), rng.randint(10, 99)
-            out.append({"q": f"What is {a} - {b}? Answer with only the number.", "a": str(a - b), "kind": "int"})
-        elif kind == "mul":
-            a, b = rng.randint(2, 15), rng.randint(2, 15)
-            out.append({"q": f"What is {a} * {b}? Answer with only the number.", "a": str(a * b), "kind": "int"})
-        elif kind == "div":
-            b = rng.randint(2, 12)
-            q = rng.randint(2, 25)
-            a = b * q
-            out.append({"q": f"What is {a} / {b}? Answer with only the number.", "a": str(q), "kind": "int"})
-        else:
-            a, b = rng.randint(20, 200), rng.randint(3, 9)
-            out.append({"q": f"What is {a} mod {b}? Answer with only the number.", "a": str(a % b), "kind": "int"})
-    return out
-
-
 def build_capability_prompts(block_seed=None):
     """Return the per-round capability prompt list.
 
@@ -17643,64 +17612,10 @@ def main():
         except Exception:
             args.tensor_parallel_size = 1
 
-    # v30.2 — Student-side GPU dispatch.
-    # On a multi-GPU pod, the teacher uses tensor-parallel across all
-    # GPUs (above), but the student forward pass can either:
-    #   (a) Use the same TP layout as the teacher (faster per prompt
-    #       for big students). This is the default when
-    #       DISTIL_STUDENT_TP_SIZE is unset.
-    #   (b) Run multiple students in parallel on disjoint GPU groups
-    #       (faster when many students need scoring per round).
-    #       This requires DISTIL_STUDENT_PARALLELISM > 1, which
-    #       partitions the visible GPUs into N worker groups of
-    #       (total_gpus // N) GPUs each.
-    # Default settings preserve existing single-GPU behaviour.
-    student_tp = os.environ.get("DISTIL_STUDENT_TP_SIZE")
-    if student_tp:
-        try:
-            args.student_tp_size = max(1, int(student_tp))
-        except ValueError:
-            args.student_tp_size = 1
-    else:
-        args.student_tp_size = 1
-    student_par = os.environ.get("DISTIL_STUDENT_PARALLELISM")
-    if student_par:
-        try:
-            args.student_parallelism = max(1, int(student_par))
-        except ValueError:
-            args.student_parallelism = 1
-    else:
-        args.student_parallelism = 1
-    if args.student_parallelism > 1:
-        # Sanity check: parallelism × per-worker GPU count ≤ visible.
-        try:
-            total_gpus = torch.cuda.device_count()
-        except Exception:
-            total_gpus = 1
-        per_worker = max(1, total_gpus // args.student_parallelism)
-        print(
-            f"[eval] Student parallelism: {args.student_parallelism} "
-            f"workers × {per_worker} GPU(s) each "
-            f"(total visible: {total_gpus}). Note: this is currently "
-            f"a configuration knob — the actual worker-pool dispatch "
-            f"will land in v30.4 once a multi-GPU pod is provisioned.",
-            flush=True,
-        )
-
-    # v30.3 — Student-prompt-batch size. When > 1 (and a multi-GPU pod
-    # is available), N consecutive prompts are padded together and run
-    # through the student in a single forward pass. Significantly
-    # speeds up Phase B at the cost of padding overhead. Default 1
-    # preserves existing single-prompt behaviour.
-    #
-    # Implementation note: enabling batched forward requires careful
-    # handling of (a) variable prompt + continuation lengths via
-    # attention masks, (b) per-prompt logits slicing for KL/EOPD/IS-KL
-    # /forking-RKL/trace computation, and (c) memory budget (B prompts
-    # × max_seq_len × vocab_size float32). Default kept at 1; values
-    # 2–8 are typical wall-time wins of 1.5–3x on H200-class hardware
-    # for similar-length prompts (climbmix-400b shards have low
-    # length variance so padding overhead is small).
+    # Student forward-pass batch size (DISTIL_STUDENT_BATCH_SIZE).
+    # Pads N consecutive prompts together for one forward pass; default
+    # 1 preserves single-prompt behaviour. Values 2–8 give 1.5–3x speedup
+    # on H200-class hardware when prompt-length variance is low.
     student_batch = os.environ.get("DISTIL_STUDENT_BATCH_SIZE")
     if student_batch:
         try:
