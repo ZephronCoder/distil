@@ -5,7 +5,7 @@ import json
 import logging
 import time
 
-from eval.state import ValidatorState
+from eval.state import RECENT_KINGS_MAX, ValidatorState
 from scripts.validator.config import DISTIL_ROLE_ID, PAIRED_TEST_ALPHA, EVAL_PROMPTS_H2H
 from scripts.validator.composite import (
     ARENA_V3_AXIS_WEIGHTS,
@@ -68,6 +68,36 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
     import os as _os
     single_eval_active = bool(int(_os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
 
+    # Compute the new king's actual emission share under the v30.4
+    # multi-king payout policy: emission is split equally across the
+    # ``RECENT_KINGS_MAX`` (=5) most-recent distinct king UIDs. The
+    # caller (``post_round`` → ``_record_king_change``) has already
+    # pushed ``new_uid`` to ``state.recent_kings[0]`` before invoking
+    # this function, so the live recent-kings queue is the source of
+    # truth here. We dedupe + cap defensively in case a legacy caller
+    # invoked us pre-record. Honors ``MULTI_KING_PAYOUT_ENABLED=0`` for
+    # the legacy winner-takes-all override.
+    distinct_kings: list[int] = []
+    for u in (getattr(state, "recent_kings", []) or []):
+        try:
+            u_i = int(u)
+        except (TypeError, ValueError):
+            continue
+        if u_i < 0 or u_i in distinct_kings:
+            continue
+        distinct_kings.append(u_i)
+        if len(distinct_kings) >= RECENT_KINGS_MAX:
+            break
+    try:
+        new_uid_i = int(new_uid)
+        if new_uid_i >= 0 and new_uid_i not in distinct_kings:
+            distinct_kings.insert(0, new_uid_i)
+            distinct_kings = distinct_kings[:RECENT_KINGS_MAX]
+    except (TypeError, ValueError):
+        pass
+    multi_king_enabled = bool(int(_os.environ.get("MULTI_KING_PAYOUT_ENABLED", "1") or 1))
+    n_kings = max(1, len(distinct_kings)) if multi_king_enabled else 1
+
     earnings_line = ""
     try:
         import urllib.request
@@ -75,12 +105,35 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
         price_data = json.loads(resp.read())
         tao_per_day = price_data.get("miners_tao_per_day", 0)
         tao_usd = price_data.get("tao_usd", 0)
-        usd_per_day = tao_per_day * tao_usd
         if tao_per_day > 0 and tao_usd > 0:
-            earnings_line = (
-                f"\n💰 **King earns ~{tao_per_day:.1f} τ/day (${usd_per_day:,.0f}/day)** — "
-                f"winner takes all!\n"
-            )
+            king_tao_per_day = tao_per_day / n_kings
+            king_usd_per_day = king_tao_per_day * tao_usd
+            usd_per_day = tao_per_day * tao_usd
+            share_pct = 100.0 / n_kings
+            steady_pct = 100.0 / RECENT_KINGS_MAX
+            if not multi_king_enabled:
+                earnings_line = (
+                    f"\n💰 **King earns ~{tao_per_day:.1f} τ/day "
+                    f"(${usd_per_day:,.0f}/day)** — winner takes all "
+                    f"(`MULTI_KING_PAYOUT_ENABLED=0`).\n"
+                )
+            elif n_kings == 1:
+                earnings_line = (
+                    f"\n💰 **UID {new_uid} earns ~{king_tao_per_day:.1f} τ/day "
+                    f"(${king_usd_per_day:,.0f}/day)** — currently 100% of the "
+                    f"~{tao_per_day:.1f} τ/day crown pool. Emission auto-splits "
+                    f"equally across the {RECENT_KINGS_MAX} most-recent distinct "
+                    f"kings, so this share dilutes toward ~{steady_pct:.0f}% as "
+                    f"new kings are crowned.\n"
+                )
+            else:
+                earnings_line = (
+                    f"\n💰 **UID {new_uid} earns ~{king_tao_per_day:.1f} τ/day "
+                    f"(${king_usd_per_day:,.0f}/day)** — {share_pct:.0f}% of the "
+                    f"~{tao_per_day:.1f} τ/day crown pool, split equally across "
+                    f"the {n_kings} most-recent distinct kings (cap "
+                    f"{RECENT_KINGS_MAX}).\n"
+                )
     except Exception as e:
         logger.warning(f"Failed to fetch price data for announcement: {e}")
 

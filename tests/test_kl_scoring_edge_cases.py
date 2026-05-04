@@ -634,6 +634,145 @@ class TestStateConsistency(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Announcement Earnings-Line Tests (multi-king payout)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAnnouncementEarningsLine(unittest.TestCase):
+    """Verify the new-king Discord announcement reflects the v30.4
+    multi-king payout policy (emission split equally across the
+    RECENT_KINGS_MAX most-recent distinct kings) instead of the
+    deprecated ``winner takes all`` wording. Bug reported by Sebastian
+    on 2026-05-04 after the UID 188 cold-start announcement still
+    claimed the king took 100 percent of emission.
+    """
+
+    def _mocked_price_response(self, tao_per_day=137.8, tao_usd=2.0):
+        from io import BytesIO
+
+        class _Resp(BytesIO):
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *_):
+                return False
+
+        body = json.dumps({
+            "miners_tao_per_day": tao_per_day,
+            "tao_usd": tao_usd,
+        }).encode()
+        return _Resp(body)
+
+    def _make_state(self, recent_kings, tmpdir):
+        """Build a real ValidatorState in tmpdir with the given recent_kings
+        history. Using the real class keeps this test honest about the
+        ``state.save_announcement`` write path.
+        """
+        from eval.state import ValidatorState
+
+        s = ValidatorState(tmpdir)
+        s.recent_kings = list(recent_kings)
+        return s
+
+    def _build_announcement(self, recent_kings, new_uid=188,
+                            tao_per_day=137.8, tao_usd=2.0,
+                            multi_king_env="1"):
+        """Invoke ``announce_new_king`` with the price endpoint mocked
+        and return the queued announcement dict.
+        """
+        from scripts.validator.announcements import announce_new_king
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = self._make_state(recent_kings, tmpdir)
+            env_patch = patch.dict(
+                os.environ,
+                {"SINGLE_EVAL_MODE": "1", "MULTI_KING_PAYOUT_ENABLED": multi_king_env},
+                clear=False,
+            )
+            url_patch = patch(
+                "urllib.request.urlopen",
+                return_value=self._mocked_price_response(tao_per_day, tao_usd),
+            )
+            with env_patch, url_patch:
+                announce_new_king(
+                    new_uid=new_uid,
+                    new_model="best26/sn97-us-v7",
+                    new_kl=2.055847,
+                    old_uid=None,
+                    old_model=None,
+                    old_kl=None,
+                    state=state,
+                    paired_prompts=60,
+                    total_prompts=60,
+                    new_composite_final=0.268,
+                    new_composite_worst=0.040,
+                    new_composite_weighted=0.655,
+                    new_composite_worst_3_mean=0.102,
+                    new_limiting_axis="long_form_judge",
+                )
+            ann_path = Path(tmpdir) / "announcement.json"
+            self.assertTrue(ann_path.exists(), "announcement file not written")
+            return json.loads(ann_path.read_text())
+
+    def test_no_winner_takes_all_wording_in_steady_state(self):
+        """When the recent-kings queue is full (5 distinct kings), the
+        announcement must NOT contain 'winner takes all' and must show
+        the king's actual 20% share."""
+        ann = self._build_announcement([188, 195, 107, 42, 17])
+        msg = ann["message"]
+        self.assertNotIn("winner takes all", msg.lower())
+        self.assertIn("20% of the", msg)
+        self.assertIn("split equally across the 5 most-recent", msg)
+        # New king's per-day take is the pool divided by 5: 137.8 / 5 = 27.56.
+        self.assertIn("~27.6 τ/day", msg)
+
+    def test_cold_start_one_king_shows_dilution_note(self):
+        """When only the new king sits in the queue, the line must
+        explain that the share will dilute as new kings are crowned —
+        not pretend it is winner-takes-all forever."""
+        ann = self._build_announcement([188])
+        msg = ann["message"]
+        self.assertNotIn("winner takes all", msg.lower())
+        self.assertIn("currently 100%", msg)
+        self.assertIn("dilutes toward ~20%", msg)
+        # Single-king cold-start: full pool to the new king.
+        self.assertIn("~137.8 τ/day", msg)
+        self.assertIn("UID 188 earns ~137.8 τ/day", msg)
+
+    def test_three_kings_shows_one_third_share(self):
+        """Three distinct kings in queue → each gets 33% of the pool.
+        137.8 / 3 = 45.93… — formatted as ~45.9."""
+        ann = self._build_announcement([188, 195, 107])
+        msg = ann["message"]
+        self.assertNotIn("winner takes all", msg.lower())
+        self.assertIn("33% of the", msg)
+        self.assertIn("split equally across the 3 most-recent", msg)
+        self.assertIn("~45.9 τ/day", msg)
+
+    def test_legacy_winner_takes_all_env_override(self):
+        """If an operator sets ``MULTI_KING_PAYOUT_ENABLED=0`` we honor
+        the legacy winner-takes-all behaviour AND surface the override
+        in the message so it can't drift unnoticed."""
+        ann = self._build_announcement([188], multi_king_env="0")
+        msg = ann["message"]
+        self.assertIn("winner takes all", msg.lower())
+        self.assertIn("MULTI_KING_PAYOUT_ENABLED=0", msg)
+        self.assertIn("~137.8 τ/day", msg)
+
+    def test_new_uid_added_defensively_when_queue_lacks_it(self):
+        """If the caller invokes ``announce_new_king`` BEFORE
+        ``_record_king_change`` has pushed the new king onto the queue,
+        the announcement must still account for the new king. Belt-and-
+        braces against future caller-order regressions."""
+        # Queue has 4 OTHER kings; new king is 188 and is NOT in the
+        # queue → effective n_kings = 5, share = 20%.
+        ann = self._build_announcement([195, 107, 42, 17], new_uid=188)
+        msg = ann["message"]
+        self.assertIn("20% of the", msg)
+        self.assertIn("split equally across the 5 most-recent", msg)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Reproduce Prompts Script Tests
 # ═══════════════════════════════════════════════════════════════════════════════
 
