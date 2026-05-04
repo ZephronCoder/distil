@@ -2106,6 +2106,101 @@ def long_form_judge_response_probe(model, tokenizer, device="cuda",
     return out
 
 
+def judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
+                             concurrency: int = 4) -> dict:
+    """API-routed equivalent of :func:`judge_teacher_score`.
+
+    Replaces the local ``teacher.generate(...)`` call with a request
+    to the OpenAI-compatible teacher API (Kimi K2.6 via OpenRouter →
+    Inceptron in production). Same returned shape so the caller code
+    is identical.
+
+    Why this exists
+    ---------------
+    Pre-2026-05-04 Phase B always loaded the local teacher onto GPU
+    via ``load_model(args.teacher, device)`` to run rubric grading.
+    After the API teacher cutover (2026-05-03) the teacher is Kimi
+    K2.6 1T-param sparse MoE. Loading it locally requires:
+      * ~600 GB disk for the safetensors snapshot
+      * >1 TB VRAM at bf16 (won't fit on H200 NVL's 140 GB)
+    so Phase B silently failed every round, dropping judge /
+    chat-turns / long-form-judge scores from the composite. This
+    function (and its long-form / chat-turns siblings below) routes
+    the rubric grading through the same API that already serves
+    Phase A logprobs, so Phase B can run without ever touching the
+    local GPU.
+
+    Parallelism: each (prompt, response) → single-digit grade is
+    independent, so we fan out via ThreadPoolExecutor. Concurrency
+    defaults to 4 to stay under the Inceptron rate-limit bucket
+    (the same per-second budget as the Phase A logprob fetcher).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        from scripts.api_teacher import _greedy_text_one
+    except ImportError:
+        from api_teacher import _greedy_text_one  # type: ignore
+
+    agg = {
+        "n": 0, "n_valid": 0, "mean_score": None,
+        "normalized": None, "per_prompt": [],
+    }
+    if api_cfg is None or tokenizer is None or not collected:
+        return agg
+    prompts = collected.get("prompts") or []
+    responses = collected.get("responses") or []
+    if not prompts or not responses:
+        return agg
+
+    def _grade_one(idx_pair):
+        idx, (prompt, response) = idx_pair
+        try:
+            rubric = JUDGE_RUBRIC_TEMPLATE.format(
+                prompt=prompt.strip(),
+                response=_sanitize_grader_response(
+                    (response or "").strip()
+                )[:2048],
+            )
+            rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
+            text = _greedy_text_one(rendered, api_cfg, max_new_tokens=8, idx=idx)
+            score = _parse_judge_score(text)
+            return idx, prompt, response, text, score, None
+        except Exception as e:
+            return idx, prompt, response, "", None, e
+
+    items = list(enumerate(zip(prompts, responses)))
+    results_idx: dict[int, tuple] = {}
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        for fut in ex.map(_grade_one, items):
+            i, prompt, response, text, score, err = fut
+            results_idx[i] = (prompt, response, text, score, err)
+
+    scores: list[int | None] = []
+    for i in range(len(items)):
+        prompt, response, text, score, err = results_idx[i]
+        agg["n"] += 1
+        scores.append(score)
+        per = {
+            "prompt": prompt[:160],
+            "response_preview": (response or "")[:120],
+            "raw": text[:24],
+            "score": score,
+        }
+        if err is not None:
+            per["error"] = str(err)[:120]
+            per["score"] = None
+        if score is not None:
+            agg["n_valid"] += 1
+        agg["per_prompt"].append(per)
+
+    valid = [s for s in scores if s is not None]
+    if valid:
+        mean = sum(valid) / len(valid)
+        agg["mean_score"] = round(mean, 3)
+        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    return agg
+
+
 def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
                                   device: str = "cuda") -> dict:
     """v30 — teacher scores student long-form responses on the long-form
@@ -2248,6 +2343,130 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
         # not knowing when to stop). A derailed budget-filler gets
         # 0.05 × 0.5 = 0.025 (compounded). A coherent response that
         # emitted EOS naturally gets 1.0 × 1.0 = 1.0.
+        combined = coh * term
+        derail_factors.append(combined)
+        if i < len(agg["per_prompt"]):
+            agg["per_prompt"][i]["coherence"] = round(coh, 3)
+            agg["per_prompt"][i]["termination"] = round(term, 3)
+            agg["per_prompt"][i]["gen_tokens"] = gen_len
+    if derail_factors:
+        coh_mean = sum(derail_factors) / len(derail_factors)
+        agg["coherence_factor"] = round(coh_mean, 3)
+        if term_factors:
+            agg["termination_factor"] = round(
+                sum(term_factors) / len(term_factors), 3,
+            )
+        if agg.get("normalized") is not None:
+            penalised = agg["normalized"] * coh_mean
+            agg["normalized_pre_coherence"] = agg["normalized"]
+            agg["normalized"] = round(penalised, 4)
+    return agg
+
+
+def long_form_judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
+                                       concurrency: int = 4) -> dict:
+    """API-routed equivalent of :func:`long_form_judge_teacher_score`.
+
+    Same routing rationale as :func:`judge_teacher_score_api` — Phase B
+    rubric grading must work in API mode after the Kimi K2.6 cutover.
+
+    Preserves the post-rubric coherence × termination derail
+    penalisation block. The per-prompt heuristic detection runs on
+    the student response text (already in ``collected``) so the
+    detector itself doesn't need the teacher at all — it's gated only
+    on the rubric grade being non-None, which is the exact same
+    condition the local-teacher version uses.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        from scripts.api_teacher import _greedy_text_one
+    except ImportError:
+        from api_teacher import _greedy_text_one  # type: ignore
+
+    agg = {
+        "n": 0, "n_valid": 0, "mean_score": None,
+        "normalized": None, "per_prompt": [],
+    }
+    if api_cfg is None or tokenizer is None or not collected:
+        return agg
+    prompts = collected.get("prompts") or []
+    responses = collected.get("responses") or []
+    if not prompts or not responses:
+        return agg
+
+    def _grade_one(idx_pair):
+        idx, (prompt, response) = idx_pair
+        try:
+            rubric = LONG_FORM_JUDGE_RUBRIC_TEMPLATE.format(
+                prompt=prompt.strip(),
+                response=_sanitize_grader_response(
+                    (response or "").strip()
+                )[:4096],
+            )
+            rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
+            text = _greedy_text_one(rendered, api_cfg, max_new_tokens=8, idx=idx)
+            score = _parse_judge_score(text)
+            return idx, prompt, response, text, score, None
+        except Exception as e:
+            return idx, prompt, response, "", None, e
+
+    items = list(enumerate(zip(prompts, responses)))
+    results_idx: dict[int, tuple] = {}
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        for fut in ex.map(_grade_one, items):
+            i, prompt, response, text, score, err = fut
+            results_idx[i] = (prompt, response, text, score, err)
+
+    scores: list[int | None] = []
+    for i in range(len(items)):
+        prompt, response, text, score, err = results_idx[i]
+        agg["n"] += 1
+        scores.append(score)
+        per = {
+            "prompt": prompt[:160],
+            "response_preview": (response or "")[:120],
+            "raw": text[:24],
+            "score": score,
+        }
+        if err is not None:
+            per["error"] = str(err)[:120]
+            per["score"] = None
+        if score is not None:
+            agg["n_valid"] += 1
+        agg["per_prompt"].append(per)
+
+    valid = [s for s in scores if s is not None]
+    if valid:
+        mean = sum(valid) / len(valid)
+        agg["mean_score"] = round(mean, 3)
+        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+
+    # Post-rubric coherence × termination derail penalisation
+    # (identical to the local-teacher path so axis values are
+    # directly comparable across teacher modes).
+    gen_tokens_list = collected.get("gen_tokens") or []
+    derail_factors = []
+    term_factors = []
+    for i, response in enumerate(responses):
+        if i >= len(scores) or scores[i] is None:
+            continue
+        coh = _coherence_factor(response or "")
+        max_tokens = LONG_FORM_JUDGE_MAX_TOKENS
+        gen_len = (
+            int(gen_tokens_list[i])
+            if i < len(gen_tokens_list) and gen_tokens_list[i] is not None
+            else max_tokens
+        )
+        if max_tokens <= 0:
+            term = 1.0
+        elif gen_len < int(max_tokens * 0.95):
+            term = 1.0
+        elif gen_len >= max_tokens:
+            term = 0.5
+        else:
+            term = 1.0 - (gen_len - int(max_tokens * 0.95)) / max(1, int(max_tokens * 0.05)) * 0.5
+        term = max(0.5, min(1.0, term))
+        term_factors.append(term)
         combined = coh * term
         derail_factors.append(combined)
         if i < len(agg["per_prompt"]):
@@ -3032,6 +3251,77 @@ def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
     finally:
         if was_training:
             teacher.train()
+    valid = [s for s in scores if s is not None]
+    if valid:
+        mean = sum(valid) / len(valid)
+        agg["mean_score"] = round(mean, 3)
+        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    return agg
+
+
+def chat_turns_teacher_score_api(api_cfg, tokenizer, collected: dict,
+                                  concurrency: int = 4) -> dict:
+    """API-routed equivalent of :func:`chat_turns_teacher_score`.
+
+    Same routing rationale as the two judge_*_api siblings above.
+    Concurrency is parallelised per (convo, responses) tuple — there
+    are typically only 4 of these per student so the budget stays
+    well under any rate limit.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        from scripts.api_teacher import _greedy_text_one
+    except ImportError:
+        from api_teacher import _greedy_text_one  # type: ignore
+
+    agg = {
+        "n": 0, "n_valid": 0, "mean_score": None,
+        "normalized": None, "per_convo": [],
+        "n_turns": (collected or {}).get("n_turns", 3),
+    }
+    if api_cfg is None or tokenizer is None or not collected:
+        return agg
+    prompts = collected.get("prompts") or []
+    responses = collected.get("responses") or []
+    if not prompts or not responses:
+        return agg
+
+    def _grade_one(idx_pair):
+        idx, (convo, convo_responses) = idx_pair
+        try:
+            transcript = _format_transcript(convo, convo_responses)
+            rubric = CHAT_TURNS_RUBRIC_TEMPLATE.format(transcript=transcript[:4096])
+            rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
+            text = _greedy_text_one(rendered, api_cfg, max_new_tokens=8, idx=idx)
+            score = _parse_judge_score(text)
+            return idx, convo, text, score, None
+        except Exception as e:
+            return idx, convo, "", None, e
+
+    items = list(enumerate(zip(prompts, responses)))
+    results_idx: dict[int, tuple] = {}
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        for fut in ex.map(_grade_one, items):
+            i, convo, text, score, err = fut
+            results_idx[i] = (convo, text, score, err)
+
+    scores: list[int | None] = []
+    for i in range(len(items)):
+        convo, text, score, err = results_idx[i]
+        agg["n"] += 1
+        scores.append(score)
+        per = {
+            "seed": (convo[0] or "")[:120] if convo else "",
+            "raw": text[:24],
+            "score": score,
+        }
+        if err is not None:
+            per["error"] = str(err)[:120]
+            per["score"] = None
+        if score is not None:
+            agg["n_valid"] += 1
+        agg["per_convo"].append(per)
+
     valid = [s for s in scores if s is not None]
     if valid:
         mean = sum(valid) / len(valid)
@@ -19730,30 +20020,69 @@ def main():
         or (LONG_FORM_JUDGE_ENABLED and _lf_store)
     )
     if _need_teacher:
+        # 2026-05-04: in API teacher mode the local `load_model` would
+        # try to download Kimi K2.6 (~600 GB) and load it into the
+        # H200's 140 GB VRAM, which is simply impossible. The previous
+        # behaviour silently failed via the outer try/except, dropping
+        # judge / chat-turns / long-form-judge scores from EVERY round
+        # since the cutover. We now route each Phase B grading task
+        # through the same OpenRouter API used for Phase A logprob
+        # collection. RKL still requires local logits (it's a true KL,
+        # not a rubric grade) so it's no-op'd in API mode.
+        _phb_api_mode = (
+            getattr(args, "teacher_mode", "vllm") == "api"
+            or os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+        )
         try:
+            _rkl_label_phb = "off" if _phb_api_mode else (
+                "on" if (ON_POLICY_RKL_ENABLED and _rkl_store) else "off")
             print(f"\n[eval] Phase B: teacher-side scoring "
-                  f"(RKL={'on' if (ON_POLICY_RKL_ENABLED and _rkl_store) else 'off'}, "
+                  f"(mode={'api' if _phb_api_mode else 'local'}, "
+                  f"RKL={_rkl_label_phb}, "
                   f"judge={'on' if (JUDGE_PROBE_ENABLED and _judge_store) else 'off'}, "
                   f"chat_turns={'on' if (CHAT_TURNS_PROBE_ENABLED and _chat_store) else 'off'}, "
                   f"long_form_judge={'on' if (LONG_FORM_JUDGE_ENABLED and _lf_store) else 'off'})",
                   flush=True)
-            # Free the king if it's still resident — teacher forward pass
-            # wants all the VRAM it can get.
-            try:
-                if king_model is not None:
-                    del king_model
-                    king_model = None
-            except Exception:
-                pass
-            free_gpu()
+            # Free the king if it's still resident — local teacher
+            # forward pass wants all the VRAM. Skip the GPU dance in
+            # API mode since we don't load anything onto the GPU.
+            if not _phb_api_mode:
+                try:
+                    if king_model is not None:
+                        del king_model
+                        king_model = None
+                except Exception:
+                    pass
+                free_gpu()
             _phb_t0 = time.time()
-            teacher_b = load_model(args.teacher, device)
-            teacher_b.eval()
-            print(f"[eval] Teacher reloaded for Phase B ({time.time() - _phb_t0:.0f}s), "
-                  f"VRAM: {gpu_mem_str()}", flush=True)
+            teacher_b = None
+            api_cfg_phb = None
+            if _phb_api_mode:
+                # Build (or rebuild) an APIConfig from env. Phase A
+                # already validated the credentials so this should
+                # always succeed; if it doesn't, the Phase A pass
+                # would have aborted the round long before we got here.
+                try:
+                    from scripts.api_teacher import APIConfig
+                except ImportError:
+                    from api_teacher import APIConfig  # type: ignore
+                api_cfg_phb = APIConfig.from_env()
+                print(f"[eval] Phase B via API ({api_cfg_phb.model})", flush=True)
+            else:
+                teacher_b = load_model(args.teacher, device)
+                teacher_b.eval()
+                print(f"[eval] Teacher reloaded for Phase B ({time.time() - _phb_t0:.0f}s), "
+                      f"VRAM: {gpu_mem_str()}", flush=True)
 
             # ── Phase B.1: on-policy RKL scoring ────────────────────
-            if ON_POLICY_RKL_ENABLED and _rkl_store:
+            # 2026-05-04: in API mode there's no local teacher to
+            # gather full logits from, and the OpenAI logprobs spec
+            # only exposes top-K — that's enough for KL distillation
+            # (Phase A) but not for a true on-policy reverse-KL score
+            # which needs the full distribution. Skip RKL in API mode;
+            # ON_POLICY_RKL_IN_COMPOSITE is already 0 in production
+            # post-cutover so this doesn't move composite rankings.
+            if ON_POLICY_RKL_ENABLED and _rkl_store and not _phb_api_mode:
                 _rkl_t0 = time.time()
                 n_scored = 0
                 for sn, rolls in _rkl_store.items():
@@ -19801,7 +20130,13 @@ def main():
                 for sn, collected in _judge_store.items():
                     try:
                         _jb_s_t0 = time.time()
-                        judged = judge_teacher_score(teacher_b, tokenizer, collected, device=device)
+                        if _phb_api_mode:
+                            judged = judge_teacher_score_api(
+                                api_cfg_phb, tokenizer, collected,
+                                concurrency=max(1, getattr(api_cfg_phb, "concurrency", 4) // 2),
+                            )
+                        else:
+                            judged = judge_teacher_score(teacher_b, tokenizer, collected, device=device)
                         dur = time.time() - _jb_s_t0
                         payload = {
                             "n": judged["n"],
@@ -19844,9 +20179,15 @@ def main():
                 for sn, collected in _lf_store.items():
                     try:
                         _lf_s_t0 = time.time()
-                        judged_lf = long_form_judge_teacher_score(
-                            teacher_b, tokenizer, collected, device=device,
-                        )
+                        if _phb_api_mode:
+                            judged_lf = long_form_judge_teacher_score_api(
+                                api_cfg_phb, tokenizer, collected,
+                                concurrency=max(1, getattr(api_cfg_phb, "concurrency", 4) // 2),
+                            )
+                        else:
+                            judged_lf = long_form_judge_teacher_score(
+                                teacher_b, tokenizer, collected, device=device,
+                            )
                         dur = time.time() - _lf_s_t0
                         payload = {
                             "n": judged_lf["n"],
@@ -19891,8 +20232,14 @@ def main():
                 for sn, collected in _chat_store.items():
                     try:
                         _ct_s_t0 = time.time()
-                        judged = chat_turns_teacher_score(
-                            teacher_b, tokenizer, collected, device=device)
+                        if _phb_api_mode:
+                            judged = chat_turns_teacher_score_api(
+                                api_cfg_phb, tokenizer, collected,
+                                concurrency=max(1, getattr(api_cfg_phb, "concurrency", 4) // 2),
+                            )
+                        else:
+                            judged = chat_turns_teacher_score(
+                                teacher_b, tokenizer, collected, device=device)
                         dur = time.time() - _ct_s_t0
                         payload = {
                             "n": judged["n"],
@@ -19929,11 +20276,12 @@ def main():
                       f"({_chat_label})",
                       flush=True)
 
-            try:
-                del teacher_b
-            except Exception:
-                pass
-            free_gpu()
+            if not _phb_api_mode:
+                try:
+                    del teacher_b
+                except Exception:
+                    pass
+                free_gpu()
             timings["phase_b_total"] = time.time() - _phb_t0
         except Exception as e:
             print(f"[eval] Phase B teacher scoring failed (non-fatal): {e}", flush=True)
