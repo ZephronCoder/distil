@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from config import EPOCH_BLOCKS, MAX_BATCH_UIDS, MAX_COMPARE_UIDS, STATE_DIR
 from external import get_commitments as fetch_commitments_data, get_model_info as fetch_model_info_data
 from helpers.cache import _get_stale
+from helpers.dq import _dq_reason_for_commitment
 from helpers.h2h import compact_round, index_by_uid, load_history, rounds_for_uid, uid_stats
 from helpers.sanitize import _safe_json_load, _sanitize_floats
 from state_store import (
@@ -40,36 +41,6 @@ def _failure_matches_commitment(fail_entry: str, commitment: dict) -> bool:
         f_repo, f_rev = fail_entry.split("@", 1)
         return f_repo == repo and (f_rev == rev or not rev)
     return fail_entry == repo
-
-
-def _dq_reason_for_commitment(uid: int, hotkey: str | None, commitment: dict | None, dq: dict):
-    """Resolve the DQ reason shown to API consumers for a UID's current commitment.
-
-    2026-05-04 — DQ scope changed from per-(hotkey, commit_block) to
-    per-hotkey: once a hotkey is DQ'd, a new on-chain commit on the same
-    hotkey does NOT clear the DQ. The miner needs a fresh registration
-    to be re-evaluated. The ``commitment`` arg is no longer consulted
-    for keying — kept on the signature so callers don't have to plumb
-    it out. Lookup order:
-      1. Bare hotkey (current policy).
-      2. Any legacy ``hotkey:<block>`` entry (pre-2026-05-04 stores).
-      3. UID string (very-legacy pre-hotkey-migration entries).
-    """
-    del commitment
-    uid_str = str(uid)
-    if hotkey and hotkey in dq:
-        return dq.get(hotkey)
-    if hotkey:
-        prefix = f"{hotkey}:"
-        legacy_reason = None
-        for k, v in dq.items():
-            if k.startswith(prefix):
-                legacy_reason = v
-        if legacy_reason is not None:
-            return legacy_reason
-    if uid_str in dq:
-        return dq.get(uid_str)
-    return None
 
 
 @router.get("/api/commitments", tags=["Miners"], summary="Miner model commitments",

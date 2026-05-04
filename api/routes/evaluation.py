@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from config import ANNOUNCEMENT_CLAIMS_KEEP, EPOCH_BLOCKS, STATE_DIR
 from helpers.cache import _get_stale
+from helpers.dq import _dq_reason_for_commitment
 from helpers.sanitize import _sanitize_floats, _safe_json_load
 from state_store import (
     benchmarks,
@@ -33,33 +34,6 @@ from state_store import (
 )
 
 router = APIRouter()
-
-
-def _dq_reason_for_commitment(uid: int, hotkey: str | None, commitment: dict | None, dq: dict):
-    """Resolve the DQ reason shown to API consumers for a UID's current commitment.
-
-    2026-05-04 — DQ scope is per-hotkey (see ``eval/scoring.py``). The
-    ``commitment`` arg is no longer consulted for keying — kept on the
-    signature so callers don't have to plumb it out. Lookup order:
-      1. Bare hotkey (current policy).
-      2. Any legacy ``hotkey:<block>`` entry (pre-2026-05-04 stores).
-      3. UID string (very-legacy pre-hotkey-migration entries).
-    """
-    del commitment
-    uid_str = str(uid)
-    if hotkey and hotkey in dq:
-        return dq.get(hotkey)
-    if hotkey:
-        prefix = f"{hotkey}:"
-        legacy_reason = None
-        for k, v in dq.items():
-            if k.startswith(prefix):
-                legacy_reason = v
-        if legacy_reason is not None:
-            return legacy_reason
-    if uid_str in dq:
-        return dq.get(uid_str)
-    return None
 
 
 @router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
