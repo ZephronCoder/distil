@@ -1862,30 +1862,24 @@ def judge_response_probe(model, tokenizer, device="cuda"):
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = eos_ids[0] if eos_ids else 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for prompt in JUDGE_PROBE_PROMPTS:
-                try:
-                    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
-                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                    gen = model.generate(
-                        ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    out["responses"].append(_strip_thinking_probe(text))
-                    out["gen_tokens"].append(int(new_ids.shape[0]))
-                except Exception as e:
-                    out["responses"].append("")
-                    out["gen_tokens"].append(0)
-                    print(f"[judge-probe] student gen error: {str(e)[:120]}", flush=True)
-    finally:
-        if was_training:
-            model.train()
+    with _model_eval_no_grad(model):
+        for prompt in JUDGE_PROBE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                gen = model.generate(
+                    ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                out["responses"].append(_strip_thinking_probe(text))
+                out["gen_tokens"].append(int(new_ids.shape[0]))
+            except Exception as e:
+                out["responses"].append("")
+                out["gen_tokens"].append(0)
+                print(f"[judge-probe] student gen error: {str(e)[:120]}", flush=True)
     return out
 
 
@@ -2050,50 +2044,44 @@ def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = eos_ids[0] if eos_ids else 0
-    was_training = teacher.training
-    teacher.eval()
     scores: list[int | None] = []
-    try:
-        with torch.no_grad():
-            for prompt, response in zip(prompts, responses):
-                agg["n"] += 1
-                try:
-                    rubric = JUDGE_RUBRIC_TEMPLATE.format(
-                        prompt=prompt.strip(),
-                        response=_sanitize_grader_response(
-                            (response or "").strip()
-                        )[:2048],
-                    )
-                    rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-                    ids = tokenizer(rendered, return_tensors="pt",
-                                    truncation=True, max_length=4096).input_ids.to(device)
-                    gen = teacher.generate(
-                        ids, max_new_tokens=8,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    score = _parse_judge_score(text)
-                    scores.append(score)
-                    agg["per_prompt"].append({
-                        "prompt": prompt[:160],
-                        "response_preview": (response or "")[:120],
-                        "raw": text[:24],
-                        "score": score,
-                    })
-                    if score is not None:
-                        agg["n_valid"] += 1
-                except Exception as e:
-                    scores.append(None)
-                    agg["per_prompt"].append({
-                        "prompt": prompt[:160],
-                        "error": str(e)[:120],
-                        "score": None,
-                    })
-    finally:
-        if was_training:
-            teacher.train()
+    with _model_eval_no_grad(teacher):
+        for prompt, response in zip(prompts, responses):
+            agg["n"] += 1
+            try:
+                rubric = JUDGE_RUBRIC_TEMPLATE.format(
+                    prompt=prompt.strip(),
+                    response=_sanitize_grader_response(
+                        (response or "").strip()
+                    )[:2048],
+                )
+                rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
+                ids = tokenizer(rendered, return_tensors="pt",
+                                truncation=True, max_length=4096).input_ids.to(device)
+                gen = teacher.generate(
+                    ids, max_new_tokens=8,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                score = _parse_judge_score(text)
+                scores.append(score)
+                agg["per_prompt"].append({
+                    "prompt": prompt[:160],
+                    "response_preview": (response or "")[:120],
+                    "raw": text[:24],
+                    "score": score,
+                })
+                if score is not None:
+                    agg["n_valid"] += 1
+            except Exception as e:
+                scores.append(None)
+                agg["per_prompt"].append({
+                    "prompt": prompt[:160],
+                    "error": str(e)[:120],
+                    "score": None,
+                })
     valid = [s for s in scores if s is not None]
     if valid:
         mean = sum(valid) / len(valid)
@@ -2147,30 +2135,24 @@ def long_form_judge_response_probe(model, tokenizer, device="cuda",
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = eos_ids[0] if eos_ids else 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for prompt in LONG_FORM_JUDGE_PROMPTS:
-                try:
-                    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
-                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                    gen = model.generate(
-                        ids, max_new_tokens=cap,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    out["responses"].append(_strip_thinking_probe(text))
-                    out["gen_tokens"].append(int(new_ids.shape[0]))
-                except Exception as e:
-                    out["responses"].append("")
-                    out["gen_tokens"].append(0)
-                    print(f"[long-form-judge] student gen error: {str(e)[:120]}", flush=True)
-    finally:
-        if was_training:
-            model.train()
+    with _model_eval_no_grad(model):
+        for prompt in LONG_FORM_JUDGE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                gen = model.generate(
+                    ids, max_new_tokens=cap,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                out["responses"].append(_strip_thinking_probe(text))
+                out["gen_tokens"].append(int(new_ids.shape[0]))
+            except Exception as e:
+                out["responses"].append("")
+                out["gen_tokens"].append(0)
+                print(f"[long-form-judge] student gen error: {str(e)[:120]}", flush=True)
     return out
 
 
@@ -2307,53 +2289,47 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = eos_ids[0] if eos_ids else 0
-    was_training = teacher.training
-    teacher.eval()
     scores: list[int | None] = []
-    try:
-        with torch.no_grad():
-            for prompt, response in zip(prompts, responses):
-                agg["n"] += 1
-                try:
-                    rubric = LONG_FORM_JUDGE_RUBRIC_TEMPLATE.format(
-                        prompt=prompt.strip(),
-                        response=_sanitize_grader_response(
-                            (response or "").strip()
-                        )[:4096],
-                    )
-                    rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-                    # Cap rubric prompt at 6144 input tokens to stay
-                    # safely under the teacher's 8192 context cap on a
-                    # 4-paragraph response.
-                    ids = tokenizer(rendered, return_tensors="pt",
-                                    truncation=True, max_length=6144).input_ids.to(device)
-                    gen = teacher.generate(
-                        ids, max_new_tokens=8,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    score = _parse_judge_score(text)
-                    scores.append(score)
-                    agg["per_prompt"].append({
-                        "prompt": prompt[:160],
-                        "response_preview": (response or "")[:120],
-                        "raw": text[:24],
-                        "score": score,
-                    })
-                    if score is not None:
-                        agg["n_valid"] += 1
-                except Exception as e:
-                    scores.append(None)
-                    agg["per_prompt"].append({
-                        "prompt": prompt[:160],
-                        "error": str(e)[:120],
-                        "score": None,
-                    })
-    finally:
-        if was_training:
-            teacher.train()
+    with _model_eval_no_grad(teacher):
+        for prompt, response in zip(prompts, responses):
+            agg["n"] += 1
+            try:
+                rubric = LONG_FORM_JUDGE_RUBRIC_TEMPLATE.format(
+                    prompt=prompt.strip(),
+                    response=_sanitize_grader_response(
+                        (response or "").strip()
+                    )[:4096],
+                )
+                rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
+                # Cap rubric prompt at 6144 input tokens to stay
+                # safely under the teacher's 8192 context cap on a
+                # 4-paragraph response.
+                ids = tokenizer(rendered, return_tensors="pt",
+                                truncation=True, max_length=6144).input_ids.to(device)
+                gen = teacher.generate(
+                    ids, max_new_tokens=8,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                score = _parse_judge_score(text)
+                scores.append(score)
+                agg["per_prompt"].append({
+                    "prompt": prompt[:160],
+                    "response_preview": (response or "")[:120],
+                    "raw": text[:24],
+                    "score": score,
+                })
+                if score is not None:
+                    agg["n_valid"] += 1
+            except Exception as e:
+                scores.append(None)
+                agg["per_prompt"].append({
+                    "prompt": prompt[:160],
+                    "error": str(e)[:120],
+                    "score": None,
+                })
     valid = [s for s in scores if s is not None]
     if valid:
         mean = sum(valid) / len(valid)
@@ -3202,46 +3178,40 @@ def chat_turns_response_probe(model, tokenizer, device="cuda"):
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = eos_ids[0] if eos_ids else 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for convo in CHAT_TURNS_PROBE_PROMPTS:
-                turn_responses: list[str] = []
-                turn_tokens: list[int] = []
-                msgs: list[dict] = []
-                for user_turn in convo:
-                    msgs.append({"role": "user", "content": user_turn})
-                    try:
-                        rendered = _render_chat_multi_turn(
-                            tokenizer, msgs, enable_thinking=False)
-                        ids = tokenizer(
-                            rendered, return_tensors="pt",
-                            truncation=True, max_length=3072,
-                        ).input_ids.to(device)
-                        gen = model.generate(
-                            ids, max_new_tokens=CHAT_TURNS_PROBE_MAX_TOKENS,
-                            do_sample=False, temperature=1.0, top_p=1.0,
-                            pad_token_id=pad_id, eos_token_id=eos_ids,
-                            use_cache=True,
-                        )
-                        new_ids = gen[0, ids.shape[1]:]
-                        text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                        resp = _strip_thinking_probe(text)
-                        turn_responses.append(resp)
-                        turn_tokens.append(int(new_ids.shape[0]))
-                        msgs.append({"role": "assistant", "content": resp})
-                    except Exception as e:
-                        turn_responses.append("")
-                        turn_tokens.append(0)
-                        msgs.append({"role": "assistant", "content": ""})
-                        print(f"[chat-turns-probe] student gen error: "
-                              f"{str(e)[:120]}", flush=True)
-                out["responses"].append(turn_responses)
-                out["gen_tokens"].append(turn_tokens)
-    finally:
-        if was_training:
-            model.train()
+    with _model_eval_no_grad(model):
+        for convo in CHAT_TURNS_PROBE_PROMPTS:
+            turn_responses: list[str] = []
+            turn_tokens: list[int] = []
+            msgs: list[dict] = []
+            for user_turn in convo:
+                msgs.append({"role": "user", "content": user_turn})
+                try:
+                    rendered = _render_chat_multi_turn(
+                        tokenizer, msgs, enable_thinking=False)
+                    ids = tokenizer(
+                        rendered, return_tensors="pt",
+                        truncation=True, max_length=3072,
+                    ).input_ids.to(device)
+                    gen = model.generate(
+                        ids, max_new_tokens=CHAT_TURNS_PROBE_MAX_TOKENS,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids,
+                        use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    resp = _strip_thinking_probe(text)
+                    turn_responses.append(resp)
+                    turn_tokens.append(int(new_ids.shape[0]))
+                    msgs.append({"role": "assistant", "content": resp})
+                except Exception as e:
+                    turn_responses.append("")
+                    turn_tokens.append(0)
+                    msgs.append({"role": "assistant", "content": ""})
+                    print(f"[chat-turns-probe] student gen error: "
+                          f"{str(e)[:120]}", flush=True)
+            out["responses"].append(turn_responses)
+            out["gen_tokens"].append(turn_tokens)
     return out
 
 
@@ -3274,51 +3244,45 @@ def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = eos_ids[0] if eos_ids else 0
-    was_training = teacher.training
-    teacher.eval()
     scores: list[int | None] = []
-    try:
-        with torch.no_grad():
-            for convo, convo_responses in zip(prompts, responses):
-                agg["n"] += 1
-                try:
-                    transcript = _format_transcript(convo, convo_responses)
-                    rubric = CHAT_TURNS_RUBRIC_TEMPLATE.format(
-                        transcript=transcript[:4096])
-                    rendered = _render_chat_prompt(
-                        tokenizer, rubric, enable_thinking=False)
-                    ids = tokenizer(
-                        rendered, return_tensors="pt",
-                        truncation=True, max_length=6144,
-                    ).input_ids.to(device)
-                    gen = teacher.generate(
-                        ids, max_new_tokens=8,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids,
-                        use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    score = _parse_judge_score(text)
-                    scores.append(score)
-                    seed_preview = (convo[0] or "")[:120]
-                    agg["per_convo"].append({
-                        "seed": seed_preview,
-                        "raw": text[:24],
-                        "score": score,
-                    })
-                    if score is not None:
-                        agg["n_valid"] += 1
-                except Exception as e:
-                    scores.append(None)
-                    agg["per_convo"].append({
-                        "seed": (convo[0] or "")[:120] if convo else "",
-                        "error": str(e)[:120],
-                        "score": None,
-                    })
-    finally:
-        if was_training:
-            teacher.train()
+    with _model_eval_no_grad(teacher):
+        for convo, convo_responses in zip(prompts, responses):
+            agg["n"] += 1
+            try:
+                transcript = _format_transcript(convo, convo_responses)
+                rubric = CHAT_TURNS_RUBRIC_TEMPLATE.format(
+                    transcript=transcript[:4096])
+                rendered = _render_chat_prompt(
+                    tokenizer, rubric, enable_thinking=False)
+                ids = tokenizer(
+                    rendered, return_tensors="pt",
+                    truncation=True, max_length=6144,
+                ).input_ids.to(device)
+                gen = teacher.generate(
+                    ids, max_new_tokens=8,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids,
+                    use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                score = _parse_judge_score(text)
+                scores.append(score)
+                seed_preview = (convo[0] or "")[:120]
+                agg["per_convo"].append({
+                    "seed": seed_preview,
+                    "raw": text[:24],
+                    "score": score,
+                })
+                if score is not None:
+                    agg["n_valid"] += 1
+            except Exception as e:
+                scores.append(None)
+                agg["per_convo"].append({
+                    "seed": (convo[0] or "")[:120] if convo else "",
+                    "error": str(e)[:120],
+                    "score": None,
+                })
     valid = [s for s in scores if s is not None]
     if valid:
         mean = sum(valid) / len(valid)
