@@ -841,6 +841,64 @@ def select_king_by_composite(
     return top_uid, top_record
 
 
+def _dethrone_compare(
+    incumbent_uid: int | None,
+    incumbent_record: dict | None,
+    challenger_uid: int,
+    challenger_record: dict,
+    margin: float,
+    primary_key: str,
+) -> bool:
+    """Generic dethrone comparison on a primary key with a weighted fallback.
+
+    Decision rule, applied in order:
+      1. Clear win:        ``ch_primary > inc_primary × (1 + margin)``.
+      2. Clear regression: ``ch_primary < inc_primary × (1 − margin)``.
+      3. Tied region (within ±margin or both at the saturated floor):
+         fall back to ``weighted`` × (1 + margin).
+
+    ``primary_key`` is "final" for the v30.2+ blended rank and "worst"
+    for legacy v28 records that predate the schema bump.
+    """
+    ch_p = (challenger_record or {}).get(primary_key)
+    if ch_p is None:
+        return False
+    if incumbent_uid is None or not incumbent_record:
+        return float(ch_p) > 0.0
+    if challenger_uid == incumbent_uid:
+        return True
+    inc_p = incumbent_record.get(primary_key)
+    if inc_p is None:
+        return float(ch_p) > 0.0
+
+    inc_pf = float(inc_p)
+    ch_pf = float(ch_p)
+    rel_margin = max(0.0, float(margin))
+
+    both_saturated = (
+        inc_pf <= SINGLE_EVAL_WORST_FLOOR_EPSILON
+        and ch_pf <= SINGLE_EVAL_WORST_FLOOR_EPSILON
+    )
+    if not both_saturated:
+        if ch_pf > inc_pf * (1.0 + rel_margin):
+            return True
+        if ch_pf < inc_pf * (1.0 - rel_margin):
+            return False
+
+    ch_w = (challenger_record or {}).get("weighted")
+    inc_w = incumbent_record.get("weighted")
+    if ch_w is None or inc_w is None:
+        return False
+    try:
+        ch_wf = float(ch_w)
+        inc_wf = float(inc_w)
+    except (TypeError, ValueError):
+        return False
+    if inc_wf <= 0.0:
+        return ch_wf > 0.0
+    return ch_wf > inc_wf * (1.0 + rel_margin)
+
+
 def resolve_dethrone(
     incumbent_uid: int | None,
     incumbent_record: dict | None,
@@ -850,124 +908,21 @@ def resolve_dethrone(
 ) -> bool:
     """Return True iff challenger should take the crown from incumbent.
 
-    v30.2 (2026-04-29): the canonical dethrone key is now ``final``
-    (a 0.7·worst_3_mean + 0.3·weighted blend) rather than ``worst``
+    v30.2 (2026-04-29): the canonical dethrone key is ``final``
+    (0.7·worst_3_mean + 0.3·weighted blend) rather than ``worst``
     (single-axis min). The blend smooths the single-axis-min noise
-    pathology while preserving anti-Goodhart pressure (~70% of the
+    pathology while preserving anti-Goodhart pressure (~70 % of the
     score is still bottom-3-axis driven).
 
-    Decision rule:
-      1. Clear win on ``final``: ``ch_final > inc_final × (1 + margin)``.
-         Challenger dominates on the blended ranking. Take the crown.
-      2. Clear regression on ``final``: ``ch_final < inc_final × (1 − margin)``.
-         Reject. Protects against single-eval noise dethroning a
-         genuinely-better king.
-      3. Tied region (within ±margin): fall back to a strict ``weighted``
-         comparison. Covers saturated-floor cases and exact-tie quantum
-         cases the old ``worst``-based dethrone had to special-case.
-
-    Backward compat: if the records lack ``final`` (legacy v28 records
-    pre-bump), fall back to the v28 worst+weighted decision rule.
+    Backward compat: legacy v28 records without ``final`` fall back to
+    the v28 ``worst``-based decision rule.
     """
-    ch_final = (challenger_record or {}).get("final")
-    inc_final = (incumbent_record or {}).get("final") if incumbent_record else None
-
-    if ch_final is None:
-        # Backward-compat path: legacy v28 record without ``final``.
-        # Fall through to the v28 worst-based decision rule.
-        return _resolve_dethrone_legacy_worst(
-            incumbent_uid, incumbent_record,
-            challenger_uid, challenger_record, margin,
-        )
-
-    if incumbent_uid is None or not incumbent_record:
-        return float(ch_final) > 0.0
-    if challenger_uid == incumbent_uid:
-        return True
-    if inc_final is None:
-        return float(ch_final) > 0.0
-
-    inc_final_f = float(inc_final)
-    ch_final_f = float(ch_final)
-    rel_margin = max(0.0, float(margin))
-
-    # Saturated-floor handling: if both are at the floor (~0), neither
-    # axis-blend is informative; defer to weighted directly.
-    both_saturated = (
-        inc_final_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
-        and ch_final_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
+    primary = "final" if (challenger_record or {}).get("final") is not None else "worst"
+    return _dethrone_compare(
+        incumbent_uid, incumbent_record,
+        challenger_uid, challenger_record,
+        margin, primary_key=primary,
     )
-    if not both_saturated:
-        win_threshold = inc_final_f * (1.0 + rel_margin)
-        if ch_final_f > win_threshold:
-            return True
-        regress_threshold = inc_final_f * (1.0 - rel_margin)
-        if ch_final_f < regress_threshold:
-            return False
-
-    # Tied region: fall back to ``weighted`` with the same relative margin.
-    ch_w = (challenger_record or {}).get("weighted")
-    inc_w = incumbent_record.get("weighted")
-    if ch_w is None or inc_w is None:
-        return False
-    try:
-        ch_w_f = float(ch_w)
-        inc_w_f = float(inc_w)
-    except (TypeError, ValueError):
-        return False
-    if inc_w_f <= 0.0:
-        return ch_w_f > 0.0
-    weighted_threshold = inc_w_f * (1.0 + rel_margin)
-    return ch_w_f > weighted_threshold
-
-
-def _resolve_dethrone_legacy_worst(
-    incumbent_uid: int | None,
-    incumbent_record: dict | None,
-    challenger_uid: int,
-    challenger_record: dict,
-    margin: float = SINGLE_EVAL_DETHRONE_MARGIN,
-) -> bool:
-    """v28-and-earlier dethrone rule using ``worst`` (single-axis min) +
-    ``weighted`` fallback. Kept for backward compatibility on legacy
-    records that pre-date the v30.2 schema bump."""
-    ch_worst = (challenger_record or {}).get("worst")
-    if ch_worst is None:
-        return False
-    if incumbent_uid is None or not incumbent_record:
-        return float(ch_worst) > 0.0
-    if challenger_uid == incumbent_uid:
-        return True
-    inc_worst = incumbent_record.get("worst")
-    if inc_worst is None:
-        return float(ch_worst) > 0.0
-    inc_worst_f = float(inc_worst)
-    ch_worst_f = float(ch_worst)
-    rel_margin = max(0.0, float(margin))
-    both_saturated = (
-        inc_worst_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
-        and ch_worst_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
-    )
-    if not both_saturated:
-        win_threshold = inc_worst_f * (1.0 + rel_margin)
-        if ch_worst_f > win_threshold:
-            return True
-        regress_threshold = inc_worst_f * (1.0 - rel_margin)
-        if ch_worst_f < regress_threshold:
-            return False
-    ch_w = (challenger_record or {}).get("weighted")
-    inc_w = incumbent_record.get("weighted")
-    if ch_w is None or inc_w is None:
-        return False
-    try:
-        ch_w_f = float(ch_w)
-        inc_w_f = float(inc_w)
-    except (TypeError, ValueError):
-        return False
-    if inc_w_f <= 0.0:
-        return ch_w_f > 0.0
-    weighted_threshold = inc_w_f * (1.0 + rel_margin)
-    return ch_w_f > weighted_threshold
 
 
 def _seed_one_h2h_round(state, latest: dict) -> int:

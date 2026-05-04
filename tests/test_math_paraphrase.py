@@ -280,65 +280,36 @@ class TestMathParaphraseAppliedAtRoundStart(unittest.TestCase):
     is wired but never called from the live eval path."""
 
     def test_math_samples_mutate_per_round(self):
-        """Manually populate the math pool, set two different
-        block_seeds, and confirm at least some samples differ."""
-        # Cleanly install a small synthetic math pool and reset state.
-        pev._BENCH_POOLS["math"] = [
-            {
-                "src": "gsm8k",
-                "question": "Find the total cost when each apple costs 2 dollars and Sue buys 5.",
-                "gold": "10",
-            },
-            {
-                "src": "gsm8k",
-                "question": "Calculate the area of a circle with radius 7. Express the answer in square units.",
-                "gold": "153.94",
-            },
-            {
-                "src": "math500",
-                "question": (
-                    r"Let $x$ be a positive integer. Determine the number of integer "
-                    r"solutions to $x^2 < 100$."
-                ),
-                "gold": "9",
-            },
-        ]
-        # Pre-populate the other pools the round-start path expects so
-        # the iteration doesn't crash on absent keys.
-        for k in (
-            "code", "reasoning", "knowledge", "ifeval", "aime", "mbpp",
-            "tool_use", "self_consistency", "arc", "truthful", "robustness",
-            "noise",
-        ):
-            pev._BENCH_POOLS.setdefault(k, [])
-        # Fresh per-round state so set_bench_block_seed actually picks.
+        """Two different block_seeds must produce different math samples.
+
+        v27+ wires ``set_bench_block_seed`` to ``_generate_math_items``,
+        which mixes the block_seed into every parameter draw and any
+        downstream paraphrase keying. If that wiring regresses, both
+        seeds would yield identical sample lists.
+        """
         pev._BENCH_BLOCK_SEED = None
         for k in list(pev._BENCH_SAMPLES.keys()):
             pev._BENCH_SAMPLES[k] = []
-        # Force the bench-load path to skip (we already populated pools).
-        pev._BENCH_POOLS_LOADED = True
 
         try:
             pev.set_bench_block_seed(11111)
             samples_a = list(pev._BENCH_SAMPLES["math"])
+            pev._BENCH_BLOCK_SEED = None
+            for k in list(pev._BENCH_SAMPLES.keys()):
+                pev._BENCH_SAMPLES[k] = []
             pev.set_bench_block_seed(22222)
             samples_b = list(pev._BENCH_SAMPLES["math"])
         finally:
-            # Reset so other tests don't see our synthetic pool.
-            pev._BENCH_POOLS["math"] = []
             for k in list(pev._BENCH_SAMPLES.keys()):
                 pev._BENCH_SAMPLES[k] = []
             pev._BENCH_BLOCK_SEED = None
-            pev._BENCH_POOLS_LOADED = False
 
-        # At least one of the chosen items should have rotated wording
-        # between the two block seeds (helper is hot).
         a_questions = {it["question"] for it in samples_a}
         b_questions = {it["question"] for it in samples_b}
         self.assertNotEqual(
             a_questions, b_questions,
             "math_bench samples did not rotate between block_seeds — "
-            "paraphrase wiring NOT hot from set_bench_block_seed",
+            "procedural wiring NOT hot from set_bench_block_seed",
         )
 
 

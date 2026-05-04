@@ -222,45 +222,25 @@ class TestRobustnessPerturbations(unittest.TestCase):
                     f"{name} paraphrase removed digit '{digit}' — grading would break",
                 )
 
-    def test_robustness_pool_is_alias_of_math(self):
-        # _BENCH_POOLS is module-level state. We don't load the math
-        # pool here (no datasets package on the test runner) but we
-        # can verify the alias hook in `_bench_load_pools` would set
-        # them equal: compare list identity post-init when math is
-        # populated. We simulate by directly stamping the pool.
-        self.mod._BENCH_POOLS["math"] = [
-            {"src": "gsm8k", "question": "What is 2+2?", "gold": "4"},
-        ]
-        self.mod._BENCH_POOLS["robustness"] = self.mod._BENCH_POOLS["math"]
-        self.assertIs(
-            self.mod._BENCH_POOLS["robustness"], self.mod._BENCH_POOLS["math"],
-            "robustness pool should alias (not copy) math so growth is "
-            "tracked",
-        )
-
-    def test_robustness_sample_uses_independent_stream(self):
-        # When robustness and math share a pool but are sampled with
-        # different stream offsets, _pick_bench_items must yield a
-        # *different* permutation for the same block_seed. This is
-        # the central anti-collision property — without it, robustness
-        # and math would always score the same items and the axis
-        # would degenerate to "math under a wrapper".
-        items = [
-            {"src": "gsm8k", "question": f"q{i}", "gold": str(i)}
-            for i in range(40)
-        ]
-        self.mod._BENCH_POOLS["math"] = list(items)
-        self.mod._BENCH_POOLS["robustness"] = self.mod._BENCH_POOLS["math"]
+    def test_robustness_uses_disjoint_procedural_stream(self):
+        # v27+ replaced the static ``_BENCH_POOLS`` machinery with the
+        # ``_generate_*_items`` procedural generators. ``robustness`` and
+        # ``math`` get different XOR offsets in ``set_bench_block_seed``
+        # so their per-round items are near-disjoint — without this
+        # property, robustness would degrade into "math under a wrapper".
+        # Driving ``_generate_math_items`` directly keeps the test
+        # robust to whether ``robustness`` is currently muted (k=0).
         block_seed = 8042854
-        math_pick = self.mod._pick_bench_items("math", block_seed, 4)
-        rob_pick = self.mod._pick_bench_items("robustness", block_seed, 4)
-        self.assertEqual(len(math_pick), 4)
-        self.assertEqual(len(rob_pick), 4)
+        n = 4
+        math_q = [it["question"] for it in self.mod._generate_math_items(block_seed, n)]
+        rob_q = [it["question"] for it in self.mod._generate_math_items(
+            block_seed ^ 0x524F, n)]
+        self.assertEqual(len(math_q), n)
+        self.assertEqual(len(rob_q), n)
         self.assertNotEqual(
-            [it["question"] for it in math_pick],
-            [it["question"] for it in rob_pick],
-            "math and robustness picks must differ — same block_seed, "
-            "different stream offsets",
+            math_q, rob_q,
+            "math and robustness samples must differ — same block_seed, "
+            "different procedural stream offsets",
         )
 
 

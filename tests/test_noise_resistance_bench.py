@@ -173,46 +173,32 @@ class TestNoisePerturbations(unittest.TestCase):
         )
         self.assertIn("3.14159", out)
 
-    def test_noise_pool_is_alias_of_math(self):
-        """Pool aliasing — set the math pool, the noise pool must
-        observe the same items."""
-        self.mod._BENCH_POOLS["math"] = [
-            {"src": "gsm8k", "question": "What is 1+1?", "gold": "2"},
-        ]
-        self.mod._BENCH_POOLS["noise"] = self.mod._BENCH_POOLS["math"]
-        self.assertIs(
-            self.mod._BENCH_POOLS["noise"], self.mod._BENCH_POOLS["math"],
-            "noise pool should alias (not copy) math",
-        )
+    def test_noise_uses_disjoint_procedural_stream(self):
+        """v27+ — math / robustness / noise each generate procedural
+        items under disjoint XOR offsets in ``_generate_math_items``,
+        so the same block_seed produces different sample sets.
+        Without this, noise_resistance would degrade into "math under
+        a typo wrapper" and the axis would lose independent signal.
 
-    def test_noise_sample_uses_independent_stream(self):
-        """math, robustness, and noise should all draw under different
-        stream offsets — same block_seed, three different sample sets.
-        This is the core anti-collision property."""
-        items = [
-            {"src": "gsm8k", "question": f"q{i}", "gold": str(i)}
-            for i in range(40)
-        ]
-        self.mod._BENCH_POOLS["math"] = list(items)
-        self.mod._BENCH_POOLS["robustness"] = self.mod._BENCH_POOLS["math"]
-        self.mod._BENCH_POOLS["noise"] = self.mod._BENCH_POOLS["math"]
+        Drives ``_generate_math_items`` directly so the test is robust
+        to whether ``noise``/``robustness`` are currently muted (k=0)
+        in the live composite.
+        """
         block_seed = 8042854
-        math_pick = self.mod._pick_bench_items("math", block_seed, 4)
-        rob_pick = self.mod._pick_bench_items("robustness", block_seed, 4)
-        noise_pick = self.mod._pick_bench_items("noise", block_seed, 4)
-        self.assertEqual(len(math_pick), 4)
-        self.assertEqual(len(rob_pick), 4)
-        self.assertEqual(len(noise_pick), 4)
-        # All three must be pairwise different — same seed, three offsets.
-        sets = [
-            tuple(it["question"] for it in math_pick),
-            tuple(it["question"] for it in rob_pick),
-            tuple(it["question"] for it in noise_pick),
-        ]
+        n = 4
+        sets = (
+            tuple(it["question"] for it in self.mod._generate_math_items(block_seed, n)),
+            tuple(it["question"] for it in self.mod._generate_math_items(
+                block_seed ^ 0x524F, n)),
+            tuple(it["question"] for it in self.mod._generate_math_items(
+                block_seed ^ 0x4E4F, n)),
+        )
+        for s in sets:
+            self.assertEqual(len(s), n)
         self.assertEqual(
-            len({tuple(s) for s in sets}), 3,
-            "math/robustness/noise must each pick a distinct sample set "
-            "under the same block_seed",
+            len({s for s in sets}), 3,
+            "math/robustness/noise must each generate a distinct sample "
+            "set under the same block_seed",
         )
 
 

@@ -600,30 +600,23 @@ class TestBBHShuffleSetBenchBlockSeedIntegration(unittest.TestCase):
     Goodhart vector in production."""
 
     def setUp(self):
-        # Save and clear bench samples / pools we touch so each test
-        # is hermetic.
-        self._saved_pool_reasoning = list(pev._BENCH_POOLS.get("reasoning") or [])
+        # Save and clear bench samples so each test is hermetic.
         self._saved_samples = dict(pev._BENCH_SAMPLES)
         pev._BENCH_SAMPLES.clear()
 
     def tearDown(self):
-        pev._BENCH_POOLS["reasoning"] = self._saved_pool_reasoning
         pev._BENCH_SAMPLES.clear()
         pev._BENCH_SAMPLES.update(self._saved_samples)
 
     def test_reasoning_samples_are_shuffled_at_round_start(self):
-        """v27 supersedes the v20 BBH-pool-shuffle wiring with a procedural
-        generator (``_generate_reasoning_items``), so the static
-        ``_BENCH_POOLS['reasoning']`` is no longer consulted at round
-        start. Instead, verify that:
-          1. ``set_bench_block_seed`` populates ``_BENCH_SAMPLES['reasoning']``
-             without reading from ``_BENCH_POOLS['reasoning']``.
+        """v27+ generates reasoning items via ``_generate_reasoning_items``
+        (no static pool consulted). Verify:
+          1. ``set_bench_block_seed`` populates ``_BENCH_SAMPLES['reasoning']``.
           2. Each sample carries a well-formed gold (parenthesized letter or
              plain letter) and an inline ``Options:`` block, matching the
              contract that ``reasoning_bench_probe`` consumes.
-          3. Different ``block_seed`` values produce different sample sets
-             (rotation is real, not a no-op)."""
-        pev._BENCH_POOLS["reasoning"] = []
+          3. Different ``block_seed`` values produce different sample sets.
+        """
         pev.set_bench_block_seed(4242)
         samples_a = list(pev._BENCH_SAMPLES.get("reasoning") or [])
         self.assertGreater(len(samples_a), 0, "reasoning samples missing")
@@ -647,44 +640,32 @@ class TestBBHShuffleSetBenchBlockSeedIntegration(unittest.TestCase):
         )
 
     def test_set_bench_block_seed_deterministic_across_runs(self):
-        """Two separate calls to ``set_bench_block_seed`` with the same
-        seed and the same pool produce the same samples — guarantees
-        cross-validator agreement on reasoning_bench."""
-        pool = [
-            _logical_deduction_item(gold="(A)"),
-            _movie_recommendation_item(gold="(C)"),
-        ]
-        pev._BENCH_POOLS["reasoning"] = pool
-
+        """Two calls with the same seed produce the same samples —
+        guarantees cross-validator agreement on reasoning_bench."""
         pev.set_bench_block_seed(31415)
         run1 = [(s["question"], s["gold"]) for s in (pev._BENCH_SAMPLES.get("reasoning") or [])]
 
+        pev._BENCH_BLOCK_SEED = None
+        pev._BENCH_SAMPLES["reasoning"] = []
         pev.set_bench_block_seed(31415)
         run2 = [(s["question"], s["gold"]) for s in (pev._BENCH_SAMPLES.get("reasoning") or [])]
 
         self.assertEqual(run1, run2)
 
     def test_set_bench_block_seed_varies_with_block_seed(self):
-        """Different block_seeds produce different samples (or at
-        least different golds for at least one item) — proves rotation
-        is wired through, not silently skipped."""
-        pool = [
-            _logical_deduction_item(gold="(A)"),
-            _movie_recommendation_item(gold="(C)"),
-            _seven_options_item(gold="(D)"),
-        ]
-        pev._BENCH_POOLS["reasoning"] = pool
-
-        gold_sets = []
+        """Different block_seeds produce different samples — proves
+        procedural rotation is wired through."""
+        sample_sets = []
         for seed in (1, 7, 99, 12345, 7654321):
+            pev._BENCH_BLOCK_SEED = None
+            pev._BENCH_SAMPLES["reasoning"] = []
             pev.set_bench_block_seed(seed)
             samples = pev._BENCH_SAMPLES.get("reasoning") or []
-            gold_sets.append(tuple(sorted(s["gold"] for s in samples)))
+            sample_sets.append(tuple((s["question"], s["gold"]) for s in samples))
 
-        unique_orderings = set(gold_sets)
         self.assertGreater(
-            len(unique_orderings), 1,
-            "all block_seeds produced identical golds — no rotation observed",
+            len(set(sample_sets)), 1,
+            "all block_seeds produced identical samples — no rotation observed",
         )
 
 
