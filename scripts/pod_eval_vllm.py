@@ -18958,14 +18958,33 @@ def main():
                     _term = int(_cprobe_meta.get("prompts_terminated") or 0)
                     _tested = int(_cprobe_meta.get("prompts_tested") or 0)
                     _mean_gen = float(_cprobe_meta.get("mean_gen_tokens") or 0.0)
-                    if _tested > 0 and (_term / _tested) < 0.25 and _mean_gen >= 700:
-                        lf_cap_override = 2048
-                        print(
-                            f"  [lfj] derail detected (chat term="
-                            f"{_term}/{_tested}, mean_gen={_mean_gen:.0f}); "
-                            f"capping LFJ_MAX_TOKENS=6144→2048 to save ~12 min",
-                            flush=True,
-                        )
+                    _term_rate = (_term / _tested) if _tested > 0 else 1.0
+                    # Three-tier derail detection. Healthy students that
+                    # emit EOS at 50-200 tokens stay at the full cap;
+                    # mid-ramblers (mean >= 400) get 4096 to save 33%
+                    # while still capturing the tail; chronic derailers
+                    # (term <= 0.25 OR mean >= 600) get 2048; extreme
+                    # cases (term=0/N AND mean ~= chat_max) get 1024.
+                    if _tested > 0:
+                        if _term == 0 and _mean_gen >= (CHAT_PROBE_MAX_TOKENS * 0.85):
+                            lf_cap_override = 1024
+                            tier = "extreme"
+                        elif _term_rate <= 0.25 or _mean_gen >= 600:
+                            lf_cap_override = 2048
+                            tier = "chronic"
+                        elif _mean_gen >= 400:
+                            lf_cap_override = 4096
+                            tier = "mid"
+                        else:
+                            tier = None
+                        if lf_cap_override is not None:
+                            print(
+                                f"  [lfj] {tier}-derail detected (chat term="
+                                f"{_term}/{_tested}, mean_gen={_mean_gen:.0f}); "
+                                f"capping LFJ_MAX_TOKENS={LONG_FORM_JUDGE_MAX_TOKENS}"
+                                f"→{lf_cap_override} ({tier} tier)",
+                                flush=True,
+                            )
                 lf_raw = long_form_judge_response_probe(
                     student, tokenizer, device,
                     max_tokens_override=lf_cap_override,
@@ -19067,15 +19086,36 @@ def main():
                     _term = int(_cprobe_meta.get("prompts_terminated") or 0)
                     _tested = int(_cprobe_meta.get("prompts_tested") or 0)
                     _mean_gen = float(_cprobe_meta.get("mean_gen_tokens") or 0.0)
-                    if _tested > 0 and (_term / _tested) < 0.25 and _mean_gen >= 700:
-                        _BENCH_TOKEN_BUDGET_FACTOR = 0.25
-                        print(
-                            f"  [bench] derail detected (chat term="
-                            f"{_term}/{_tested}, mean_gen={_mean_gen:.0f}); "
-                            f"capping per-axis MAX_TOKENS to 25% "
-                            f"(saves ~19 min/student of garbage generation)",
-                            flush=True,
-                        )
+                    _term_rate = (_term / _tested) if _tested > 0 else 1.0
+                    # Same three-tier model as LFJ above. Healthy
+                    # students keep the full budget; mid-ramblers get
+                    # 50% (~9 min saved); chronic derailers 25% (~19
+                    # min saved); extreme cases 15% (~22 min saved).
+                    # The per-axis answer extractors find the same
+                    # "nothing" in 25% of the budget as in the full
+                    # budget for derailed students, so this is a
+                    # pure latency win — no signal lost.
+                    if _tested > 0:
+                        if _term == 0 and _mean_gen >= (CHAT_PROBE_MAX_TOKENS * 0.85):
+                            _BENCH_TOKEN_BUDGET_FACTOR = 0.15
+                            tier = "extreme"
+                        elif _term_rate <= 0.25 or _mean_gen >= 600:
+                            _BENCH_TOKEN_BUDGET_FACTOR = 0.25
+                            tier = "chronic"
+                        elif _mean_gen >= 400:
+                            _BENCH_TOKEN_BUDGET_FACTOR = 0.5
+                            tier = "mid"
+                        else:
+                            tier = None
+                        if _BENCH_TOKEN_BUDGET_FACTOR < 1.0:
+                            pct = int(_BENCH_TOKEN_BUDGET_FACTOR * 100)
+                            print(
+                                f"  [bench] {tier}-derail detected (chat term="
+                                f"{_term}/{_tested}, mean_gen={_mean_gen:.0f}); "
+                                f"capping per-axis MAX_TOKENS to {pct}% "
+                                f"({tier} tier)",
+                                flush=True,
+                            )
                 # Surface the in-flight axis to the dashboard so the
                 # ~25-min bench phase doesn't look stuck. The
                 # _set_stage helper is captured from the enclosing
