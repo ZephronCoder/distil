@@ -13,6 +13,7 @@ from scripts.validator.composite import (
     LONG_FORM_DERAIL_DQ_ENABLED,
     LONG_FORM_DERAIL_DQ_RATIO,
     LONG_FORM_DERAIL_DQ_THRESHOLD,
+    _resolve_king_kl,
     _resolve_king_rkl,
     annotate_h2h_with_composite,
     compute_composite,
@@ -995,6 +996,14 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         king_rkl_ref_early = _resolve_king_rkl(king_h2h_kl, students_data_early, _early_h2h_stub)
     except Exception:
         king_rkl_ref_early = None
+    # 2026-05-04 — same cold-start fix as the late ranking path: when
+    # ``king_h2h_kl`` is None (no king this round), use the round-wide
+    # minimum kl_global_avg as the kl-axis anchor so dethronement
+    # vetos don't silently mis-score the kl axis as None.
+    try:
+        king_kl_ref_early = _resolve_king_kl(king_h2h_kl, students_data_early)
+    except Exception:
+        king_kl_ref_early = king_h2h_kl
     # Reference (Qwen 4B base) model name for the baseline-floor veto.
     # When INCLUDE_REFERENCE_IN_ROUND=1 the reference is in models_to_eval
     # at REFERENCE_UID, so we resolve its model name once here. If the
@@ -1315,6 +1324,16 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         king_rkl_ref = _resolve_king_rkl(king_h2h_kl, students_data, _tmp_h2h)
     except Exception:
         king_rkl_ref = None
+    # 2026-05-04 (Sebastian's dashboard report): in cold-start rounds
+    # ``king_h2h_kl`` is ``None`` because there's no king to compare
+    # against, which made every student's composite ``kl`` axis null.
+    # Fall back to the round-wide minimum kl_global_avg so the axis
+    # is meaningful for everyone — the new winner scores 1.0 on kl,
+    # subsequent rounds inherit them as the natural anchor.
+    try:
+        king_kl_ref = _resolve_king_kl(king_h2h_kl, students_data)
+    except Exception:
+        king_kl_ref = king_h2h_kl
 
     # 2026-04-28 (v29.1): resolve same-round reference axis values once
     # so the dethroner ranking applies the same per-axis baseline-relative
@@ -1333,7 +1352,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         _ref_row = students_data.get(_REF_MODEL_RANK) if _REF_MODEL_RANK else None
         if _ref_row is not None:
             _ref_axes_for_ranking = _compute_axes_rank(
-                _ref_row, king_h2h_kl, king_rkl_ref,
+                _ref_row, king_kl_ref, king_rkl_ref,
             )
     except Exception:
         _ref_axes_for_ranking = None
@@ -1345,7 +1364,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         ref_axes = None if uid == _ref_uid_for_ranking else _ref_axes_for_ranking
         try:
             return compute_composite(
-                data, king_h2h_kl, king_rkl_ref,
+                data, king_kl_ref, king_rkl_ref,
                 reference_axes=ref_axes,
             )
         except Exception:

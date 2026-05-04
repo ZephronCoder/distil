@@ -2,6 +2,7 @@
 
 import dynamic from "next/dynamic";
 import type { TabId } from "./site-header";
+import { ChatKingPill } from "./chat-king-pill";
 
 // Lazy import — Three.js only needed on Home, ~600KB gzipped, no SSR.
 const DitheredSurface = dynamic(
@@ -33,13 +34,17 @@ export function HomePanel({ kingUid, kingModel, onTab }: HomePanelProps) {
 
       {/* Wordmark + footer */}
       <div className="flex flex-col min-h-0 overflow-hidden">
-        <div className="flex-1 flex flex-col justify-center px-8 sm:px-12 py-12 min-h-0">
+        <div className="flex-1 flex flex-col justify-center px-8 sm:px-12 py-12 min-h-0 gap-6">
           <h1 className="text-[clamp(56px,7vw,108px)] leading-[0.95] tracking-[-0.05em] font-medium">
             distil
             <span className="serif block text-[0.5em] mt-1 leading-tight tracking-[-0.02em] text-meta">
               a giant.
             </span>
           </h1>
+          {/* Chat-king pill: the dashboard's transparent window into
+              what model chat.arbos.life is currently talking to. See
+              ChatKingPill for the three-state spec (live/paused/offline). */}
+          <ChatKingPill variant="block" />
         </div>
         <div className="border-t border-border px-8 sm:px-12 py-4 flex flex-wrap items-center gap-4 text-[11px]">
           <span className="text-[10px] uppercase tracking-[0.18em] text-meta">SN97</span>

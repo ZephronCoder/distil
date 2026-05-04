@@ -864,6 +864,42 @@ function ScoresView({
   );
 }
 
+/**
+ * Per-axis "why is this null" hints. Surfaces in the row's tooltip
+ * when ``primary`` is null AND the axis isn't flagged eval-broken,
+ * so users on the Axes tab don't have to guess whether a blank
+ * score means "axis off" vs "data missing" vs "scoring error".
+ *
+ * Sebastian's report 2026-05-04: "kl and on policy rkl show blank
+ * on the dashboard." Both have legitimate-but-non-obvious reasons
+ * to be null right now (cold-start anchor missing for kl;
+ * OpenRouter API teacher mode skips Phase B for on_policy_rkl
+ * because the API only exposes top-K logprobs, not full token
+ * distributions). The hints make that explicit.
+ */
+const AXIS_NULL_HINTS: Record<string, string> = {
+  on_policy_rkl:
+    "Disabled under the OpenRouter API teacher mode (Kimi-K2.6 cutover, 2026-05-02). On-policy reverse-KL needs the teacher's full per-token distribution to score the student's rollouts; the OpenAI logprobs spec only exposes top-K, which is enough for KL distillation but not for true RKL. Will become measurable again if/when we move back to a self-hosted teacher vLLM.",
+  kl:
+    "No king reference for this round yet (cold-start). The kl axis normalises against the king's KL; until a king is crowned this round, the axis is undefined. The next round will inherit the freshly-crowned king as the anchor.",
+  degeneracy:
+    "No degeneracy probe data — the round either disabled the probe or the student errored before the probe ran.",
+  long_gen_coherence:
+    "Long-form coherence probe not run for this row (probe disabled, student errored, or pre-probe-version snapshot).",
+  self_consistency_bench:
+    "Bench axis muted to weight 0 (v28 quality > quantity rebalance). Still computed for telemetry — appears as null when the round skipped this axis or the bench didn't return a value.",
+  arc_bench:
+    "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  truthful_bench:
+    "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  procedural_bench:
+    "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  noise_resistance_bench:
+    "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  super_teacher:
+    "Super-teacher axis removed in v30.5 (2026-05-02). Kept in the schema for backward compatibility with old snapshots.",
+};
+
 function ScoreRow({
   axis,
   primary,
@@ -880,6 +916,13 @@ function ScoreRow({
   isBroken: boolean;
 }) {
   const label = axis.replace(/_bench$/, "").replace(/_/g, " ");
+  const nullHint =
+    primary == null && !isBroken ? AXIS_NULL_HINTS[axis] : undefined;
+  const tooltip = isBroken
+    ? "axis dropped this round (eval-broken)"
+    : isLimiting
+      ? "single lowest axis — counts in worst_3_mean (and legacy composite.worst)"
+      : nullHint;
   return (
     <div
       className={[
@@ -887,13 +930,7 @@ function ScoreRow({
         isBroken ? "opacity-50" : "",
         isLimiting ? "border-l-2 border-foreground pl-2 -ml-2" : "",
       ].join(" ")}
-      title={
-        isBroken
-          ? "axis dropped this round (eval-broken)"
-          : isLimiting
-            ? "single lowest axis — counts in worst_3_mean (and legacy composite.worst)"
-            : undefined
-      }
+      title={tooltip}
     >
       <div className="text-foreground capitalize truncate" title={axis}>
         {label}
@@ -915,7 +952,10 @@ function ScoreRow({
           />
         )}
       </div>
-      <span className="text-right">
+      <span
+        className="text-right"
+        title={primary == null && nullHint ? nullHint : undefined}
+      >
         {primary != null ? primary.toFixed(3) : "—"}
       </span>
       {hasCompare && (

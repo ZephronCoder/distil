@@ -634,6 +634,109 @@ class TestStateConsistency(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# KL Anchor Resolution Tests (cold-start fallback)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestResolveKingKl(unittest.TestCase):
+    """Verify the cold-start kl-axis fallback added 2026-05-04 after
+    Sebastian's report that the dashboard ``Kl`` axis was blank for
+    every student in the post-Kimi-cutover round (because king_h2h_kl
+    was ``None`` and ``_axis_kl`` returns None whenever its anchor is
+    missing). The fallback uses the round-wide minimum kl_global_avg
+    as the anchor so the new winner scores 1.0 on kl and challengers
+    get a meaningful denominator.
+    """
+
+    def test_uses_king_kl_when_available(self):
+        """Normal rounds: anchor on the king's KL, ignore the round
+        minimum even if a non-king student had a lower KL (pre-existing
+        behaviour preserved by the fallback path)."""
+        from scripts.validator.composite import _resolve_king_kl
+
+        students_data = {
+            "king/m": {"kl_global_avg": 0.30},
+            "challenger/a": {"kl_global_avg": 0.25},
+            "challenger/b": {"kl_global_avg": 0.50},
+        }
+        self.assertEqual(_resolve_king_kl(0.30, students_data), 0.30)
+        self.assertEqual(_resolve_king_kl(2.5, students_data), 2.5)
+
+    def test_falls_back_to_round_min_when_king_kl_missing(self):
+        """Cold-start rounds (king_h2h_kl=None): anchor on the
+        round-wide minimum kl_global_avg so the kl axis is populated."""
+        from scripts.validator.composite import _resolve_king_kl
+
+        students_data = {
+            "challenger/a": {"kl_global_avg": 2.05},
+            "challenger/b": {"kl_global_avg": 4.30},
+            "challenger/c": {"kl_global_avg": 1.60},
+        }
+        self.assertEqual(
+            _resolve_king_kl(None, students_data), 1.60,
+            "should pick the lowest KL as the anchor",
+        )
+
+    def test_falls_back_to_round_min_for_inf_or_zero_king_kl(self):
+        """Defensive: ``inf`` / 0 / negative king_kl values are treated
+        as missing and fall back to the round minimum (these are
+        sentinel values for failed evals, not legitimate anchors)."""
+        from scripts.validator.composite import _resolve_king_kl
+
+        students_data = {"a": {"kl_global_avg": 1.5}}
+        self.assertEqual(_resolve_king_kl(float("inf"), students_data), 1.5)
+        self.assertEqual(_resolve_king_kl(0.0, students_data), 1.5)
+        self.assertEqual(_resolve_king_kl(-1.0, students_data), 1.5)
+        self.assertEqual(_resolve_king_kl(float("nan"), students_data), 1.5)
+
+    def test_returns_none_when_no_data_at_all(self):
+        """Bootstrap round before any student has scored: nothing to
+        anchor on, return None and let the caller decide."""
+        from scripts.validator.composite import _resolve_king_kl
+
+        self.assertIsNone(_resolve_king_kl(None, {}))
+        self.assertIsNone(_resolve_king_kl(None, {"a": {}}))
+        self.assertIsNone(_resolve_king_kl(None, {"a": {"kl_global_avg": None}}))
+
+    def test_kl_axis_populated_in_cold_start_via_fallback(self):
+        """End-to-end: under cold-start (king_kl=None) the kl axis is
+        meaningful when computed against the resolved anchor — the
+        round's best student scores 1.0, others get the natural
+        anchor/student ratio."""
+        from scripts.validator.composite import _axis_kl, _resolve_king_kl
+
+        students_data = {
+            "winner/m": {"kl_global_avg": 2.0},
+            "challenger/a": {"kl_global_avg": 4.0},
+        }
+        anchor = _resolve_king_kl(None, students_data)
+        self.assertEqual(anchor, 2.0)
+        self.assertAlmostEqual(
+            _axis_kl(students_data["winner/m"], anchor), 1.0, places=4,
+        )
+        self.assertAlmostEqual(
+            _axis_kl(students_data["challenger/a"], anchor), 0.5, places=4,
+        )
+
+    def test_skips_teacher_self_kl_floor(self):
+        """The teacher-vs-itself row reports kl≈0 by construction. The
+        fallback's ``skip_floor`` (1e-4) drops it from the anchor pool
+        so a real student's KL becomes the anchor instead of ~0
+        (which would force every challenger to score None on kl)."""
+        from scripts.validator.composite import _resolve_king_kl
+
+        students_data = {
+            "teacher": {"kl_global_avg": 1e-9},
+            "student/a": {"kl_global_avg": 2.5},
+            "student/b": {"kl_global_avg": 3.0},
+        }
+        self.assertEqual(
+            _resolve_king_kl(None, students_data), 2.5,
+            "teacher's near-zero self-KL must be skipped",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Announcement Earnings-Line Tests (multi-king payout)
 # ═══════════════════════════════════════════════════════════════════════════════
 

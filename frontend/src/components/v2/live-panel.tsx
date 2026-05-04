@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { CLIENT_API_BASE } from "@/lib/subnet";
+import { ChatKingPill } from "./chat-king-pill";
 
 interface EvalOrderItem {
   uid: number;
@@ -245,6 +246,14 @@ export function LivePanel() {
             )}
           </div>
           <div className="text-meta mt-1">{explainer}</div>
+          {/* Chat status — explains the "500 Server Connection Error"
+              users hit on chat.arbos.life mid-eval (Sebastian
+              report 2026-05-04). The chat vLLM is paused while
+              eval owns the H200; the pill auto-flips to "live"
+              when the server comes back. */}
+          <div className="mt-2 pt-2 border-t border-border">
+            <ChatKingPill variant="block" />
+          </div>
         </div>
 
         <div className="flex flex-col gap-3">

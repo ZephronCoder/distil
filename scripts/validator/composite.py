@@ -2208,6 +2208,36 @@ def _resolve_king_metric_min(students_data: dict[Any, dict],
     return best
 
 
+def _resolve_king_kl(king_kl: float | None,
+                     students_data: dict[Any, dict]) -> float | None:
+    """Round-wide reference KL for the ``kl`` axis.
+
+    Mirrors :func:`_resolve_king_rkl` for the ``kl_global_avg`` metric.
+    When a king is seated for the round we anchor on the king's KL.
+    When there is no king (cold-start, post-cutover, or single-eval
+    mode where the king isn't a round participant), we fall back to
+    the round-wide MINIMUM ``kl_global_avg`` so the kl axis still has
+    a meaningful denominator.
+
+    Without this fallback the kl axis was ``None`` for every student
+    in cold-start rounds because ``_axis_kl`` returns ``None`` whenever
+    its ``king_kl`` argument is ``None``. That left the dashboard
+    showing blank for ``Kl`` on the entire post-Kimi-cutover leader-
+    board (Sebastian's report 2026-05-04). With the fallback the new
+    round winner scores 1.0 on ``kl`` (best-anchored), challengers
+    score on the king/winner ratio, and subsequent rounds inherit the
+    crowned king's KL as the natural anchor.
+    """
+    try:
+        if king_kl is not None:
+            v = float(king_kl)
+            if v == v and v > 0 and v not in (float("inf"), float("-inf")):
+                return v
+    except (TypeError, ValueError):
+        pass
+    return _resolve_king_metric_min(students_data, "kl_global_avg")
+
+
 def _resolve_king_eopd(students_data: dict[Any, dict],
                        h2h_results: list[dict]) -> float | None:
     """v30 — round-wide reference adaptive-KL for the entropy-aware
