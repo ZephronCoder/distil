@@ -18237,8 +18237,27 @@ def main():
 
         # Load student (or reuse king)
         live_progress["phase"] = "loading_student"
-        live_progress["current"] = {"student_name": student_name, "student_idx": student_idx, "prompts_done": 0}
+        live_progress["current"] = {"student_name": student_name, "student_idx": student_idx, "prompts_done": 0, "stage": "loading_weights"}
         _write_progress()
+
+        # 2026-05-04: ``_set_stage`` lets the dashboard show what's
+        # actually happening between "loading_student" and "kl scoring
+        # 0/60 prompts". Without it, the entire probe pipeline (chat
+        # ~65s + capability ~36s + judge ~16s + LFJ ~720s on derail-
+        # prone students + chat-turns ~180s + bench battery ~300s)
+        # runs while the dashboard says "0/60 prompts" — miners then
+        # complain in #distil-97 that the eval is stuck. The stage
+        # label travels through state.eval_progress.json and the API
+        # surfaces it to the live panel.
+        def _set_stage(name: str, **extra) -> None:
+            cur = live_progress.get("current") or {}
+            if not isinstance(cur, dict):
+                return
+            cur["stage"] = name
+            for k, v in extra.items():
+                cur[k] = v
+            live_progress["current"] = cur
+            _write_progress()
 
         is_king = (student_name == king_name)
 
@@ -18366,6 +18385,7 @@ def main():
             chat_probe_this = False
         if chat_probe_this:
             try:
+                _set_stage("chat_probe")
                 _cp_start = time.time()
                 cprobe = chat_response_probe(student, tokenizer, device)
                 _cp_dur = time.time() - _cp_start
@@ -18488,6 +18508,7 @@ def main():
             cap_probe_this = False
         if cap_probe_this:
             try:
+                _set_stage("capability_probe")
                 _cp_start = time.time()
                 cap = capability_probe(student, tokenizer, device)
                 _cp_dur = time.time() - _cp_start
@@ -18531,6 +18552,7 @@ def main():
             judge_collect_this = False
         if judge_collect_this:
             try:
+                _set_stage("judge_probe")
                 _jp_start = time.time()
                 judge_raw = judge_response_probe(student, tokenizer, device)
                 _jp_dur = time.time() - _jp_start
@@ -18568,6 +18590,7 @@ def main():
             long_form_collect_this = False
         if long_form_collect_this:
             try:
+                _set_stage("long_form_judge_probe")
                 _lf_start = time.time()
                 lf_raw = long_form_judge_response_probe(student, tokenizer, device)
                 _lf_dur = time.time() - _lf_start
@@ -18604,6 +18627,7 @@ def main():
             chat_turns_collect_this = False
         if chat_turns_collect_this:
             try:
+                _set_stage("chat_turns_probe")
                 _ct_start = time.time()
                 chat_turns_raw = chat_turns_response_probe(
                     student, tokenizer, device)
@@ -18649,6 +18673,7 @@ def main():
             bench_this = False
         if bench_this:
             try:
+                _set_stage("bench_battery")
                 bench_res = run_bench_battery(student, tokenizer, device)
                 total_w = bench_res.pop("_total_wall_s", 0.0)
                 results["students"].setdefault(student_name, {})
@@ -19173,6 +19198,7 @@ def main():
                         "prompts_done": i + 1, "prompts_total": effective_total,
                         "kl_running_mean": round(running_mean, 6),
                         "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far else None,
+                        "stage": "kl_scoring",
                     }
                     _write_progress()
 

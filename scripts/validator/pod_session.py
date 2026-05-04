@@ -47,8 +47,32 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             now = float(resume_pod_eval.get("started_at") or now)
         except (TypeError, ValueError):
             pass
-    est_teacher_s = 90
-    est_per_student_s = 5 * n_prompts
+    # 2026-05-04: Per-round-wall-time recalibration. Old estimates
+    # (teacher=90s, student=5*n_prompts=300s) predicted ~50 min for a
+    # 10-student round; live timing on H200 NVL with the Kimi K2.6 API
+    # teacher path shows ~370s teacher generation + ~15 min probe + KL
+    # per student = ~3 hours. Underestimating drives miner panic in
+    # Discord ("eval is stuck") because the dashboard ETA expires while
+    # the round is barely past student #1.
+    #
+    # Components (median, single 1xH200 NVL pod):
+    #   • teacher_api_phase:  370s (60 prompts × 6s avg via OpenRouter
+    #                              concurrency=4)
+    #   • teacher_probe_refs: 145s (32 think + 36 cap + 4 chat probes
+    #                              via API)
+    #   • per-student load:   140s (33B Kimi-arch download + load)
+    #   • per-student probes: 380s (chat 65s + capability 36s + judge
+    #                              16s + LFJ 720s on derail-prone
+    #                              students... call it 380s for the
+    #                              healthy case, gets revised below if
+    #                              we detect derail in chat probe)
+    #   • per-student KL:     180s (60 prompts × 3s on H200 eager mode)
+    #
+    # If DISTIL_TEACHER_MODE=api we skip local vLLM bootstrap, so the
+    # teacher phase is dominated by API throughput, not GPU load.
+    _api_mode = os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+    est_teacher_s = 515 if _api_mode else 180
+    est_per_student_s = 700  # load + probes + KL (median, healthy path)
     est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
     eval_order = []
     if king_uid is not None and king_uid in models_to_eval:

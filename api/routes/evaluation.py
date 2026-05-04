@@ -341,6 +341,14 @@ def get_queue():
 
     lb_contenders = [c.get("uid") for c in (lb.get("contenders") or []) if c.get("uid") is not None]
 
+    # 2026-05-04: surface ``current.stage`` to the dashboard so the UI
+    # can display "running long_form_judge probe" instead of "0/60
+    # prompts" while a student is still in the probe pipeline. Without
+    # this, miners see "0/60" stuck for ~15 min per student during
+    # chat / capability / judge / LFJ / chat-turns / bench probes and
+    # report the round as hung in #distil-97.
+    cur = prog.get("current") or {}
+    current_stage = cur.get("stage") if isinstance(cur, dict) else None
     payload = {
         "active": bool(prog.get("active")),
         "phase": prog.get("phase"),
@@ -354,6 +362,7 @@ def get_queue():
         "students_done": prog.get("students_done"),
         "prompts_total": prog.get("prompts_total"),
         "prompts_done": prog.get("prompts_done"),
+        "current_stage": current_stage,
         "teacher_prompts_done": prog.get("teacher_prompts_done"),
         "slots": slots,
         "top4_leaderboard_contenders": lb_contenders,
@@ -735,6 +744,7 @@ def get_dashboard():
                 "prompts_total": prog.get("prompts_total"),
                 "current_student": prog.get("current_student") or (prog.get("current") or {}).get("student_name"),
                 "current_kl": prog.get("current_kl") or (prog.get("current") or {}).get("kl_running_mean"),
+                "current_stage": (prog.get("current") or {}).get("stage"),
                 "eval_order": prog.get("eval_order"),
                 "teacher_prompts_done": prog.get("teacher_prompts_done"),
             },

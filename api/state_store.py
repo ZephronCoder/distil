@@ -214,6 +214,12 @@ def normalize_eval_progress(progress):
         "current_best": "best_kl_so_far",
         "current_se": "kl_running_se",
         "current_ci": "ci_95",
+        # 2026-05-04: per-student probe stage (chat_probe,
+        # capability_probe, judge_probe, long_form_judge_probe,
+        # chat_turns_probe, bench_battery, kl_scoring). Used by the
+        # dashboard's eval-queue row to show what's running between
+        # "loading_student" and "kl_scoring N/60 prompts".
+        "current_stage": "stage",
     }
     for flat_key, nested_key in fields.items():
         flat_value = normalized.get(flat_key)

@@ -30,6 +30,12 @@ interface EvalProgress {
   prompts_total?: number;
   current_prompt?: number;
   current_kl?: number;
+  // 2026-05-04: name of the per-student stage in flight (e.g.
+  // "chat_probe", "long_form_judge_probe", "kl_scoring"). Used by the
+  // queue row to show what's actually running while X/N prompts is
+  // still 0 (i.e. before KL scoring begins). Surfaced via
+  // ``current.stage`` from the pod's eval_progress.json.
+  current_stage?: string | null;
   teacher_prompts_done?: number;
   started_at?: number;
   estimated_completion?: number;
@@ -380,6 +386,20 @@ function QueueRow({ status, uid, model, role, completed, current }: QueueRowProp
         typeof current.current_kl === "number"
           ? ` · KL ${current.current_kl.toFixed(4)}`
           : "";
+      const stage = current.current_stage as string | null | undefined;
+      // 2026-05-04: when a stage is reported and we haven't started
+      // KL scoring yet, show what the eval is actually doing instead
+      // of "0/N prompts". The X/N counter only increments during the
+      // KL pass at the END of the per-student pipeline; before that
+      // we're in chat / capability / judge / long-form-judge / chat-
+      // turns / bench probes for ~15 min and miners read "0/60" as
+      // "the eval is hung".
+      if (stage && stage !== "kl_scoring" && pd === 0) {
+        const stageLabel = stage
+          .replace(/_/g, " ")
+          .replace(/\bprobe\b/, "probe");
+        return `running ${stageLabel}`;
+      }
       return `${pd}/${pt} prompts${klPart}`;
     }
     return "queued";
