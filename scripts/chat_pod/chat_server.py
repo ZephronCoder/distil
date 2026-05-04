@@ -90,14 +90,112 @@ def _hf_cli() -> str:
     raise RuntimeError("no huggingface CLI found (need `hf` or `huggingface-cli`)")
 
 
+_KING_MARKER = "/root/king-model/.king_marker.json"
+
+
+def _read_marker() -> dict:
+    """Return the persisted king-marker payload (model + revision + ts)."""
+    try:
+        with open(_KING_MARKER) as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_marker(model: str, revision: str | None):
+    """Persist a marker file describing what's currently in MODEL_DIR.
+
+    Lets the next chat_server startup skip the 30 GB re-download when the
+    king hasn't changed. We persist BOTH the HF repo id and the revision
+    so a same-repo king upgrade (e.g. UID promoting a new commit) still
+    triggers a fresh pull.
+    """
+    try:
+        with open(_KING_MARKER, "w") as f:
+            json.dump(
+                {"model": model, "revision": revision, "ts": time.time()}, f,
+            )
+    except OSError as exc:
+        log(f"warning: could not write king marker: {exc}")
+
+
+def _is_complete_download() -> bool:
+    """Best-effort check that MODEL_DIR contains a usable model.
+
+    Heuristic: ``config.json`` + ``model.safetensors.index.json`` present,
+    AND every shard listed in the index actually exists on disk. We pick
+    these two files because every transformers checkpoint we serve has
+    them, and the index lets us verify the shards weren't truncated by
+    a previous crashed download.
+    """
+    config_path = MODEL_DIR / "config.json"
+    if not config_path.exists():
+        return False
+    index_path = MODEL_DIR / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            with open(index_path) as f:
+                idx = json.load(f)
+            shards = set((idx.get("weight_map") or {}).values())
+            for shard in shards:
+                if not (MODEL_DIR / shard).exists():
+                    return False
+            return True
+        except (OSError, ValueError):
+            return False
+    # Single-file model — good enough if there's any *.safetensors.
+    return any(MODEL_DIR.glob("*.safetensors"))
+
+
 def download_model():
+    """Download the king model — but skip the 30 GB pull if we already have it.
+
+    Pre-2026-05-04 this function unconditionally ``shutil.rmtree``'d
+    ``/root/king-model`` and re-downloaded. That's fine when chat_server
+    only runs once per king crowning, but the API's
+    ``_ensure_chat_server`` watchdog re-spawns the bootstrapper every
+    time vLLM dies (eval-pod GPU contention, OOMs, restarts after
+    network blips, etc.). On the chat-bench pod this means a fresh 30 GB
+    DeepSeek-V3 / Kimi-K2 pull every restart even when the on-disk
+    weights are already perfect — chat stays dark for 5-10 min instead
+    of the ~60 s it takes vLLM to load + warm up. Worse, two concurrent
+    downloads race-delete each other's tmp incomplete files (``shutil.move``
+    blowups in ``hf_hub_download._chmod_and_move``), poisoning the
+    download for both processes.
+
+    The marker file (``/root/king-model/.king_marker.json``) records what
+    HF repo + revision is in the dir. If the marker matches what we were
+    asked to serve AND the shard files are still on disk, we skip the
+    download entirely. Mismatch (new king, revision bump, partial
+    download) → wipe + re-download fresh.
+
+    Sebastian's report 2026-05-04 ("chat doesn't work with current king")
+    was caused by exactly this race: the API spawned 2-3 chat_server.py
+    processes during a single eval-end window, each tried to wipe + re-
+    download, and the racing rmtree+download crashed all of them with
+    ``FileNotFoundError`` on the same incomplete path.
+    """
+    marker = _read_marker()
+    if (
+        marker.get("model") == MODEL_NAME
+        and marker.get("revision") == MODEL_REVISION
+        and _is_complete_download()
+    ):
+        log(
+            f"skipping download — marker matches "
+            f"({MODEL_NAME}@{MODEL_REVISION or 'latest'}, "
+            f"on disk since {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(marker.get('ts', 0)))} UTC)"
+        )
+        return
     if MODEL_DIR.exists():
+        log("wiping stale MODEL_DIR (marker mismatch or incomplete download)")
         shutil.rmtree(MODEL_DIR)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [_hf_cli(), "download", MODEL_NAME, "--local-dir", str(MODEL_DIR)]
     if MODEL_REVISION:
         cmd += ["--revision", MODEL_REVISION]
     run(cmd)
+    _write_marker(MODEL_NAME, MODEL_REVISION)
 
 
 def patch_config_and_tokenizer():
@@ -329,7 +427,51 @@ def exec_vllm():
     os.execvp(cmd[0], cmd)
 
 
+def _acquire_startup_lock():
+    """Serialise concurrent ``chat_server.py`` startups via ``flock``.
+
+    The API watchdog (``api/routes/chat.py:_ensure_chat_server``) and the
+    validator's ``ensure_chat_server_running`` BOTH spawn this script
+    when chat is dark, and they don't coordinate with each other. We've
+    seen up to 3 simultaneous chat_server processes during a single
+    eval-end window, all racing on the same model dir and port. The
+    second/third invocations crash on:
+
+      * ``FileNotFoundError`` mid-download (rmtree races)
+      * ``Address already in use`` when two vLLMs fight for port 8100
+      * dueling weight loaders if both somehow get past download
+
+    A non-blocking ``fcntl.flock(LOCK_EX | LOCK_NB)`` on a pid-stamped
+    lock file at ``/tmp/chat_server.lock`` lets the first invocation win
+    cleanly: subsequent invocations log + exit 0 (so the watchdog
+    doesn't see a crash and re-spawn yet again). The OS releases the
+    lock automatically when this process exits — no manual cleanup
+    needed even on hard kill.
+    """
+    import fcntl
+    lock_path = "/tmp/chat_server.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            with open(lock_path) as f:
+                holder = f.read().strip()
+        except OSError:
+            holder = "?"
+        log(
+            f"another chat_server is already starting (pid={holder}); "
+            f"exiting cleanly to avoid race."
+        )
+        sys.exit(0)
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    # Intentionally leak the fd so the lock survives until process exit.
+    return fd
+
+
 if __name__ == "__main__":
+    _acquire_startup_lock()
     rev_suffix = f"@{MODEL_REVISION}" if MODEL_REVISION else ""
     log(f"bootstrapping model={MODEL_NAME}{rev_suffix} port={PORT}")
     download_model()
