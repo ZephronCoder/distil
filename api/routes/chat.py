@@ -22,7 +22,7 @@ from config import (
 from helpers.rate_limit import _chat_rate_limiter, _openai_api_rate_limiter
 from helpers.sanitize import _safe_json_load
 from helpers.ssh import _ssh_exec, SshExecError
-from state_store import h2h_latest, read_cache, uid_hotkey_map
+from state_store import h2h_latest, read_cache, read_state, uid_hotkey_map
 
 router = APIRouter()
 
@@ -32,22 +32,39 @@ router = APIRouter()
 def _get_king_info():
     h2h = h2h_latest()
     king_uid = h2h.get("king_uid")
-    if king_uid is None:
-        return None, None
-    for r in h2h.get("results", []):
-        if r.get("is_king") or r.get("uid") == king_uid:
-            return king_uid, r.get("model")
-    commitments_data = read_cache("commitments", {})
-    commitments = (
-        commitments_data.get("commitments", commitments_data)
-        if isinstance(commitments_data, dict)
-        else {}
-    )
-    king_hotkey = uid_hotkey_map().get(str(king_uid))
-    if king_hotkey and king_hotkey in commitments:
-        info = commitments[king_hotkey]
-        return king_uid, info.get("model") if isinstance(info, dict) else info
-    return king_uid, None
+    if king_uid is not None:
+        for r in h2h.get("results", []):
+            if r.get("is_king") or r.get("uid") == king_uid:
+                return king_uid, r.get("model")
+        commitments_data = read_cache("commitments", {})
+        commitments = (
+            commitments_data.get("commitments", commitments_data)
+            if isinstance(commitments_data, dict)
+            else {}
+        )
+        king_hotkey = uid_hotkey_map().get(str(king_uid))
+        if king_hotkey and king_hotkey in commitments:
+            info = commitments[king_hotkey]
+            return king_uid, info.get("model") if isinstance(info, dict) else info
+        return king_uid, None
+
+    # 2026-05-04 (Kimi cutover follow-up): h2h_latest can sit at king_uid=None
+    # for an entire eval generation when the prior king is DQ'd by a hard
+    # arch-cutover (e.g. Qwen→Kimi) and no Kimi-arch student has been
+    # crowned yet. The chat-keeper's vLLM is still serving the *previous*
+    # king (state/chat_pod.json keeps a reference for exactly this
+    # scenario), so we surface that to the chat router instead of going
+    # 503 — chat staying live during the gap is more important than
+    # leaderboard purity in the API surface (the dashboard still reads
+    # h2h_latest directly so the leaderboard correctly shows "no king").
+    chat_pod_state = read_state("chat_pod.json", {}) or {}
+    fallback_model = chat_pod_state.get("model")
+    if fallback_model:
+        # We don't know the original UID for the legacy king (h2h_latest
+        # was reset on cutover) — surface a sentinel so callers that
+        # care can detect this is a fallback.
+        return -1, fallback_model
+    return None, None
 
 
 # ── Shared SSH-curl helpers ──────────────────────────────────────────────────
