@@ -4433,15 +4433,13 @@ def chat_response_probe(model, tokenizer, device="cuda"):
             return stats
         eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
-        was_training = model.training
-        model.eval()
         terminated = 0
         non_empty = 0
         gen_tokens_acc = 0
         content_chars_acc = 0
         reasoning_frac_acc = 0.0
 
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for prompt in CHAT_PROBE_PROMPTS:
                 msgs = [{"role": "user", "content": prompt}]
                 try:
@@ -4509,8 +4507,6 @@ def chat_response_probe(model, tokenizer, device="cuda"):
                 f"mean_think_frac={stats['mean_reasoning_fraction']:.2f}"
             )
 
-        if was_training:
-            model.train()
         return stats
     except Exception as e:
         stats["reason"] = f"probe_error:{str(e)[:120]}"
@@ -4731,7 +4727,15 @@ def capability_probe(model, tokenizer, device="cuda"):
         if not getattr(tokenizer, "chat_template", None):
             return out
 
-        eos_ids, pad_id = _eos_pad_ids(tokenizer)
+        eos_ids = []
+        for tok in ["<|im_end|>", "<|endoftext|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0:
+                eos_ids.append(tid)
+        if getattr(tokenizer, "eos_token_id", None) is not None:
+            eos_ids.append(int(tokenizer.eos_token_id))
+        eos_ids = list(set(eos_ids)) or None
+        pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
 
         with _model_eval_no_grad(model):
             for item in CAPABILITY_PROBE_PROMPTS:
@@ -5971,14 +5975,8 @@ def _model_eval_no_grad(model):
         with torch.no_grad():
             yield
         return
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            yield
-    finally:
-        if was_training:
-            model.train()
+    with _model_eval_no_grad(model):
+        yield
 
 
 def _eos_pad_ids(tokenizer) -> tuple[list[int] | None, int]:
@@ -6018,7 +6016,15 @@ def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     Uses the same eos/pad setup as the existing probes so behavior is
     identical to capability_probe / chat_response_probe.
     """
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    eos_ids = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     # Apply the derail-budget multiplier. Floor at 64 tokens so even
@@ -7105,7 +7111,15 @@ def _bench_generate_sampled(model, tokenizer, prompt: str, max_new_tokens: int,
     (prompt, seed, temperature, top_p)). Everything else matches the
     greedy variant for behavioral parity.
     """
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    eos_ids = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     prev_state = None
@@ -14321,7 +14335,15 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
         return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
     think_prompts = _pick_think_probe_prompts(block_seed)
     try:
-        eos_ids, pad_id = _eos_pad_ids(tokenizer)
+        eos_ids = []
+        for tok in ["<|im_end|>", "<|endoftext|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0:
+                eos_ids.append(tid)
+        if getattr(tokenizer, "eos_token_id", None) is not None:
+            eos_ids.append(int(tokenizer.eos_token_id))
+        eos_ids = list(set(eos_ids)) or None
+        pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
 
         with _model_eval_no_grad(teacher):
             for prompt in think_prompts:
