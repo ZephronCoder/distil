@@ -415,14 +415,25 @@ def exec_vllm():
         # ``function_calling=native`` requests succeed end-to-end.
         #
         # We deliberately do NOT add ``--reasoning-parser kimi_k2``: that
-        # parser treats everything before a ``</think>`` token (or
-        # ``<|tool_calls_section_begin|>``) as reasoning, including
-        # responses that never open a ``<think>`` block at all. Our
-        # distilled students don't follow Kimi's thinking template
-        # rigorously, so the parser swallows the entire visible answer
-        # into the ``reasoning`` field and clients render an empty
-        # message bubble. Until a king ships that genuinely emits Kimi
-        # thinking tokens, leave reasoning unparsed.
+        # parser treats everything before ``</think>`` (or
+        # ``<|tool_calls_section_begin|>``) as reasoning. The Kimi K2
+        # chat template auto-prepends ``<think>`` to the assistant turn,
+        # so a king that never emits ``</think>`` lands the entire answer
+        # in ``message.reasoning`` (empty content) — verified live on
+        # ``bodenmaurice/distil-new-v16`` after we tried it.
+        #
+        # Instead we surface thinking client-side: the v5 system prompt
+        # (``<!--sn97-system-v5-thinking-->`` in
+        # ``configure_webui_tools.py``) tells the king to wrap scratch in
+        # ``<think>…</think>`` blocks, and Open-WebUI's
+        # ``DEFAULT_REASONING_TAGS`` (in
+        # ``open_webui/utils/middleware.py``) splits those out into a
+        # collapsible Thinking section client-side. When the king ignores
+        # the instruction we fall back to plain content rendering — the
+        # chat is still usable, just without a Thinking pane for that
+        # turn. Future thinking-capable kings (or a vLLM that ships a
+        # parser with a friendlier "no </think>" fallback) can flip the
+        # parser back on without other changes.
         cmd += [
             "--enable-auto-tool-choice",
             "--tool-call-parser", "kimi_k2",
@@ -431,9 +442,9 @@ def exec_vllm():
         ]
     elif family == "kimi_k2":
         # Text-only DeepSeek V3 inner of Kimi K2 — same tool-call template
-        # as the vision wrapper. Tool parser only; reasoning parser is
-        # off for the same reason as ``kimi_k25`` (would empty out
-        # ``message.content`` for non-thinking-template responses).
+        # as the vision wrapper. Reasoning parser is off for the same
+        # reason as ``kimi_k25``; we use the v5 system prompt + Open-WebUI
+        # client-side ``<think>…</think>`` parsing instead.
         cmd += [
             "--enable-auto-tool-choice",
             "--tool-call-parser", "kimi_k2",
