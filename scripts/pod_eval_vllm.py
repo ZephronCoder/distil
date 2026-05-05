@@ -14647,15 +14647,13 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
 
         eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
-        was_training = model.training
-        model.eval()
         terminated = 0
         gen_tokens_acc = 0
         student_m = []
         samples = []
 
         think_prompts = _pick_think_probe_prompts(block_seed)
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for prompt in think_prompts:
                 msgs = [{"role": "user", "content": prompt}]
                 try:
@@ -14807,8 +14805,6 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
                 f"mean_gen={stats['mean_gen_tokens']:.0f}"
             )
 
-        if was_training:
-            model.train()
         return stats
     except Exception as e:
         stats["reason"] = f"think_probe_error:{str(e)[:120]}"
@@ -14864,9 +14860,7 @@ def on_policy_rollouts(student, tokenizer, device="cuda",
 
     eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
-    was_training = student.training
-    student.eval()
-    try:
+    with _model_eval_no_grad(student):
         for p_idx, prompt in enumerate(prompts):
             try:
                 msgs = [{"role": "user", "content": prompt}]
@@ -14881,19 +14875,17 @@ def on_policy_rollouts(student, tokenizer, device="cuda",
                 torch.manual_seed(seed + p_idx)
                 if device == "cuda":
                     torch.cuda.manual_seed(seed + p_idx)
-                with torch.no_grad():
-                    out = student.generate(
-                        ids, max_new_tokens=max_new,
-                        do_sample=True, temperature=temperature, top_p=top_p,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
+                out = student.generate(
+                    ids, max_new_tokens=max_new,
+                    do_sample=True, temperature=temperature, top_p=top_p,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
                 prompt_len = int(ids.shape[1])
                 full_ids = out  # [1, prompt_len + gen_len]
                 gen_len = int(full_ids.shape[1] - prompt_len)
                 if gen_len <= 0:
                     continue
-                with torch.no_grad():
-                    s_logits = student(full_ids).logits.float()
+                s_logits = student(full_ids).logits.float()
                 # Positions prompt_len-1 .. end-1 predict the generated tokens
                 cont = s_logits[0, prompt_len - 1:-1, :]  # [gen_len, V]
                 if cont.shape[0] == 0:
@@ -14921,9 +14913,6 @@ def on_policy_rollouts(student, tokenizer, device="cuda",
             except Exception as e:
                 print(f"[on-policy-rkl] rollout {p_idx} error: {str(e)[:120]}", flush=True)
                 continue
-    finally:
-        if was_training:
-            student.train()
     return rollouts
 
 
@@ -14959,9 +14948,7 @@ def on_policy_rkl_score(teacher, rollouts: list[dict], device: str = "cuda",
     if teacher is None or not rollouts:
         return agg
 
-    was_training = teacher.training
-    teacher.eval()
-    try:
+    with _model_eval_no_grad(teacher):
         per_rollout = []
         total_rkl = 0.0
         total_fkl = 0.0
@@ -14976,8 +14963,7 @@ def on_policy_rkl_score(teacher, rollouts: list[dict], device: str = "cuda",
                 topk_idx = r["topk_idx"].to(device)          # [gen_len, K]
                 s_topk_lp = r["topk_logprobs"].to(device)    # [gen_len, K]
                 sampled_lp_s = r["sampled_logprobs"].to(device)  # [gen_len]
-                with torch.no_grad():
-                    t_logits = teacher(full_ids).logits.float()
+                t_logits = teacher(full_ids).logits.float()
                 t_cont = t_logits[0, prompt_len - 1:-1, :]   # [gen_len, V]
                 if t_cont.shape[0] == 0:
                     continue
@@ -15055,9 +15041,6 @@ def on_policy_rkl_score(teacher, rollouts: list[dict], device: str = "cuda",
         agg["per_rollout"] = per_rollout
         agg["skew_alpha"] = skew_alpha
         agg["top_k"] = int(rollouts[0]["topk_idx"].shape[-1]) if rollouts else None
-    finally:
-        if was_training:
-            teacher.train()
     return agg
 
 
