@@ -4,7 +4,6 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any
 
 from eval.private_pool import dp_noise_for
 from eval.scoring import disqualify, is_disqualified, record_failure, reset_failures
@@ -689,6 +688,226 @@ def _resolve_dethrone_winner(dethroners: list[dict]) -> int:
                 f"deferred to next round): {outliers}"
             )
     return winner
+
+
+def _composite_for_uid(
+    uid, *, uid_to_model, students_data, king_kl_ref, king_rkl_ref,
+    ref_uid_for_ranking, ref_axes_for_ranking,
+):
+    """Return composite axes for a UID, anchored to the round's king & ref.
+
+    Reference itself is the anchor — don't dock it against itself. Falls
+    open to a stub composite when the underlying data is missing or
+    ``compute_composite`` throws.
+    """
+    model = uid_to_model.get(uid)
+    data = students_data.get(model) or {}
+    ref_axes = None if uid == ref_uid_for_ranking else ref_axes_for_ranking
+    try:
+        return compute_composite(
+            data, king_kl_ref, king_rkl_ref,
+            reference_axes=ref_axes,
+        )
+    except Exception:
+        return {"worst": None, "weighted": None, "axes": {}, "present_count": 0}
+
+
+def _resolve_reference_axes_for_ranking(
+    students_data, king_kl_ref, king_rkl_ref,
+):
+    """Resolve same-round reference axis values once for ranking.
+
+    2026-04-28 (v29.1): the dethroner ranking and the late display
+    composite need to apply the same per-axis baseline-relative penalty;
+    without resolving the reference axes once here they would disagree
+    for kings/challengers that regress below Qwen-4B-base on a bench
+    axis. Falls open to (None, None) when the reference is missing or
+    ``compute_axes`` throws — penalty silently disables that round and
+    ranking degrades to the pre-v29.1 behaviour.
+    """
+    try:
+        from eval.runtime import REFERENCE_MODEL as _REF_MODEL_RANK
+        from eval.runtime import REFERENCE_UID as _REF_UID_RANK
+        from scripts.validator.composite import compute_axes as _compute_axes_rank
+        ref_row = students_data.get(_REF_MODEL_RANK) if _REF_MODEL_RANK else None
+        if ref_row is None:
+            return _REF_UID_RANK, None
+        return _REF_UID_RANK, _compute_axes_rank(ref_row, king_kl_ref, king_rkl_ref)
+    except Exception:
+        return None, None
+
+
+def _select_h2h_winner(
+    *,
+    h2h_candidates, epsilon_dethroned_by, king_uid, king_kl, state,
+    uid_to_model, students_data, king_kl_ref, king_rkl_ref,
+):
+    """Pick the round's H2H winner and re-sort h2h_candidates by composite.
+
+    Composite-worst (descending, higher-is-better) is the primary key.
+    Ties break by composite-weighted, then by KL ascending so behaviour
+    degrades gracefully to KL-only when the composite is missing
+    (e.g. full-vocab KL still computed but probes errored).
+
+    The paired t-test gate (``epsilon_dethroned_by``) is unchanged — it
+    still enforces statistical significance before a crown changes hands
+    — but which challenger is considered the canonical winner, and what
+    we display as #1, is now driven by composite.worst.
+
+    Returns ``(winner_uid, winner_kl, epsilon_dethroned_by)`` — the third
+    component may be cleared when the integrity check trips.
+    """
+    if not h2h_candidates:
+        return None, float("inf"), epsilon_dethroned_by
+    ref_uid_for_ranking, ref_axes_for_ranking = _resolve_reference_axes_for_ranking(
+        students_data, king_kl_ref, king_rkl_ref,
+    )
+
+    def _rank_key(item):
+        uid_i, kl_i = item
+        comp = _composite_for_uid(
+            uid_i, uid_to_model=uid_to_model, students_data=students_data,
+            king_kl_ref=king_kl_ref, king_rkl_ref=king_rkl_ref,
+            ref_uid_for_ranking=ref_uid_for_ranking,
+            ref_axes_for_ranking=ref_axes_for_ranking,
+        )
+        worst = comp.get("worst")
+        weighted = comp.get("weighted")
+        present = comp.get("present_count") or 0
+        if worst is None or present < 2:
+            return (0, float("-inf"), float("-inf"), kl_i)
+        return (1, worst, weighted if weighted is not None else 0.0, -kl_i)
+
+    h2h_candidates.sort(key=_rank_key, reverse=True)
+    best_uid, best_kl = h2h_candidates[0]
+    if king_uid is not None and best_uid != king_uid and epsilon_dethroned_by is None:
+        logger.info(f"King UID {king_uid} retains crown (no challenger passed paired t-test)")
+        return king_uid, state.scores.get(str(king_uid), king_kl), epsilon_dethroned_by
+    if epsilon_dethroned_by is None:
+        return best_uid, best_kl, epsilon_dethroned_by
+    challenger_model = uid_to_model.get(epsilon_dethroned_by, "")
+    try:
+        from huggingface_hub import HfApi
+        info = HfApi().model_info(challenger_model)
+        if info.private:
+            logger.warning(
+                f"BLOCKED dethronement: UID {epsilon_dethroned_by} model "
+                f"{challenger_model} is now private!"
+            )
+            logger.info(f"King UID {king_uid} retains crown (challenger failed integrity check)")
+            state.dq_reasons[str(epsilon_dethroned_by)] = "Model went private after scoring"
+            return king_uid, state.scores.get(str(king_uid), king_kl), None
+        logger.info(
+            f"UID {epsilon_dethroned_by} is new king (paired t-test "
+            f"p<{PAIRED_TEST_ALPHA}), integrity check passed"
+        )
+        return epsilon_dethroned_by, state.scores.get(str(epsilon_dethroned_by), best_kl), epsilon_dethroned_by
+    except Exception as exc:
+        logger.warning(
+            f"BLOCKED dethronement: UID {epsilon_dethroned_by} model "
+            f"{challenger_model} integrity check failed: {exc}"
+        )
+        logger.info(f"King UID {king_uid} retains crown (challenger failed integrity check)")
+        state.dq_reasons[str(epsilon_dethroned_by)] = "Model not accessible on HuggingFace"
+        return king_uid, state.scores.get(str(king_uid), king_kl), None
+
+
+def _annotate_and_sort_composite(
+    h2h_results, *, king_h2h_kl, students_data, results,
+):
+    """Run composite annotation, backfill veto markers, sort by composite.
+
+    Catches and logs the rare composite-pipeline failure so a downstream
+    issue (probes errored mid-round, schema drift) doesn't take out the
+    entire round; the legacy KL-only ranking still holds in that case.
+    """
+    try:
+        # Teacher sanity gate (2026-04-23): if pod_eval_vllm recorded a
+        # row for the teacher as a pseudo-student (via the
+        # ``TEACHER_SANITY_PROBE`` path), pass it to the composite
+        # annotator so axes where the teacher itself scored below the
+        # sanity floor drop out this round. Falls back to None when the
+        # teacher wasn't probed (older pod_eval builds) and the gate
+        # fails open — same behaviour as before this commit.
+        teacher_name = results.get("teacher")
+        teacher_row = students_data.get(teacher_name) if teacher_name else None
+        # Import locally to keep composite.py ML-dep free (see its
+        # module docstring). The reference model is the always-in-round
+        # base student used for king_health telemetry (distil-97, 2026-04-24).
+        from eval.runtime import REFERENCE_MODEL as _REF_MODEL
+        from eval.runtime import REFERENCE_UID as _REF_UID
+        annotate_h2h_with_composite(
+            h2h_results, king_h2h_kl, students_data,
+            teacher_student_row=teacher_row,
+            reference_model=_REF_MODEL,
+            reference_uid=_REF_UID,
+        )
+        # Backfill the vs_king string for entries that would have passed
+        # the KL gate (``... dethroned``) but were blocked by the
+        # composite-floor veto. Without this the dashboard would say
+        # "dethroned" for a challenger that never actually took the
+        # crown, which is exactly the kind of false-positive signal the
+        # Discord has been asking us to surface clearly.
+        for row in h2h_results:
+            if row.get("is_king") or row.get("disqualified"):
+                continue
+            vs = row.get("vs_king") or ""
+            if " dethroned" not in vs:
+                continue
+            comp = row.get("composite") or {}
+            worst = comp.get("worst")
+            present = comp.get("present_count") or 0
+            if worst is None or present < COMPOSITE_DETHRONE_MIN_AXES:
+                continue
+            if worst >= COMPOSITE_DETHRONE_FLOOR:
+                continue
+            axes = comp.get("axes") or {}
+            broken_axes = set(comp.get("broken_axes") or [])
+            active = set(get_effective_axis_weights().keys()) - broken_axes
+            ax_name, ax_val = min(
+                ((k, v) for k, v in axes.items() if v is not None and k in active),
+                key=lambda kv: kv[1],
+                default=(None, None),
+            )
+            row["vs_king"] = (
+                vs.replace(" dethroned", f" blocked: {ax_name}={ax_val:.2f}")
+                if ax_name is not None
+                else vs.replace(" dethroned", " blocked by composite")
+            )
+            row["composite_veto"] = {
+                "worst_axis": ax_name,
+                "worst_value": round(float(ax_val), 4) if ax_val is not None else None,
+                "floor": COMPOSITE_DETHRONE_FLOOR,
+            }
+
+        # Re-sort h2h_results by composite.worst (desc) so the leaderboard
+        # endpoint and h2h_latest display rank order matches the ranking
+        # key used for crown decisions. KL stays as an informational field
+        # on each row.
+        def _sort_key(row):
+            comp = row.get("composite") or {}
+            worst = comp.get("worst")
+            kl_neg = -(row.get("kl") or float("inf"))
+            if worst is None:
+                return (0, float("-inf"), kl_neg)
+            return (1, worst, kl_neg)
+        h2h_results.sort(key=_sort_key, reverse=True)
+        for entry in h2h_results:
+            comp = entry.get("composite") or {}
+            worst = comp.get("worst")
+            if worst is None:
+                continue
+            axes = comp.get("axes", {})
+            axes_str = " ".join(
+                f"{k}={v:.2f}" if v is not None else f"{k}=–"
+                for k, v in axes.items()
+            )
+            logger.info(
+                f"  composite UID {entry.get('uid')}: "
+                f"worst={worst:.3f} weighted={comp.get('weighted')} [{axes_str}]"
+            )
+    except Exception as exc:
+        logger.warning(f"composite annotation failed: {exc}")
 
 
 def _handle_eval_error_and_record_failure(
@@ -1535,184 +1754,33 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             h2h_candidates.append((uid, state.scores[uid_str]))
 
     # ── T2.1: composite-worst as the ranking key ────────────────────────
-    # We compute composite up-front for every h2h candidate (plus the king
-    # if scored this round) so the canonical "best" is decided by the
-    # minimum-axis rule rather than raw KL. The paired t-test gate
-    # (``epsilon_dethroned_by``) is unchanged — it still enforces
-    # statistical significance before a crown changes hands — but which
-    # challenger is considered the canonical winner, and what we display
-    # as #1, is now driven by composite.worst. ``students_data``,
-    # ``king_kl_ref`` and ``king_rkl_ref`` were resolved earlier (above
-    # the dethronement loop) and are reused here unchanged.
-
-    # 2026-04-28 (v29.1): resolve same-round reference axis values once
-    # so the dethroner ranking applies the same per-axis baseline-relative
-    # penalty that ``annotate_h2h_with_composite`` will use later. Without
-    # this the early ranking key (composite.worst) and the later
-    # display-time composite would disagree for kings/challengers that
-    # regress below Qwen-4B-base on a bench axis. Fail open to None when
-    # the reference is missing or compute_axes throws — penalty silently
-    # disables that round and ranking degrades to the pre-v29.1 behavior.
-    _ref_axes_for_ranking: dict | None = None
-    _ref_uid_for_ranking: Any = None
-    try:
-        from eval.runtime import REFERENCE_MODEL as _REF_MODEL_RANK, REFERENCE_UID as _REF_UID_RANK
-        from scripts.validator.composite import compute_axes as _compute_axes_rank
-        _ref_uid_for_ranking = _REF_UID_RANK
-        _ref_row = students_data.get(_REF_MODEL_RANK) if _REF_MODEL_RANK else None
-        if _ref_row is not None:
-            _ref_axes_for_ranking = _compute_axes_rank(
-                _ref_row, king_kl_ref, king_rkl_ref,
-            )
-    except Exception:
-        _ref_axes_for_ranking = None
-
-    def _composite_for(uid):
-        model = uid_to_model.get(uid)
-        data = students_data.get(model) or {}
-        # Reference itself is the anchor: don't dock it against itself.
-        ref_axes = None if uid == _ref_uid_for_ranking else _ref_axes_for_ranking
-        try:
-            return compute_composite(
-                data, king_kl_ref, king_rkl_ref,
-                reference_axes=ref_axes,
-            )
-        except Exception:
-            return {"worst": None, "weighted": None, "axes": {}, "present_count": 0}
-
-    winner_uid, winner_kl = None, float("inf")
-    if h2h_candidates:
-        # Primary sort: composite.worst descending (higher-is-better).
-        # Ties broken by composite.weighted, then by KL ascending so
-        # behaviour degrades gracefully to KL-only when composite is
-        # missing (e.g. full-vocab KL still computed but probes errored).
-        def _rank_key(item):
-            uid_i, kl_i = item
-            comp = _composite_for(uid_i)
-            worst = comp.get("worst")
-            weighted = comp.get("weighted")
-            present = comp.get("present_count") or 0
-            # Sentinel: composite missing → fall back to KL-only rank.
-            if worst is None or present < 2:
-                return (0, float("-inf"), float("-inf"), kl_i)
-            return (1, worst, weighted if weighted is not None else 0.0, -kl_i)
-
-        h2h_candidates.sort(key=_rank_key, reverse=True)
-        best_uid, best_kl = h2h_candidates[0]
-        if king_uid is not None and best_uid != king_uid and epsilon_dethroned_by is None:
-            winner_uid = king_uid
-            winner_kl = state.scores.get(str(king_uid), king_kl)
-            logger.info(f"King UID {king_uid} retains crown (no challenger passed paired t-test)")
-        elif epsilon_dethroned_by is not None:
-            challenger_model = uid_to_model.get(epsilon_dethroned_by, "")
-            try:
-                from huggingface_hub import HfApi
-
-                info = HfApi().model_info(challenger_model)
-                if info.private:
-                    logger.warning(f"BLOCKED dethronement: UID {epsilon_dethroned_by} model {challenger_model} is now private!")
-                    winner_uid = king_uid
-                    winner_kl = state.scores.get(str(king_uid), king_kl)
-                    logger.info(f"King UID {king_uid} retains crown (challenger failed integrity check)")
-                    state.dq_reasons[str(epsilon_dethroned_by)] = "Model went private after scoring"
-                    epsilon_dethroned_by = None
-                else:
-                    winner_uid = epsilon_dethroned_by
-                    winner_kl = state.scores.get(str(epsilon_dethroned_by), best_kl)
-                    logger.info(f"UID {winner_uid} is new king (paired t-test p<{PAIRED_TEST_ALPHA}), integrity check passed")
-            except Exception as exc:
-                logger.warning(f"BLOCKED dethronement: UID {epsilon_dethroned_by} model {challenger_model} integrity check failed: {exc}")
-                winner_uid = king_uid
-                winner_kl = state.scores.get(str(king_uid), king_kl)
-                logger.info(f"King UID {king_uid} retains crown (challenger failed integrity check)")
-                state.dq_reasons[str(epsilon_dethroned_by)] = "Model not accessible on HuggingFace"
-                epsilon_dethroned_by = None
-        else:
-            winner_uid, winner_kl = best_uid, best_kl
-    h2h_results = _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt, uid_to_model, state.dq_reasons, uid_to_hotkey, commitments)
-    try:
-        # Teacher sanity gate (2026-04-23): if pod_eval_vllm recorded a
-        # row for the teacher as a pseudo-student (via the
-        # ``TEACHER_SANITY_PROBE`` path), pass it to the composite
-        # annotator so axes where the teacher itself scored below the
-        # sanity floor drop out this round. Falls back to None when the
-        # teacher wasn't probed (older pod_eval builds) and the gate
-        # fails open — same behaviour as before this commit.
-        teacher_name = results.get("teacher")
-        teacher_row = students_data.get(teacher_name) if teacher_name else None
-        # Import locally to keep composite.py ML-dep free (see its
-        # module docstring). The reference model is the always-in-round
-        # base student used for king_health telemetry (distil-97, 2026-04-24).
-        from eval.runtime import REFERENCE_MODEL as _REF_MODEL, REFERENCE_UID as _REF_UID
-        annotate_h2h_with_composite(
-            h2h_results, king_h2h_kl, students_data,
-            teacher_student_row=teacher_row,
-            reference_model=_REF_MODEL,
-            reference_uid=_REF_UID,
-        )
-        # Backfill the vs_king string for entries that would have passed
-        # the KL gate (``... dethroned``) but were blocked by the
-        # composite-floor veto. Without this the dashboard would say
-        # "dethroned" for a challenger that never actually took the
-        # crown, which is exactly the kind of false-positive signal the
-        # Discord has been asking us to surface clearly.
-        for row in h2h_results:
-            if row.get("is_king") or row.get("disqualified"):
-                continue
-            vs = row.get("vs_king") or ""
-            if " dethroned" not in vs:
-                continue
-            comp = row.get("composite") or {}
-            worst = comp.get("worst")
-            present = comp.get("present_count") or 0
-            if worst is None or present < COMPOSITE_DETHRONE_MIN_AXES:
-                continue
-            if worst >= COMPOSITE_DETHRONE_FLOOR:
-                continue
-            axes = comp.get("axes") or {}
-            broken_axes = set(comp.get("broken_axes") or [])
-            _active = set(get_effective_axis_weights().keys()) - broken_axes
-            bad = min(
-                ((k, v) for k, v in axes.items() if v is not None and k in _active),
-                key=lambda kv: kv[1],
-                default=(None, None),
-            )
-            ax_name, ax_val = bad
-            row["vs_king"] = (
-                vs.replace(" dethroned", f" blocked: {ax_name}={ax_val:.2f}")
-                if ax_name is not None
-                else vs.replace(" dethroned", " blocked by composite")
-            )
-            row["composite_veto"] = {
-                "worst_axis": ax_name,
-                "worst_value": round(float(ax_val), 4) if ax_val is not None else None,
-                "floor": COMPOSITE_DETHRONE_FLOOR,
-            }
-        # Re-sort h2h_results by composite.worst (desc) so the leaderboard
-        # endpoint and h2h_latest display rank order matches the ranking
-        # key used for crown decisions. KL stays as an informational field
-        # on each row.
-        def _h2h_sort_key(row):
-            comp = row.get("composite") or {}
-            worst = comp.get("worst")
-            if worst is None:
-                return (0, float("-inf"), -(row.get("kl") or float("inf")))
-            return (1, worst, -(row.get("kl") or float("inf")))
-        h2h_results.sort(key=_h2h_sort_key, reverse=True)
-
-        for entry in h2h_results:
-            comp = entry.get("composite") or {}
-            worst = comp.get("worst")
-            if worst is not None:
-                axes = comp.get("axes", {})
-                axes_str = " ".join(f"{k}={v:.2f}" if v is not None else f"{k}=–"
-                                    for k, v in axes.items())
-                logger.info(
-                    f"  composite UID {entry.get('uid')}: "
-                    f"worst={worst:.3f} weighted={comp.get('weighted')} [{axes_str}]"
-                )
-    except Exception as exc:
-        logger.warning(f"composite annotation failed: {exc}")
+    # The canonical winner (and the dashboard #1) is decided by composite
+    # minimum-axis rather than raw KL. The paired t-test gate
+    # (``epsilon_dethroned_by``) still enforces statistical significance
+    # before the crown changes hands. ``students_data``, ``king_kl_ref``
+    # and ``king_rkl_ref`` were resolved above the dethronement loop and
+    # are reused here unchanged.
+    winner_uid, winner_kl, epsilon_dethroned_by = _select_h2h_winner(
+        h2h_candidates=h2h_candidates,
+        epsilon_dethroned_by=epsilon_dethroned_by,
+        king_uid=king_uid,
+        king_kl=king_kl,
+        state=state,
+        uid_to_model=uid_to_model,
+        students_data=students_data,
+        king_kl_ref=king_kl_ref,
+        king_rkl_ref=king_rkl_ref,
+    )
+    h2h_results = _build_h2h_results(
+        results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt,
+        uid_to_model, state.dq_reasons, uid_to_hotkey, commitments,
+    )
+    _annotate_and_sort_composite(
+        h2h_results,
+        king_h2h_kl=king_h2h_kl,
+        students_data=students_data,
+        results=results,
+    )
 
     # Persist canonical absolute composite per UID. Always-on so the table
     # accumulates whether SINGLE_EVAL_MODE is flipped or not — when the
