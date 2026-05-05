@@ -1831,53 +1831,6 @@ LONG_FORM_JUDGE_RUBRIC_TEMPLATE = (
 )
 
 
-def _collect_greedy_responses(model, tokenizer, device, prompts: list[str],
-                              max_new_tokens: int, log_tag: str) -> dict:
-    """Greedy ``model.generate`` over a list of prompts; collect text +
-    token counts. Used by judge / long-form-judge response probes (and
-    can be reused for any future ``one-prompt-in, one-string-out`` axis).
-
-    Returns ``{"prompts": [...], "responses": [...], "gen_tokens": [...]}``
-    where ``responses[i]`` has been ``_strip_thinking_probe``-cleaned,
-    and a missing tokenizer/model/chat_template/empty-prompts cleanly
-    falls back to empty lists (so Phase B teacher scoring sees an empty
-    rollout instead of crashing).
-
-    The per-prompt try/except mirrors the previous probe-by-probe
-    behaviour: a single bad generation is logged and slotted with empty
-    text so the rollout list stays index-aligned with ``prompts``.
-    """
-    out: dict = {
-        "prompts": list(prompts),
-        "responses": [],
-        "gen_tokens": [],
-    }
-    if tokenizer is None or model is None or not prompts:
-        return out
-    if not getattr(tokenizer, "chat_template", None):
-        return out
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
-    with _model_eval_no_grad(model):
-        for prompt in prompts:
-            try:
-                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
-                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                gen = model.generate(
-                    ids, max_new_tokens=max_new_tokens,
-                    do_sample=False, temperature=1.0, top_p=1.0,
-                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                )
-                new_ids = gen[0, ids.shape[1]:]
-                text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                out["responses"].append(_strip_thinking_probe(text))
-                out["gen_tokens"].append(int(new_ids.shape[0]))
-            except Exception as e:
-                out["responses"].append("")
-                out["gen_tokens"].append(0)
-                print(f"[{log_tag}] student gen error: {str(e)[:120]}", flush=True)
-    return out
-
-
 def judge_response_probe(model, tokenizer, device="cuda"):
     """Collect greedy student responses to the current round's judge prompts.
 
@@ -1889,12 +1842,35 @@ def judge_response_probe(model, tokenizer, device="cuda"):
     tokens. This matches the "user types a question and gets a response"
     deployment usage the judge axis is approximating.
     """
-    return _collect_greedy_responses(
-        model, tokenizer, device,
-        prompts=list(JUDGE_PROBE_PROMPTS),
-        max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
-        log_tag="judge-probe",
-    )
+    out = {
+        "prompts": list(JUDGE_PROBE_PROMPTS),
+        "responses": [],
+        "gen_tokens": [],
+    }
+    if tokenizer is None or model is None or not JUDGE_PROBE_PROMPTS:
+        return out
+    if not getattr(tokenizer, "chat_template", None):
+        return out
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    with _model_eval_no_grad(model):
+        for prompt in JUDGE_PROBE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                gen = model.generate(
+                    ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                out["responses"].append(_strip_thinking_probe(text))
+                out["gen_tokens"].append(int(new_ids.shape[0]))
+            except Exception as e:
+                out["responses"].append("")
+                out["gen_tokens"].append(0)
+                print(f"[judge-probe] student gen error: {str(e)[:120]}", flush=True)
+    return out
 
 
 def _parse_judge_score(text: str) -> int | None:
@@ -2027,12 +2003,16 @@ def _sanitize_grader_response(text: str) -> str:
     return out
 
 
-def _finalize_digit_rubric_aggregate(agg: dict, scores: "list[int | None]") -> None:
-    """Compute mean + 1..5 → 0..1 normalization and store on ``agg``.
+def _finalize_digit_rubric_aggregate(
+    agg: dict, scores: "list[int | None]",
+) -> None:
+    """Fill ``mean_score`` + ``normalized`` from non-``None`` rubric scores.
 
-    Used by every teacher scorer that produces 1-5 integer rubric grades
-    (``judge_teacher_score`` / ``_api``, ``long_form_judge_teacher_score`` /
-    ``_api``, ``chat_turns_teacher_score`` / ``_api``).
+    The same 5-line block ran inline at the bottom of every digit-rubric
+    teacher scorer (judge × 2, long-form judge × 2, chat-turns × 2).
+    Centralising it removes ~25 LOC and means a future rubric-scale
+    change (e.g. 1-5 → 1-7) only needs one edit. Mutates ``agg`` in
+    place to match the historical call-site shape.
     """
     valid = [s for s in scores if s is not None]
     if not valid:
@@ -2043,25 +2023,36 @@ def _finalize_digit_rubric_aggregate(agg: dict, scores: "list[int | None]") -> N
 
 
 def _apply_lfj_derail_and_termination_penalty(
-    agg: dict,
-    *,
+    agg: dict, *,
     responses: "list[str]",
     scores: "list[int | None]",
     gen_tokens_list: "list[int | None]",
-    max_tokens: int,
+    max_tokens: int = None,  # type: ignore[assignment]
 ) -> None:
-    """Apply coherence × termination derail penalty to a long-form-judge agg.
+    """Multiply LFJ rubric grade by per-prompt coherence × termination.
 
-    2026-05-01 (v30.4): the rubric alone is too lenient on long-form derail
-    (e.g. "...turret despizano buble sphere pete thinowy galactic
-    translation..." can still earn 4-5/5). This statistical detector multiplies
-    the rubric score by:
-      • ``_coherence_factor(response)`` — penalises non-ASCII bursts, repeated
-        50-char windows, glossary-mode degeneration and absurd compound coinage
-      • a termination factor — 1.0 if EOS arrives before 95 percent of the
-        budget, ramping down to 0.5 if the model fills the budget
-    Both per-prompt factors and the resulting means are written onto ``agg``.
+    The block was duplicated verbatim between
+    :func:`long_form_judge_teacher_score` (local) and
+    :func:`long_form_judge_teacher_score_api` (API). Centralising
+    guarantees the local and API teacher modes produce directly
+    comparable axis values.
+
+    For each scored response we compute:
+
+      * ``coh = _coherence_factor(response)``  — gibberish / word-salad
+        detector (returns [0, 1]; see :func:`_coherence_factor`).
+      * ``term`` — natural-termination factor: 1.0 if the model emitted
+        EOS before 95% of the budget, 0.5 if it filled the budget,
+        linearly interpolated in between. Models that fill ``max_tokens``
+        are either derailed or never knew when to stop.
+
+    ``coh × term`` becomes the per-prompt penalty. The mean across
+    prompts multiplies ``agg["normalized"]``; the original value is
+    preserved as ``normalized_pre_coherence`` so dashboards can show
+    "rubric grade" vs "rubric grade after derail penalty" side-by-side.
     """
+    if max_tokens is None:
+        max_tokens = LONG_FORM_JUDGE_MAX_TOKENS
     derail_factors: list[float] = []
     term_factors: list[float] = []
     for i, response in enumerate(responses):
@@ -2080,13 +2071,13 @@ def _apply_lfj_derail_and_termination_penalty(
         elif gen_len >= max_tokens:
             term = 0.5
         else:
-            term = 1.0 - (gen_len - int(max_tokens * 0.95)) / max(
-                1, int(max_tokens * 0.05),
+            term = 1.0 - (
+                (gen_len - int(max_tokens * 0.95))
+                / max(1, int(max_tokens * 0.05))
             ) * 0.5
         term = max(0.5, min(1.0, term))
         term_factors.append(term)
-        combined = coh * term
-        derail_factors.append(combined)
+        derail_factors.append(coh * term)
         if i < len(agg["per_prompt"]):
             agg["per_prompt"][i]["coherence"] = round(coh, 3)
             agg["per_prompt"][i]["termination"] = round(term, 3)
@@ -2100,9 +2091,198 @@ def _apply_lfj_derail_and_termination_penalty(
             sum(term_factors) / len(term_factors), 3,
         )
     if agg.get("normalized") is not None:
-        penalised = agg["normalized"] * coh_mean
         agg["normalized_pre_coherence"] = agg["normalized"]
-        agg["normalized"] = round(penalised, 4)
+        agg["normalized"] = round(agg["normalized"] * coh_mean, 4)
+
+
+def _api_teacher_greedy():
+    """Single import point for ``api_teacher._greedy_text_one``.
+
+    The teacher API helper module is shipped alongside this script on
+    the eval pod, so direct package-style imports may not resolve when
+    pod_eval_vllm runs as a top-level script. Both ``scripts.api_teacher``
+    and ``api_teacher`` are tried in order.
+    """
+    try:
+        from scripts.api_teacher import _greedy_text_one  # type: ignore
+    except ImportError:
+        from api_teacher import _greedy_text_one  # type: ignore
+    return _greedy_text_one
+
+
+def _teacher_rubric_local(
+    *,
+    teacher,
+    tokenizer,
+    device: str,
+    items: list,
+    build_rubric,
+    record_extras,
+    max_input_len: int = 4096,
+    max_new_tokens: int = 8,
+) -> "tuple[list[int | None], list[dict]]":
+    """Run a local-HF digit-rubric grading pass over ``items``.
+
+    Each item is rendered via ``build_rubric(item) -> str`` (the rubric
+    template + the formatted (prompt, response) / transcript), tokenised
+    with truncation at ``max_input_len``, fed to the teacher under
+    ``_model_eval_no_grad`` for an 8-token greedy completion, and
+    finally parsed with :func:`_parse_judge_score`.
+
+    ``record_extras(item) -> dict`` returns per-item dashboard fields
+    that vary by axis (``prompt`` / ``response_preview`` for judges,
+    ``seed`` for chat-turns).
+
+    Returns ``(scores, records)`` aligned 1:1 with ``items``: ``scores[i]``
+    is ``None`` on parse failure / exception, ``records[i]`` always has
+    the extras + ``raw`` + ``score`` and on exception adds ``error``.
+    """
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    scores: list[int | None] = []
+    records: list[dict] = []
+    with _model_eval_no_grad(teacher):
+        for item in items:
+            try:
+                rubric = build_rubric(item)
+                rendered = _render_chat_prompt(
+                    tokenizer, rubric, enable_thinking=False,
+                )
+                ids = tokenizer(
+                    rendered, return_tensors="pt",
+                    truncation=True, max_length=max_input_len,
+                ).input_ids.to(device)
+                gen = teacher.generate(
+                    ids, max_new_tokens=max_new_tokens,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                score = _parse_judge_score(text)
+                scores.append(score)
+                records.append({
+                    **record_extras(item),
+                    "raw": text[:24],
+                    "score": score,
+                })
+            except Exception as e:
+                scores.append(None)
+                records.append({
+                    **record_extras(item),
+                    "error": str(e)[:120],
+                    "score": None,
+                })
+    return scores, records
+
+
+def _teacher_rubric_api(
+    *,
+    api_cfg,
+    tokenizer,
+    items: list,
+    build_rubric,
+    record_extras,
+    concurrency: int = 4,
+    max_new_tokens: int = 8,
+) -> "tuple[list[int | None], list[dict]]":
+    """API-routed counterpart of :func:`_teacher_rubric_local`.
+
+    Same call shape, but the per-item rubric forward fans out via
+    ``ThreadPoolExecutor`` against the OpenAI-compatible teacher API
+    (Kimi K2.6 via OpenRouter → Inceptron in production).
+    Concurrency defaults to 4 to stay under the Inceptron rate-limit
+    bucket. Indices are preserved so per-item alignment with ``items``
+    is identical to the local path.
+    """
+    greedy_text_one = _api_teacher_greedy()
+
+    def _grade_one(idx_pair):
+        idx, item = idx_pair
+        try:
+            rubric = build_rubric(item)
+            rendered = _render_chat_prompt(
+                tokenizer, rubric, enable_thinking=False,
+            )
+            text = greedy_text_one(
+                rendered, api_cfg, max_new_tokens=max_new_tokens, idx=idx,
+            )
+            score = _parse_judge_score(text)
+            return idx, item, text, score, None
+        except Exception as e:
+            return idx, item, "", None, e
+
+    indexed = list(enumerate(items))
+    grade_results: dict[int, tuple] = {}
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        for fut in ex.map(_grade_one, indexed):
+            i, item, text, score, err = fut
+            grade_results[i] = (item, text, score, err)
+
+    scores: list[int | None] = []
+    records: list[dict] = []
+    for i in range(len(indexed)):
+        item, text, score, err = grade_results[i]
+        scores.append(score)
+        rec = {
+            **record_extras(item),
+            "raw": text[:24],
+            "score": score,
+        }
+        if err is not None:
+            rec["error"] = str(err)[:120]
+            rec["score"] = None
+        records.append(rec)
+    return scores, records
+
+
+def _build_judge_rubric(item: tuple) -> str:
+    prompt, response = item
+    return JUDGE_RUBRIC_TEMPLATE.format(
+        prompt=prompt.strip(),
+        response=_sanitize_grader_response((response or "").strip())[:2048],
+    )
+
+
+def _build_lfj_rubric(item: tuple) -> str:
+    prompt, response = item
+    return LONG_FORM_JUDGE_RUBRIC_TEMPLATE.format(
+        prompt=prompt.strip(),
+        response=_sanitize_grader_response((response or "").strip())[:4096],
+    )
+
+
+def _judge_record_extras(item: tuple) -> dict:
+    prompt, response = item
+    return {"prompt": prompt[:160], "response_preview": (response or "")[:120]}
+
+
+def _finalize_judge_agg(agg: dict, scores: list, records: list, key: str) -> dict:
+    """Stamp the per-item ``records`` onto ``agg[key]`` and refresh
+    ``n`` / ``n_valid`` + the 1..5 → 0..1 footer.
+
+    Used by every teacher rubric scorer (judge / LFJ / chat-turns,
+    local + API) so the four trailing lines stay in lockstep.
+    """
+    agg[key] = records
+    agg["n"] = len(records)
+    agg["n_valid"] = sum(1 for s in scores if s is not None)
+    _finalize_digit_rubric_aggregate(agg, scores)
+    return agg
+
+
+def _judge_rubric_inputs(collected: dict) -> "list[tuple] | None":
+    """Pull (prompts, responses) zipped items out of the rollout dict.
+
+    Returns ``None`` if the rollout is missing or has no usable rows;
+    the caller then short-circuits with the empty agg.
+    """
+    if not collected:
+        return None
+    prompts = collected.get("prompts") or []
+    responses = collected.get("responses") or []
+    if not prompts or not responses:
+        return None
+    return list(zip(prompts, responses))
 
 
 def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda") -> dict:
@@ -2115,91 +2295,21 @@ def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda
     returned alongside the raw list so the dashboard can show the
     distribution.
     """
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_prompt": [],
-    }
-    if teacher is None or tokenizer is None or not collected:
+    agg = {"n": 0, "n_valid": 0, "mean_score": None,
+           "normalized": None, "per_prompt": []}
+    if teacher is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
-    scores: list[int | None] = []
-    with _model_eval_no_grad(teacher):
-        for prompt, response in zip(prompts, responses):
-            agg["n"] += 1
-            try:
-                rubric = JUDGE_RUBRIC_TEMPLATE.format(
-                    prompt=prompt.strip(),
-                    response=_sanitize_grader_response(
-                        (response or "").strip()
-                    )[:2048],
-                )
-                rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-                ids = tokenizer(rendered, return_tensors="pt",
-                                truncation=True, max_length=4096).input_ids.to(device)
-                gen = teacher.generate(
-                    ids, max_new_tokens=8,
-                    do_sample=False, temperature=1.0, top_p=1.0,
-                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                )
-                new_ids = gen[0, ids.shape[1]:]
-                text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                score = _parse_judge_score(text)
-                scores.append(score)
-                agg["per_prompt"].append({
-                    "prompt": prompt[:160],
-                    "response_preview": (response or "")[:120],
-                    "raw": text[:24],
-                    "score": score,
-                })
-                if score is not None:
-                    agg["n_valid"] += 1
-            except Exception as e:
-                scores.append(None)
-                agg["per_prompt"].append({
-                    "prompt": prompt[:160],
-                    "error": str(e)[:120],
-                    "score": None,
-                })
-    _finalize_digit_rubric_aggregate(agg, scores)
-    return agg
-
-
-def long_form_judge_response_probe(model, tokenizer, device="cuda",
-                                    max_tokens_override: int | None = None):
-    """v30 — collect greedy student responses to long-form essay prompts.
-
-    Same shape as ``judge_response_probe`` but uses
-    ``LONG_FORM_JUDGE_PROMPTS`` and ``LONG_FORM_JUDGE_MAX_TOKENS``
-    so the student has room to produce a 300-500 word response.
-    Greedy decoding (deterministic across validators given the same
-    block_seed → same prompt set).
-
-    Phase A only. The collected responses are stashed in
-    ``_LONG_FORM_JUDGE_ROLLOUTS`` for Phase B teacher scoring.
-
-    2026-05-04 — ``max_tokens_override`` lets the caller cap the
-    per-prompt budget below ``LONG_FORM_JUDGE_MAX_TOKENS`` (default
-    6144). Used by the per-student dispatcher to slash LFJ wall time
-    on derail-prone students that we already KNOW from chat_probe will
-    fill the entire 6144-token budget without emitting EOS. We still
-    get the full derail signal at 2048 tokens (the coherence detector
-    works on the response text length, not the absolute cap), but pay
-    1/3 the wall time per derailed student. Healthy students that
-    emit EOS at ~500-1000 tokens are not affected by the cap.
-    """
-    cap = int(max_tokens_override) if max_tokens_override else LONG_FORM_JUDGE_MAX_TOKENS
-    out = _collect_greedy_responses(
-        model, tokenizer, device,
-        prompts=list(LONG_FORM_JUDGE_PROMPTS),
-        max_new_tokens=cap,
-        log_tag="long-form-judge",
+    scores, records = _teacher_rubric_local(
+        teacher=teacher, tokenizer=tokenizer, device=device,
+        items=items,
+        build_rubric=_build_judge_rubric,
+        record_extras=_judge_record_extras,
+        max_input_len=4096,
     )
-    out["max_tokens_cap"] = cap
-    return out
+    return _finalize_judge_agg(agg, scores, records, "per_prompt")
 
 
 def judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
@@ -2216,81 +2326,34 @@ def judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
     Pre-2026-05-04 Phase B always loaded the local teacher onto GPU
     via ``load_model(args.teacher, device)`` to run rubric grading.
     After the API teacher cutover (2026-05-03) the teacher is Kimi
-    K2.6 1T-param sparse MoE. Loading it locally requires:
-      * ~600 GB disk for the safetensors snapshot
-      * >1 TB VRAM at bf16 (won't fit on H200 NVL's 140 GB)
-    so Phase B silently failed every round, dropping judge /
-    chat-turns / long-form-judge scores from the composite. This
-    function (and its long-form / chat-turns siblings below) routes
-    the rubric grading through the same API that already serves
-    Phase A logprobs, so Phase B can run without ever touching the
-    local GPU.
+    K2.6 1T-param sparse MoE — ~600 GB disk, >1 TB VRAM at bf16,
+    won't fit on H200 NVL's 140 GB. So Phase B silently failed every
+    round, dropping judge / chat-turns / long-form-judge scores from
+    the composite. This function (and its long-form / chat-turns
+    siblings below) routes the rubric grading through the same API
+    that already serves Phase A logprobs, so Phase B can run without
+    ever touching the local GPU.
 
     Parallelism: each (prompt, response) → single-digit grade is
     independent, so we fan out via ThreadPoolExecutor. Concurrency
     defaults to 4 to stay under the Inceptron rate-limit bucket
     (the same per-second budget as the Phase A logprob fetcher).
     """
-    from concurrent.futures import ThreadPoolExecutor
-    try:
-        from scripts.api_teacher import _greedy_text_one
-    except ImportError:
-        from api_teacher import _greedy_text_one  # type: ignore
-
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_prompt": [],
-    }
-    if api_cfg is None or tokenizer is None or not collected:
+    agg = {"n": 0, "n_valid": 0, "mean_score": None,
+           "normalized": None, "per_prompt": []}
+    if api_cfg is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-
-    def _grade_one(idx_pair):
-        idx, (prompt, response) = idx_pair
-        try:
-            rubric = JUDGE_RUBRIC_TEMPLATE.format(
-                prompt=prompt.strip(),
-                response=_sanitize_grader_response(
-                    (response or "").strip()
-                )[:2048],
-            )
-            rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-            text = _greedy_text_one(rendered, api_cfg, max_new_tokens=8, idx=idx)
-            score = _parse_judge_score(text)
-            return idx, prompt, response, text, score, None
-        except Exception as e:
-            return idx, prompt, response, "", None, e
-
-    items = list(enumerate(zip(prompts, responses)))
-    results_idx: dict[int, tuple] = {}
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-        for fut in ex.map(_grade_one, items):
-            i, prompt, response, text, score, err = fut
-            results_idx[i] = (prompt, response, text, score, err)
-
-    scores: list[int | None] = []
-    for i in range(len(items)):
-        prompt, response, text, score, err = results_idx[i]
-        agg["n"] += 1
-        scores.append(score)
-        per = {
-            "prompt": prompt[:160],
-            "response_preview": (response or "")[:120],
-            "raw": text[:24],
-            "score": score,
-        }
-        if err is not None:
-            per["error"] = str(err)[:120]
-            per["score"] = None
-        if score is not None:
-            agg["n_valid"] += 1
-        agg["per_prompt"].append(per)
-
-    _finalize_digit_rubric_aggregate(agg, scores)
-    return agg
+    scores, records = _teacher_rubric_api(
+        api_cfg=api_cfg, tokenizer=tokenizer,
+        items=items,
+        build_rubric=_build_judge_rubric,
+        record_extras=_judge_record_extras,
+        concurrency=concurrency,
+    )
+    return _finalize_judge_agg(agg, scores, records, "per_prompt")
 
 
 def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
@@ -2309,66 +2372,30 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
     therefore dominated by the response-collection pass (Phase A),
     not the rubric pass (Phase B) — typical ~6s/student for 4 long
     prompts vs <1s for the teacher rubric.
+
+    Input is capped at 6144 tokens to stay safely under the teacher's
+    8192 context cap on a 4-paragraph response.
     """
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_prompt": [],
-    }
-    if teacher is None or tokenizer is None or not collected:
+    agg = {"n": 0, "n_valid": 0, "mean_score": None,
+           "normalized": None, "per_prompt": []}
+    if teacher is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
-    scores: list[int | None] = []
-    with _model_eval_no_grad(teacher):
-        for prompt, response in zip(prompts, responses):
-            agg["n"] += 1
-            try:
-                rubric = LONG_FORM_JUDGE_RUBRIC_TEMPLATE.format(
-                    prompt=prompt.strip(),
-                    response=_sanitize_grader_response(
-                        (response or "").strip()
-                    )[:4096],
-                )
-                rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-                # Cap rubric prompt at 6144 input tokens to stay
-                # safely under the teacher's 8192 context cap on a
-                # 4-paragraph response.
-                ids = tokenizer(rendered, return_tensors="pt",
-                                truncation=True, max_length=6144).input_ids.to(device)
-                gen = teacher.generate(
-                    ids, max_new_tokens=8,
-                    do_sample=False, temperature=1.0, top_p=1.0,
-                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                )
-                new_ids = gen[0, ids.shape[1]:]
-                text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                score = _parse_judge_score(text)
-                scores.append(score)
-                agg["per_prompt"].append({
-                    "prompt": prompt[:160],
-                    "response_preview": (response or "")[:120],
-                    "raw": text[:24],
-                    "score": score,
-                })
-                if score is not None:
-                    agg["n_valid"] += 1
-            except Exception as e:
-                scores.append(None)
-                agg["per_prompt"].append({
-                    "prompt": prompt[:160],
-                    "error": str(e)[:120],
-                    "score": None,
-                })
-    _finalize_digit_rubric_aggregate(agg, scores)
+    scores, records = _teacher_rubric_local(
+        teacher=teacher, tokenizer=tokenizer, device=device,
+        items=items,
+        build_rubric=_build_lfj_rubric,
+        record_extras=_judge_record_extras,
+        max_input_len=6144,
+    )
+    _finalize_judge_agg(agg, scores, records, "per_prompt")
     _apply_lfj_derail_and_termination_penalty(
         agg,
-        responses=responses,
+        responses=collected.get("responses") or [],
         scores=scores,
         gen_tokens_list=collected.get("gen_tokens") or [],
-        max_tokens=LONG_FORM_JUDGE_MAX_TOKENS,
     )
     return agg
 
@@ -2387,72 +2414,26 @@ def long_form_judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
     on the rubric grade being non-None, which is the exact same
     condition the local-teacher version uses.
     """
-    from concurrent.futures import ThreadPoolExecutor
-    try:
-        from scripts.api_teacher import _greedy_text_one
-    except ImportError:
-        from api_teacher import _greedy_text_one  # type: ignore
-
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_prompt": [],
-    }
-    if api_cfg is None or tokenizer is None or not collected:
+    agg = {"n": 0, "n_valid": 0, "mean_score": None,
+           "normalized": None, "per_prompt": []}
+    if api_cfg is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-
-    def _grade_one(idx_pair):
-        idx, (prompt, response) = idx_pair
-        try:
-            rubric = LONG_FORM_JUDGE_RUBRIC_TEMPLATE.format(
-                prompt=prompt.strip(),
-                response=_sanitize_grader_response(
-                    (response or "").strip()
-                )[:4096],
-            )
-            rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-            text = _greedy_text_one(rendered, api_cfg, max_new_tokens=8, idx=idx)
-            score = _parse_judge_score(text)
-            return idx, prompt, response, text, score, None
-        except Exception as e:
-            return idx, prompt, response, "", None, e
-
-    items = list(enumerate(zip(prompts, responses)))
-    results_idx: dict[int, tuple] = {}
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-        for fut in ex.map(_grade_one, items):
-            i, prompt, response, text, score, err = fut
-            results_idx[i] = (prompt, response, text, score, err)
-
-    scores: list[int | None] = []
-    for i in range(len(items)):
-        prompt, response, text, score, err = results_idx[i]
-        agg["n"] += 1
-        scores.append(score)
-        per = {
-            "prompt": prompt[:160],
-            "response_preview": (response or "")[:120],
-            "raw": text[:24],
-            "score": score,
-        }
-        if err is not None:
-            per["error"] = str(err)[:120]
-            per["score"] = None
-        if score is not None:
-            agg["n_valid"] += 1
-        agg["per_prompt"].append(per)
-
-    _finalize_digit_rubric_aggregate(agg, scores)
-
+    scores, records = _teacher_rubric_api(
+        api_cfg=api_cfg, tokenizer=tokenizer,
+        items=items,
+        build_rubric=_build_lfj_rubric,
+        record_extras=_judge_record_extras,
+        concurrency=concurrency,
+    )
+    _finalize_judge_agg(agg, scores, records, "per_prompt")
     _apply_lfj_derail_and_termination_penalty(
         agg,
-        responses=responses,
+        responses=collected.get("responses") or [],
         scores=scores,
         gen_tokens_list=collected.get("gen_tokens") or [],
-        max_tokens=LONG_FORM_JUDGE_MAX_TOKENS,
     )
     return agg
 
@@ -3131,6 +3112,25 @@ def chat_turns_response_probe(model, tokenizer, device="cuda"):
     return out
 
 
+def _build_chat_turns_rubric(item: tuple) -> str:
+    convo, convo_responses = item
+    transcript = _format_transcript(convo, convo_responses)
+    return CHAT_TURNS_RUBRIC_TEMPLATE.format(transcript=transcript[:4096])
+
+
+def _chat_turns_record_extras(item: tuple) -> dict:
+    convo, _ = item
+    return {"seed": (convo[0] or "")[:120] if convo else ""}
+
+
+def _chat_turns_agg_init(collected: dict) -> dict:
+    return {
+        "n": 0, "n_valid": 0, "mean_score": None,
+        "normalized": None, "per_convo": [],
+        "n_turns": (collected or {}).get("n_turns", 3),
+    }
+
+
 def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
                              device: str = "cuda") -> dict:
     """Phase B — teacher scores each multi-turn transcript on a 1-5
@@ -3138,59 +3138,20 @@ def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
     normalized to [0, 1]. Distribution + per-conversation scores stored
     for dashboard transparency.
     """
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_convo": [],
-        "n_turns": (collected or {}).get("n_turns", 3),
-    }
-    if teacher is None or tokenizer is None or not collected:
+    agg = _chat_turns_agg_init(collected)
+    if teacher is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
-    scores: list[int | None] = []
-    with _model_eval_no_grad(teacher):
-        for convo, convo_responses in zip(prompts, responses):
-            agg["n"] += 1
-            try:
-                transcript = _format_transcript(convo, convo_responses)
-                rubric = CHAT_TURNS_RUBRIC_TEMPLATE.format(
-                    transcript=transcript[:4096])
-                rendered = _render_chat_prompt(
-                    tokenizer, rubric, enable_thinking=False)
-                ids = tokenizer(
-                    rendered, return_tensors="pt",
-                    truncation=True, max_length=6144,
-                ).input_ids.to(device)
-                gen = teacher.generate(
-                    ids, max_new_tokens=8,
-                    do_sample=False, temperature=1.0, top_p=1.0,
-                    pad_token_id=pad_id, eos_token_id=eos_ids,
-                    use_cache=True,
-                )
-                new_ids = gen[0, ids.shape[1]:]
-                text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                score = _parse_judge_score(text)
-                scores.append(score)
-                seed_preview = (convo[0] or "")[:120]
-                agg["per_convo"].append({
-                    "seed": seed_preview,
-                    "raw": text[:24],
-                    "score": score,
-                })
-                if score is not None:
-                    agg["n_valid"] += 1
-            except Exception as e:
-                scores.append(None)
-                agg["per_convo"].append({
-                    "seed": (convo[0] or "")[:120] if convo else "",
-                    "error": str(e)[:120],
-                    "score": None,
-                })
-    _finalize_digit_rubric_aggregate(agg, scores)
-    return agg
+    scores, records = _teacher_rubric_local(
+        teacher=teacher, tokenizer=tokenizer, device=device,
+        items=items,
+        build_rubric=_build_chat_turns_rubric,
+        record_extras=_chat_turns_record_extras,
+        max_input_len=6144,
+    )
+    return _finalize_judge_agg(agg, scores, records, "per_convo")
 
 
 def chat_turns_teacher_score_api(api_cfg, tokenizer, collected: dict,
@@ -3202,62 +3163,20 @@ def chat_turns_teacher_score_api(api_cfg, tokenizer, collected: dict,
     are typically only 4 of these per student so the budget stays
     well under any rate limit.
     """
-    from concurrent.futures import ThreadPoolExecutor
-    try:
-        from scripts.api_teacher import _greedy_text_one
-    except ImportError:
-        from api_teacher import _greedy_text_one  # type: ignore
-
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_convo": [],
-        "n_turns": (collected or {}).get("n_turns", 3),
-    }
-    if api_cfg is None or tokenizer is None or not collected:
+    agg = _chat_turns_agg_init(collected)
+    if api_cfg is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-
-    def _grade_one(idx_pair):
-        idx, (convo, convo_responses) = idx_pair
-        try:
-            transcript = _format_transcript(convo, convo_responses)
-            rubric = CHAT_TURNS_RUBRIC_TEMPLATE.format(transcript=transcript[:4096])
-            rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-            text = _greedy_text_one(rendered, api_cfg, max_new_tokens=8, idx=idx)
-            score = _parse_judge_score(text)
-            return idx, convo, text, score, None
-        except Exception as e:
-            return idx, convo, "", None, e
-
-    items = list(enumerate(zip(prompts, responses)))
-    results_idx: dict[int, tuple] = {}
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-        for fut in ex.map(_grade_one, items):
-            i, convo, text, score, err = fut
-            results_idx[i] = (convo, text, score, err)
-
-    scores: list[int | None] = []
-    for i in range(len(items)):
-        convo, text, score, err = results_idx[i]
-        agg["n"] += 1
-        scores.append(score)
-        per = {
-            "seed": (convo[0] or "")[:120] if convo else "",
-            "raw": text[:24],
-            "score": score,
-        }
-        if err is not None:
-            per["error"] = str(err)[:120]
-            per["score"] = None
-        if score is not None:
-            agg["n_valid"] += 1
-        agg["per_convo"].append(per)
-
-    _finalize_digit_rubric_aggregate(agg, scores)
-    return agg
+    scores, records = _teacher_rubric_api(
+        api_cfg=api_cfg, tokenizer=tokenizer,
+        items=items,
+        build_rubric=_build_chat_turns_rubric,
+        record_extras=_chat_turns_record_extras,
+        concurrency=concurrency,
+    )
+    return _finalize_judge_agg(agg, scores, records, "per_convo")
 
 
 _CAPABILITY_STATIC_POOL = [
@@ -4689,17 +4608,10 @@ def capability_probe(model, tokenizer, device="cuda"):
 
         with _model_eval_no_grad(model):
             for item in CAPABILITY_PROBE_PROMPTS:
-                msgs = [{"role": "user", "content": item["q"]}]
                 try:
-                    try:
-                        rendered = tokenizer.apply_chat_template(
-                            msgs, tokenize=False, add_generation_prompt=True,
-                            enable_thinking=False,
-                        )
-                    except TypeError:
-                        rendered = tokenizer.apply_chat_template(
-                            msgs, tokenize=False, add_generation_prompt=True,
-                        )
+                    rendered = _render_chat_prompt(
+                        tokenizer, item["q"], enable_thinking=False,
+                    )
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
                     gen = model.generate(
                         ids, max_new_tokens=CAPABILITY_PROBE_MAX_TOKENS,
@@ -5756,11 +5668,82 @@ def _shuffle_bbh_mc_options(item: dict, block_seed) -> dict:
     return out
 
 
+# Registry of every per-round bench item generator. Each entry is
+# ``(samples_key, generator_name, seed_xor_offset, n_items, extra_args)``;
+# the dispatcher resolves ``generator_name`` from the module's globals
+# (lazy lookup so the generators can stay defined later in the file
+# without tripping a forward-reference NameError at import time) and
+# loops once per round to populate ``_BENCH_SAMPLES``. The XOR offsets
+# keep procedural pools statistically independent across benches that
+# share the same generator (math → tool_use / self_consistency /
+# robustness / noise; code → mbpp).
+_BENCH_SAMPLE_GENERATORS: tuple[tuple[str, str, int, int, tuple], ...] = (
+    ("math", "_generate_math_items", 0, BENCH_MATH_PER_ROUND, ()),
+    ("code", "_generate_code_items", 0, BENCH_CODE_PER_ROUND, ()),
+    ("reasoning", "_generate_reasoning_items", 0, BENCH_REASONING_PER_ROUND, ()),
+    # ``knowledge_bench`` v2 (2026-04-29): replaces the legacy MC pool with
+    # procedural fact-like reasoning items (price tables, transitive
+    # ordering, container counting, alphabet/calendar/weekday/unit/roman
+    # conventions). Open-ended generation, regex-match grading, no MC
+    # random-pick floor — see ``_generate_knowledge_v2_items`` for the
+    # full subtype taxonomy.
+    ("knowledge", "_generate_knowledge_v2_items", 0, BENCH_KNOWLEDGE_PER_ROUND, ()),
+    ("ifeval", "_generate_ifeval_items", 0, BENCH_IFEVAL_PER_ROUND, ()),
+    ("aime", "_generate_aime_items", 0, BENCH_AIME_PER_ROUND, ()),
+    ("mbpp", "_generate_code_items", 0x4D42, BENCH_MBPP_PER_ROUND, ()),
+    ("tool_use", "_generate_math_items", 0x546F, BENCH_TOOL_USE_PER_ROUND, ()),
+    ("self_consistency", "_generate_math_items", 0x5343, BENCH_SELF_CONSISTENCY_PER_ROUND, ()),
+    ("arc", "_generate_mc_items", 0x4143, BENCH_ARC_PER_ROUND, ()),
+    ("truthful", "_generate_mc_items", 0x5452, BENCH_TRUTHFUL_PER_ROUND, ()),
+    # Session 3.5: long-context needle is procedural — generate fresh
+    # items per round so pools rotate but every validator sees the
+    # same items this round. Only generator with an extra positional
+    # arg (``n_distractors``).
+    ("long_context", "_generate_long_context_items", 0, BENCH_LC_PER_ROUND, (BENCH_LC_DISTRACTORS,)),
+    ("procedural", "_generate_procedural_items", 0, BENCH_PROCEDURAL_PER_ROUND, ()),
+    # v27: ``robustness`` and ``noise`` test paraphrase / typo
+    # invariance respectively. Disjoint stream offsets keep their pools
+    # independent from the canonical math pool above; the bench probes
+    # apply runtime perturbations to ground-truth math items.
+    ("robustness", "_generate_math_items", 0x524F, BENCH_ROBUSTNESS_PER_ROUND, ()),
+    ("noise", "_generate_math_items", 0x4E4F, BENCH_NOISE_PER_ROUND, ()),
+    # v29.2 — debug_bench (procedural buggy-code).
+    ("debug", "_generate_debug_items", 0, BENCH_DEBUG_PER_ROUND, ()),
+    # v29.4 — procedural correction (buggy code + error trace),
+    # multi-doc synthesis (cross-card retrieval), calibration (solvable
+    # + unsolvable), refactoring (style-constrained refactor).
+    ("correction", "_generate_correction_items", 0, BENCH_CORRECTION_PER_ROUND, ()),
+    ("multi_doc", "_generate_multi_doc_items", 0, BENCH_MULTI_DOC_PER_ROUND, ()),
+    ("calibration", "_generate_calibration_items", 0, BENCH_CALIBRATION_PER_ROUND, ()),
+    ("refactor", "_generate_refactor_items", 0, BENCH_REFACTOR_PER_ROUND, ()),
+    # v30 — pragmatic_bench (theory-of-mind + scalar implicature +
+    # speech-act items).
+    ("pragmatic", "_generate_pragmatic_items", 0, BENCH_PRAGMATIC_PER_ROUND, ()),
+)
+
+
 def set_bench_block_seed(block_seed):
     """Regenerate per-round bench samples from the current block_seed.
 
     Idempotent: no-op if already seeded with the same value. Called once
     per round from ``main()`` right after the other per-round setters.
+
+    All generation goes through ``_BENCH_SAMPLE_GENERATORS`` (defined just
+    above) so adding a new bench is a one-line registry edit instead of a
+    fresh ``_BENCH_SAMPLES[name] = ...`` block plus a print-line append.
+
+    ── v27 Session 3.20 (2026-04-26 Goodhart hardening, full procedural switch) ──
+    Public-dataset items are unsafe: every (question, gold) pair is
+    discoverable on disk, so a miner can pre-compute answers for the
+    whole pool. v22-v26 paraphrase / option-shuffle rotated wording but
+    not semantics, so a {paraphrased_question → answer} lookup still
+    saturated the axis. v27 generates the bench items per round from
+    ``block_seed``: there is no offline dataset, so memorisation is not
+    available as a strategy. Round duration is unchanged because
+    per-item generation is microseconds. The public datasets remain
+    available for ``scripts/eval_pod/auto_benchmark.sh`` to run post-hoc
+    evalscope verification against the king on a separate pod, but the
+    validator never trains-or-evals against the public items.
     """
     global _BENCH_BLOCK_SEED
     if not BENCH_BATTERY_ENABLED:
@@ -5768,120 +5751,14 @@ def set_bench_block_seed(block_seed):
     if block_seed == _BENCH_BLOCK_SEED and all(_BENCH_SAMPLES[k] for k in _BENCH_SAMPLES):
         return
     _BENCH_BLOCK_SEED = block_seed
-    # ── v27 Session 3.20 (2026-04-26 Goodhart hardening, full procedural switch) ──
-    # Public-dataset items are unsafe: every (question, gold) pair is
-    # discoverable on disk, so a miner can pre-compute answers for the
-    # whole pool. v22-v26 paraphrase / option-shuffle rotated wording
-    # but not semantics, so a {paraphrased_question → answer} lookup
-    # still saturated the axis. v27 generates the bench items per round
-    # from ``block_seed``: there is no offline dataset, so memorisation
-    # is not even available as a strategy. Round duration is unchanged
-    # because per-item generation is microseconds. The public datasets
-    # remain available for ``scripts/eval_pod/auto_benchmark.sh`` to run
-    # post-hoc evalscope verification against the king on a separate
-    # pod, but the validator never trains-or-evals against the public
-    # items.
-    _BENCH_SAMPLES["math"] = _generate_math_items(block_seed, BENCH_MATH_PER_ROUND)
-    _BENCH_SAMPLES["code"] = _generate_code_items(block_seed, BENCH_CODE_PER_ROUND)
-    _BENCH_SAMPLES["reasoning"] = _generate_reasoning_items(
-        block_seed, BENCH_REASONING_PER_ROUND,
+    for key, gen_name, xor_off, n_items, extra_args in _BENCH_SAMPLE_GENERATORS:
+        gen = globals()[gen_name]
+        _BENCH_SAMPLES[key] = gen(block_seed ^ xor_off, n_items, *extra_args)
+    counts = ", ".join(
+        f"{key}={len(_BENCH_SAMPLES[key])}"
+        for key, *_ in _BENCH_SAMPLE_GENERATORS
     )
-    # ``knowledge_bench`` v2 (2026-04-29): replaces the legacy MC pool
-    # with procedural fact-like reasoning items (price tables, transitive
-    # ordering, container counting, alphabet/calendar/weekday/unit/roman
-    # conventions). Open-ended generation, regex-match grading, no MC
-    # random-pick floor. See ``_generate_knowledge_v2_items`` for the
-    # full subtype taxonomy. Items are 100% procedural — every
-    # (question, gold) pair is fresh per block_seed, no static pool to
-    # memorise.
-    _BENCH_SAMPLES["knowledge"] = _generate_knowledge_v2_items(
-        block_seed, BENCH_KNOWLEDGE_PER_ROUND,
-    )
-    _BENCH_SAMPLES["ifeval"] = _generate_ifeval_items(
-        block_seed, BENCH_IFEVAL_PER_ROUND,
-    )
-    _BENCH_SAMPLES["aime"] = _generate_aime_items(block_seed, BENCH_AIME_PER_ROUND)
-    _BENCH_SAMPLES["mbpp"] = _generate_code_items(
-        block_seed ^ 0x4D42, BENCH_MBPP_PER_ROUND,
-    )
-    _BENCH_SAMPLES["tool_use"] = _generate_math_items(
-        block_seed ^ 0x546F, BENCH_TOOL_USE_PER_ROUND,
-    )
-    _BENCH_SAMPLES["self_consistency"] = _generate_math_items(
-        block_seed ^ 0x5343, BENCH_SELF_CONSISTENCY_PER_ROUND,
-    )
-    _BENCH_SAMPLES["arc"] = _generate_mc_items(
-        block_seed ^ 0x4143, BENCH_ARC_PER_ROUND,
-    )
-    _BENCH_SAMPLES["truthful"] = _generate_mc_items(
-        block_seed ^ 0x5452, BENCH_TRUTHFUL_PER_ROUND,
-    )
-    # Session 3.5: long-context needle is procedural — generate fresh items
-    # per round from a seed mixed with the block_seed so pools rotate but
-    # every validator generates the same items this round.
-    _BENCH_SAMPLES["long_context"] = _generate_long_context_items(
-        block_seed, BENCH_LC_PER_ROUND, BENCH_LC_DISTRACTORS,
-    )
-    _BENCH_SAMPLES["procedural"] = _generate_procedural_items(
-        block_seed, BENCH_PROCEDURAL_PER_ROUND,
-    )
-    # v27: ``robustness`` and ``noise`` test paraphrase / typo invariance.
-    # We generate fresh procedural math items under disjoint stream
-    # offsets, then let ``robustness_bench_probe`` apply its runtime
-    # paraphrase and ``noise_resistance_bench_probe`` its runtime typo
-    # injection. The signal — "does the model still solve the same
-    # problem under wording perturbation / character noise?" — is
-    # preserved, but every (question, answer) pair is fresh per round.
-    _BENCH_SAMPLES["robustness"] = _generate_math_items(
-        block_seed ^ 0x524F, BENCH_ROBUSTNESS_PER_ROUND,
-    )
-    _BENCH_SAMPLES["noise"] = _generate_math_items(
-        block_seed ^ 0x4E4F, BENCH_NOISE_PER_ROUND,
-    )
-    # v29.2 — debug_bench. Procedural buggy-code items.
-    _BENCH_SAMPLES["debug"] = _generate_debug_items(
-        block_seed, BENCH_DEBUG_PER_ROUND,
-    )
-    # v29.4 — procedural correction (buggy code + error trace), multi-doc
-    # synthesis (cross-card retrieval), calibration (solvable +
-    # unsolvable), refactoring (style-constrained refactor).
-    _BENCH_SAMPLES["correction"] = _generate_correction_items(
-        block_seed, BENCH_CORRECTION_PER_ROUND,
-    )
-    _BENCH_SAMPLES["multi_doc"] = _generate_multi_doc_items(
-        block_seed, BENCH_MULTI_DOC_PER_ROUND,
-    )
-    _BENCH_SAMPLES["calibration"] = _generate_calibration_items(
-        block_seed, BENCH_CALIBRATION_PER_ROUND,
-    )
-    _BENCH_SAMPLES["refactor"] = _generate_refactor_items(
-        block_seed, BENCH_REFACTOR_PER_ROUND,
-    )
-    # v30 — pragmatic_bench (procedural theory-of-mind + scalar +
-    # speech-act items).
-    _BENCH_SAMPLES["pragmatic"] = _generate_pragmatic_items(
-        block_seed, BENCH_PRAGMATIC_PER_ROUND,
-    )
-    print(
-        f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
-        f"code={len(_BENCH_SAMPLES['code'])}, "
-        f"reasoning={len(_BENCH_SAMPLES['reasoning'])}, "
-        f"knowledge={len(_BENCH_SAMPLES['knowledge'])}, "
-        f"ifeval={len(_BENCH_SAMPLES['ifeval'])}, "
-        f"aime={len(_BENCH_SAMPLES['aime'])}, "
-        f"mbpp={len(_BENCH_SAMPLES['mbpp'])}, "
-        f"tool_use={len(_BENCH_SAMPLES['tool_use'])}, "
-        f"self_consistency={len(_BENCH_SAMPLES['self_consistency'])}, "
-        f"arc={len(_BENCH_SAMPLES['arc'])}, "
-        f"truthful={len(_BENCH_SAMPLES['truthful'])}, "
-        f"long_context={len(_BENCH_SAMPLES['long_context'])}, "
-        f"procedural={len(_BENCH_SAMPLES['procedural'])}, "
-        f"robustness={len(_BENCH_SAMPLES['robustness'])}, "
-        f"noise={len(_BENCH_SAMPLES['noise'])}, "
-        f"debug={len(_BENCH_SAMPLES['debug'])}, "
-        f"pragmatic={len(_BENCH_SAMPLES['pragmatic'])}",
-        flush=True,
-    )
+    print(f"[bench] round samples: {counts}", flush=True)
 
 
 # ── bench generation helper (reuses chat template + eos/pad setup) ────
@@ -6144,24 +6021,24 @@ def _run_simple_bench(model, tokenizer, device, sample_key: str,
     """Scaffolding for the per-item generate→grade→tally bench probes.
 
     Every "simple" bench (math, aime, ifeval, knowledge, reasoning, arc,
-    truthful, procedural, long_context, …) used to copy/paste the same
-    ~30-line block: init out dict, fetch samples, eval+no_grad guard,
-    per-item generate+grade+append, finalize token stats. Centralising
-    the scaffolding removes ~250 LOC of boilerplate and means a future
-    fix (per-item timing, batched generation, side-channel logging)
-    only needs one edit.
+    truthful, procedural, …) used to copy/paste the same ~30-line block:
+    init out dict, fetch samples, eval+no_grad, per-item generate +
+    grade + append, finalize token stats. Centralising the scaffolding
+    removes ~600 LOC of boilerplate and means a future fix (per-item
+    timing, batched generation, side-channel logging) only needs one
+    edit.
 
     The per-bench parts are:
       * ``sample_key`` — index into ``_BENCH_SAMPLES``.
       * ``max_tokens`` — generation budget for this axis.
       * ``prompt_fn(item) -> str`` — render the user prompt.
-      * ``grade_fn(item, text, tok) -> (item_record_dict, ok_int)`` —
-        grade the generation and assemble the per-item record.
+      * ``grade_fn(item, text, tok) -> (item_dict, ok_int)`` — grade
+        the generation and assemble the per-item record.
 
     ``grade_fn`` is allowed to raise — the inner try/except records the
     error on the item without aborting the rest of the batch. The outer
     try/except sets ``out["error"]`` for catastrophic failures (model
-    crash, tokenizer issue) so the bench drops cleanly out of the
+    load issue, tokenizer crash) so the bench drops cleanly out of the
     composite instead of taking the round down.
     """
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
@@ -6176,12 +6053,118 @@ def _run_simple_bench(model, tokenizer, device, sample_key: str,
                         model, tokenizer, prompt_fn(it),
                         max_tokens, device, enable_thinking=enable_thinking,
                     )
-                    record, ok = grade_fn(it, text, int(tok))
-                    out["items"].append(record)
+                    item, ok = grade_fn(it, text, int(tok))
+                    out["items"].append(item)
                     out["n"] += 1
                     out["correct"] += int(ok)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def _run_humaneval_sandbox_bench(
+    model, tokenizer, device, *,
+    sample_key: str,
+    max_tokens: int,
+    build_prompt,
+    build_sandbox_tuple=None,
+    extra_item_fields: tuple[str, ...] = (),
+    post_sandbox_hook=None,
+) -> dict:
+    """Scaffolding for the HumanEval-sandbox graded probes.
+
+    ``code_bench`` / ``debug_bench`` / ``correction_bench`` /
+    ``mbpp_bench`` / ``refactor_bench`` used to copy/paste the same
+    ~70-line block: import sandbox, generate per-item under
+    eval+no_grad, build sandbox input tuples, run ``hs.run_batch``,
+    then merge results back into ``out["items"]``. Centralising the
+    scaffolding removes ~300 LOC and means future fixes (sandbox worker
+    count tuning, batched generation, sandbox timeout knobs) only need
+    one edit.
+
+    Per-bench parts:
+      * ``sample_key`` — index into ``_BENCH_SAMPLES``.
+      * ``max_tokens`` — generation budget.
+      * ``build_prompt(item) -> str`` — render the user prompt.
+      * ``build_sandbox_tuple(gen, item) -> tuple`` — defaults to the
+        canonical ``(item["prompt"], gen, item["test"], item["entry_point"])``
+        used by ``code_bench`` / ``debug_bench`` / ``correction_bench``;
+        ``mbpp_bench`` overrides because its tests are bare asserts that
+        must be wrapped in ``def check(candidate):``.
+      * ``extra_item_fields`` — additional item-record fields to copy
+        through (e.g. ``("src",)`` for ``correction_bench`` per-template
+        telemetry).
+      * ``post_sandbox_hook(item, gen, sandbox_result) -> (ok, extra)`` —
+        called once per sandbox-graded item if non-None. ``ok`` is the
+        FINAL pass/fail (overrides the raw sandbox pass), ``extra`` is
+        a dict of additional item-record fields. ``refactor_bench`` uses
+        this to layer an AST-based style-constraint check on top of the
+        sandbox tests.
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get(sample_key) or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    if build_sandbox_tuple is None:
+        def build_sandbox_tuple(gen, it):
+            return (it["prompt"], gen, it["test"], it["entry_point"])
+    try:
+        generations: list[tuple[str, int, dict]] = []
+        with _model_eval_no_grad(model):
+            for it in samples:
+                try:
+                    gen, tok = _bench_generate(
+                        model, tokenizer, build_prompt(it),
+                        max_tokens, device, enable_thinking=False,
+                    )
+                    generations.append((gen, int(tok), it))
+                except Exception as e:
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        sandbox_input = [
+            build_sandbox_tuple(_strip_thinking_probe(gen or ""), it)
+            for gen, _tok, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = (
+            hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        )
+        idx = 0
+        for gen, tok, it in generations:
+            extras = {f: it.get(f, "") for f in extra_item_fields}
+            if "gen_error" in it:
+                out["items"].append({
+                    **extras,
+                    "task_id": it.get("task_id"),
+                    "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            sandbox_ok = bool(r and r.passed)
+            if post_sandbox_hook is not None:
+                ok, hook_extras = post_sandbox_hook(it, gen, r)
+            else:
+                ok, hook_extras = sandbox_ok, {}
+            out["items"].append({
+                **extras,
+                **hook_extras,
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": bool(ok),
+                "gen_tokens": int(tok),
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(bool(ok))
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -6208,117 +6191,24 @@ def math_bench_probe(model, tokenizer, device="cuda"):
     )
 
 
-# ── sandbox-graded code probes (code/debug/correction/mbpp) ───────────
-
-
-def _run_sandbox_bench(model, tokenizer, device, *, sample_key: str,
-                       max_tokens: int, prompt_fn,
-                       sandbox_input_fn, item_extras_fn=None,
-                       post_sandbox_hook=None) -> dict:
-    """Scaffolding for the humaneval-sandbox-graded code probes.
-
-    code/debug/correction/mbpp/refactor all share the same two-pass pattern:
-      1. Generate per-item Python under model.eval() / no_grad().
-      2. Drop the generations into ``humaneval_sandbox.run_batch`` (4
-         worker subprocesses) and pair the results back with items.
-
-    The per-bench variation is all squeezed into closures:
-      * ``prompt_fn(item) -> str`` — render the user prompt.
-      * ``sandbox_input_fn(item, generation) -> tuple`` — assemble the
-        ``(prompt, generation, test, entry_point)`` tuple the sandbox
-        runner expects (mbpp wraps the test in ``def check(candidate):``;
-        the others pass the original prompt + test verbatim).
-      * ``item_extras_fn(item) -> dict`` (optional) — extra per-item
-        record fields beyond the standard {task_id, entry_point, ok,
-        gen_tokens, reason, tail} (e.g. ``src`` for correction_bench /
-        refactor_bench).
-      * ``post_sandbox_hook(item, generation, sandbox_result) ->
-        (final_ok, extra_fields)`` (optional) — called once per
-        sandbox-graded item to layer additional checks on top of the
-        sandbox tests. ``final_ok`` overrides the raw sandbox pass;
-        ``extra_fields`` is merged into the per-item record. The
-        refactor_bench probe uses this for its AST-based style-constraint
-        check ("no nested loops" / "max lines"); a refactor that passes
-        the unit tests but violates the constraint scores 0.
-
-    A missing ``humaneval_sandbox`` import drops the bench cleanly with
-    an ``error`` set so composite skips it instead of taking the round
-    down — same fail-soft behaviour as before.
-    """
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get(sample_key) or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    extras = item_extras_fn or (lambda _it: {})
-    try:
-        generations: list[tuple[str, int, dict]] = []
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_fn(it),
-                        max_tokens, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        sandbox_input = [
-            sandbox_input_fn(it, _strip_thinking_probe(gen or ""))
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    **extras(it),
-                    "task_id": it.get("task_id"),
-                    "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            sandbox_ok = bool(r and r.passed)
-            if post_sandbox_hook is not None:
-                ok, hook_extras = post_sandbox_hook(it, gen, r)
-            else:
-                ok, hook_extras = sandbox_ok, {}
-            out["items"].append({
-                **extras(it),
-                **hook_extras,
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": bool(ok),
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(bool(ok))
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
-
-
 # ── code_bench ─────────────────────────────────────────────────────────
 
 def code_bench_probe(model, tokenizer, device="cuda"):
-    return _run_sandbox_bench(
-        model, tokenizer, device, sample_key="code",
-        max_tokens=BENCH_CODE_MAX_TOKENS,
-        prompt_fn=lambda it: (
+    """Run the code_bench probe (HumanEval-style code completion).
+
+    Prompt = "Complete the following Python function" + problem signature
+    + docstring. Sandbox graded via :func:`_run_humaneval_sandbox_bench`.
+    """
+    def _build_prompt(it):
+        return (
             "Complete the following Python function. "
-            "Output only the function body (no extra explanation, no markdown fences).\n\n"
-            f"{it['prompt']}"
-        ),
-        sandbox_input_fn=lambda it, gen: (it["prompt"], gen, it["test"], it["entry_point"]),
+            "Output only the function body (no extra explanation, no "
+            f"markdown fences).\n\n{it['prompt']}"
+        )
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="code", max_tokens=BENCH_CODE_MAX_TOKENS,
+        build_prompt=_build_prompt,
     )
 
 
@@ -6334,16 +6224,16 @@ def debug_bench_probe(model, tokenizer, device="cuda"):
     apply because the prompt ends mid-``def`` block exactly like
     ``code_bench``.
     """
-    return _run_sandbox_bench(
-        model, tokenizer, device, sample_key="debug",
-        max_tokens=BENCH_DEBUG_MAX_TOKENS,
-        prompt_fn=lambda it: (
+    def _build_prompt(it):
+        return (
             "Fix the bug in the following Python function. "
-            "Output only the function body (no extra "
-            "explanation, no markdown fences).\n\n"
-            f"{it['prompt']}"
-        ),
-        sandbox_input_fn=lambda it, gen: (it["prompt"], gen, it["test"], it["entry_point"]),
+            "Output only the function body (no extra explanation, no "
+            f"markdown fences).\n\n{it['prompt']}"
+        )
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="debug", max_tokens=BENCH_DEBUG_MAX_TOKENS,
+        build_prompt=_build_prompt,
     )
 
 
@@ -6356,19 +6246,21 @@ def correction_bench_probe(model, tokenizer, device="cuda"):
     the prompt embeds a buggy reference (commented out) + an explicit
     error trace + the fresh signature; the model emits the corrected
     body. Item-level pass = sandbox runs the corrected function and all
-    asserts pass.
+    asserts pass. ``src`` is propagated through ``extra_item_fields`` so
+    per-template saturation telemetry can break out which subtypes are
+    saturated vs floored.
     """
-    return _run_sandbox_bench(
-        model, tokenizer, device, sample_key="correction",
-        max_tokens=BENCH_CORRECTION_MAX_TOKENS,
-        prompt_fn=lambda it: (
+    def _build_prompt(it):
+        return (
             "Read the test failure trace and fix the bug. "
             "Output only the corrected function body (no extra "
-            "explanation, no markdown fences).\n\n"
-            f"{it['prompt']}"
-        ),
-        sandbox_input_fn=lambda it, gen: (it["prompt"], gen, it["test"], it["entry_point"]),
-        item_extras_fn=lambda it: {"src": it.get("src", "")},
+            f"explanation, no markdown fences).\n\n{it['prompt']}"
+        )
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="correction", max_tokens=BENCH_CORRECTION_MAX_TOKENS,
+        build_prompt=_build_prompt,
+        extra_item_fields=("src",),
     )
 
 
@@ -6388,30 +6280,53 @@ def _format_multi_doc_prompt(it: dict) -> str:
 
 def multi_doc_synthesis_bench_probe(model, tokenizer, device="cuda"):
     """Run the multi_doc_synthesis_bench probe (v29.4)."""
-    def _grade(it, text, tok):
-        cleaned = _strip_thinking_probe(text or "").strip()
-        gold = str(it.get("answer", ""))
-        confuser_answers = it.get("confuser_answers") or []
-        pred_lower = cleaned.lower()
-        gold_in_pred = bool(gold and gold.lower() in pred_lower)
-        confuser_in_pred = any(
-            ca and ca.lower() in pred_lower for ca in confuser_answers
-        )
-        ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
-        return {
-            "src": it.get("src", ""),
-            "kind": it.get("kind"),
-            "gold": gold[:60],
-            "pred_tail": cleaned[-160:],
-            "ok": bool(ok),
-            "gen_tokens": tok,
-            "confuser_hit": bool(confuser_answers and confuser_in_pred),
-            "gold_in_pred": gold_in_pred,
-        }, ok
-    return _run_simple_bench(
-        model, tokenizer, device, "multi_doc", BENCH_MULTI_DOC_MAX_TOKENS,
-        prompt_fn=_format_multi_doc_prompt, grade_fn=_grade,
-    )
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("multi_doc") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_multi_doc_prompt(it)
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_MULTI_DOC_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    gold = str(it.get("answer", ""))
+                    confuser_answers = it.get("confuser_answers") or []
+                    pred_lower = cleaned.lower()
+                    gold_in_pred = bool(gold and gold.lower() in pred_lower)
+                    confuser_in_pred = any(
+                        ca and ca.lower() in pred_lower for ca in confuser_answers
+                    )
+                    ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "kind": it.get("kind"),
+                        "gold": gold[:60],
+                        "pred_tail": cleaned[-160:],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "confuser_hit": bool(confuser_answers and confuser_in_pred),
+                        "gold_in_pred": gold_in_pred,
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""), "error": str(e)[:120],
+                    })
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── calibration_bench (v29.4) ────────────────────────────────────────────
@@ -6584,6 +6499,15 @@ def refactor_bench_probe(model, tokenizer, device="cuda"):
     AND fails the tests still surfaces ``constraint_reason="tests_failed
     _skip_constraint"`` so we can tell the two failure modes apart.
     """
+    def _build_prompt(it):
+        return (
+            "Refactor the function shown. Your refactor must "
+            "preserve behaviour AND meet the style constraint. "
+            "Output only the function (signature + body), no "
+            "extra explanation.\n\n"
+            f"{it['prompt']}"
+        )
+
     def _post_sandbox(it, gen, r):
         tests_passed = bool(r and r.passed)
         constraint_ok = False
@@ -6605,20 +6529,12 @@ def refactor_bench_probe(model, tokenizer, device="cuda"):
             "constraint_reason": constraint_reason,
         }
 
-    return _run_sandbox_bench(
-        model, tokenizer, device, sample_key="refactor",
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="refactor",
         max_tokens=BENCH_REFACTOR_MAX_TOKENS,
-        prompt_fn=lambda it: (
-            "Refactor the function shown. Your refactor must "
-            "preserve behaviour AND meet the style constraint. "
-            "Output only the function (signature + body), no "
-            "extra explanation.\n\n"
-            f"{it['prompt']}"
-        ),
-        sandbox_input_fn=lambda it, gen: (
-            it["prompt"], gen, it["test"], it["entry_point"],
-        ),
-        item_extras_fn=lambda it: {"src": it.get("src", "")},
+        build_prompt=_build_prompt,
+        extra_item_fields=("src",),
         post_sandbox_hook=_post_sandbox,
     )
 
@@ -6646,21 +6562,20 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
                     cleaned = _strip_thinking_probe(text or "").strip()
                     ok = _knowledge_v2_grade_one(text or "", it)
                     subtype = it.get("category", "unknown")
-                    sub = out["per_subtype"].setdefault(
-                        subtype, {"n": 0, "correct": 0}
-                    )
-                    sub["n"] += 1
-                    sub["correct"] += int(ok)
-                    # v30.3 — also record under per_src so the saturation
-                    # audit (which iterates composite.per_src) sees this
-                    # axis. ``src`` is the full ``pragmatic/<subtype>``
+                    # v30.3 — record under per_subtype (legacy) AND per_src
+                    # so the saturation audit (which iterates per_src) sees
+                    # this axis. ``src`` is the full ``pragmatic/<subtype>``
                     # tag from the generator.
                     src_key = str(it.get("src", f"pragmatic/{subtype}"))
-                    src = out["per_src"].setdefault(
-                        src_key, {"n": 0, "correct": 0}
-                    )
-                    src["n"] += 1
-                    src["correct"] += int(ok)
+                    for bucket_dict, bucket_key in (
+                        (out["per_subtype"], subtype),
+                        (out["per_src"], src_key),
+                    ):
+                        bucket = bucket_dict.setdefault(
+                            bucket_key, {"n": 0, "correct": 0}
+                        )
+                        bucket["n"] += 1
+                        bucket["correct"] += int(ok)
                     out["items"].append({
                         "src": it.get("src", ""),
                         "category": subtype,
@@ -6674,16 +6589,11 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
         out["pass_frac"] = out["correct"] / max(1, out["n"])
-        for sub_name, sub_stats in out["per_subtype"].items():
-            sub_stats["pass_frac"] = (
-                sub_stats["correct"] / sub_stats["n"]
-                if sub_stats["n"] else 0.0
-            )
-        for src_name, src_stats in out["per_src"].items():
-            src_stats["pass_frac"] = (
-                src_stats["correct"] / src_stats["n"]
-                if src_stats["n"] else 0.0
-            )
+        for stats_dict in (out["per_subtype"], out["per_src"]):
+            for stats in stats_dict.values():
+                stats["pass_frac"] = (
+                    stats["correct"] / stats["n"] if stats["n"] else 0.0
+                )
         _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
@@ -6745,22 +6655,42 @@ def _reasoning_score_one(pred: str, gold: str) -> int:
 
 
 def reasoning_bench_probe(model, tokenizer, device="cuda"):
-    def _grade(it, text, tok):
-        pred = _reasoning_extract_answer(text, it["gold"])
-        ok = _reasoning_score_one(pred, it["gold"])
-        return {
-            "src": it.get("src", ""),
-            "pred": pred[:80],
-            "gold": it["gold"][:40],
-            "ok": bool(ok),
-            "gen_tokens": tok,
-            "tail": text[-120:],
-        }, ok
-    return _run_simple_bench(
-        model, tokenizer, device, "reasoning", BENCH_REASONING_MAX_TOKENS,
-        prompt_fn=lambda it: _reasoning_format_prompt(it["question"], it["gold"]),
-        grade_fn=_grade,
-    )
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("reasoning") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _reasoning_format_prompt(it["question"], it["gold"])
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_REASONING_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    pred = _reasoning_extract_answer(text, it["gold"])
+                    ok = _reasoning_score_one(pred, it["gold"])
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "pred": pred[:80],
+                        "gold": it["gold"][:40],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── knowledge_bench (MMLU-Pro) ─────────────────────────────────────────
@@ -6872,68 +6802,106 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
     semantics in a single deploy without invalidating a pre-existing
     cache that may still contain the old shape.
     """
-    def _prompt(it):
-        return it["question"] if "accept" in it else _format_mmlu_prompt(it)
-
-    def _grade(it, text, tok):
-        cleaned = _strip_thinking_probe(text or "").strip()
-        if "accept" in it:
-            ok = _knowledge_v2_grade_one(text or "", it)
-            return {
-                "src": it.get("src", ""),
-                "category": it.get("category", ""),
-                "gold": str(it.get("gold", ""))[:40],
-                "pred_tail": cleaned[-120:].strip(),
-                "ok": bool(ok),
-                "gen_tokens": tok,
-            }, ok
-        pred = _extract_mmlu_letter(cleaned, max_letter="J")
-        ok = 1 if pred and pred == it["gold_letter"] else 0
-        return {
-            "src": it.get("src", ""),
-            "category": it.get("category", ""),
-            "pred": pred,
-            "gold": it["gold_letter"],
-            "ok": bool(ok),
-            "gen_tokens": tok,
-            "tail": text[-120:],
-        }, ok
-
-    return _run_simple_bench(
-        model, tokenizer, device, "knowledge", BENCH_KNOWLEDGE_MAX_TOKENS,
-        prompt_fn=_prompt, grade_fn=_grade,
-    )
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("knowledge") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    is_v2 = "accept" in it
+                    if is_v2:
+                        prompt_text = it["question"]
+                    else:
+                        prompt_text = _format_mmlu_prompt(it)
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_KNOWLEDGE_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    if is_v2:
+                        ok = _knowledge_v2_grade_one(text or "", it)
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "category": it.get("category", ""),
+                            "gold": str(it.get("gold", ""))[:40],
+                            "pred_tail": cleaned[-120:].strip(),
+                            "ok": bool(ok),
+                            "gen_tokens": int(tok),
+                        })
+                    else:
+                        pred = _extract_mmlu_letter(cleaned, max_letter="J")
+                        ok = 1 if pred and pred == it["gold_letter"] else 0
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "category": it.get("category", ""),
+                            "pred": pred,
+                            "gold": it["gold_letter"],
+                            "ok": bool(ok),
+                            "gen_tokens": int(tok),
+                            "tail": text[-120:],
+                        })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── ifeval_bench ───────────────────────────────────────────────────────
 
 def ifeval_bench_probe(model, tokenizer, device="cuda"):
-    if not (_BENCH_SAMPLES.get("ifeval") and model is not None and tokenizer is not None):
-        return {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("ifeval") or []
+    if not samples or model is None or tokenizer is None:
+        return out
     try:
         import ifeval_vendor as _ifev  # type: ignore
     except ImportError:
-        return {"n": 0, "correct": 0, "pass_frac": 0.0, "items": [],
-                "error": "ifeval_vendor not importable on pod"}
-
-    def _grade(it, text, tok):
-        cleaned = _strip_thinking_probe(text or "")
-        all_pass, per = _ifev.evaluate_item(
-            cleaned, it["instruction_ids"], it.get("kwargs") or [],
-        )
-        return {
-            "src": it.get("src", ""),
-            "instruction_ids": it["instruction_ids"],
-            "per_instruction": per,
-            "ok": bool(all_pass),
-            "gen_tokens": tok,
-            "tail": text[-120:],
-        }, int(all_pass)
-
-    return _run_simple_bench(
-        model, tokenizer, device, "ifeval", BENCH_IFEVAL_MAX_TOKENS,
-        prompt_fn=lambda it: it["prompt"], grade_fn=_grade,
-    )
+        out["error"] = "ifeval_vendor not importable on pod"
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    text, tok = _bench_generate(
+                        model, tokenizer, it["prompt"],
+                        BENCH_IFEVAL_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "")
+                    all_pass, per = _ifev.evaluate_item(
+                        cleaned, it["instruction_ids"], it.get("kwargs") or [],
+                    )
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "instruction_ids": it["instruction_ids"],
+                        "per_instruction": per,
+                        "ok": bool(all_pass),
+                        "gen_tokens": int(tok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += int(all_pass)
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── Session 3 bench probes ─────────────────────────────────────────────
@@ -7068,12 +7036,15 @@ def _mbpp_build_prompt(item: dict) -> str:
     )
 
 
-def _mbpp_wrap_test_for_sandbox(test: str) -> str:
-    """Wrap raw MBPP asserts in a ``def check(candidate):`` body so the
-    humaneval_sandbox runner (which calls ``check({entry_point})``)
-    can run them. The asserts reference the target by name and Python
-    resolves it from module scope where the generation defined it, so
-    no rebinding is needed — we only need to indent into ``check``.
+def _mbpp_wrap_for_sandbox(test: str, entry_point: str) -> str:
+    """Wrap MBPP ``test`` (raw asserts) in ``def check(candidate):``.
+
+    MBPP solutions don't stub the function signature the way HumanEval
+    does — generations define a fresh function. The sandbox runner
+    expects a top-level ``check(candidate)`` callable, so we indent the
+    raw assert lines into a ``check`` body. The asserts reference the
+    target function by name; Python resolves it from module scope (no
+    rebinding to ``candidate`` required).
     """
     indented = "\n".join(
         (f"    {line}" if line.strip() else "")
@@ -7083,16 +7054,21 @@ def _mbpp_wrap_test_for_sandbox(test: str) -> str:
 
 
 def mbpp_bench_probe(model, tokenizer, device="cuda"):
-    return _run_sandbox_bench(
-        model, tokenizer, device, sample_key="mbpp",
-        max_tokens=BENCH_MBPP_MAX_TOKENS,
-        prompt_fn=_mbpp_build_prompt,
-        # MBPP solutions don't stub the function signature like
-        # HumanEval does; we pass an empty prompt (generation defines
-        # the function) and wrap the asserts in ``def check`` so the
-        # shared sandbox runner can use them unchanged.
-        sandbox_input_fn=lambda it, gen: (
-            "", gen, _mbpp_wrap_test_for_sandbox(it["test"]), it["entry_point"],
+    """Run the MBPP-style code completion probe.
+
+    Differs from ``code_bench`` only in (a) prompt is built by
+    :func:`_mbpp_build_prompt` (adds entry-point name hint), and
+    (b) the sandbox tuple uses an empty prompt + wrapped ``check``
+    helper because MBPP tests are bare asserts, not signature stubs.
+    """
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="mbpp", max_tokens=BENCH_MBPP_MAX_TOKENS,
+        build_prompt=_mbpp_build_prompt,
+        build_sandbox_tuple=lambda gen, it: (
+            "", gen,
+            _mbpp_wrap_for_sandbox(it["test"], it["entry_point"]),
+            it["entry_point"],
         ),
     )
 
@@ -7172,7 +7148,9 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        with _model_eval_no_grad(model):
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
             for it in samples:
                 try:
                     pass1_prompt = (
@@ -7232,6 +7210,8 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         out["tool_used_count"] = sum(
             1 for i in out["items"] if isinstance(i, dict) and i.get("tool_used")
@@ -7263,7 +7243,9 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
     base_seed = _coerce_block_seed(_BENCH_BLOCK_SEED) or 0
     base_seed ^= _BENCH_STREAM.get("self_consistency", 0)
     try:
-        with _model_eval_no_grad(model):
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
             for q_idx, it in enumerate(samples):
                 try:
                     prompt_text = _math_format_prompt(it["question"], "math500")
@@ -7314,6 +7296,8 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         out["k_samples"] = k_samples
         out["temperature"] = BENCH_SELF_CONSISTENCY_TEMP
@@ -7337,22 +7321,43 @@ def _format_arc_prompt(item: dict) -> str:
 
 
 def arc_bench_probe(model, tokenizer, device="cuda"):
-    def _grade(it, text, tok):
-        cleaned = _strip_thinking_probe(text or "").strip()
-        pred = _extract_mmlu_letter(cleaned, max_letter="E")
-        ok = 1 if pred and pred == it["gold_letter"] else 0
-        return {
-            "src": it.get("src", ""),
-            "pred": pred,
-            "gold": it["gold_letter"],
-            "ok": bool(ok),
-            "gen_tokens": tok,
-            "tail": text[-120:],
-        }, ok
-    return _run_simple_bench(
-        model, tokenizer, device, "arc", BENCH_ARC_MAX_TOKENS,
-        prompt_fn=_format_arc_prompt, grade_fn=_grade,
-    )
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("arc") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_arc_prompt(it)
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_ARC_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    pred = _extract_mmlu_letter(cleaned, max_letter="E")
+                    ok = 1 if pred and pred == it["gold_letter"] else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "pred": pred,
+                        "gold": it["gold_letter"],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── long_context_bench (Session 3.5 — procedural needle-in-haystack) ──
@@ -13497,91 +13502,61 @@ def _pick_robustness_perturbations(
     return pool[:target_k]
 
 
-def _run_perturbation_bench(model, tokenizer, device, *, sample_key: str,
-                            max_tokens: int, perturbations,
-                            base_prompt_fn, grade_fn,
-                            seed_root: int | None = None) -> dict:
-    """Scaffolding for robustness/noise bench probes.
-
-    Both axes test the same shape: per-item × per-perturbation grid where
-    each cell perturbs ``base_prompt_fn(item)`` then re-runs the standard
-    generate+grade pipeline. The only difference is the perturbation
-    signature: robustness uses ``perturb(prompt) -> str`` (deterministic
-    by axis seed at perturbation-pick time), noise uses
-    ``perturb(prompt, seed) -> str`` (sub-seeded per (item, pert) for
-    reproducible internal randomness).
-
-    ``seed_root`` toggles between the two: ``None`` → robustness mode
-    (no seed passed); int → noise mode (sub-seed mixed per cell).
-    ``perturbations`` is the list of ``(name, fn)`` pairs the caller
-    has already picked. ``grade_fn(it, text, tok) -> (record, ok)``
-    returns the per-item record (perturbation field added by helper).
-    """
+def robustness_bench_probe(model, tokenizer, device="cuda"):
     out: dict = {
         "n": 0, "correct": 0, "pass_frac": 0.0,
-        "items": [], "perturbations": [name for name, _ in perturbations],
+        "items": [], "perturbations": [],
     }
-    samples = _BENCH_SAMPLES.get(sample_key) or []
-    if not samples or model is None or tokenizer is None or not perturbations:
+    samples = _BENCH_SAMPLES.get("robustness") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    perturbations = _pick_robustness_perturbations(
+        _BENCH_BLOCK_SEED, BENCH_ROBUSTNESS_PERTURB_K,
+    )
+    out["perturbations"] = [name for name, _ in perturbations]
+    if not perturbations:
         return out
     try:
-        with _model_eval_no_grad(model):
-            for item_idx, it in enumerate(samples):
-                base_prompt = base_prompt_fn(it)
-                for pert_idx, (name, perturb) in enumerate(perturbations):
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                base_prompt = _math_format_prompt(
+                    it["question"], it.get("src", ""),
+                )
+                for name, perturb in perturbations:
                     try:
-                        if seed_root is None:
-                            prompt = perturb(base_prompt)
-                        else:
-                            sub_seed = (seed_root + item_idx * 1009 + pert_idx * 13) & 0x7FFFFFFF
-                            prompt = perturb(base_prompt, sub_seed)
+                        prompt = perturb(base_prompt)
                         text, tok = _bench_generate(
                             model, tokenizer, prompt,
-                            max_tokens, device, enable_thinking=False,
+                            BENCH_ROBUSTNESS_MAX_TOKENS, device,
+                            enable_thinking=False,
                         )
-                        record, ok = grade_fn(it, text, int(tok))
-                        record["perturbation"] = name
-                        out["items"].append(record)
+                        pred = _math_extract_answer(text, it.get("src", ""))
+                        ok = _math_score_one(pred, it["gold"])
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "perturbation": name,
+                            "pred": (pred or "")[:80],
+                            "gold": str(it.get("gold", ""))[:40],
+                            "ok": bool(ok),
+                            "gen_tokens": int(tok),
+                        })
                         out["n"] += 1
-                        out["correct"] += int(ok)
+                        out["correct"] += ok
                     except Exception as e:
                         out["items"].append({
                             "src": it.get("src", ""),
                             "perturbation": name,
                             "error": str(e)[:120],
                         })
+        if was_training:
+            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
-
-
-def robustness_bench_probe(model, tokenizer, device="cuda"):
-    perturbations = _pick_robustness_perturbations(
-        _BENCH_BLOCK_SEED, BENCH_ROBUSTNESS_PERTURB_K,
-    )
-
-    def _grade(it, text, tok):
-        pred = _math_extract_answer(text, it.get("src", ""))
-        ok = _math_score_one(pred, it["gold"])
-        return {
-            "src": it.get("src", ""),
-            "pred": (pred or "")[:80],
-            "gold": str(it.get("gold", ""))[:40],
-            "ok": bool(ok),
-            "gen_tokens": tok,
-        }, ok
-
-    return _run_perturbation_bench(
-        model, tokenizer, device, sample_key="robustness",
-        max_tokens=BENCH_ROBUSTNESS_MAX_TOKENS,
-        perturbations=perturbations,
-        base_prompt_fn=lambda it: _math_format_prompt(
-            it["question"], it.get("src", ""),
-        ),
-        grade_fn=_grade,
-    )
 
 
 # ── noise_resistance_bench (Session 3.7 — adversarial-noise sibling) ──
@@ -13753,54 +13728,104 @@ def _pick_noise_perturbations(
 
 
 def noise_resistance_bench_probe(model, tokenizer, device="cuda"):
+    out: dict = {
+        "n": 0, "correct": 0, "pass_frac": 0.0,
+        "items": [], "perturbations": [],
+    }
+    samples = _BENCH_SAMPLES.get("noise") or []
+    if not samples or model is None or tokenizer is None:
+        return out
     perturbations = _pick_noise_perturbations(
         _BENCH_BLOCK_SEED, BENCH_NOISE_PERTURB_K,
     )
-
-    def _grade(it, text, tok):
-        pred = _math_extract_answer(text, it.get("src", ""))
-        ok = _math_score_one(pred, it["gold"])
-        return {
-            "src": it.get("src", ""),
-            "pred": (pred or "")[:80],
-            "gold": str(it.get("gold", ""))[:40],
-            "ok": bool(ok),
-            "gen_tokens": tok,
-        }, ok
-
-    # Per-(item, pert) deterministic seed mixing so internal randomness
-    # inside a wrapper (typo positions, etc.) is reproducible across
-    # validators in the same round but rotates per block. Seed
-    # propagation handled by _run_perturbation_bench in noise mode.
+    out["perturbations"] = [name for name, _ in perturbations]
+    if not perturbations:
+        return out
     seed_root = int(_BENCH_BLOCK_SEED or 0) ^ _BENCH_STREAM.get("noise", 0)
-    return _run_perturbation_bench(
-        model, tokenizer, device, sample_key="noise",
-        max_tokens=BENCH_NOISE_MAX_TOKENS,
-        perturbations=perturbations,
-        base_prompt_fn=lambda it: _math_format_prompt(
-            it["question"], it.get("src", ""),
-        ),
-        grade_fn=_grade,
-        seed_root=seed_root,
-    )
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for item_idx, it in enumerate(samples):
+                base_prompt = _math_format_prompt(
+                    it["question"], it.get("src", ""),
+                )
+                for pert_idx, (name, perturb) in enumerate(perturbations):
+                    try:
+                        # Per-(item, pert) deterministic seed so internal
+                        # randomness inside a wrapper (typo positions, etc.)
+                        # is reproducible across validators in the same
+                        # round but rotates per block.
+                        sub_seed = (seed_root + item_idx * 1009 + pert_idx * 13) & 0x7FFFFFFF
+                        prompt = perturb(base_prompt, sub_seed)
+                        text, tok = _bench_generate(
+                            model, tokenizer, prompt,
+                            BENCH_NOISE_MAX_TOKENS, device,
+                            enable_thinking=False,
+                        )
+                        pred = _math_extract_answer(text, it.get("src", ""))
+                        ok = _math_score_one(pred, it["gold"])
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "perturbation": name,
+                            "pred": (pred or "")[:80],
+                            "gold": str(it.get("gold", ""))[:40],
+                            "ok": bool(ok),
+                            "gen_tokens": int(tok),
+                        })
+                        out["n"] += 1
+                        out["correct"] += ok
+                    except Exception as e:
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "perturbation": name,
+                            "error": str(e)[:120],
+                        })
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 def procedural_bench_probe(model, tokenizer, device="cuda"):
-    def _grade(it, text, tok):
-        cleaned = _strip_thinking_probe(text or "").strip()
-        gold = str(it.get("answer", ""))
-        ok = 1 if _answer_exact_in_text(gold, cleaned, strict=True) else 0
-        return {
-            "src": it.get("src", ""),
-            "gold": gold,
-            "ok": bool(ok),
-            "gen_tokens": tok,
-            "pred_tail": cleaned[-120:],
-        }, ok
-    return _run_simple_bench(
-        model, tokenizer, device, "procedural", BENCH_PROCEDURAL_MAX_TOKENS,
-        prompt_fn=lambda it: it["prompt"], grade_fn=_grade,
-    )
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("procedural") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    text, tok = _bench_generate(
+                        model, tokenizer, it["prompt"],
+                        BENCH_PROCEDURAL_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    gold = str(it.get("answer", ""))
+                    ok = 1 if _answer_exact_in_text(gold, cleaned, strict=True) else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "gold": gold,
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "pred_tail": cleaned[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── truthful_bench (Session 3.4 — adversarial factuality MC) ─────────
@@ -13824,22 +13849,43 @@ def _format_truthful_prompt(item: dict) -> str:
 
 
 def truthful_bench_probe(model, tokenizer, device="cuda"):
-    def _grade(it, text, tok):
-        cleaned = _strip_thinking_probe(text or "").strip()
-        pred = _extract_mmlu_letter(cleaned, max_letter="J")
-        ok = 1 if pred and pred == it["gold_letter"] else 0
-        return {
-            "src": it.get("src", ""),
-            "pred": pred,
-            "gold": it["gold_letter"],
-            "ok": bool(ok),
-            "gen_tokens": tok,
-            "tail": text[-120:],
-        }, ok
-    return _run_simple_bench(
-        model, tokenizer, device, "truthful", BENCH_TRUTHFUL_MAX_TOKENS,
-        prompt_fn=_format_truthful_prompt, grade_fn=_grade,
-    )
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("truthful") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_truthful_prompt(it)
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_TRUTHFUL_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    pred = _extract_mmlu_letter(cleaned, max_letter="J")
+                    ok = 1 if pred and pred == it["gold_letter"] else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "pred": pred,
+                        "gold": it["gold_letter"],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── long_context_bench (Session 3.5 — retrieval over long context) ───
@@ -13873,35 +13919,56 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
     moment the model says ANY other code, it loses the item — even if
     the gold is also somewhere in the output.
     """
-    def _grade(it, text, tok):
-        cleaned = _strip_thinking_probe(text or "").strip()
-        gold = str(it.get("answer", ""))
-        confuser_answers = it.get("confuser_answers") or []
-        pred_upper = cleaned.upper()
-        gold_in_pred = bool(gold and gold.upper() in pred_upper)
-        confuser_in_pred = any(
-            ca and ca.upper() in pred_upper for ca in confuser_answers
-        )
-        ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
-        # confuser_hit telemetry: the model emitted a confuser code,
-        # whether or not it also emitted the gold. Lets us tell
-        # "dumped everything" from "picked the wrong needle".
-        confuser_hit = bool(confuser_answers and confuser_in_pred)
-        return {
-            "src": it.get("src", ""),
-            "gold": gold,
-            "pred_tail": cleaned[-120:],
-            "ok": bool(ok),
-            "gen_tokens": tok,
-            "needle_position": it.get("needle_position"),
-            "confuser_positions": it.get("confuser_positions", []),
-            "confuser_hit": confuser_hit,
-            "gold_in_pred": gold_in_pred,
-        }, ok
-    return _run_simple_bench(
-        model, tokenizer, device, "long_context", BENCH_LC_MAX_TOKENS,
-        prompt_fn=_format_long_context_prompt, grade_fn=_grade,
-    )
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("long_context") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_long_context_prompt(it)
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_LC_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    gold = str(it.get("answer", ""))
+                    confuser_answers = it.get("confuser_answers") or []
+                    pred_upper = cleaned.upper()
+                    gold_in_pred = bool(gold and gold.upper() in pred_upper)
+                    confuser_in_pred = any(
+                        ca and ca.upper() in pred_upper for ca in confuser_answers
+                    )
+                    ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
+                    # confuser_hit = the model emitted a confuser code,
+                    # whether or not it also emitted the gold. This is the
+                    # axis we expect bad models to fail on.
+                    confuser_hit = bool(confuser_answers and confuser_in_pred)
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "gold": gold,
+                        "pred_tail": cleaned[-120:],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "needle_position": it.get("needle_position"),
+                        "confuser_positions": it.get("confuser_positions", []),
+                        "confuser_hit": confuser_hit,
+                        "gold_in_pred": gold_in_pred,
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 def run_bench_battery(model, tokenizer, device="cuda",
@@ -14368,15 +14435,27 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
             stats["reason"] = "think_probe_skip:no_chat_template"
             return stats
 
-        eos_ids, pad_id = _eos_pad_ids(tokenizer)
+        eos_ids = []
+        for tok in ["<|im_end|>", "<|endoftext|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0:
+                eos_ids.append(tid)
+        if getattr(tokenizer, "eos_token_id", None) is not None:
+            eos_ids.append(int(tokenizer.eos_token_id))
+        eos_ids = list(set(eos_ids)) or None
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = eos_ids[0] if eos_ids else 0
 
+        was_training = model.training
+        model.eval()
         terminated = 0
         gen_tokens_acc = 0
         student_m = []
         samples = []
 
         think_prompts = _pick_think_probe_prompts(block_seed)
-        with _model_eval_no_grad(model):
+        with torch.no_grad():
             for prompt in think_prompts:
                 msgs = [{"role": "user", "content": prompt}]
                 try:
@@ -14528,6 +14607,8 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
                 f"mean_gen={stats['mean_gen_tokens']:.0f}"
             )
 
+        if was_training:
+            model.train()
         return stats
     except Exception as e:
         stats["reason"] = f"think_probe_error:{str(e)[:120]}"
@@ -14583,7 +14664,9 @@ def on_policy_rollouts(student, tokenizer, device="cuda",
 
     eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
-    with _model_eval_no_grad(student):
+    was_training = student.training
+    student.eval()
+    try:
         for p_idx, prompt in enumerate(prompts):
             try:
                 msgs = [{"role": "user", "content": prompt}]
@@ -14598,17 +14681,19 @@ def on_policy_rollouts(student, tokenizer, device="cuda",
                 torch.manual_seed(seed + p_idx)
                 if device == "cuda":
                     torch.cuda.manual_seed(seed + p_idx)
-                out = student.generate(
-                    ids, max_new_tokens=max_new,
-                    do_sample=True, temperature=temperature, top_p=top_p,
-                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                )
+                with torch.no_grad():
+                    out = student.generate(
+                        ids, max_new_tokens=max_new,
+                        do_sample=True, temperature=temperature, top_p=top_p,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
                 prompt_len = int(ids.shape[1])
                 full_ids = out  # [1, prompt_len + gen_len]
                 gen_len = int(full_ids.shape[1] - prompt_len)
                 if gen_len <= 0:
                     continue
-                s_logits = student(full_ids).logits.float()
+                with torch.no_grad():
+                    s_logits = student(full_ids).logits.float()
                 # Positions prompt_len-1 .. end-1 predict the generated tokens
                 cont = s_logits[0, prompt_len - 1:-1, :]  # [gen_len, V]
                 if cont.shape[0] == 0:
@@ -14636,6 +14721,9 @@ def on_policy_rollouts(student, tokenizer, device="cuda",
             except Exception as e:
                 print(f"[on-policy-rkl] rollout {p_idx} error: {str(e)[:120]}", flush=True)
                 continue
+    finally:
+        if was_training:
+            student.train()
     return rollouts
 
 
@@ -14671,7 +14759,9 @@ def on_policy_rkl_score(teacher, rollouts: list[dict], device: str = "cuda",
     if teacher is None or not rollouts:
         return agg
 
-    with _model_eval_no_grad(teacher):
+    was_training = teacher.training
+    teacher.eval()
+    try:
         per_rollout = []
         total_rkl = 0.0
         total_fkl = 0.0
@@ -14686,7 +14776,8 @@ def on_policy_rkl_score(teacher, rollouts: list[dict], device: str = "cuda",
                 topk_idx = r["topk_idx"].to(device)          # [gen_len, K]
                 s_topk_lp = r["topk_logprobs"].to(device)    # [gen_len, K]
                 sampled_lp_s = r["sampled_logprobs"].to(device)  # [gen_len]
-                t_logits = teacher(full_ids).logits.float()
+                with torch.no_grad():
+                    t_logits = teacher(full_ids).logits.float()
                 t_cont = t_logits[0, prompt_len - 1:-1, :]   # [gen_len, V]
                 if t_cont.shape[0] == 0:
                     continue
@@ -14764,6 +14855,9 @@ def on_policy_rkl_score(teacher, rollouts: list[dict], device: str = "cuda",
         agg["per_rollout"] = per_rollout
         agg["skew_alpha"] = skew_alpha
         agg["top_k"] = int(rollouts[0]["topk_idx"].shape[-1]) if rollouts else None
+    finally:
+        if was_training:
+            teacher.train()
     return agg
 
 

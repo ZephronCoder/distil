@@ -481,35 +481,42 @@ class TestCodeParaphraseAppliedAtRoundStart(unittest.TestCase):
         """v27: code/mbpp samples must come from the procedural generator
         keyed on block_seed (not from a static pool with paraphrasing).
         This is a strictly stronger Goodhart defense than v23 paraphrase.
+
+        We assert against the ``_BENCH_SAMPLE_GENERATORS`` registry
+        directly so the test survives source-text refactors but still
+        fails the moment ``code`` is silently dropped from the round-start
+        wiring.
         """
-        src = open(pev.__file__).read()
-        self.assertIn(
-            '_BENCH_SAMPLES["code"] = _generate_code_items(block_seed', src,
-            "set_bench_block_seed does not wire _generate_code_items — "
+        registry = pev._BENCH_SAMPLE_GENERATORS
+        code_entry = next((e for e in registry if e[0] == "code"), None)
+        self.assertIsNotNone(
+            code_entry,
+            "set_bench_block_seed registry has no `code` entry — "
             "v27 procedural generation will not take effect at round-start",
+        )
+        self.assertEqual(
+            code_entry[1], "_generate_code_items",
+            "`code` entry must dispatch to _generate_code_items",
         )
 
     def test_wiring_covers_code_and_mbpp(self):
         """Both ``code`` and ``mbpp`` sample lists must be procedurally
-        generated per round (v27 — replaces v23 paraphrase wiring)."""
-        src = open(pev.__file__).read()
-        code_pattern = re.compile(
-            r'_BENCH_SAMPLES\["code"\]\s*=\s*_generate_code_items\(\s*block_seed',
-            re.DOTALL,
-        )
-        mbpp_pattern = re.compile(
-            r'_BENCH_SAMPLES\["mbpp"\]\s*=\s*_generate_code_items\(\s*\n?\s*'
-            r'block_seed\s*\^\s*0x4D42',
-            re.DOTALL,
-        )
-        self.assertTrue(
-            code_pattern.search(src),
-            "code_bench procedural wiring missing from set_bench_block_seed",
-        )
-        self.assertTrue(
-            mbpp_pattern.search(src),
-            "mbpp_bench procedural wiring missing from set_bench_block_seed",
-        )
+        generated per round (v27 — replaces v23 paraphrase wiring).
+
+        ``mbpp`` shares the code generator but uses the ``0x4D42`` XOR
+        offset to keep its procedural pool independent from
+        ``code_bench``.
+        """
+        registry = {entry[0]: entry for entry in pev._BENCH_SAMPLE_GENERATORS}
+        self.assertIn("code", registry,
+                      "code_bench procedural wiring missing from registry")
+        self.assertIn("mbpp", registry,
+                      "mbpp_bench procedural wiring missing from registry")
+        self.assertEqual(registry["code"][1], "_generate_code_items")
+        self.assertEqual(registry["mbpp"][1], "_generate_code_items")
+        self.assertEqual(registry["mbpp"][2], 0x4D42,
+                         "mbpp must use the 0x4D42 XOR offset to stay "
+                         "independent from code_bench's pool")
 
 
 # ── Tests: Edge-case robustness ──────────────────────────────────────
