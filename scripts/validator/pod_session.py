@@ -18,6 +18,110 @@ EARLY_STOP_MIN = int(os.environ.get("DISTIL_EARLY_STOP_MIN", "0") or "0")
 logger = logging.getLogger("distillation.remote_validator")
 
 
+# Validator env vars that propagate into the pod's eval shell so a
+# systemd override can flip behaviour without redeploying the pod
+# bundle. Centralised here (vs inline in run_eval_on_pod) so a new
+# tunable is added in one place and the function body stays
+# scrollable. See ``scripts/pod_eval_vllm.py`` for the per-var
+# semantics; the comment groups below mirror the historical groupings
+# in case a quick visual scan is needed during incident triage.
+_POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
+    # Bench battery toggles
+    "BENCH_BATTERY_ENABLED",
+    "BENCH_BATTERY_SHADOW_AXES",
+    "BENCH_BATTERY_LITE",
+    "POD_PER_MODEL_TIMEOUT",
+    "ARENA_V3_AXES_IN_COMPOSITE",
+    "REASONING_DENSITY_IN_COMPOSITE",
+    # Validator-authoritative composite gates (2026-04-26): without
+    # these the pod-side ``in_composite`` log labels lied vs the
+    # validator's actual scoring. See pod_eval_vllm.py
+    # JUDGE_PROBE_IN_COMPOSITE alignment patch.
+    "JUDGE_AXIS_IN_COMPOSITE",
+    "CHAT_TURNS_AXIS_IN_COMPOSITE",
+    "PARETO_DOMINANCE_GATE",
+    "KING_REGRESSION_GATE",
+    # Bench sample counts (per round)
+    "BENCH_MATH_PER_ROUND",
+    "BENCH_CODE_PER_ROUND",
+    "BENCH_REASONING_PER_ROUND",
+    "BENCH_KNOWLEDGE_PER_ROUND",
+    "BENCH_IFEVAL_PER_ROUND",
+    "BENCH_AIME_PER_ROUND",
+    "BENCH_MBPP_PER_ROUND",
+    "BENCH_TOOL_USE_PER_ROUND",
+    "BENCH_SELF_CONSISTENCY_PER_ROUND",
+    "BENCH_SELF_CONSISTENCY_SAMPLES",
+    "BENCH_ARC_PER_ROUND",
+    "BENCH_TRUTHFUL_PER_ROUND",
+    "BENCH_LC_PER_ROUND",
+    "BENCH_PROCEDURAL_PER_ROUND",
+    "BENCH_ROBUSTNESS_PER_ROUND",
+    "BENCH_ROBUSTNESS_PERTURB_K",
+    "BENCH_NOISE_PER_ROUND",
+    "BENCH_NOISE_PERTURB_K",
+    # Bench max-token budgets (added 2026-04-25 to cap wall time —
+    # the default 1024-token AIME budget alone burns ~120s/student
+    # even when the model can't solve a single problem).
+    "BENCH_MATH_MAX_TOKENS",
+    "BENCH_CODE_MAX_TOKENS",
+    "BENCH_REASONING_MAX_TOKENS",
+    "BENCH_KNOWLEDGE_MAX_TOKENS",
+    "BENCH_IFEVAL_MAX_TOKENS",
+    "BENCH_AIME_MAX_TOKENS",
+    "BENCH_MBPP_MAX_TOKENS",
+    "BENCH_TOOL_USE_MAX_TOKENS",
+    "BENCH_SELF_CONSISTENCY_MAX_TOKENS",
+    "BENCH_ARC_MAX_TOKENS",
+    "BENCH_TRUTHFUL_MAX_TOKENS",
+    "BENCH_LC_MAX_TOKENS",
+    "BENCH_PROCEDURAL_MAX_TOKENS",
+    "BENCH_ROBUSTNESS_MAX_TOKENS",
+    "BENCH_NOISE_MAX_TOKENS",
+    # Probe knobs
+    "JUDGE_PROBE_PER_ROUND",
+    "JUDGE_PROBE_MAX_TOKENS",
+    "CHAT_TURNS_PROBE_PER_ROUND",
+    "CHAT_TURNS_PROBE_MAX_TOKENS",
+    "CHAT_TURNS_PROBE",
+    # Cloud-API teacher path (2026-05-03 Kimi K2.6 cutover): when
+    # DISTIL_TEACHER_MODE=api the pod skips local vLLM/HF teacher
+    # entirely and fetches generation + top-K logprobs from an
+    # external OpenAI-compatible provider. See
+    # scripts/api_teacher.py for design.
+    "DISTIL_TEACHER_MODE",
+    "DISTIL_TEACHER_API_BASE",
+    "DISTIL_TEACHER_API_KEY",
+    "OPENROUTER_API_KEY",  # accepted as alias inside api_teacher.from_env
+    "DISTIL_TEACHER_API_MODEL",
+    "DISTIL_TEACHER_API_ENDPOINT",
+    "DISTIL_TEACHER_API_PROVIDERS",
+    "DISTIL_TEACHER_API_CONCURRENCY",
+    "DISTIL_TEACHER_API_TOP_LOGPROBS",
+    "DISTIL_TEACHER_API_TIMEOUT_S",
+    "DISTIL_TEACHER_API_DISABLE_REASONING",
+    "DISTIL_OPENROUTER_REFERER",
+    "DISTIL_OPENROUTER_TITLE",
+    # 2026-05-04: student-side knobs propagated through to the pod.
+    # ``DISTIL_STUDENT_BATCH_SIZE`` activates the v30.4 batched-forward
+    # path (currently dormant unless set) which gives a 2-3x wall-time
+    # win on the per-prompt KL loop. Without propagation the pod env
+    # never sees it and the pod falls back to single-prompt forwards.
+    "DISTIL_STUDENT_BATCH_SIZE",
+)
+
+
+def _is_api_teacher_mode() -> bool:
+    """Return True iff DISTIL_TEACHER_MODE=api in the validator env.
+
+    Routed through one helper so the (lower-cased, env-driven) check
+    is consistent across ETA computation, vLLM startup gating and
+    any future caller. The pod-side equivalent lives in
+    ``scripts/api_teacher.py``.
+    """
+    return os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+
+
 def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, is_full_eval: bool, use_vllm: bool, eval_script: str, block_seed: int | None = None, resume_pod_eval: dict | None = None):
     """Drive a pod-side eval to completion, downloading results when done.
 
@@ -108,7 +212,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # roughly 7 derailed × 19 min + 3 healthy × 45 min = ~270 min on
     # a 10-student round. Bake that into the ETA so miners' "stuck"
     # complaints stop spiking on every round restart.
-    _api_mode = os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+    _api_mode = _is_api_teacher_mode()
     est_teacher_s = 515 if _api_mode else 180
     # Mixed-fleet average: weight 70% derailed × 19 min + 30%
     # healthy × 45 min = ~27 min/student post-cap. Use 1700s as the
@@ -390,7 +494,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # vLLM server never spins up — but pinning ``--no-vllm`` here keeps
     # the inner_eval command self-documenting and prevents any future
     # regression where the vLLM startup races with the API generation.
-    _api_mode = os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+    _api_mode = _is_api_teacher_mode()
     if use_vllm and not _api_mode:
         # Eval shares the GPU with the chat-king vLLM. Two regimes:
         #
@@ -650,95 +754,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # shadow axes: aime/mbpp/tool_use/self_consistency/arc/truthful/long_context)
     # adds ~6 min/student (~84 min/round for 14 students). Propagate the
     # tunables from validator env so we can flip them via systemd override
-    # without redeploying code. See ``scripts/pod_eval_vllm.py`` for semantics.
-    for _propagate in (
-        "BENCH_BATTERY_ENABLED",
-        "BENCH_BATTERY_SHADOW_AXES",
-        "BENCH_BATTERY_LITE",
-        "POD_PER_MODEL_TIMEOUT",
-        "ARENA_V3_AXES_IN_COMPOSITE",
-        "REASONING_DENSITY_IN_COMPOSITE",
-        # 2026-04-26 — propagate validator-authoritative composite gates
-        # so the pod-side `pod_eval_vllm.py` reports `in_composite` /
-        # log labels that match what the validator will actually do
-        # downstream. Previously the pod read separate ``*_PROBE_IN_COMPOSITE``
-        # variables that defaulted to "0" while these axes defaulted to
-        # "1" in composite.py, so the eval log lied about whether axes
-        # were in production. See pod_eval_vllm.py JUDGE_PROBE_IN_COMPOSITE
-        # alignment patch.
-        "JUDGE_AXIS_IN_COMPOSITE",
-        "CHAT_TURNS_AXIS_IN_COMPOSITE",
-        "PARETO_DOMINANCE_GATE",
-        "KING_REGRESSION_GATE",
-        # Bench sample counts.
-        "BENCH_MATH_PER_ROUND",
-        "BENCH_CODE_PER_ROUND",
-        "BENCH_REASONING_PER_ROUND",
-        "BENCH_KNOWLEDGE_PER_ROUND",
-        "BENCH_IFEVAL_PER_ROUND",
-        "BENCH_AIME_PER_ROUND",
-        "BENCH_MBPP_PER_ROUND",
-        "BENCH_TOOL_USE_PER_ROUND",
-        "BENCH_SELF_CONSISTENCY_PER_ROUND",
-        "BENCH_SELF_CONSISTENCY_SAMPLES",
-        "BENCH_ARC_PER_ROUND",
-        "BENCH_TRUTHFUL_PER_ROUND",
-        "BENCH_LC_PER_ROUND",
-        "BENCH_PROCEDURAL_PER_ROUND",
-        "BENCH_ROBUSTNESS_PER_ROUND",
-        "BENCH_ROBUSTNESS_PERTURB_K",
-        "BENCH_NOISE_PER_ROUND",
-        "BENCH_NOISE_PERTURB_K",
-        # Bench max-token budgets — added 2026-04-25 17:00 UTC after live
-        # round wall-time observation pegged the bench battery at ~11 min/
-        # student. The default 1024-token AIME budget alone burns ~120 s/
-        # student even when the model can't get a single problem right;
-        # tightening it (and other budgets) is the single biggest lever.
-        "BENCH_MATH_MAX_TOKENS",
-        "BENCH_CODE_MAX_TOKENS",
-        "BENCH_REASONING_MAX_TOKENS",
-        "BENCH_KNOWLEDGE_MAX_TOKENS",
-        "BENCH_IFEVAL_MAX_TOKENS",
-        "BENCH_AIME_MAX_TOKENS",
-        "BENCH_MBPP_MAX_TOKENS",
-        "BENCH_TOOL_USE_MAX_TOKENS",
-        "BENCH_SELF_CONSISTENCY_MAX_TOKENS",
-        "BENCH_ARC_MAX_TOKENS",
-        "BENCH_TRUTHFUL_MAX_TOKENS",
-        "BENCH_LC_MAX_TOKENS",
-        "BENCH_PROCEDURAL_MAX_TOKENS",
-        "BENCH_ROBUSTNESS_MAX_TOKENS",
-        "BENCH_NOISE_MAX_TOKENS",
-        # Probe knobs.
-        "JUDGE_PROBE_PER_ROUND",
-        "JUDGE_PROBE_MAX_TOKENS",
-        "CHAT_TURNS_PROBE_PER_ROUND",
-        "CHAT_TURNS_PROBE_MAX_TOKENS",
-        "CHAT_TURNS_PROBE",
-        # ── Cloud-API teacher path (2026-05-03 Kimi K2.6 cutover) ──
-        # When DISTIL_TEACHER_MODE=api the pod skips local vLLM/HF teacher
-        # entirely and fetches generation + top-K logprobs from an external
-        # OpenAI-compatible provider. See scripts/api_teacher.py for design.
-        "DISTIL_TEACHER_MODE",
-        "DISTIL_TEACHER_API_BASE",
-        "DISTIL_TEACHER_API_KEY",
-        "OPENROUTER_API_KEY",  # accepted as alias inside api_teacher.from_env
-        "DISTIL_TEACHER_API_MODEL",
-        "DISTIL_TEACHER_API_ENDPOINT",
-        "DISTIL_TEACHER_API_PROVIDERS",
-        "DISTIL_TEACHER_API_CONCURRENCY",
-        "DISTIL_TEACHER_API_TOP_LOGPROBS",
-        "DISTIL_TEACHER_API_TIMEOUT_S",
-        "DISTIL_TEACHER_API_DISABLE_REASONING",
-        "DISTIL_OPENROUTER_REFERER",
-        "DISTIL_OPENROUTER_TITLE",
-        # 2026-05-04: Student-side knobs propagated through to the pod.
-        # ``DISTIL_STUDENT_BATCH_SIZE`` activates the v30.4 batched-forward
-        # path (currently dormant unless set) which gives a 2-3x wall-time
-        # win on the per-prompt KL loop. Without propagation the pod env
-        # never sees it and the pod falls back to single-prompt forwards.
-        "DISTIL_STUDENT_BATCH_SIZE",
-    ):
+    # without redeploying code. See ``scripts/pod_eval_vllm.py`` for semantics
+    # and ``_POD_EVAL_ENV_ALLOWLIST`` (top of this module) for the full list.
+    for _propagate in _POD_EVAL_ENV_ALLOWLIST:
         _v = os.environ.get(_propagate)
         if _v is not None:
             eval_env[_propagate] = _v
