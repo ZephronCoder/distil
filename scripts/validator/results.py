@@ -1057,10 +1057,6 @@ def _check_activation_copy_dq(
         for u, info in models_to_eval.items()
         if info.get("commit_block") is not None
     }
-    uid_to_round_model = {
-        u: info.get("model") for u, info in models_to_eval.items()
-        if info.get("model")
-    }
     uid_to_round_revision = {
         u: info.get("revision", "main") for u, info in models_to_eval.items()
         if info.get("model")
@@ -1075,7 +1071,6 @@ def _check_activation_copy_dq(
         evaluated_uids=state.evaluated_uids,
         composite_scores=state.composite_scores,
         revision=this_revision,
-        uid_to_model=uid_to_round_model,
         uid_to_revision=uid_to_round_revision,
     )
     if not is_copy:

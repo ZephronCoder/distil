@@ -113,7 +113,6 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
                                  uid_to_coldkey=None,
                                  evaluated_uids=None, composite_scores=None,
                                  revision: str = "main",
-                                 uid_to_model: dict = None,
                                  uid_to_revision: dict = None):
     """Compare the incoming model's activation fingerprint against stored ones.
 
@@ -344,7 +343,6 @@ def _one_eval_per_registration_enabled() -> bool:
 def _check_registration_already_used(
     hotkey: str, model_repo: str, revision: str,
     state: ValidatorState,
-    coldkey: str | None = None,
     commit_block: int | None = None,
 ) -> tuple[bool, str | None]:
     """Has this hotkey already used its one-eval-per-registration slot?
@@ -361,10 +359,11 @@ def _check_registration_already_used(
       • Hotkey in tracker, different (model, revision) → recommit
         spam. Reject.
 
-    The ``coldkey`` arg is preserved for telemetry (it gets persisted
-    into ``evaluated_hotkeys[hotkey].coldkey`` so the dashboard can
-    surface coldkey clustering) but is NOT used for cross-hotkey
-    enforcement — multiple hotkeys under one coldkey are allowed.
+    Coldkey is persisted into ``evaluated_hotkeys[hotkey].coldkey``
+    by ``merge_composite_scores`` (see ``single_eval.py``) so the
+    dashboard can surface coldkey clustering, but cross-hotkey
+    enforcement is NOT applied — multiple hotkeys under one coldkey
+    are allowed.
 
     Re-registration of a deregistered slot installs a brand new
     hotkey on Bittensor, so a fresh hotkey naturally bypasses this
@@ -400,6 +399,196 @@ def _check_registration_already_used(
     )
 
 
+def _clear_uid_hash_and_stale_dqs(
+    *,
+    uid: int,
+    hotkey: str,
+    stored_hotkey,
+    stored_commit_block,
+    state: ValidatorState,
+    log_reason: str,
+    new_block,
+    reset_failures_fn=None,
+) -> None:
+    """Drop a UID's stored model hash + stale DQ entries.
+
+    Called when a UID's commitment changes (different block, different
+    hotkey, or a legacy hash with no stored block) so the next round
+    re-runs the full integrity check against the new revision.
+
+    DQ keys are cleared under two shapes — ``{hotkey}:{block}``
+    (block-scoped) and ``{hotkey}`` (legacy unscoped) — for both
+    the current hotkey and the previously stored one (if different),
+    so a UID-recycle that DQ'd the old occupant doesn't poison the
+    new one. Also discards ``evaluated_uids`` membership and any
+    cached score so the new commitment is treated as fresh.
+
+    ``reset_failures_fn(uid, state.failures)`` is called when supplied
+    (the full-check path always resets failures so a transient
+    network blip from the previous occupant doesn't gate the new
+    submission; the quick-path skips it because the caller falls
+    through to a full check that will reset failures itself).
+    """
+    logger.info(
+        f"UID {uid}: {log_reason} at block {new_block} "
+        f"(was {stored_commit_block}), resetting hash"
+    )
+    state.model_hashes.pop(str(uid), None)
+    state.model_hashes.pop(f"{uid}_block", None)
+    state.model_hashes.pop(f"{uid}_hotkey", None)
+    for dq_hk in [hotkey, stored_hotkey] if stored_hotkey else [hotkey]:
+        for dq_key in [f"{dq_hk}:{stored_commit_block}", dq_hk]:
+            if dq_key and dq_key in state.dq_reasons:
+                logger.info(f"UID {uid}: Clearing stale DQ: {dq_key}")
+                del state.dq_reasons[dq_key]
+    state.evaluated_uids.discard(str(uid))
+    state.scores.pop(str(uid), None)
+    if reset_failures_fn is not None:
+        reset_failures_fn(uid, state.failures)
+
+
+def _resolve_weight_duplicate(
+    *,
+    uid: int,
+    model_repo: str,
+    revision: str,
+    hotkey: str,
+    this_commit_block,
+    this_block,
+    duplicate_uid: int,
+    hash_value: str,
+    commit: dict,
+    commitments: dict,
+    uid_to_hotkey: dict,
+    state: ValidatorState,
+    valid_models: dict,
+    disqualified: set,
+    register_fn,
+    detection_label: str,
+    duplicate_log_label: str,
+    griefing_log_label: str,
+    weight_phrase: str,
+    weight_suffix: str = "",
+) -> bool:
+    """Resolve a weight duplicate detection (SHA hash or content hash).
+
+    Both ``check_duplicate_hash`` (SHA256 of weight tensors) and
+    ``check_duplicate_content_hash`` (shard-invariant content hash)
+    converge on the same downstream pipeline:
+
+      1. Try the HF-upload-time tiebreak via :func:`_hf_upload_griefing_swap`.
+         If the would-be "original" was actually uploaded later than the
+         would-be "copy", swap the DQ direction.
+      2. Otherwise compare chain commit blocks: the later commit is the
+         copy unless the GRIEFING guard fires (later UID is already
+         evaluated, earlier UID never was — the earlier UID is the
+         copy that pre-reserved a slot then uploaded king weights).
+      3. Register the canonical hash under the keeper so future detections
+         match against the right UID.
+
+    The two callers differ only in (a) which ``register_fn`` /
+    ``detection_label`` they pass and (b) the log/DQ wording.
+    Centralising the resolver keeps fix-ups in lockstep — a bug fixed
+    in one block was historically not fixed in the other (drift bug class).
+
+    ``weight_suffix`` is appended after the model name in DQ reasons
+    (content-hash uses " (re-sharded)"; SHA-hash leaves it empty).
+
+    Returns ``True`` if ``uid`` itself was DQ'd and the caller should
+    ``continue`` to the next UID; ``False`` if a different UID was DQ'd
+    (or no DQ at all) and the caller should keep processing ``uid``.
+    """
+    orig_block = commitments.get(duplicate_uid, {}).get("block", float("inf"))
+    orig_model = commitments.get(duplicate_uid, {}).get("model", "?")
+    orig_revision = commitments.get(duplicate_uid, {}).get("revision", "main")
+    orig_hotkey = uid_to_hotkey.get(duplicate_uid, str(duplicate_uid))
+    orig_commit_block = commitments.get(duplicate_uid, {}).get("block")
+
+    hf_swap = _hf_upload_griefing_swap(
+        state_dir=state.state_dir,
+        this_uid=uid, this_repo=model_repo, this_revision=revision,
+        this_block=this_block, this_hotkey=hotkey,
+        orig_uid=duplicate_uid, orig_repo=orig_model, orig_revision=orig_revision,
+        orig_block=orig_block, orig_hotkey=orig_hotkey,
+        detection_label=detection_label,
+    )
+    if hf_swap is not None:
+        griefer_uid = hf_swap["copy_uid"]
+        griefer_hotkey = hf_swap["copy_hotkey"]
+        griefer_block = hf_swap["copy_block"]
+        keeper_uid = hf_swap["original_uid"]
+        keeper_repo = hf_swap["original_repo"]
+        state.scores[str(griefer_uid)] = MAX_KL_THRESHOLD + 1
+        disqualify(
+            griefer_hotkey,
+            f"copy: {weight_phrase} UID {keeper_uid} ({keeper_repo}){weight_suffix}, "
+            f"HF upload griefing (chain block {griefer_block} earlier than victim, "
+            f"but HF upload was {int(hf_swap['orig_ts'] - hf_swap['this_ts'])}s "
+            f"after victim's upload)",
+            state.dq_reasons,
+            commit_block=griefer_block,
+        )
+        valid_models.pop(griefer_uid, None)
+        disqualified.add(griefer_uid)
+        register_fn(hash_value, keeper_uid, state.state_dir)
+        return griefer_uid == uid
+
+    this_evaluated = (
+        str(uid) in state.evaluated_uids
+        and str(uid) in state.composite_scores
+    )
+    orig_evaluated = (
+        str(duplicate_uid) in state.evaluated_uids
+        and str(duplicate_uid) in state.composite_scores
+    )
+    if this_block >= orig_block and not (this_evaluated and not orig_evaluated):
+        logger.info(
+            f"UID {uid} ({model_repo}): {duplicate_log_label} of UID {duplicate_uid}"
+        )
+        state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+        disqualify(
+            hotkey,
+            f"copy: {weight_phrase} UID {duplicate_uid} ({orig_model}){weight_suffix}, "
+            f"committed later at block {this_block} vs {orig_block}",
+            state.dq_reasons,
+            commit_block=this_commit_block,
+        )
+        disqualified.add(uid)
+        return True
+    if this_evaluated and not orig_evaluated and this_block >= orig_block:
+        logger.warning(
+            f"UID {duplicate_uid} ({orig_model}): {griefing_log_label} — committed earlier "
+            f"(block {orig_block}) but never evaluated; UID {uid} has composite scores. "
+            f"DQ'ing the unevaluated model."
+        )
+        state.scores[str(duplicate_uid)] = MAX_KL_THRESHOLD + 1
+        disqualify(
+            orig_hotkey,
+            f"copy: {weight_phrase} UID {uid} ({model_repo}){weight_suffix}, "
+            f"griefing attack (committed earlier but never evaluated)",
+            state.dq_reasons,
+            commit_block=orig_commit_block,
+        )
+        valid_models.pop(duplicate_uid, None)
+        disqualified.add(duplicate_uid)
+        register_fn(hash_value, uid, state.state_dir)
+    else:
+        logger.info(
+            f"UID {duplicate_uid} is {duplicate_log_label.lower()} of UID {uid} (committed earlier)"
+        )
+        state.scores[str(duplicate_uid)] = MAX_KL_THRESHOLD + 1
+        disqualify(
+            orig_hotkey,
+            f"copy: {weight_phrase} UID {uid} ({model_repo}){weight_suffix}, committed later",
+            state.dq_reasons,
+            commit_block=orig_commit_block,
+        )
+        valid_models.pop(duplicate_uid, None)
+        disqualified.add(duplicate_uid)
+        register_fn(hash_value, uid, state.state_dir)
+    return False
+
+
 def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: ValidatorState, max_params_b: float):
     valid_models = {}
     disqualified = set()
@@ -421,7 +610,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         # cross-hotkey-under-same-coldkey commits are NOT rejected.
         coldkey = uid_to_coldkey.get(uid) if uid_to_coldkey else None
         already_used, reason = _check_registration_already_used(
-            hotkey, model_repo, revision, state, coldkey=coldkey,
+            hotkey, model_repo, revision, state,
             commit_block=this_commit_block,
         )
         if already_used:
@@ -501,18 +690,15 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             block_changed_quick = this_commit_block and stored_block_quick and this_commit_block != stored_block_quick
             if hotkey_changed_quick or block_changed_quick:
                 reason = "hotkey changed (UID recycled)" if hotkey_changed_quick else "new commitment"
-                logger.info(f"UID {uid}: quick re-check: {reason} at block {this_commit_block} (was {stored_block_quick}), resetting hash")
+                _clear_uid_hash_and_stale_dqs(
+                    uid=uid, hotkey=hotkey,
+                    stored_hotkey=stored_hotkey_quick,
+                    stored_commit_block=stored_block_quick,
+                    state=state,
+                    log_reason=f"quick re-check: {reason}",
+                    new_block=this_commit_block,
+                )
                 expected_hash = None
-                state.model_hashes.pop(str(uid), None)
-                state.model_hashes.pop(f"{uid}_block", None)
-                state.model_hashes.pop(f"{uid}_hotkey", None)
-                for dq_hk in [hotkey, stored_hotkey_quick] if stored_hotkey_quick else [hotkey]:
-                    for dq_key in [f"{dq_hk}:{stored_block_quick}", dq_hk]:
-                        if dq_key and dq_key in state.dq_reasons:
-                            logger.info(f"UID {uid}: Clearing stale DQ: {dq_key}")
-                            del state.dq_reasons[dq_key]
-                state.evaluated_uids.discard(uid_str)
-                state.scores.pop(uid_str, None)
                 _needs_full_check = True
             if not _needs_full_check:
                 integrity = verify_model_integrity(model_repo, revision, expected_hash)
@@ -538,7 +724,6 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             continue
         logger.info(f"Checking {model_repo}...")
         hf_user = model_repo.split("/")[0] if "/" in model_repo else None
-        coldkey = uid_to_coldkey.get(uid)
         flag_reason = is_flagged(coldkey=coldkey, hf_username=hf_user, dq=state.dq_reasons)
         if flag_reason:
             logger.warning(f"UID {uid} FLAGGED: {flag_reason}")
@@ -556,85 +741,20 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         if model_hash:
             original_uid = check_duplicate_hash(model_hash, uid, state.state_dir)
             if original_uid is not None:
-                orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
                 this_block = commit.get("block", float("inf"))
-                orig_model = commitments.get(original_uid, {}).get("model", "?")
-                orig_revision = commitments.get(original_uid, {}).get("revision", "main")
-                orig_hotkey_str = uid_to_hotkey.get(original_uid, str(original_uid))
-                orig_commit_block = commitments.get(original_uid, {}).get("block")
-
-                hf_swap = _hf_upload_griefing_swap(
-                    state_dir=state.state_dir,
-                    this_uid=uid, this_repo=model_repo, this_revision=revision,
-                    this_block=this_block, this_hotkey=hotkey,
-                    orig_uid=original_uid, orig_repo=orig_model, orig_revision=orig_revision,
-                    orig_block=orig_block, orig_hotkey=orig_hotkey_str,
+                if _resolve_weight_duplicate(
+                    uid=uid, model_repo=model_repo, revision=revision, hotkey=hotkey,
+                    this_commit_block=this_commit_block, this_block=this_block,
+                    duplicate_uid=original_uid, hash_value=model_hash,
+                    commit=commit, commitments=commitments, uid_to_hotkey=uid_to_hotkey,
+                    state=state, valid_models=valid_models, disqualified=disqualified,
+                    register_fn=register_model_hash,
                     detection_label="SHA256-hash copy:",
-                )
-                if hf_swap is not None:
-                    griefer_uid = hf_swap["copy_uid"]
-                    griefer_repo = hf_swap["copy_repo"]
-                    griefer_hotkey = hf_swap["copy_hotkey"]
-                    griefer_block = hf_swap["copy_block"]
-                    keeper_uid = hf_swap["original_uid"]
-                    keeper_repo = hf_swap["original_repo"]
-                    state.scores[str(griefer_uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        griefer_hotkey,
-                        f"copy: identical weights to UID {keeper_uid} ({keeper_repo}), "
-                        f"HF upload griefing (chain block {griefer_block} earlier than victim, "
-                        f"but HF upload was {int(hf_swap['orig_ts'] - hf_swap['this_ts'])}s "
-                        f"after victim's upload)",
-                        state.dq_reasons,
-                        commit_block=griefer_block,
-                    )
-                    valid_models.pop(griefer_uid, None)
-                    disqualified.add(griefer_uid)
-                    register_model_hash(model_hash, keeper_uid, state.state_dir)
-                    if griefer_uid == uid:
-                        continue
-
-                this_evaluated = str(uid) in state.evaluated_uids and str(uid) in state.composite_scores
-                orig_evaluated = str(original_uid) in state.evaluated_uids and str(original_uid) in state.composite_scores
-                if this_block >= orig_block and not (this_evaluated and not orig_evaluated):
-                    logger.info(f"UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}")
-                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        hotkey,
-                        f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}",
-                        state.dq_reasons,
-                        commit_block=this_commit_block,
-                    )
-                    disqualified.add(uid)
+                    duplicate_log_label="DUPLICATE",
+                    griefing_log_label="GRIEFING COPY",
+                    weight_phrase="identical weights to",
+                ):
                     continue
-                if this_evaluated and not orig_evaluated and this_block >= orig_block:
-                    logger.warning(
-                        f"UID {original_uid} ({orig_model}): GRIEFING COPY — committed earlier "
-                        f"(block {orig_block}) but never evaluated; UID {uid} has composite scores. "
-                        f"DQ'ing the unevaluated model."
-                    )
-                    state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        orig_hotkey_str,
-                        f"copy: identical weights to UID {uid} ({model_repo}), griefing attack (committed earlier but never evaluated)",
-                        state.dq_reasons,
-                        commit_block=orig_commit_block,
-                    )
-                    valid_models.pop(original_uid, None)
-                    disqualified.add(original_uid)
-                    register_model_hash(model_hash, uid, state.state_dir)
-                else:
-                    logger.info(f"UID {original_uid} is duplicate of UID {uid} (committed earlier)")
-                    state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        orig_hotkey_str,
-                        f"copy: identical weights to UID {uid} ({model_repo}), committed later",
-                        state.dq_reasons,
-                        commit_block=orig_commit_block,
-                    )
-                    valid_models.pop(original_uid, None)
-                    disqualified.add(original_uid)
-                    register_model_hash(model_hash, uid, state.state_dir)
             else:
                 register_model_hash(model_hash, uid, state.state_dir)
         # Shard-invariant content hash — catches re-sharded copies that slip
@@ -643,84 +763,21 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         if content_hash:
             dup_uid = check_duplicate_content_hash(content_hash, uid, state.state_dir)
             if dup_uid is not None:
-                orig_block = commitments.get(dup_uid, {}).get("block", float("inf"))
                 this_block = commit.get("block", float("inf"))
-                orig_model = commitments.get(dup_uid, {}).get("model", "?")
-                orig_revision = commitments.get(dup_uid, {}).get("revision", "main")
-                orig_hotkey = uid_to_hotkey.get(dup_uid, str(dup_uid))
-                orig_commit_block = commitments.get(dup_uid, {}).get("block")
-
-                hf_swap = _hf_upload_griefing_swap(
-                    state_dir=state.state_dir,
-                    this_uid=uid, this_repo=model_repo, this_revision=revision,
-                    this_block=this_block, this_hotkey=hotkey,
-                    orig_uid=dup_uid, orig_repo=orig_model, orig_revision=orig_revision,
-                    orig_block=orig_block, orig_hotkey=orig_hotkey,
+                if _resolve_weight_duplicate(
+                    uid=uid, model_repo=model_repo, revision=revision, hotkey=hotkey,
+                    this_commit_block=this_commit_block, this_block=this_block,
+                    duplicate_uid=dup_uid, hash_value=content_hash,
+                    commit=commit, commitments=commitments, uid_to_hotkey=uid_to_hotkey,
+                    state=state, valid_models=valid_models, disqualified=disqualified,
+                    register_fn=register_content_hash,
                     detection_label="content-hash copy:",
-                )
-                if hf_swap is not None:
-                    griefer_uid = hf_swap["copy_uid"]
-                    griefer_repo = hf_swap["copy_repo"]
-                    griefer_hotkey = hf_swap["copy_hotkey"]
-                    griefer_block = hf_swap["copy_block"]
-                    keeper_uid = hf_swap["original_uid"]
-                    keeper_repo = hf_swap["original_repo"]
-                    state.scores[str(griefer_uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        griefer_hotkey,
-                        f"copy: identical tensor content as UID {keeper_uid} ({keeper_repo}) (re-sharded), "
-                        f"HF upload griefing (chain block {griefer_block} earlier than victim, but HF upload "
-                        f"was {int(hf_swap['orig_ts'] - hf_swap['this_ts'])}s after victim)",
-                        state.dq_reasons,
-                        commit_block=griefer_block,
-                    )
-                    valid_models.pop(griefer_uid, None)
-                    disqualified.add(griefer_uid)
-                    register_content_hash(content_hash, keeper_uid, state.state_dir)
-                    if griefer_uid == uid:
-                        continue
-
-                this_evaluated = str(uid) in state.evaluated_uids and str(uid) in state.composite_scores
-                orig_evaluated = str(dup_uid) in state.evaluated_uids and str(dup_uid) in state.composite_scores
-                if this_block >= orig_block and not (this_evaluated and not orig_evaluated):
-                    logger.info(f"UID {uid} ({model_repo}): CONTENT-DUPLICATE of UID {dup_uid}")
-                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        hotkey,
-                        f"copy: identical tensor content as UID {dup_uid} ({orig_model}) (re-sharded), committed later at block {this_block} vs {orig_block}",
-                        state.dq_reasons,
-                        commit_block=this_commit_block,
-                    )
-                    disqualified.add(uid)
+                    duplicate_log_label="CONTENT-DUPLICATE",
+                    griefing_log_label="GRIEFING COPY (content hash)",
+                    weight_phrase="identical tensor content as",
+                    weight_suffix=" (re-sharded)",
+                ):
                     continue
-                if this_evaluated and not orig_evaluated and this_block >= orig_block:
-                    logger.warning(
-                        f"UID {dup_uid} ({orig_model}): GRIEFING COPY (content hash) — committed earlier "
-                        f"(block {orig_block}) but never evaluated; UID {uid} has composite scores. "
-                        f"DQ'ing the unevaluated model."
-                    )
-                    state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        orig_hotkey,
-                        f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), griefing attack (committed earlier but never evaluated)",
-                        state.dq_reasons,
-                        commit_block=orig_commit_block,
-                    )
-                    valid_models.pop(dup_uid, None)
-                    disqualified.add(dup_uid)
-                    register_content_hash(content_hash, uid, state.state_dir)
-                else:
-                    logger.info(f"UID {dup_uid} is content-duplicate of UID {uid} (committed earlier)")
-                    state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        orig_hotkey,
-                        f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), committed later",
-                        state.dq_reasons,
-                        commit_block=orig_commit_block,
-                    )
-                    valid_models.pop(dup_uid, None)
-                    disqualified.add(dup_uid)
-                    register_content_hash(content_hash, uid, state.state_dir)
             else:
                 register_content_hash(content_hash, uid, state.state_dir)
         expected_hash = state.model_hashes.get(str(uid))
@@ -731,19 +788,16 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         legacy_no_block = expected_hash is not None and stored_commit_block is None and this_commit_block
         if hotkey_changed or block_changed or legacy_no_block:
             reason = "hotkey changed (UID recycled)" if hotkey_changed else "new commitment" if block_changed else "legacy hash (no block stored)"
-            logger.info(f"UID {uid}: {reason} at block {this_commit_block} (was {stored_commit_block}), resetting hash")
+            _clear_uid_hash_and_stale_dqs(
+                uid=uid, hotkey=hotkey,
+                stored_hotkey=stored_hotkey,
+                stored_commit_block=stored_commit_block,
+                state=state,
+                log_reason=reason,
+                new_block=this_commit_block,
+                reset_failures_fn=reset_failures,
+            )
             expected_hash = None
-            state.model_hashes.pop(str(uid), None)
-            state.model_hashes.pop(f"{uid}_block", None)
-            state.model_hashes.pop(f"{uid}_hotkey", None)
-            for dq_hk in [hotkey, stored_hotkey] if stored_hotkey else [hotkey]:
-                for dq_key in [f"{dq_hk}:{stored_commit_block}", dq_hk]:
-                    if dq_key and dq_key in state.dq_reasons:
-                        logger.info(f"UID {uid}: Clearing stale DQ: {dq_key}")
-                        del state.dq_reasons[dq_key]
-            state.evaluated_uids.discard(str(uid))
-            state.scores.pop(str(uid), None)
-            reset_failures(uid, state.failures)
         integrity = verify_model_integrity(model_repo, revision, expected_hash)
         if integrity.get("transient"):
             logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {integrity['reason']}, will retry")
