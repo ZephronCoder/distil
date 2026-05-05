@@ -445,6 +445,36 @@ def _dq_student(
         state.evaluated_uids.add(str(uid))
 
 
+def _dq_student_by_uid(
+    *,
+    state, uid: int, model_name: str,
+    models_to_eval: dict, uid_to_hotkey: dict,
+    reason: str, label: str,
+    log_event_msg: str | None = None, log_event_level: str = "warning",
+    mark_evaluated: bool = True,
+) -> None:
+    """Resolve (hotkey, commit_block) via :func:`_student_id` and DQ.
+
+    Convenience wrapper for the per-student DQ branches in
+    ``process_results`` that don't already have hotkey / commit_block in
+    scope. Cuts out the boilerplate two-call ``_student_id`` →
+    ``_dq_student`` pattern at every fraud / copy / derail branch.
+
+    Use :func:`_dq_student` directly when an alternative commit_block is
+    needed (e.g. the activation-copy branch that wants
+    ``this_commit_block`` from outer scope rather than the one stored on
+    the round entry).
+    """
+    hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
+    _dq_student(
+        state=state, uid=uid, model_name=model_name,
+        hotkey=hotkey, commit_block=commit_block,
+        reason=reason, label=label,
+        log_event_msg=log_event_msg, log_event_level=log_event_level,
+        mark_evaluated=mark_evaluated,
+    )
+
+
 def _run_dethrone_vetos(
     *,
     challenger_uid: int,
@@ -998,10 +1028,9 @@ def _check_long_form_derail_dq(
         f"fresh hotkey on chain with a model that "
         f"doesn't derail."
     )
-    hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
-    _dq_student(
+    _dq_student_by_uid(
         state=state, uid=uid, model_name=model_name,
-        hotkey=hotkey, commit_block=commit_block,
+        models_to_eval=models_to_eval, uid_to_hotkey=uid_to_hotkey,
         reason=reason, label="LONG_FORM_INCOHERENCE",
         log_event_msg=(
             f"UID {uid} ({model_name}) DQ: long_form_incoherence "
@@ -1545,10 +1574,9 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 + (f" (UID {copy_uid})" if copy_uid else "")
                 + " — identical logit distribution"
             )
-            hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
-            _dq_student(
+            _dq_student_by_uid(
                 state=state, uid=uid, model_name=model_name,
-                hotkey=hotkey, commit_block=commit_block,
+                models_to_eval=models_to_eval, uid_to_hotkey=uid_to_hotkey,
                 reason=reason, label="FUNCTIONAL COPY",
             )
             continue
@@ -1559,10 +1587,9 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         ):
             continue
         if student_result.get("status") == "fraud_vram":
-            hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
-            _dq_student(
+            _dq_student_by_uid(
                 state=state, uid=uid, model_name=model_name,
-                hotkey=hotkey, commit_block=commit_block,
+                models_to_eval=models_to_eval, uid_to_hotkey=uid_to_hotkey,
                 reason=student_result.get("reason", "VRAM fraud detected"),
                 label="FRAUD",
             )
@@ -1583,10 +1610,9 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 f"Model cannot be continued-pretrained — see "
                 f"https://distil.arbos.life/docs#anti-finetune"
             )
-            hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
-            _dq_student(
+            _dq_student_by_uid(
                 state=state, uid=uid, model_name=model_name,
-                hotkey=hotkey, commit_block=commit_block,
+                models_to_eval=models_to_eval, uid_to_hotkey=uid_to_hotkey,
                 reason=reason, label="ANTI-FINETUNE",
                 log_event_msg=f"UID {uid} ({model_name}) DQ: anti-finetune ({detail})",
             )
@@ -1602,10 +1628,9 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             logger.warning(f"UID {uid} ({model_name}): ⚠️ {speed_flag}")
         kl = student_result.get("kl_global_avg", float("inf"))
         if kl <= 1e-6:
-            hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
-            _dq_student(
+            _dq_student_by_uid(
                 state=state, uid=uid, model_name=model_name,
-                hotkey=hotkey, commit_block=commit_block,
+                models_to_eval=models_to_eval, uid_to_hotkey=uid_to_hotkey,
                 reason=f"FRAUD: KL={kl:.10f} — model produces identical outputs to teacher",
                 label="FRAUD",
             )

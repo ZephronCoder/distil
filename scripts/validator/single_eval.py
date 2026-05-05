@@ -86,6 +86,57 @@ SINGLE_EVAL_WORST_FLOOR_EPSILON = float(
 )
 
 
+def _composite_record_from_payload(
+    comp: dict,
+    *,
+    model: str,
+    revision: str,
+    block: int | None,
+    extras: dict | None = None,
+) -> dict:
+    """Build a normalised composite record from an h2h ``composite`` payload.
+
+    Both ``merge_composite_scores`` (live round results) and
+    ``_seed_one_h2h_round`` (bootstrap from saved H2H rounds) need to
+    project the on-the-wire ``composite`` dict into the canonical
+    on-disk record shape. Centralising the projection keeps the two
+    paths in lockstep — a new field added to one is automatically
+    visible in the other and on every record we persist.
+
+    ``extras`` is merged in last so callers can stamp path-specific
+    fields (``broken_axes`` / ``version`` / ``present_count`` for the
+    live path, ``_bootstrapped`` for the seed path) without
+    duplicating the float-coercion boilerplate.
+    """
+    def _maybe_float(value):
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    record: dict = {
+        "worst": float(comp.get("worst")),
+        # v30.2 — final ranking key + worst_3_mean.
+        "final": _maybe_float(comp.get("final")),
+        "worst_3_mean": _maybe_float(comp.get("worst_3_mean")),
+        "final_alpha": comp.get("final_alpha"),
+        "weighted": _maybe_float(comp.get("weighted")),
+        "axes": dict(comp.get("axes") or {}),
+        "n_axes": int(comp.get("present_count") or 0),
+        "model": model,
+        "revision": revision,
+        "block": block,
+        "ts": time.time(),
+        "axis_spread": comp.get("axis_spread"),
+        "bench_vs_rel_gap": comp.get("bench_vs_rel_gap"),
+    }
+    if extras:
+        record.update(extras)
+    return record
+
+
 def _commit_signature(info: dict | None) -> tuple:
     """Return a tuple that uniquely identifies a commitment.
 
@@ -213,31 +264,17 @@ def merge_composite_scores(
             continue
         uid_str = str(uid)
         info = models_to_eval.get(uid, {}) or {}
-        record = {
-            "worst": float(worst),
-            # v30.2 — final ranking key + worst_3_mean.
-            "final": (
-                float(comp["final"]) if comp.get("final") is not None else None
-            ),
-            "worst_3_mean": (
-                float(comp["worst_3_mean"]) if comp.get("worst_3_mean") is not None else None
-            ),
-            "final_alpha": comp.get("final_alpha"),
-            "weighted": (
-                float(comp["weighted"]) if comp.get("weighted") is not None else None
-            ),
-            "axes": dict(comp.get("axes") or {}),
-            "n_axes": int(comp.get("present_count") or 0),
-            "present_count": int(comp.get("present_count") or 0),
-            "broken_axes": list(comp.get("broken_axes") or []),
-            "version": comp.get("version"),
-            "model": info.get("model") or row.get("model") or "",
-            "revision": info.get("revision") or "main",
-            "block": info.get("commit_block") or current_block,
-            "ts": time.time(),
-            "axis_spread": comp.get("axis_spread"),
-            "bench_vs_rel_gap": comp.get("bench_vs_rel_gap"),
-        }
+        record = _composite_record_from_payload(
+            comp,
+            model=info.get("model") or row.get("model") or "",
+            revision=info.get("revision") or "main",
+            block=info.get("commit_block") or current_block,
+            extras={
+                "present_count": int(comp.get("present_count") or 0),
+                "broken_axes": list(comp.get("broken_axes") or []),
+                "version": comp.get("version"),
+            },
+        )
         state.composite_scores[uid_str] = record
         n_updated += 1
         # 2026-05-01 (v30.4): one-eval-per-registration tracker.
@@ -947,30 +984,13 @@ def _seed_one_h2h_round(state, latest: dict) -> int:
         uid_str = str(uid)
         if uid_str in state.composite_scores:
             continue
-        state.composite_scores[uid_str] = {
-            "worst": float(worst),
-            # v30.2 — also seed final/worst_3_mean from the bootstrap
-            # h2h record so legacy seedings carry the new ranking key.
-            "final": (
-                float(comp["final"]) if comp.get("final") is not None else None
-            ),
-            "worst_3_mean": (
-                float(comp["worst_3_mean"]) if comp.get("worst_3_mean") is not None else None
-            ),
-            "final_alpha": comp.get("final_alpha"),
-            "weighted": (
-                float(comp["weighted"]) if comp.get("weighted") is not None else None
-            ),
-            "axes": dict(comp.get("axes") or {}),
-            "n_axes": int(comp.get("present_count") or 0),
-            "model": row.get("model") or "",
-            "revision": row.get("revision") or "main",
-            "block": block,
-            "ts": time.time(),
-            "axis_spread": comp.get("axis_spread"),
-            "bench_vs_rel_gap": comp.get("bench_vs_rel_gap"),
-            "_bootstrapped": True,
-        }
+        state.composite_scores[uid_str] = _composite_record_from_payload(
+            comp,
+            model=row.get("model") or "",
+            revision=row.get("revision") or "main",
+            block=block,
+            extras={"_bootstrapped": True},
+        )
         seeded += 1
     return seeded
 

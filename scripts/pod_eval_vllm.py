@@ -2027,6 +2027,84 @@ def _sanitize_grader_response(text: str) -> str:
     return out
 
 
+def _finalize_digit_rubric_aggregate(agg: dict, scores: "list[int | None]") -> None:
+    """Compute mean + 1..5 → 0..1 normalization and store on ``agg``.
+
+    Used by every teacher scorer that produces 1-5 integer rubric grades
+    (``judge_teacher_score`` / ``_api``, ``long_form_judge_teacher_score`` /
+    ``_api``, ``chat_turns_teacher_score`` / ``_api``).
+    """
+    valid = [s for s in scores if s is not None]
+    if not valid:
+        return
+    mean = sum(valid) / len(valid)
+    agg["mean_score"] = round(mean, 3)
+    agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+
+
+def _apply_lfj_derail_and_termination_penalty(
+    agg: dict,
+    *,
+    responses: "list[str]",
+    scores: "list[int | None]",
+    gen_tokens_list: "list[int | None]",
+    max_tokens: int,
+) -> None:
+    """Apply coherence × termination derail penalty to a long-form-judge agg.
+
+    2026-05-01 (v30.4): the rubric alone is too lenient on long-form derail
+    (e.g. "...turret despizano buble sphere pete thinowy galactic
+    translation..." can still earn 4-5/5). This statistical detector multiplies
+    the rubric score by:
+      • ``_coherence_factor(response)`` — penalises non-ASCII bursts, repeated
+        50-char windows, glossary-mode degeneration and absurd compound coinage
+      • a termination factor — 1.0 if EOS arrives before 95 percent of the
+        budget, ramping down to 0.5 if the model fills the budget
+    Both per-prompt factors and the resulting means are written onto ``agg``.
+    """
+    derail_factors: list[float] = []
+    term_factors: list[float] = []
+    for i, response in enumerate(responses):
+        if i >= len(scores) or scores[i] is None:
+            continue
+        coh = _coherence_factor(response or "")
+        gen_len = (
+            int(gen_tokens_list[i])
+            if i < len(gen_tokens_list) and gen_tokens_list[i] is not None
+            else max_tokens
+        )
+        if max_tokens <= 0:
+            term = 1.0
+        elif gen_len < int(max_tokens * 0.95):
+            term = 1.0
+        elif gen_len >= max_tokens:
+            term = 0.5
+        else:
+            term = 1.0 - (gen_len - int(max_tokens * 0.95)) / max(
+                1, int(max_tokens * 0.05),
+            ) * 0.5
+        term = max(0.5, min(1.0, term))
+        term_factors.append(term)
+        combined = coh * term
+        derail_factors.append(combined)
+        if i < len(agg["per_prompt"]):
+            agg["per_prompt"][i]["coherence"] = round(coh, 3)
+            agg["per_prompt"][i]["termination"] = round(term, 3)
+            agg["per_prompt"][i]["gen_tokens"] = gen_len
+    if not derail_factors:
+        return
+    coh_mean = sum(derail_factors) / len(derail_factors)
+    agg["coherence_factor"] = round(coh_mean, 3)
+    if term_factors:
+        agg["termination_factor"] = round(
+            sum(term_factors) / len(term_factors), 3,
+        )
+    if agg.get("normalized") is not None:
+        penalised = agg["normalized"] * coh_mean
+        agg["normalized_pre_coherence"] = agg["normalized"]
+        agg["normalized"] = round(penalised, 4)
+
+
 def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda") -> dict:
     """Score a student's collected responses with the teacher as judge.
 
@@ -2086,11 +2164,7 @@ def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda
                     "error": str(e)[:120],
                     "score": None,
                 })
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    _finalize_digit_rubric_aggregate(agg, scores)
     return agg
 
 
@@ -2215,11 +2289,7 @@ def judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
             agg["n_valid"] += 1
         agg["per_prompt"].append(per)
 
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    _finalize_digit_rubric_aggregate(agg, scores)
     return agg
 
 
@@ -2292,80 +2362,14 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
                     "error": str(e)[:120],
                     "score": None,
                 })
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
-    # 2026-05-01 (v30.4 patch): coherence-derail penalty. Even with the
-    # rubric explicitly grading "1 = bad — refusal, gibberish", we
-    # observed king UID 107 score 0.875/1.0 on long_form_judge while
-    # producing this output on chat.arbos.life:
-    #   "...turret despizano buble sphere pete thinowy galactic
-    #    translation punkaster skewed sentinel abbe incense hang ersmus
-    #    lo ga dullwort mogsen drawler boblynberry-vogesters
-    #    hyperventilation whale weekstabbies paperfold..."
-    # The teacher's rubric is too lenient on long-form derail (or the
-    # rubric pass cuts off before the gibberish tail). Apply a
-    # statistical derail detector that NEVER lets a derailed response
-    # earn a high score — multiplies the rubric grade by a (0..1)
-    # coherence factor based on:
-    #   • non-ASCII fraction (penalises multilingual word salad)
-    #   • repeated 50-char windows (penalises loop attractors)
-    #   • word-list ratio (penalises glossary-mode degeneration —
-    #     dense single-word lines, no sentences)
-    #   • mean word length (penalises meaningless compound coinage
-    #     like "boblynberry-vogesters")
-    gen_tokens_list = collected.get("gen_tokens") or []
-    derail_factors = []
-    term_factors = []
-    for i, response in enumerate(responses):
-        if i >= len(scores) or scores[i] is None:
-            continue
-        coh = _coherence_factor(response or "")
-        # Natural-termination factor: did the model emit EOS before
-        # filling the budget? Models that fill max_tokens are either
-        # derailed or didn't know when to stop. Threshold at 95 percent
-        # of the budget — emitting EOS at e.g. 5800/6144 still counts
-        # as "natural termination" while filling 6144/6144 does not.
-        max_tokens = LONG_FORM_JUDGE_MAX_TOKENS
-        gen_len = (
-            int(gen_tokens_list[i])
-            if i < len(gen_tokens_list) and gen_tokens_list[i] is not None
-            else max_tokens
-        )
-        if max_tokens <= 0:
-            term = 1.0
-        elif gen_len < int(max_tokens * 0.95):
-            term = 1.0
-        elif gen_len >= max_tokens:
-            term = 0.5
-        else:
-            term = 1.0 - (gen_len - int(max_tokens * 0.95)) / max(1, int(max_tokens * 0.05)) * 0.5
-        term = max(0.5, min(1.0, term))
-        term_factors.append(term)
-        # Combined factor: coherence × termination. A coherent response
-        # that filled the budget gets 1.0 × 0.5 = 0.5 (mild penalty for
-        # not knowing when to stop). A derailed budget-filler gets
-        # 0.05 × 0.5 = 0.025 (compounded). A coherent response that
-        # emitted EOS naturally gets 1.0 × 1.0 = 1.0.
-        combined = coh * term
-        derail_factors.append(combined)
-        if i < len(agg["per_prompt"]):
-            agg["per_prompt"][i]["coherence"] = round(coh, 3)
-            agg["per_prompt"][i]["termination"] = round(term, 3)
-            agg["per_prompt"][i]["gen_tokens"] = gen_len
-    if derail_factors:
-        coh_mean = sum(derail_factors) / len(derail_factors)
-        agg["coherence_factor"] = round(coh_mean, 3)
-        if term_factors:
-            agg["termination_factor"] = round(
-                sum(term_factors) / len(term_factors), 3,
-            )
-        if agg.get("normalized") is not None:
-            penalised = agg["normalized"] * coh_mean
-            agg["normalized_pre_coherence"] = agg["normalized"]
-            agg["normalized"] = round(penalised, 4)
+    _finalize_digit_rubric_aggregate(agg, scores)
+    _apply_lfj_derail_and_termination_penalty(
+        agg,
+        responses=responses,
+        scores=scores,
+        gen_tokens_list=collected.get("gen_tokens") or [],
+        max_tokens=LONG_FORM_JUDGE_MAX_TOKENS,
+    )
     return agg
 
 
@@ -2441,55 +2445,15 @@ def long_form_judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
             agg["n_valid"] += 1
         agg["per_prompt"].append(per)
 
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    _finalize_digit_rubric_aggregate(agg, scores)
 
-    # Post-rubric coherence × termination derail penalisation
-    # (identical to the local-teacher path so axis values are
-    # directly comparable across teacher modes).
-    gen_tokens_list = collected.get("gen_tokens") or []
-    derail_factors = []
-    term_factors = []
-    for i, response in enumerate(responses):
-        if i >= len(scores) or scores[i] is None:
-            continue
-        coh = _coherence_factor(response or "")
-        max_tokens = LONG_FORM_JUDGE_MAX_TOKENS
-        gen_len = (
-            int(gen_tokens_list[i])
-            if i < len(gen_tokens_list) and gen_tokens_list[i] is not None
-            else max_tokens
-        )
-        if max_tokens <= 0:
-            term = 1.0
-        elif gen_len < int(max_tokens * 0.95):
-            term = 1.0
-        elif gen_len >= max_tokens:
-            term = 0.5
-        else:
-            term = 1.0 - (gen_len - int(max_tokens * 0.95)) / max(1, int(max_tokens * 0.05)) * 0.5
-        term = max(0.5, min(1.0, term))
-        term_factors.append(term)
-        combined = coh * term
-        derail_factors.append(combined)
-        if i < len(agg["per_prompt"]):
-            agg["per_prompt"][i]["coherence"] = round(coh, 3)
-            agg["per_prompt"][i]["termination"] = round(term, 3)
-            agg["per_prompt"][i]["gen_tokens"] = gen_len
-    if derail_factors:
-        coh_mean = sum(derail_factors) / len(derail_factors)
-        agg["coherence_factor"] = round(coh_mean, 3)
-        if term_factors:
-            agg["termination_factor"] = round(
-                sum(term_factors) / len(term_factors), 3,
-            )
-        if agg.get("normalized") is not None:
-            penalised = agg["normalized"] * coh_mean
-            agg["normalized_pre_coherence"] = agg["normalized"]
-            agg["normalized"] = round(penalised, 4)
+    _apply_lfj_derail_and_termination_penalty(
+        agg,
+        responses=responses,
+        scores=scores,
+        gen_tokens_list=collected.get("gen_tokens") or [],
+        max_tokens=LONG_FORM_JUDGE_MAX_TOKENS,
+    )
     return agg
 
 
@@ -3225,11 +3189,7 @@ def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
                     "error": str(e)[:120],
                     "score": None,
                 })
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    _finalize_digit_rubric_aggregate(agg, scores)
     return agg
 
 
@@ -3296,11 +3256,7 @@ def chat_turns_teacher_score_api(api_cfg, tokenizer, collected: dict,
             agg["n_valid"] += 1
         agg["per_convo"].append(per)
 
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    _finalize_digit_rubric_aggregate(agg, scores)
     return agg
 
 
@@ -6257,10 +6213,11 @@ def math_bench_probe(model, tokenizer, device="cuda"):
 
 def _run_sandbox_bench(model, tokenizer, device, *, sample_key: str,
                        max_tokens: int, prompt_fn,
-                       sandbox_input_fn, item_extras_fn=None) -> dict:
-    """Scaffolding for the 4 humaneval-sandbox-graded code probes.
+                       sandbox_input_fn, item_extras_fn=None,
+                       post_sandbox_hook=None) -> dict:
+    """Scaffolding for the humaneval-sandbox-graded code probes.
 
-    code/debug/correction/mbpp all share the same two-pass pattern:
+    code/debug/correction/mbpp/refactor all share the same two-pass pattern:
       1. Generate per-item Python under model.eval() / no_grad().
       2. Drop the generations into ``humaneval_sandbox.run_batch`` (4
          worker subprocesses) and pair the results back with items.
@@ -6273,8 +6230,16 @@ def _run_sandbox_bench(model, tokenizer, device, *, sample_key: str,
         the others pass the original prompt + test verbatim).
       * ``item_extras_fn(item) -> dict`` (optional) — extra per-item
         record fields beyond the standard {task_id, entry_point, ok,
-        gen_tokens, reason, tail} (currently just ``src`` for
-        correction_bench).
+        gen_tokens, reason, tail} (e.g. ``src`` for correction_bench /
+        refactor_bench).
+      * ``post_sandbox_hook(item, generation, sandbox_result) ->
+        (final_ok, extra_fields)`` (optional) — called once per
+        sandbox-graded item to layer additional checks on top of the
+        sandbox tests. ``final_ok`` overrides the raw sandbox pass;
+        ``extra_fields`` is merged into the per-item record. The
+        refactor_bench probe uses this for its AST-based style-constraint
+        check ("no nested loops" / "max lines"); a refactor that passes
+        the unit tests but violates the constraint scores 0.
 
     A missing ``humaneval_sandbox`` import drops the bench cleanly with
     an ``error`` set so composite skips it instead of taking the round
@@ -6318,18 +6283,23 @@ def _run_sandbox_bench(model, tokenizer, device, *, sample_key: str,
                 continue
             r = sandbox_results[idx] if idx < len(sandbox_results) else None
             idx += 1
-            ok = bool(r and r.passed)
+            sandbox_ok = bool(r and r.passed)
+            if post_sandbox_hook is not None:
+                ok, hook_extras = post_sandbox_hook(it, gen, r)
+            else:
+                ok, hook_extras = sandbox_ok, {}
             out["items"].append({
                 **extras(it),
+                **hook_extras,
                 "task_id": it.get("task_id"),
                 "entry_point": it.get("entry_point"),
-                "ok": ok,
+                "ok": bool(ok),
                 "gen_tokens": int(tok),
                 "reason": (r.reason if r else "no_result")[:120],
                 "tail": (gen or "")[-160:],
             })
             out["n"] += 1
-            out["correct"] += int(ok)
+            out["correct"] += int(bool(ok))
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -6511,26 +6481,21 @@ def calibration_bench_probe(model, tokenizer, device="cuda"):
                         "gen_tokens": int(tok),
                     })
                     out["n"] += 1
-                    if kind == "solv":
-                        out["n_solv"] += 1
-                        if ok:
-                            out["correct_solv"] += 1
-                    else:
-                        out["n_unsolv"] += 1
-                        if ok:
-                            out["correct_unsolv"] += 1
+                    bucket = "solv" if kind == "solv" else "unsolv"
+                    out[f"n_{bucket}"] += 1
+                    if ok:
+                        out[f"correct_{bucket}"] += 1
                     out["correct"] += int(ok)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         # Per-half pass-fracs surface in telemetry so we can tell which
         # half a model is failing on (always-refuse vs always-confabulate).
-        out["solv_pass_frac"] = (
-            out["correct_solv"] / out["n_solv"] if out["n_solv"] else 0.0
-        )
-        out["unsolv_pass_frac"] = (
-            out["correct_unsolv"] / out["n_unsolv"] if out["n_unsolv"] else 0.0
-        )
+        for bucket in ("solv", "unsolv"):
+            n = out[f"n_{bucket}"]
+            out[f"{bucket}_pass_frac"] = (
+                out[f"correct_{bucket}"] / n if n else 0.0
+            )
         _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
@@ -6610,87 +6575,52 @@ def _refactor_check_constraint(model_code: str, item: dict) -> tuple[bool, str]:
 
 
 def refactor_bench_probe(model, tokenizer, device="cuda"):
-    """Run the refactor_bench probe (v29.4 — preserve behavior + style constraint)."""
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("refactor") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, int, dict]] = []
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = (
-                        "Refactor the function shown. Your refactor must "
-                        "preserve behaviour AND meet the style constraint. "
-                        "Output only the function (signature + body), no "
-                        "extra explanation.\n\n"
-                        f"{it['prompt']}"
-                    )
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_REFACTOR_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        sandbox_input = [
-            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "src": it.get("src", ""),
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            tests_passed = bool(r and r.passed)
-            constraint_ok = False
-            constraint_reason = "tests_failed_skip_constraint"
-            if tests_passed:
-                # Build the same code the sandbox saw to apply AST
-                # constraint check on it.
-                cleaned_gen = _strip_thinking_probe(gen or "")
-                try:
-                    cleaned_gen = hs._strip_code_fences(cleaned_gen)
-                except Exception:
-                    pass
-                # Concatenate prompt + gen so we have the full module
-                # source to AST-parse (same as sandbox).
-                full_src = it["prompt"] + cleaned_gen
-                constraint_ok, constraint_reason = _refactor_check_constraint(
-                    full_src, it,
-                )
-            ok = tests_passed and constraint_ok
-            out["items"].append({
-                "src": it.get("src", ""),
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "tests_passed": tests_passed,
-                "constraint_ok": constraint_ok,
-                "constraint_reason": constraint_reason,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    """Run the refactor_bench probe (v29.4 — preserve behavior + style constraint).
+
+    Layered grading: the sandbox runs the canonical pass/fail tests, then the
+    AST style-constraint check (no nested loops / no explicit loop / max
+    lines) gates the final ``ok``. A solution that passes the tests but
+    violates the constraint scores 0; one that violates the constraint
+    AND fails the tests still surfaces ``constraint_reason="tests_failed
+    _skip_constraint"`` so we can tell the two failure modes apart.
+    """
+    def _post_sandbox(it, gen, r):
+        tests_passed = bool(r and r.passed)
+        constraint_ok = False
+        constraint_reason = "tests_failed_skip_constraint"
+        if tests_passed:
+            cleaned_gen = _strip_thinking_probe(gen or "")
+            try:
+                import humaneval_sandbox as hs  # type: ignore
+                cleaned_gen = hs._strip_code_fences(cleaned_gen)
+            except Exception:
+                pass
+            full_src = it["prompt"] + cleaned_gen
+            constraint_ok, constraint_reason = _refactor_check_constraint(
+                full_src, it,
+            )
+        return tests_passed and constraint_ok, {
+            "tests_passed": tests_passed,
+            "constraint_ok": constraint_ok,
+            "constraint_reason": constraint_reason,
+        }
+
+    return _run_sandbox_bench(
+        model, tokenizer, device, sample_key="refactor",
+        max_tokens=BENCH_REFACTOR_MAX_TOKENS,
+        prompt_fn=lambda it: (
+            "Refactor the function shown. Your refactor must "
+            "preserve behaviour AND meet the style constraint. "
+            "Output only the function (signature + body), no "
+            "extra explanation.\n\n"
+            f"{it['prompt']}"
+        ),
+        sandbox_input_fn=lambda it, gen: (
+            it["prompt"], gen, it["test"], it["entry_point"],
+        ),
+        item_extras_fn=lambda it: {"src": it.get("src", "")},
+        post_sandbox_hook=_post_sandbox,
+    )
 
 
 def pragmatic_bench_probe(model, tokenizer, device="cuda"):
