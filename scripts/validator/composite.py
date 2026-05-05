@@ -2267,6 +2267,20 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
             pass
     broken = (broken or set()) | reference_broken
 
+    # Bundle the v30 shadow-axis king references + teacher axes into a
+    # single kwargs dict so the four compute_axes/compute_composite call
+    # sites below stop repeating the same 6-line keyword block. Adding a
+    # new shadow axis now means one extra entry here instead of editing
+    # four call sites.
+    king_refs_kwargs = {
+        "king_eopd": king_eopd,
+        "king_kl_is": king_kl_is,
+        "king_forking_rkl": king_forking_rkl,
+        "king_trace_nll": king_trace_nll,
+        "king_kl_tail": king_kl_tail,
+        "teacher_axes": teacher_axes_for_super,
+    }
+
     # 2026-04-28 (v29.1): same-round reference axes for the per-axis
     # baseline-relative penalty. We compute the Qwen-4B-base axis values
     # once here and pass them to every compute_composite call so each
@@ -2283,13 +2297,7 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
             # the reference is the anchor.
             reference_axes_raw = compute_axes(
                 reference_row, king_kl, king_rkl,
-                king_eopd=king_eopd,
-                king_kl_is=king_kl_is,
-                king_forking_rkl=king_forking_rkl,
-                king_trace_nll=king_trace_nll,
-                king_kl_tail=king_kl_tail,
-                teacher_axes=teacher_axes_for_super,
-                broken_axes=None,
+                broken_axes=None, **king_refs_kwargs,
             )
         except Exception as exc:
             logger.warning(
@@ -2306,13 +2314,7 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     if king_model and king_model in students_data:
         king_raw_axes = compute_axes(
             students_data[king_model], king_kl, king_rkl,
-            king_eopd=king_eopd,
-            king_kl_is=king_kl_is,
-            king_forking_rkl=king_forking_rkl,
-            king_trace_nll=king_trace_nll,
-            king_kl_tail=king_kl_tail,
-            teacher_axes=teacher_axes_for_super,
-            broken_axes=broken,
+            broken_axes=broken, **king_refs_kwargs,
         )
 
     # 2026-04-29 (v29.3): which bench axes carry per-template breakdown.
@@ -2348,13 +2350,7 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         ref_axes_for_call = None if is_reference_row else reference_axes_raw
         comp = compute_composite(
             students_data[model], king_kl, king_rkl,
-            broken, ref_axes_for_call,
-            king_eopd=king_eopd,
-            king_kl_is=king_kl_is,
-            king_forking_rkl=king_forking_rkl,
-            king_trace_nll=king_trace_nll,
-            king_kl_tail=king_kl_tail,
-            teacher_axes=teacher_axes_for_super,
+            broken, ref_axes_for_call, **king_refs_kwargs,
         )
         # Note: compute_composite passes ``broken`` to compute_axes
         # internally so the group axes drop broken sub-axes.
@@ -2366,13 +2362,7 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         if king_raw_axes is not None and not entry.get("is_king"):
             challenger_raw_axes = compute_axes(
                 students_data[model], king_kl, king_rkl,
-                king_eopd=king_eopd,
-                king_kl_is=king_kl_is,
-                king_forking_rkl=king_forking_rkl,
-                king_trace_nll=king_trace_nll,
-                king_kl_tail=king_kl_tail,
-                teacher_axes=teacher_axes_for_super,
-                broken_axes=broken,
+                broken_axes=broken, **king_refs_kwargs,
             )
             comp["pareto"] = compute_pareto_dominance(
                 challenger_raw_axes, king_raw_axes, include_shadow=True,
