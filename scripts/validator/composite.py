@@ -1467,28 +1467,11 @@ def resolve_reference_broken_axes(reference_student_row: dict | None) -> set[str
     if not reference_student_row:
         return set()
     broken: set[str] = set()
-    # Axes we consider eval-setup-fragile. Relative axes (kl, rkl,
-    # capability, length, degeneracy) reference at 1.0 by definition,
-    # so they're never in this set.
-    bench_axes = {
-        "aime_bench", "mbpp_bench", "code_bench", "math_bench",
-        "knowledge_bench", "reasoning_bench", "tool_use_bench",
-        "robustness_bench", "noise_resistance_bench", "ifeval_bench",
-        "self_consistency_bench", "arc_bench", "truthful_bench",
-        "long_context_bench", "procedural_bench",
-        # v29.2 — debug_bench is also an absolute-pass-frac axis
-        # eligible to be flagged broken if the reference scores 0/n
-        # (e.g. sandbox outage).
-        "debug_bench",
-        # v29.4 — same broken-axis treatment for the new SOTA axes.
-        "correction_bench", "multi_doc_synthesis_bench",
-        "calibration_bench", "refactor_bench",
-        # v30 — pragmatic_bench is procedural and self-contained so a
-        # reference 0/N is a real signal of generator regression
-        # rather than skill, justifying broken-axis treatment.
-        "pragmatic_bench",
-    }
-    for axis in bench_axes:
+    # Eval-setup-fragile axes = every absolute-pass-frac bench axis the
+    # battery defines (``_BENCH_AXIS_NAMES``). Relative axes (kl, rkl,
+    # capability, length, degeneracy, judge_probe, ...) reference at
+    # 1.0 by definition so they never need broken-axis treatment.
+    for axis in _BENCH_AXIS_NAMES:
         bench = reference_student_row.get(axis)
         if not isinstance(bench, dict):
             continue
@@ -2221,7 +2204,17 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     flipped to production; meanwhile it is surfaced in the dashboard
     and telemetry so we can validate the gate's behavior on real data
     before promotion.
+
+    2026-05-04 (Sebastian's dashboard report — kl/rkl axes blank):
+    cold-start rounds (no king seated yet, e.g. post-cutover) had
+    ``king_kl=None`` here, so every student's ``kl`` axis came out
+    ``None`` even though every row carried a valid ``kl_global_avg``.
+    Mirror the ranking-path fallback in ``process_results``: when the
+    king's KL is missing, anchor the axis on the round-wide minimum
+    ``kl_global_avg``. The new winner scores 1.0; subsequent rounds
+    inherit the crowned king's KL as the natural anchor.
     """
+    king_kl = _resolve_king_kl(king_kl, students_data)
     king_rkl = _resolve_king_rkl(king_kl, students_data, h2h_results)
     king_eopd = _resolve_king_eopd(students_data, h2h_results)
     # v30 — three additional research-paper shadow-axis king references.
