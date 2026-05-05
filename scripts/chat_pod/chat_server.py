@@ -379,17 +379,25 @@ def exec_vllm():
         "--gpu-memory-utilization", str(gpu_util),
         "--enforce-eager",
     ]
-    # 2026-05-04 (Sebastian's "chat doesn't work with current king" report):
-    # the ``kimi_k2`` / ``kimi_k25`` branches deliberately omit
-    # ``--tool-call-parser`` because vLLM doesn't ship a Kimi parser yet,
-    # but ``--enable-auto-tool-choice`` was being added unconditionally —
-    # vLLM 0.19+ rejects that combo with
-    # ``TypeError: --enable-auto-tool-choice requires --tool-call-parser``
-    # and the chat server fails before binding port 8100. So we attach
-    # ``--enable-auto-tool-choice`` ONLY in the families where we can
-    # actually pair it with a parser (``qwen35``). Kimi-family kings still
-    # get tool calling through the model's own template tokens — clients
-    # that need structured ``tool_calls`` parse them client-side.
+    # 2026-05-05 follow-up to Sebastian's 2026-05-04 "chat doesn't work with
+    # current king" report. Earlier fix made the ``kimi_k2`` / ``kimi_k25``
+    # branches omit ``--enable-auto-tool-choice`` entirely because we
+    # believed vLLM didn't ship a Kimi tool parser. That kept vLLM from
+    # crashing at boot, but it broke the chat differently: Open-WebUI
+    # sends ``tools[]`` with implicit ``tool_choice: "auto"`` (the
+    # ``sn97-king`` model row has ``params.function_calling = "native"``
+    # plus the SN97 status toolkit attached by default), and vLLM rejects
+    # those requests with HTTP 400:
+    #
+    #   "auto" tool choice requires --enable-auto-tool-choice and
+    #   --tool-call-parser to be set
+    #
+    # Effect: every chat.arbos.life turn returned an opaque "tool calls"
+    # error and the king never responded. vLLM 0.19.1 actually does ship
+    # both ``kimi_k2`` and ``deepseek_v3`` tool parsers (registered via
+    # ``vllm/tool_parsers/__init__.py``'s ``_TOOL_PARSERS_TO_REGISTER`` map)
+    # plus matching reasoning parsers, so we can wire them up properly
+    # for both Kimi families now.
     if family == "qwen35":
         # Qwen 3.5 / 3.6 emit ``<tool_call><function=name><parameter=k>v
         # </parameter></function></tool_call>`` XML — the ``qwen3_xml``
@@ -402,21 +410,34 @@ def exec_vllm():
             "--skip-mm-profiling",
         ]
     elif family == "kimi_k25":
-        # Kimi K2.5/K2.6 vision wrapper — disable vision path for text chat.
-        # vLLM doesn't ship a dedicated kimi tool parser yet, so we cannot
-        # enable auto-tool-choice. Clients that parse structured tool
-        # calls on the Kimi chat template will still work; they just
-        # receive the raw ``<|tool_calls_section_begin|>`` … tokens
-        # instead of OpenAI ``tool_calls`` JSON.
+        # Kimi K2.5/K2.6 vision wrapper — disable vision path for text chat
+        # and wire the Kimi tool parser so Open-WebUI's
+        # ``function_calling=native`` requests succeed end-to-end.
+        #
+        # We deliberately do NOT add ``--reasoning-parser kimi_k2``: that
+        # parser treats everything before a ``</think>`` token (or
+        # ``<|tool_calls_section_begin|>``) as reasoning, including
+        # responses that never open a ``<think>`` block at all. Our
+        # distilled students don't follow Kimi's thinking template
+        # rigorously, so the parser swallows the entire visible answer
+        # into the ``reasoning`` field and clients render an empty
+        # message bubble. Until a king ships that genuinely emits Kimi
+        # thinking tokens, leave reasoning unparsed.
         cmd += [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "kimi_k2",
             "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
             "--skip-mm-profiling",
         ]
     elif family == "kimi_k2":
-        # Text-only DeepSeek V3 inner of Kimi K2 — vanilla causal LM path.
-        # No auto-tool-choice (no Kimi parser); clients parse Kimi
-        # tool tokens directly off the assistant content.
-        pass
+        # Text-only DeepSeek V3 inner of Kimi K2 — same tool-call template
+        # as the vision wrapper. Tool parser only; reasoning parser is
+        # off for the same reason as ``kimi_k25`` (would empty out
+        # ``message.content`` for non-thinking-template responses).
+        cmd += [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "kimi_k2",
+        ]
     else:
         # Unknown architecture — pass no family-specific flags. We also
         # leave auto-tool-choice off because we can't guess the right
