@@ -6180,32 +6180,48 @@ def _bench_finalize_token_stats(out: dict) -> None:
     }
 
 
-def math_bench_probe(model, tokenizer, device="cuda"):
+def _run_simple_bench(model, tokenizer, device, sample_key: str,
+                      max_tokens: int, prompt_fn, grade_fn,
+                      enable_thinking: bool = False) -> dict:
+    """Scaffolding for the per-item generate→grade→tally bench probes.
+
+    Every "simple" bench (math, aime, ifeval, knowledge, reasoning, arc,
+    truthful, procedural, long_context, …) used to copy/paste the same
+    ~30-line block: init out dict, fetch samples, eval+no_grad guard,
+    per-item generate+grade+append, finalize token stats. Centralising
+    the scaffolding removes ~250 LOC of boilerplate and means a future
+    fix (per-item timing, batched generation, side-channel logging)
+    only needs one edit.
+
+    The per-bench parts are:
+      * ``sample_key`` — index into ``_BENCH_SAMPLES``.
+      * ``max_tokens`` — generation budget for this axis.
+      * ``prompt_fn(item) -> str`` — render the user prompt.
+      * ``grade_fn(item, text, tok) -> (item_record_dict, ok_int)`` —
+        grade the generation and assemble the per-item record.
+
+    ``grade_fn`` is allowed to raise — the inner try/except records the
+    error on the item without aborting the rest of the batch. The outer
+    try/except sets ``out["error"]`` for catastrophic failures (model
+    crash, tokenizer issue) so the bench drops cleanly out of the
+    composite instead of taking the round down.
+    """
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("math") or []
+    samples = _BENCH_SAMPLES.get(sample_key) or []
     if not samples or model is None or tokenizer is None:
         return out
     try:
         with _model_eval_no_grad(model):
             for it in samples:
                 try:
-                    prompt_text = _math_format_prompt(it["question"], it.get("src", ""))
                     text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_MATH_MAX_TOKENS, device, enable_thinking=False,
+                        model, tokenizer, prompt_fn(it),
+                        max_tokens, device, enable_thinking=enable_thinking,
                     )
-                    pred = _math_extract_answer(text, it.get("src", ""))
-                    ok = _math_score_one(pred, it["gold"])
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "pred": pred[:80],
-                        "gold": it["gold"][:40],
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "tail": text[-120:],
-                    })
+                    record, ok = grade_fn(it, text, int(tok))
+                    out["items"].append(record)
                     out["n"] += 1
-                    out["correct"] += ok
+                    out["correct"] += int(ok)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
         out["pass_frac"] = out["correct"] / max(1, out["n"])
@@ -6213,6 +6229,25 @@ def math_bench_probe(model, tokenizer, device="cuda"):
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
+
+
+def math_bench_probe(model, tokenizer, device="cuda"):
+    def _grade(it, text, tok):
+        pred = _math_extract_answer(text, it.get("src", ""))
+        ok = _math_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:80],
+            "gold": it["gold"][:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "math", BENCH_MATH_MAX_TOKENS,
+        prompt_fn=lambda it: _math_format_prompt(it["question"], it.get("src", "")),
+        grade_fn=_grade,
+    )
 
 
 # ── code_bench ─────────────────────────────────────────────────────────
@@ -6851,38 +6886,22 @@ def _reasoning_score_one(pred: str, gold: str) -> int:
 
 
 def reasoning_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("reasoning") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = _reasoning_format_prompt(it["question"], it["gold"])
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_REASONING_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    pred = _reasoning_extract_answer(text, it["gold"])
-                    ok = _reasoning_score_one(pred, it["gold"])
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "pred": pred[:80],
-                        "gold": it["gold"][:40],
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "tail": text[-120:],
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _grade(it, text, tok):
+        pred = _reasoning_extract_answer(text, it["gold"])
+        ok = _reasoning_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:80],
+            "gold": it["gold"][:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "reasoning", BENCH_REASONING_MAX_TOKENS,
+        prompt_fn=lambda it: _reasoning_format_prompt(it["question"], it["gold"]),
+        grade_fn=_grade,
+    )
 
 
 # ── knowledge_bench (MMLU-Pro) ─────────────────────────────────────────
@@ -6994,98 +7013,68 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
     semantics in a single deploy without invalidating a pre-existing
     cache that may still contain the old shape.
     """
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("knowledge") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    is_v2 = "accept" in it
-                    if is_v2:
-                        prompt_text = it["question"]
-                    else:
-                        prompt_text = _format_mmlu_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_KNOWLEDGE_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    cleaned = _strip_thinking_probe(text or "").strip()
-                    if is_v2:
-                        ok = _knowledge_v2_grade_one(text or "", it)
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "category": it.get("category", ""),
-                            "gold": str(it.get("gold", ""))[:40],
-                            "pred_tail": cleaned[-120:].strip(),
-                            "ok": bool(ok),
-                            "gen_tokens": int(tok),
-                        })
-                    else:
-                        pred = _extract_mmlu_letter(cleaned, max_letter="J")
-                        ok = 1 if pred and pred == it["gold_letter"] else 0
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "category": it.get("category", ""),
-                            "pred": pred,
-                            "gold": it["gold_letter"],
-                            "ok": bool(ok),
-                            "gen_tokens": int(tok),
-                            "tail": text[-120:],
-                        })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _prompt(it):
+        return it["question"] if "accept" in it else _format_mmlu_prompt(it)
+
+    def _grade(it, text, tok):
+        cleaned = _strip_thinking_probe(text or "").strip()
+        if "accept" in it:
+            ok = _knowledge_v2_grade_one(text or "", it)
+            return {
+                "src": it.get("src", ""),
+                "category": it.get("category", ""),
+                "gold": str(it.get("gold", ""))[:40],
+                "pred_tail": cleaned[-120:].strip(),
+                "ok": bool(ok),
+                "gen_tokens": tok,
+            }, ok
+        pred = _extract_mmlu_letter(cleaned, max_letter="J")
+        ok = 1 if pred and pred == it["gold_letter"] else 0
+        return {
+            "src": it.get("src", ""),
+            "category": it.get("category", ""),
+            "pred": pred,
+            "gold": it["gold_letter"],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "knowledge", BENCH_KNOWLEDGE_MAX_TOKENS,
+        prompt_fn=_prompt, grade_fn=_grade,
+    )
 
 
 # ── ifeval_bench ───────────────────────────────────────────────────────
 
 def ifeval_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("ifeval") or []
-    if not samples or model is None or tokenizer is None:
-        return out
+    if not (_BENCH_SAMPLES.get("ifeval") and model is not None and tokenizer is not None):
+        return {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
     try:
         import ifeval_vendor as _ifev  # type: ignore
     except ImportError:
-        out["error"] = "ifeval_vendor not importable on pod"
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    text, tok = _bench_generate(
-                        model, tokenizer, it["prompt"],
-                        BENCH_IFEVAL_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    cleaned = _strip_thinking_probe(text or "")
-                    all_pass, per = _ifev.evaluate_item(
-                        cleaned, it["instruction_ids"], it.get("kwargs") or [],
-                    )
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "instruction_ids": it["instruction_ids"],
-                        "per_instruction": per,
-                        "ok": bool(all_pass),
-                        "gen_tokens": int(tok),
-                        "tail": text[-120:],
-                    })
-                    out["n"] += 1
-                    out["correct"] += int(all_pass)
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+        return {"n": 0, "correct": 0, "pass_frac": 0.0, "items": [],
+                "error": "ifeval_vendor not importable on pod"}
+
+    def _grade(it, text, tok):
+        cleaned = _strip_thinking_probe(text or "")
+        all_pass, per = _ifev.evaluate_item(
+            cleaned, it["instruction_ids"], it.get("kwargs") or [],
+        )
+        return {
+            "src": it.get("src", ""),
+            "instruction_ids": it["instruction_ids"],
+            "per_instruction": per,
+            "ok": bool(all_pass),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, int(all_pass)
+
+    return _run_simple_bench(
+        model, tokenizer, device, "ifeval", BENCH_IFEVAL_MAX_TOKENS,
+        prompt_fn=lambda it: it["prompt"], grade_fn=_grade,
+    )
 
 
 # ── Session 3 bench probes ─────────────────────────────────────────────
@@ -7171,38 +7160,22 @@ def _aime_score_one(pred: str, gold: str) -> int:
 
 
 def aime_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("aime") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = _aime_format_prompt(it["question"])
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_AIME_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    pred = _aime_extract_answer(text)
-                    ok = _aime_score_one(pred, it["gold"])
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "pred": pred[:20],
-                        "gold": it["gold"][:20],
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "tail": text[-120:],
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _grade(it, text, tok):
+        pred = _aime_extract_answer(text)
+        ok = _aime_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:20],
+            "gold": it["gold"][:20],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "aime", BENCH_AIME_MAX_TOKENS,
+        prompt_fn=lambda it: _aime_format_prompt(it["question"]),
+        grade_fn=_grade,
+    )
 
 
 # ── mbpp_bench (Session 3) ─────────────────────────────────────────────
@@ -7555,39 +7528,22 @@ def _format_arc_prompt(item: dict) -> str:
 
 
 def arc_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("arc") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = _format_arc_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_ARC_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    cleaned = _strip_thinking_probe(text or "").strip()
-                    pred = _extract_mmlu_letter(cleaned, max_letter="E")
-                    ok = 1 if pred and pred == it["gold_letter"] else 0
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "pred": pred,
-                        "gold": it["gold_letter"],
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "tail": text[-120:],
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _grade(it, text, tok):
+        cleaned = _strip_thinking_probe(text or "").strip()
+        pred = _extract_mmlu_letter(cleaned, max_letter="E")
+        ok = 1 if pred and pred == it["gold_letter"] else 0
+        return {
+            "src": it.get("src", ""),
+            "pred": pred,
+            "gold": it["gold_letter"],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "arc", BENCH_ARC_MAX_TOKENS,
+        prompt_fn=_format_arc_prompt, grade_fn=_grade,
+    )
 
 
 # ── long_context_bench (Session 3.5 — procedural needle-in-haystack) ──
@@ -14013,37 +13969,21 @@ def noise_resistance_bench_probe(model, tokenizer, device="cuda"):
 
 
 def procedural_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("procedural") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    text, tok = _bench_generate(
-                        model, tokenizer, it["prompt"],
-                        BENCH_PROCEDURAL_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    cleaned = _strip_thinking_probe(text or "").strip()
-                    gold = str(it.get("answer", ""))
-                    ok = 1 if _answer_exact_in_text(gold, cleaned, strict=True) else 0
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "gold": gold,
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "pred_tail": cleaned[-120:],
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _grade(it, text, tok):
+        cleaned = _strip_thinking_probe(text or "").strip()
+        gold = str(it.get("answer", ""))
+        ok = 1 if _answer_exact_in_text(gold, cleaned, strict=True) else 0
+        return {
+            "src": it.get("src", ""),
+            "gold": gold,
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "pred_tail": cleaned[-120:],
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "procedural", BENCH_PROCEDURAL_MAX_TOKENS,
+        prompt_fn=lambda it: it["prompt"], grade_fn=_grade,
+    )
 
 
 # ── truthful_bench (Session 3.4 — adversarial factuality MC) ─────────
@@ -14067,39 +14007,22 @@ def _format_truthful_prompt(item: dict) -> str:
 
 
 def truthful_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("truthful") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = _format_truthful_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_TRUTHFUL_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    cleaned = _strip_thinking_probe(text or "").strip()
-                    pred = _extract_mmlu_letter(cleaned, max_letter="J")
-                    ok = 1 if pred and pred == it["gold_letter"] else 0
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "pred": pred,
-                        "gold": it["gold_letter"],
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "tail": text[-120:],
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _grade(it, text, tok):
+        cleaned = _strip_thinking_probe(text or "").strip()
+        pred = _extract_mmlu_letter(cleaned, max_letter="J")
+        ok = 1 if pred and pred == it["gold_letter"] else 0
+        return {
+            "src": it.get("src", ""),
+            "pred": pred,
+            "gold": it["gold_letter"],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "truthful", BENCH_TRUTHFUL_MAX_TOKENS,
+        prompt_fn=_format_truthful_prompt, grade_fn=_grade,
+    )
 
 
 # ── long_context_bench (Session 3.5 — retrieval over long context) ───
@@ -14133,52 +14056,35 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
     moment the model says ANY other code, it loses the item — even if
     the gold is also somewhere in the output.
     """
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("long_context") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = _format_long_context_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_LC_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    cleaned = _strip_thinking_probe(text or "").strip()
-                    gold = str(it.get("answer", ""))
-                    confuser_answers = it.get("confuser_answers") or []
-                    pred_upper = cleaned.upper()
-                    gold_in_pred = bool(gold and gold.upper() in pred_upper)
-                    confuser_in_pred = any(
-                        ca and ca.upper() in pred_upper for ca in confuser_answers
-                    )
-                    ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
-                    # confuser_hit = the model emitted a confuser code,
-                    # whether or not it also emitted the gold. This is the
-                    # axis we expect bad models to fail on.
-                    confuser_hit = bool(confuser_answers and confuser_in_pred)
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "gold": gold,
-                        "pred_tail": cleaned[-120:],
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "needle_position": it.get("needle_position"),
-                        "confuser_positions": it.get("confuser_positions", []),
-                        "confuser_hit": confuser_hit,
-                        "gold_in_pred": gold_in_pred,
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _grade(it, text, tok):
+        cleaned = _strip_thinking_probe(text or "").strip()
+        gold = str(it.get("answer", ""))
+        confuser_answers = it.get("confuser_answers") or []
+        pred_upper = cleaned.upper()
+        gold_in_pred = bool(gold and gold.upper() in pred_upper)
+        confuser_in_pred = any(
+            ca and ca.upper() in pred_upper for ca in confuser_answers
+        )
+        ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
+        # confuser_hit telemetry: the model emitted a confuser code,
+        # whether or not it also emitted the gold. Lets us tell
+        # "dumped everything" from "picked the wrong needle".
+        confuser_hit = bool(confuser_answers and confuser_in_pred)
+        return {
+            "src": it.get("src", ""),
+            "gold": gold,
+            "pred_tail": cleaned[-120:],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "needle_position": it.get("needle_position"),
+            "confuser_positions": it.get("confuser_positions", []),
+            "confuser_hit": confuser_hit,
+            "gold_in_pred": gold_in_pred,
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "long_context", BENCH_LC_MAX_TOKENS,
+        prompt_fn=_format_long_context_prompt, grade_fn=_grade,
+    )
 
 
 def run_bench_battery(model, tokenizer, device="cuda",
