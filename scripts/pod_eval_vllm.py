@@ -1837,10 +1837,10 @@ def judge_response_probe(model, tokenizer, device="cuda"):
     Stores ``{'prompts': [...], 'responses': [...], 'gen_tokens': [...]}``
     in a dict; caller stashes it in the module-level _JUDGE_ROLLOUTS so
     Phase B (teacher scoring) can consume it after the student is
-    unloaded. The student-side generation is deliberately the same shape
-    as the chat-probe: greedy, ``enable_thinking=False``, bounded max
-    tokens. This matches the "user types a question and gets a response"
-    deployment usage the judge axis is approximating.
+    unloaded. The student-side generation is deliberately chat-shaped:
+    greedy, bounded max tokens, and honoring the global bench thinking
+    policy. This matches the deployed "user types a question and gets a
+    response" usage the judge axis is approximating.
     """
     out = {
         "prompts": list(JUDGE_PROBE_PROMPTS),
@@ -1855,7 +1855,9 @@ def judge_response_probe(model, tokenizer, device="cuda"):
     with _model_eval_no_grad(model):
         for prompt in JUDGE_PROBE_PROMPTS:
             try:
-                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+                rendered = _render_chat_prompt(
+                    tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
+                )
                 ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
                 gen = model.generate(
                     ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
@@ -3084,7 +3086,7 @@ def chat_turns_response_probe(model, tokenizer, device="cuda"):
                 msgs.append({"role": "user", "content": user_turn})
                 try:
                     rendered = _render_chat_multi_turn(
-                        tokenizer, msgs, enable_thinking=False)
+                        tokenizer, msgs, enable_thinking=BENCH_ENABLE_THINKING)
                     ids = tokenizer(
                         rendered, return_tensors="pt",
                         truncation=True, max_length=3072,
@@ -4286,7 +4288,7 @@ def chat_response_probe(model, tokenizer, device="cuda"):
     "Thinking Process:..." loop that never emits a user-facing answer.
 
     For a short list of trivial prompts, run the student's chat template with
-    enable_thinking=False and require:
+    enable_thinking=BENCH_ENABLE_THINKING and require:
       - at least CHAT_PROBE_TERMINATE_THRESHOLD of prompts emit EOS inside
         CHAT_PROBE_MAX_TOKENS
       - at least CHAT_PROBE_TERMINATE_THRESHOLD produce non-empty content after
@@ -4323,7 +4325,7 @@ def chat_response_probe(model, tokenizer, device="cuda"):
                     try:
                         rendered = tokenizer.apply_chat_template(
                             msgs, tokenize=False, add_generation_prompt=True,
-                            enable_thinking=False,
+                            enable_thinking=BENCH_ENABLE_THINKING,
                         )
                     except TypeError:
                         rendered = tokenizer.apply_chat_template(
@@ -4610,7 +4612,7 @@ def capability_probe(model, tokenizer, device="cuda"):
             for item in CAPABILITY_PROBE_PROMPTS:
                 try:
                     rendered = _render_chat_prompt(
-                        tokenizer, item["q"], enable_thinking=False,
+                        tokenizer, item["q"], enable_thinking=BENCH_ENABLE_THINKING,
                     )
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
                     gen = model.generate(
@@ -4720,8 +4722,8 @@ BENCH_BATTERY_SHADOW_AXES = (
 #                                  math_bench at no extra wall-time).
 #   * ifeval_bench:    10 →  8 (instruction-following, weight 0.05 → 0.07).
 BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "12"))
-BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "12"))
-BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "14"))
+BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "18"))
+BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "18"))
 BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "0"))
 BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
 
@@ -4734,7 +4736,7 @@ BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
 #                                       no marginal signal).
 BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "8"))
 BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "8"))
-BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "12"))
+BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "16"))
 BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PER_ROUND", "0"))
 BENCH_SELF_CONSISTENCY_SAMPLES = int(os.environ.get("BENCH_SELF_CONSISTENCY_SAMPLES", "5"))
 BENCH_SELF_CONSISTENCY_TEMP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TEMP", "0.7"))
@@ -5862,13 +5864,10 @@ def _eos_pad_ids(tokenizer) -> tuple[list[int] | None, int]:
 # one we just override here). To run the legacy "no thinking" battery,
 # set ``BENCH_ENABLE_THINKING=0`` on the eval pod.
 #
-# Other probe-shaped functions (chat_response_probe, capability_probe,
-# chat_turns_probe, judge probes) keep their own explicit
-# ``enable_thinking=False`` because they're testing specific axes
-# (length termination, fast factual recall, multi-turn coherence,
-# grading deterministically) where thinking would distort the signal.
-# The thinking-collapse_probe already runs with ``enable_thinking=True``
-# on its own.
+# Chat-shaped probes (chat_response_probe, capability_probe, chat_turns_probe,
+# judge_response_probe) also honor this global so the eval matches deployed
+# usage. Teacher-side graders keep thinking disabled when they need a compact
+# deterministic score-only response.
 BENCH_ENABLE_THINKING = os.environ.get("BENCH_ENABLE_THINKING", "1") != "0"
 
 
@@ -14135,9 +14134,8 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
     The chat-probe teacher pass is new (2026-04-22): the composite ``length``
     axis needs a teacher-side length anchor to normalize student rambling
     against. Previously it relied on ``_TEACHER_PROBE_SAMPLES`` (think
-    probe), which is empty when ``THINK_COLLAPSE_PROBE=0`` (the default
-    after the 2026-04-19 miscalibration outage). Running the teacher on
-    the four trivial CHAT_PROBE_PROMPTS gives us an always-available
+    probe), which can be empty when ``THINK_COLLAPSE_PROBE=0``. Running
+    the teacher on the four trivial CHAT_PROBE_PROMPTS gives us an always-available
     anchor — ``enable_thinking=False`` + 48 tokens each ≈ 200 tokens total
     teacher work, negligible next to the ~300-prompt scoring pass.
     """
@@ -17947,13 +17945,12 @@ def main():
         # legitimately emit long chain-of-thought before EOS.
         #
         # The entire probe pipeline (generation, Wilson bounds, per-student
-        # storage) is retained but gated behind an opt-in env var so we can
-        # re-enable it offline once it is properly calibrated against a
-        # real teacher baseline. Default is OFF: the probe does NOT run,
-        # does NOT consume GPU time, and CANNOT DQ a model.
+        # storage) is retained behind a kill-switch env var. Default is ON
+        # because deployed chat uses thinking, and collapse under thinking is
+        # exactly the pathology this subnet must optimize away.
         think_probe_this = (
             student is not None
-            and os.environ.get("THINK_COLLAPSE_PROBE", "0") == "1"
+            and os.environ.get("THINK_COLLAPSE_PROBE", "1") == "1"
         )
         if is_king and king_model is not None and student is king_model and load_time == 0.0:
             think_probe_this = False

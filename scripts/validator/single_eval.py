@@ -18,7 +18,7 @@ This module is the seam where the new policy is enforced. When
 * ``plan_round`` does NOT seat the king. Rounds contain only new
   submissions plus the always-in reference baseline.
 * The crown is selected cross-round from ``state.composite_scores`` by the
-  worst-axis composite, not from the round's paired t-test.
+  composite ``final`` score, not from the round's paired t-test.
 
 Anything outside the flag stays on the existing behavior, so the flip is
 reversible.
@@ -33,8 +33,8 @@ import time
 from typing import Any
 
 from scripts.validator.composite import (
-    COMPOSITE_FINAL_BOTTOM_WEIGHT,
     COMPOSITE_SHADOW_VERSION,
+    _blended_final_score,
 )
 
 logger = logging.getLogger("distillation.remote_validator")
@@ -227,10 +227,7 @@ def evict_stale_evaluated_uids(state, valid_models: dict) -> list[str]:
             f"single-eval: evicted {len(evicted)} stale evaluated UIDs "
             f"(re-committed since last eval): {evicted}"
         )
-        try:
-            persist_composite_scores(state)
-        except Exception as exc:
-            logger.warning(f"single-eval: failed to persist composite_scores after eviction (non-fatal): {exc}")
+        _safe_persist_composite_scores(state, context="eviction")
     return evicted
 
 
@@ -300,29 +297,14 @@ def merge_composite_scores(
                 "composite_worst": record["worst"],
             }
     if n_updated:
-        try:
-            persist_composite_scores(state)
-        except Exception as exc:
-            logger.warning(f"single-eval: failed to persist composite_scores after merge (non-fatal): {exc}")
+        _safe_persist_composite_scores(state, context="merge")
         # Persist evaluated_hotkeys too so the policy survives validator
         # restarts. Failure is non-fatal (in-memory state remains correct).
-        try:
-            from eval.state import EVALUATED_HOTKEYS_FILE, atomic_json_write
-            atomic_json_write(
-                state._path(EVALUATED_HOTKEYS_FILE),
-                state.evaluated_hotkeys,
-                indent=2,
-            )
-        except Exception as exc:
-            logger.warning(
-                f"single-eval: failed to persist evaluated_hotkeys "
-                f"(non-fatal): {exc}"
-            )
+        _safe_persist_evaluated_hotkeys(state)
     return n_updated
 
 
 def _is_eligible_uid(
-    state,
     uid: int,
     valid_models: dict,
     dq_reasons: dict,
@@ -759,7 +741,7 @@ def select_king_by_composite(
             # should still be rewarded) without abandoning paired
             # comparison.
             if not _is_eligible_uid(
-                state, uid, valid_models, state.dq_reasons,
+                uid, valid_models, state.dq_reasons,
                 uid_to_hotkey, commitments,
             ):
                 continue
@@ -794,12 +776,9 @@ def select_king_by_composite(
                     wt_f = float(weighted_v) if weighted_v is not None else 0.0
                 except (TypeError, ValueError):
                     continue
-                # Use ``worst`` as a proxy for worst_3_mean (legacy single
-                # axis), then blend with weighted using current alpha.
-                final_f = (
-                    COMPOSITE_FINAL_BOTTOM_WEIGHT * w_f
-                    + (1.0 - COMPOSITE_FINAL_BOTTOM_WEIGHT) * wt_f
-                )
+                # ``worst`` proxies worst_k_mean (legacy single-axis); blend
+                # with weighted using the current shared bottom-weight alpha.
+                final_f = _blended_final_score(w_f, wt_f) or 0.0
             else:
                 try:
                     final_f = float(final_v)
@@ -860,7 +839,7 @@ def select_king_by_composite(
             prior_record is not None
             and prior_record.get("worst") is not None
             and _is_eligible_uid(
-                state, prior_king_uid, valid_models, state.dq_reasons,
+                prior_king_uid, valid_models, state.dq_reasons,
                 uid_to_hotkey, commitments,
             )
         )
@@ -1034,10 +1013,7 @@ def bootstrap_composite_from_h2h(state) -> int:
             f"({seeded_latest} from latest H2H block={latest.get('block')}, "
             f"{seeded_history} from {len(history)} historical rounds)"
         )
-        try:
-            persist_composite_scores(state)
-        except Exception as exc:
-            logger.warning(f"single-eval: failed to persist composite_scores after bootstrap (non-fatal): {exc}")
+        _safe_persist_composite_scores(state, context="bootstrap")
     return seeded
 
 
@@ -1057,3 +1033,35 @@ def persist_composite_scores(state) -> None:
     save_state = getattr(state, "save", None)
     if callable(save_state):
         save_state()
+
+
+def _safe_persist_composite_scores(state, *, context: str) -> None:
+    """Persist composite_scores with a non-fatal warning on failure.
+
+    Wraps the three call sites (eviction / merge / bootstrap) so the boilerplate
+    try/except + warning lives in exactly one place.
+    """
+    try:
+        persist_composite_scores(state)
+    except Exception as exc:
+        logger.warning(
+            f"single-eval: failed to persist composite_scores after {context} "
+            f"(non-fatal): {exc}"
+        )
+
+
+def _safe_persist_evaluated_hotkeys(state) -> None:
+    """Persist evaluated_hotkeys table with a non-fatal warning on failure."""
+    try:
+        from eval.state import EVALUATED_HOTKEYS_FILE, atomic_json_write
+
+        atomic_json_write(
+            state._path(EVALUATED_HOTKEYS_FILE),
+            state.evaluated_hotkeys,
+            indent=2,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"single-eval: failed to persist evaluated_hotkeys "
+            f"(non-fatal): {exc}"
+        )

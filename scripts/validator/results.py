@@ -62,10 +62,10 @@ MIN_PROMPTS_FOR_SCORE_UPDATE = 150
 #              axis is ~1.0 since they beat the king on KL)
 #
 # If the composite isn't populated on enough axes (e.g. chat_probe and
-# think_probe both errored) the gate fails open — we don't want an
-# eval-side outage to freeze the crown.
-COMPOSITE_DETHRONE_FLOOR = 0.20
-COMPOSITE_DETHRONE_MIN_AXES = 3
+# think_probe both errored) the gate fails open. The SOTA pressure is in
+# the composite weights/ranking, not a hard per-axis king-quality floor.
+COMPOSITE_DETHRONE_FLOOR = float(os.environ.get("COMPOSITE_DETHRONE_FLOOR", "0.20"))
+COMPOSITE_DETHRONE_MIN_AXES = int(os.environ.get("COMPOSITE_DETHRONE_MIN_AXES", "3"))
 
 
 def _log_finetune_probe_telemetry(
@@ -265,16 +265,8 @@ def _composite_dethrone_veto(
 
     A "veto" means the challenger passed the KL gate (paired t-test + 3%
     epsilon) but has at least one composite axis below
-    ``COMPOSITE_DETHRONE_FLOOR``. The most common cause in practice
-    (2026-04-22) is the ``length`` axis: KL-hacked students emit 3–10x
-    more tokens than the teacher on trivial prompts, which doesn't hurt
-    per-token KL but makes them unusable in chat.
-    Fail-open policy: the veto only triggers when we have ≥
-    ``COMPOSITE_DETHRONE_MIN_AXES`` populated axes AND the worst is below
-    the floor. If the composite couldn't be computed (missing data,
-    probe errored, exception), we return None and the dethrone proceeds
-    through the existing KL gate. That way a broken pod_eval_vllm probe
-    doesn't freeze the king indefinitely.
+    ``COMPOSITE_DETHRONE_FLOOR``. This remains a catastrophic-failure guard;
+    normal SOTA pressure comes from the composite ranking and soft weights.
 
     Returns:
       None if the challenger should be allowed through, OR
@@ -298,10 +290,6 @@ def _composite_dethrone_veto(
     if worst is None or worst >= COMPOSITE_DETHRONE_FLOOR:
         return None
     axes = comp.get("axes") or {}
-    # Only report axes that are actually in the active composite —
-    # shadow axes (e.g. Arena v3 Session 3, pre-promotion) may score
-    # lower than the triggering axis but should not be surfaced as the
-    # reason.
     broken_axes = set(comp.get("broken_axes") or [])
     active = set(get_effective_axis_weights().keys()) - broken_axes
     active_axes = {k: v for k, v in axes.items() if v is not None and k in active}
@@ -313,8 +301,9 @@ def _composite_dethrone_veto(
     axis_name, axis_value = worst_axis
     return {
         "reason": (
-            f"composite worst axis '{axis_name}'={axis_value:.3f} < "
-            f"floor {COMPOSITE_DETHRONE_FLOOR} (n_axes={present_count})"
+            f"composite worst axis '{axis_name}'="
+            f"{axis_value if axis_value is not None else 0.0:.3f} < "
+            f"floor {COMPOSITE_DETHRONE_FLOOR:.2f} (n_axes={present_count})"
         ),
         "worst_axis": axis_name or "unknown",
         "worst_value": float(axis_value) if axis_value is not None else 0.0,
@@ -525,8 +514,7 @@ def _run_dethrone_vetos(
             )
             log_event(
                 f"Composite floor blocked dethrone: UID {challenger_uid} "
-                f"axis {comp_veto['worst_axis']}={comp_veto['worst_value']:.3f} "
-                f"< {COMPOSITE_DETHRONE_FLOOR} {suffix}",
+                f"{comp_veto['reason']} {suffix}",
                 level="warning", state_dir=state_dir,
             )
             return True
@@ -774,15 +762,15 @@ def _select_h2h_winner(
 ):
     """Pick the round's H2H winner and re-sort h2h_candidates by composite.
 
-    Composite-worst (descending, higher-is-better) is the primary key.
-    Ties break by composite-weighted, then by KL ascending so behaviour
-    degrades gracefully to KL-only when the composite is missing
-    (e.g. full-vocab KL still computed but probes errored).
+    Composite final (bottom-K quality blended with weighted mean) is the
+    primary key. Ties break by worst-K, worst axis, weighted score, then KL
+    ascending so behaviour degrades gracefully to KL-only when the composite
+    is missing (e.g. full-vocab KL still computed but probes errored).
 
     The paired t-test gate (``epsilon_dethroned_by``) is unchanged — it
     still enforces statistical significance before a crown changes hands
     — but which challenger is considered the canonical winner, and what
-    we display as #1, is now driven by composite.worst.
+    we display as #1, is now driven by composite.final.
 
     Returns ``(winner_uid, winner_kl, epsilon_dethroned_by)`` — the third
     component may be cleared when the integrity check trips.
@@ -801,12 +789,28 @@ def _select_h2h_winner(
             ref_uid_for_ranking=ref_uid_for_ranking,
             ref_axes_for_ranking=ref_axes_for_ranking,
         )
+        final = comp.get("final")
+        worst_k = comp.get("worst_3_mean")
         worst = comp.get("worst")
         weighted = comp.get("weighted")
         present = comp.get("present_count") or 0
-        if worst is None or present < 2:
-            return (0, float("-inf"), float("-inf"), kl_i)
-        return (1, worst, weighted if weighted is not None else 0.0, -kl_i)
+        if final is None or present < 2:
+            return (
+                0,
+                float("-inf"),
+                float("-inf"),
+                float("-inf"),
+                float("-inf"),
+                -kl_i,
+            )
+        return (
+            1,
+            final,
+            worst_k if worst_k is not None else 0.0,
+            worst if worst is not None else 0.0,
+            weighted if weighted is not None else 0.0,
+            -kl_i,
+        )
 
     h2h_candidates.sort(key=_rank_key, reverse=True)
     best_uid, best_kl = h2h_candidates[0]
@@ -910,17 +914,34 @@ def _annotate_and_sort_composite(
                 "floor": COMPOSITE_DETHRONE_FLOOR,
             }
 
-        # Re-sort h2h_results by composite.worst (desc) so the leaderboard
+        # Re-sort h2h_results by composite.final (desc) so the leaderboard
         # endpoint and h2h_latest display rank order matches the ranking
         # key used for crown decisions. KL stays as an informational field
         # on each row.
         def _sort_key(row):
             comp = row.get("composite") or {}
+            final = comp.get("final")
+            worst_k = comp.get("worst_3_mean")
             worst = comp.get("worst")
+            weighted = comp.get("weighted")
             kl_neg = -(row.get("kl") or float("inf"))
-            if worst is None:
-                return (0, float("-inf"), kl_neg)
-            return (1, worst, kl_neg)
+            if final is None:
+                return (
+                    0,
+                    float("-inf"),
+                    float("-inf"),
+                    float("-inf"),
+                    float("-inf"),
+                    kl_neg,
+                )
+            return (
+                1,
+                final,
+                worst_k if worst_k is not None else 0.0,
+                worst if worst is not None else 0.0,
+                weighted if weighted is not None else 0.0,
+                kl_neg,
+            )
         h2h_results.sort(key=_sort_key, reverse=True)
         for entry in h2h_results:
             comp = entry.get("composite") or {}

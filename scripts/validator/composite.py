@@ -100,8 +100,8 @@ AXIS_WEIGHTS = {
     # 2026-04-29 (v29.7): all relative weights are now env-overridable
     # so the v30 audit rebalance (drop saturated kl/capability/length)
     # can land via distil.env without a code change.
-    "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.35")),
-    "kl":             float(os.environ.get("BENCH_KL_WEIGHT", "0.15")),
+    "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.25")),
+    "kl":             float(os.environ.get("BENCH_KL_WEIGHT", "0.05")),
     # 2026-04-29 (v30): top-K overlap axis. Per the 2026 'Rethinking OPD'
     # paper, this is the most predictive single signal of downstream
     # OPD success. Conservative initial weight 0.10 — same magnitude
@@ -109,7 +109,7 @@ AXIS_WEIGHTS = {
     # |top_K_t ∩ top_K_s| / K averaged. Add to the weighted
     # aggregation by default; gated env-overridable while we collect
     # 48h of telemetry (see TOP_K_OVERLAP_AXIS_IN_COMPOSITE below).
-    "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.10")),
+    "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.08")),
     # 2026-04-29 (v30) — entropy-aware adaptive KL axis. Per the EOPD
     # paper (arXiv 2510.27485), per-token RKL/FKL weighting based on
     # teacher entropy is +1.37 to +5.05 Pass@8 on small-model math
@@ -149,9 +149,9 @@ AXIS_WEIGHTS = {
     "tail_decoupled_kl": float(
         os.environ.get("TAIL_DECOUPLED_KL_WEIGHT", "0.0")
     ),
-    "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.25")),
-    "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.12")),
-    "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.22")),
+    "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.15")),
+    "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.15")),
+    "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.28")),
 }
 
 # v30 — top-K overlap axis gate. Defaults ON; env-flippable for fast
@@ -165,7 +165,7 @@ TOP_K_OVERLAP_AXIS_IN_COMPOSITE = (
 # normalization; callers see a per-axis breakdown and the aggregated
 # worst/weighted, so the absolute number changes slightly but the
 # ordering intent is preserved.
-JUDGE_AXIS_WEIGHT = float(os.environ.get("JUDGE_AXIS_WEIGHT", "0.15"))
+JUDGE_AXIS_WEIGHT = float(os.environ.get("JUDGE_AXIS_WEIGHT", "0.20"))
 
 # Shadow/promote gate. 2026-04-24: PROMOTED to production after the
 # original 48h telemetry window. Override with ``JUDGE_AXIS_IN_COMPOSITE=0``
@@ -223,10 +223,10 @@ BENCH_AXIS_WEIGHTS = {
 #   chat_turns_probe 0.08 (unchanged — multi-turn distinct)
 #   shadow axes (kl_is etc.) 0.02 → 0.05 each
 BENCH_GROUP_AXIS_WEIGHTS = {
-    "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.24")),
-    "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.20")),
-    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.18")),
-    "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.10")),
+    "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.28")),
+    "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.24")),
+    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.24")),
+    "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.08")),
     # 2026-05-02 (v30.5): super_teacher axis REMOVED.
     # Rationale: the axis was conceptually wrong for distillation — by
     # construction, a student matching the teacher's distribution
@@ -306,7 +306,7 @@ ARENA_V3_AXIS_WEIGHTS = {
     #     (in BENCH_AXIS_WEIGHTS above, not here)
     "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.0")),  # in math_skill_group
     "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.0")),  # in code_skill_group
-    "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.12")),
+    "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.16")),
     "self_consistency_bench":   float(os.environ.get("BENCH_SC_WEIGHT", "0.0")),
     "arc_bench":                float(os.environ.get("BENCH_ARC_WEIGHT", "0.0")),
     "truthful_bench":           float(os.environ.get("BENCH_TRUTHFUL_WEIGHT", "0.0")),
@@ -393,7 +393,7 @@ REASONING_DENSITY_IN_COMPOSITE = (
 #
 # Live: single-turn KL specialists should not dethrone if they cannot
 # maintain coherence over a short dialogue.
-CHAT_TURNS_AXIS_WEIGHT = float(os.environ.get("CHAT_TURNS_AXIS_WEIGHT", "0.08"))
+CHAT_TURNS_AXIS_WEIGHT = float(os.environ.get("CHAT_TURNS_AXIS_WEIGHT", "0.14"))
 CHAT_TURNS_AXIS_IN_COMPOSITE = (
     os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "1") != "0"
 )
@@ -426,10 +426,10 @@ JUDGE_PROBE_MIN_VALID = int(os.environ.get("JUDGE_PROBE_MIN_VALID", "4"))
 # so models that excel broadly are not penalised by a single quirky
 # subaxis floor.
 #
-# Default α = 0.7 (heavy emphasis on the bottom 3, in line with the
+# Default alpha = 0.75 (heavy emphasis on the bottom 3, in line with the
 # audit's "high (~75%)" recommendation). Tunable via env.
 COMPOSITE_FINAL_BOTTOM_WEIGHT = float(
-    os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.7")
+    os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.75")
 )
 WORST_3_MEAN_K = int(os.environ.get("WORST_3_MEAN_K", "3"))
 

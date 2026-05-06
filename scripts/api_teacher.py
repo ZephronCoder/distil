@@ -139,8 +139,10 @@ class APIConfig:
         else:
             providers = ()
 
-        # Reasoning toggle. Default: disabled (raw next-token).
-        dr_env = env("DISTIL_TEACHER_API_DISABLE_REASONING", "1")
+        # Reasoning toggle. Default ON so API-teacher generations match the
+        # thinking-enabled student bench/chat probes unless explicitly rolled
+        # back by the validator env.
+        dr_env = env("DISTIL_TEACHER_API_DISABLE_REASONING", "0")
         disable_reasoning = overrides.get("disable_reasoning",
                                           dr_env not in ("0", "false", "False", "no", ""))
 

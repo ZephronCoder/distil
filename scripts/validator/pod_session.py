@@ -151,6 +151,7 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     "CHAT_TURNS_PROBE_PER_ROUND",
     "CHAT_TURNS_PROBE_MAX_TOKENS",
     "CHAT_TURNS_PROBE",
+    "THINK_COLLAPSE_PROBE",
     # ── Cloud-API teacher path (2026-05-03 Kimi K2.6 cutover) ──
     # When DISTIL_TEACHER_MODE=api the pod skips local vLLM/HF teacher entirely
     # and fetches generation + top-K logprobs from an external OpenAI-compatible
