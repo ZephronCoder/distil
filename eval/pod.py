@@ -111,7 +111,13 @@ class PodManager:
         _retry(_do, max_attempts=max_attempts, delay=5, label=f"Download {remote}")
 
     def _prep_command(self, command: str, env: dict | None = None) -> str:
-        """Prepare a remote shell command with exported environment variables."""
+        """Prepare a shell script with exported environment variables.
+
+        This string is fed to ``bash -s`` over SSH stdin when ``env`` is
+        provided. Keeping env exports out of the SSH command line prevents API
+        keys from showing up in remote ``ps`` output while preserving the same
+        shell semantics for callers.
+        """
         if not env:
             return command
         exports = " && ".join(
@@ -127,6 +133,7 @@ class PodManager:
         doesn't complete within that many seconds.
         """
         full_command = self._prep_command(command, env)
+        ssh_command = "bash -s" if env else full_command
         started = time.time()
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
@@ -140,7 +147,12 @@ class PodManager:
                 if transport is not None:
                     transport.set_keepalive(30)
 
-                stdin, stdout, stderr = client.exec_command(full_command)
+                stdin, stdout, stderr = client.exec_command(ssh_command)
+                if env:
+                    stdin.write(full_command)
+                    if not full_command.endswith("\n"):
+                        stdin.write("\n")
+                    stdin.flush()
                 stdin.close()
                 channel = stdout.channel
                 channel.settimeout(0.1)
