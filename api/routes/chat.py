@@ -279,6 +279,25 @@ def _latest_user_text(messages: list[dict]) -> str:
     return ""
 
 
+_CLIENT_THINK_RE = re.compile(r"<think\b[^>]*>.*?</think>\s*", re.IGNORECASE | re.DOTALL)
+_RUNTIME_TRACE_LINE_RE = re.compile(
+    r"(?im)^Runtime trace, not hidden model reasoning:.*(?:\n|$)"
+)
+
+
+def _strip_client_thinking(content: str) -> str:
+    """Remove previously displayed thinking blocks from assistant history.
+
+    Open WebUI can fold streamed ``reasoning_content`` back into the next
+    assistant message as ``<think>...</think>``. That is display metadata, not
+    conversational content, and forwarding it makes the current king imitate
+    stale runtime traces on later turns.
+    """
+    content = _CLIENT_THINK_RE.sub("", content or "")
+    content = _RUNTIME_TRACE_LINE_RE.sub("", content)
+    return content.strip()
+
+
 def _clean_client_messages(messages: list[dict], *, system: str, max_history: int = 8) -> list[dict]:
     """Keep recent user/assistant text only; never forward tool specs/messages.
 
@@ -294,6 +313,10 @@ def _clean_client_messages(messages: list[dict], *, system: str, max_history: in
         content = msg.get("content")
         if not isinstance(content, str):
             continue
+        if msg["role"] == "assistant":
+            content = _strip_client_thinking(content)
+            if not content:
+                continue
         if any(marker in content for marker in _DERAIL_MARKERS):
             continue
         cleaned.append({"role": msg["role"], "content": content[:4000]})
@@ -738,7 +761,7 @@ async def _prepare_orchestrated_chat(
     """
     messages = list(body.get("messages") or [])
     user_text = _latest_user_text(messages)
-    runtime_trace = ["Runtime trace, not hidden model reasoning: inspected the latest user request."]
+    runtime_trace: list[str] = []
     tool_context: list[str] = []
 
     model_info = _model_info_answer(user_text or "")
@@ -848,20 +871,12 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
         content = f"chat server unavailable: {str(exc)[:200]}"
         model_reasoning = ""
         usage = None
-    runtime_trace.append("Forwarded the final prompt to the fast local vLLM king and returned its raw answer.")
     if tool_context:
         content = (
             _format_tool_context_for_display(tool_context)
             + "Raw model answer:\n\n"
             + (content or "(empty)")
         )
-    reasoning_parts = []
-    if model_reasoning:
-        reasoning_parts.append(model_reasoning)
-    if tool_context:
-        reasoning_parts.append("Tool outputs supplied to the model:\n" + _format_tool_context_for_display(tool_context))
-    reasoning_parts.append("\n".join(runtime_trace))
-    reasoning = "\n\n".join(reasoning_parts)
     now = int(time.time())
     response_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
     usage = usage or {
@@ -869,6 +884,14 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
         "completion_tokens": None,
         "total_tokens": None,
     }
+    message = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [],
+    }
+    if model_reasoning:
+        message["reasoning"] = model_reasoning
+        message["reasoning_content"] = model_reasoning
     return {
         "id": response_id,
         "object": "chat.completion",
@@ -878,13 +901,7 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                    "reasoning": reasoning,
-                    "reasoning_content": reasoning,
-                    "tool_calls": [],
-                },
+                "message": message,
                 "finish_reason": "stop",
             }
         ],
@@ -990,19 +1007,7 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
             yield "data: [DONE]\n\n"
             return
 
-        trace = "\n".join(runtime_trace)
-        if trace:
-            reasoning_acc.append(trace)
-            yield _openai_sse_chunk(
-                base,
-                {
-                    "role": "assistant",
-                    "reasoning": trace,
-                    "reasoning_content": trace,
-                },
-            )
-        else:
-            yield _openai_sse_chunk(base, {"role": "assistant"})
+        yield _openai_sse_chunk(base, {"role": "assistant"})
 
         if tool_context:
             prefix = _format_tool_context_for_display(tool_context) + "Raw model answer:\n\n"
@@ -1094,9 +1099,6 @@ def _stream_orchestrated_chat_response(payload: dict, king_uid: int | None, king
             vllm_body, tool_context, runtime_trace = await _prepare_orchestrated_chat(
                 payload, king_uid, king_model, stream=True,
             )
-            trace = "\n".join(runtime_trace)
-            if trace:
-                yield f"data: {json.dumps({'thinking': trace})}\n\n"
             if tool_context:
                 prefix = _format_tool_context_for_display(tool_context) + "Raw model answer:\n\n"
                 acc += prefix
