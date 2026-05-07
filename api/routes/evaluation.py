@@ -15,6 +15,7 @@ from config import ANNOUNCEMENT_CLAIMS_KEEP, EPOCH_BLOCKS, STATE_DIR
 from helpers.cache import _get_stale
 from helpers.dq import _dq_reason_for_commitment
 from helpers.sanitize import _sanitize_floats, _safe_json_load
+from eval_queue import build_queue_slots
 from state_store import (
     benchmarks,
     current_round,
@@ -316,80 +317,8 @@ def get_queue():
     rnd = current_round() or {}
     lb = top4_leaderboard() or {}
 
-    eval_order = prog.get("eval_order") or []
-    models_done = prog.get("models") if isinstance(prog.get("models"), dict) else {}
-    current_model = (
-        prog.get("current_model")
-        or prog.get("current_student")
-        or ((prog.get("current") or {}).get("student_name") if isinstance(prog.get("current"), dict) else None)
-    )
-    models_to_eval = rnd.get("models_to_eval") if isinstance(rnd.get("models_to_eval"), dict) else {}
     backlog = read_state("eval_backlog.json", {})
-    backlog_pending = {
-        int(row.get("uid")): row
-        for row in (backlog.get("pending") or [])
-        if isinstance(row, dict) and str(row.get("uid", "")).lstrip("-").isdigit()
-    }
-    completed_uids = set()
-    completed_models = set()
-    if isinstance(prog.get("completed"), list):
-        for completed in prog["completed"]:
-            if isinstance(completed, (int, str)) and str(completed).lstrip("-").isdigit():
-                completed_uids.add(int(completed))
-            elif isinstance(completed, dict):
-                student_name = completed.get("student_name") or completed.get("model")
-                if student_name:
-                    completed_models.add(student_name)
-                uid = completed.get("uid")
-                if isinstance(uid, (int, str)) and str(uid).lstrip("-").isdigit():
-                    completed_uids.add(int(uid))
-
-    slots = []
-    slot_uids = set()
-    for idx, entry in enumerate(eval_order, start=1):
-        uid = entry.get("uid")
-        model = entry.get("model")
-        role = entry.get("role")
-        slot_uids.add(uid)
-        info = models_to_eval.get(str(uid)) or models_to_eval.get(uid) or {}
-        backlog_row = (
-            backlog_pending.get(int(uid))
-            if isinstance(uid, (int, str)) and str(uid).lstrip("-").isdigit()
-            else {}
-        ) or {}
-        normalized_uid = int(uid) if isinstance(uid, (int, str)) and str(uid).lstrip("-").isdigit() else uid
-        if normalized_uid in completed_uids or (model and model in completed_models):
-            status = "done"
-        elif model and model == current_model:
-            status = "running"
-        elif model and model in models_done and (models_done.get(model) or {}).get("status") in ("done", "ok"):
-            status = "done"
-        else:
-            status = "pending"
-        slots.append({
-            "position": idx,
-            "uid": uid,
-            "model": model,
-            "role": role,
-            "status": status,
-            "commit_block": info.get("commit_block") or backlog_row.get("commit_block"),
-            "revision": info.get("revision") or backlog_row.get("revision"),
-        })
-
-    for row in backlog_pending.values():
-        uid = row.get("uid")
-        if uid in slot_uids or row.get("status") != "deferred":
-            continue
-        slots.append({
-            "position": None,
-            "uid": uid,
-            "model": row.get("model"),
-            "role": "challenger",
-            "status": "deferred",
-            "reason": "Deferred by SINGLE_EVAL_MAX_PER_ROUND FIFO cap; will be retried next round.",
-            "commit_block": row.get("commit_block"),
-            "revision": row.get("revision"),
-        })
+    slots = build_queue_slots(prog, rnd, backlog)
 
     lb_contenders = [c.get("uid") for c in (lb.get("contenders") or []) if c.get("uid") is not None]
 
