@@ -6,12 +6,11 @@ import json
 import os
 import time
 
-import threading
-
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import ANNOUNCEMENT_CLAIMS_KEEP, EPOCH_BLOCKS, STATE_DIR
+from eval_data_cache import EvalDataCache
 from helpers.cache import _get_stale
 from helpers.dq import _dq_reason_for_commitment
 from helpers.sanitize import _sanitize_floats, _safe_json_load
@@ -625,60 +624,7 @@ def get_history(limit: int = 50):
     )
 
 
-# 2026-05-04: in-memory cache for /api/eval-data. The endpoint was being
-# polled hundreds of times per second by a long-tail of dashboard tabs +
-# unidentified scrapers; each call read a 300 KB JSON off disk and parsed
-# it, blocking the uvicorn event loop and starving the chat endpoints
-# (visible as "Exceeded concurrency limit" + chat 503s, see
-# api/routes/chat.py refactor on the same date). The cache is keyed on
-# (path, mtime) — the validator overwrites/atomically renames eval_data
-# files between rounds, so when a new round lands the mtime changes and
-# we reload. For the much smaller list-mode response we cache for a flat
-# 30 s.
-_EVAL_DATA_BODY_CACHE: dict = {}
-_EVAL_DATA_BODY_LOCK = threading.Lock()
-_EVAL_DATA_LIST_CACHE: dict = {"data": None, "ts": 0.0}
-_EVAL_DATA_LIST_TTL = 30.0
-# Cap how many distinct file responses we hold to keep memory bounded.
-# Historical files don't change once written, so a small LRU is sufficient.
-_EVAL_DATA_BODY_MAX = 8
-
-
-def _serve_cached_eval_body(path: str) -> JSONResponse:
-    """Return JSONResponse for ``path``, sharing the parsed bytes across calls.
-
-    Cached on (path, mtime). Concurrent first-callers serialise on a lock so
-    we never read the same file in parallel from N threads.
-    """
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return JSONResponse(content={"error": "No eval data available"}, status_code=404)
-    key = (path, mtime)
-    cached = _EVAL_DATA_BODY_CACHE.get(key)
-    if cached is None:
-        with _EVAL_DATA_BODY_LOCK:
-            cached = _EVAL_DATA_BODY_CACHE.get(key)
-            if cached is None:
-                try:
-                    payload = read_json_file(path, {})
-                except Exception as e:
-                    return JSONResponse(content={"error": str(e)}, status_code=500)
-                # Pre-serialise so every subsequent request is a memcpy
-                # of bytes through Starlette instead of a re-encode.
-                body = json.dumps(payload).encode()
-                # Drop the oldest entries to keep memory bounded; prefer
-                # keeping the most recently inserted file alive.
-                if len(_EVAL_DATA_BODY_CACHE) >= _EVAL_DATA_BODY_MAX:
-                    for stale_key in list(_EVAL_DATA_BODY_CACHE)[: -(_EVAL_DATA_BODY_MAX - 1) or None]:
-                        _EVAL_DATA_BODY_CACHE.pop(stale_key, None)
-                cached = {"body": body}
-                _EVAL_DATA_BODY_CACHE[key] = cached
-    return Response(
-        content=cached["body"],
-        media_type="application/json",
-        headers={"Cache-Control": "public, max-age=60, stale-while-revalidate=120"},
-    )
+_EVAL_DATA_CACHE = EvalDataCache()
 
 
 @router.get("/api/eval-data", tags=["Evaluation"], summary="Eval data (prompts + completions)",
@@ -686,24 +632,13 @@ def _serve_cached_eval_body(path: str) -> JSONResponse:
 async def get_eval_data(list: bool = False, file: str = None):
     data_dir = os.path.join(STATE_DIR, "eval_data")
     if list:
-        now = time.time()
-        cached = _EVAL_DATA_LIST_CACHE
-        if cached["data"] is not None and now - cached["ts"] < _EVAL_DATA_LIST_TTL:
-            return cached["data"]
-        if not os.path.exists(data_dir):
-            payload = {"files": []}
-        else:
-            files = sorted([f for f in os.listdir(data_dir) if f.endswith(".json")], reverse=True)
-            payload = {"files": files, "count": len(files)}
-        cached["data"] = payload
-        cached["ts"] = now
-        return payload
+        return _EVAL_DATA_CACHE.list_payload(data_dir)
     path = eval_data_file(file)
     if file and not os.path.exists(path):
         return JSONResponse(content={"error": "File not found"}, status_code=404)
     if not os.path.exists(path):
         return JSONResponse(content={"error": "No eval data available"}, status_code=404)
-    return _serve_cached_eval_body(path)
+    return _EVAL_DATA_CACHE.response_for_file(path, read_json_file)
 
 
 @router.get("/api/private-pool-commit", tags=["Evaluation"],
