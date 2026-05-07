@@ -420,6 +420,25 @@ def register_content_hash(
     f.write_text(json.dumps(hashes, indent=2))
 
 
+_CONTENT_HASH_BASE_TARGETS = {
+    "model.embed_tokens.weight",
+    "model.layers.0.input_layernorm.weight",
+    "model.layers.0.mlp.down_proj.weight",
+    "model.norm.weight",
+}
+
+_CONTENT_HASH_ATTENTION_TARGETS = {
+    "model.layers.0.self_attn.q_proj.weight",
+    "model.layers.0.self_attn.k_proj.weight",
+    "model.layers.0.self_attn.v_proj.weight",
+    "model.layers.0.self_attn.o_proj.weight",
+    "model.layers.0.self_attn.q_a_proj.weight",
+    "model.layers.0.self_attn.q_b_proj.weight",
+    "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+    "model.layers.0.self_attn.kv_b_proj.weight",
+}
+
+
 def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: int = 4) -> Optional[str]:
     """
     Shard-invariant content hash from the raw bytes of a few specific tensors.
@@ -429,11 +448,9 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
     This hashes the bytes of a fixed set of named tensors, so it catches
     re-sharded copies that slip past compute_model_hash.
 
-    Samples these tensors (present on every Qwen3.5 student):
-      - model.embed_tokens.weight
-      - model.layers.0.input_layernorm.weight
-      - model.layers.0.mlp.down_proj.weight
-      - model.norm.weight
+    v2 hashes the old structural sample plus at least one attention tensor.
+    The attention requirement avoids false positives for attention-only LoRA
+    merges where layernorm/MLP/norm stay byte-identical to the base model.
     Returns hex digest or None if unavailable.
     """
     import struct
@@ -445,13 +462,9 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
         )
         if not st_files:
             return None
-        targets = {
-            "model.embed_tokens.weight",
-            "model.layers.0.input_layernorm.weight",
-            "model.layers.0.mlp.down_proj.weight",
-            "model.norm.weight",
-        }
+        targets = set(_CONTENT_HASH_BASE_TARGETS | _CONTENT_HASH_ATTENTION_TARGETS)
         tensor_hashes = []
+        found_attention = False
         with _requests.Session() as session:
             session.headers.update({'Accept-Encoding': 'identity'})
             for fname in st_files:
@@ -494,11 +507,12 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
                         continue
                     th = hashlib.sha256(data).hexdigest()
                     tensor_hashes.append(f"{tname}:{th}")
+                    found_attention = found_attention or tname in _CONTENT_HASH_ATTENTION_TARGETS
                     targets.discard(tname)
-        if not tensor_hashes:
+        if not tensor_hashes or not found_attention:
             return None
         tensor_hashes.sort()
-        return hashlib.sha256("\n".join(tensor_hashes).encode()).hexdigest()
+        return "v2:" + hashlib.sha256("\n".join(tensor_hashes).encode()).hexdigest()
     except Exception as e:
         logger.warning(f"Content hash failed for {model_repo}: {e}")
         return None
