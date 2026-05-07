@@ -81,11 +81,22 @@ def test_orchestrated_chat_omits_fake_reasoning_when_model_has_none(monkeypatch)
     assert "reasoning_content" not in msg
 
 
-def test_orchestrated_chat_answers_fibonacci_from_python_tool(monkeypatch):
-    async def fail_if_model_called(_payload, *, timeout):
-        raise AssertionError("deterministic Fibonacci tool should not call the model")
+def test_orchestrated_chat_passes_tool_results_to_model(monkeypatch):
+    captured = {}
 
-    monkeypatch.setattr(chat_route, "_local_chat_post", fail_if_model_called)
+    async def fake_local_chat_post(payload, *, timeout):
+        captured["payload"] = payload
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "The 32nd Fibonacci number is 2178309.",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(chat_route, "_local_chat_post", fake_local_chat_post)
 
     data = asyncio.run(
         chat_route._orchestrated_chat_completion(
@@ -97,16 +108,24 @@ def test_orchestrated_chat_answers_fibonacci_from_python_tool(monkeypatch):
 
     msg = data["choices"][0]["message"]
     assert "2178309" in msg["content"]
-    assert "index 32" in msg["content"]
+    assert msg["content"] == "The 32nd Fibonacci number is 2178309."
+    payload_msgs = captured["payload"]["messages"]
+    sys_msgs = [m for m in payload_msgs if m["role"] == "system"]
+    assert any("PYTHON_EXECUTION_RESULT" in m["content"] for m in sys_msgs), (
+        "tool results must be supplied to the model as authoritative context"
+    )
+    assert any("web search" in m["content"].lower() for m in sys_msgs), (
+        "system prompt must advertise the runtime tool capabilities"
+    )
+    assert any("internet access" in m["content"].lower() for m in sys_msgs)
     assert "Tool trace:" in msg["reasoning"]
-    assert "Executed Python" in msg["reasoning"]
 
 
-def test_orchestrated_chat_answers_inline_python_from_tool(monkeypatch):
-    async def fail_if_model_called(_payload, *, timeout):
-        raise AssertionError("deterministic Python tool should not call the model")
+def test_orchestrated_chat_falls_back_to_direct_answer_when_model_empty(monkeypatch):
+    async def empty_model(_payload, *, timeout):
+        return {"choices": [{"message": {"content": "   "}}]}
 
-    monkeypatch.setattr(chat_route, "_local_chat_post", fail_if_model_called)
+    monkeypatch.setattr(chat_route, "_local_chat_post", empty_model)
 
     data = asyncio.run(
         chat_route._orchestrated_chat_completion(
@@ -119,3 +138,181 @@ def test_orchestrated_chat_answers_inline_python_from_tool(monkeypatch):
     msg = data["choices"][0]["message"]
     assert "65536" in msg["content"]
     assert "Tool trace:" in msg["reasoning"]
+    assert "deterministic" in msg["reasoning"]
+
+
+def test_orchestrated_chat_falls_back_when_model_says_no_internet(monkeypatch):
+    async def derailed_model(_payload, *, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "I'm sorry, I cannot do that.",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(chat_route, "_local_chat_post", derailed_model)
+
+    data = asyncio.run(
+        chat_route._orchestrated_chat_completion(
+            {"messages": [{"role": "user", "content": "run python: print(4**8)"}]},
+            king_uid=1,
+            king_model="king/model",
+        )
+    )
+
+    msg = data["choices"][0]["message"]
+    assert "65536" in msg["content"]
+    assert "deterministic" in msg["reasoning"]
+
+
+def test_orchestrated_chat_falls_back_when_model_hallucinates_fibonacci(monkeypatch):
+    async def hallucinating_model(_payload, *, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "The 4^8th Fibonacci number is 1,024,000,000,000,000,000,000."
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(chat_route, "_local_chat_post", hallucinating_model)
+
+    data = asyncio.run(
+        chat_route._orchestrated_chat_completion(
+            {"messages": [{"role": "user", "content": "what is the 2**5th fibonacci number"}]},
+            king_uid=1,
+            king_model="king/model",
+        )
+    )
+
+    msg = data["choices"][0]["message"]
+    assert "2178309" in msg["content"]
+    assert "did not quote" in msg["reasoning"]
+
+
+def test_model_quoted_numeric_answer_helper():
+    assert chat_route._model_quoted_numeric_answer("F_32 is 2178309.", "Result: 2178309")
+    assert chat_route._model_quoted_numeric_answer(
+        "Result: 2178309",
+        "The Fibonacci index 32 result is 2,178,309.",
+    )
+    assert not chat_route._model_quoted_numeric_answer(
+        "Result: 2178309",
+        "The number is 1,024,000,000,000.",
+    )
+    big_value = "26" + "0" * 13700 + "57"
+    assert chat_route._model_quoted_numeric_answer(
+        f"F_65536 starts with {big_value[:8]} and ends with {big_value[-8:]}",
+        f"Approximately {big_value[:8]}…{big_value[-8:]}",
+    )
+    assert not chat_route._model_quoted_numeric_answer(
+        f"F_65536 starts with {big_value[:8]} and ends with {big_value[-8:]}",
+        "Approximately 102400000000000000000.",
+    )
+
+
+def test_orchestrated_chat_promotes_inline_think_blocks(monkeypatch):
+    async def think_model(_payload, *, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "<think>Let me compute step-by-step. 4 ** 8 = 65536.</think>"
+                            "The answer is 65536."
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(chat_route, "_local_chat_post", think_model)
+
+    data = asyncio.run(
+        chat_route._orchestrated_chat_completion(
+            {"messages": [{"role": "user", "content": "what is 4**8?"}]},
+            king_uid=1,
+            king_model="king/model",
+        )
+    )
+
+    msg = data["choices"][0]["message"]
+    assert msg["content"] == "The answer is 65536."
+    assert "Let me compute step-by-step" in msg["reasoning"]
+    assert "<think>" not in msg["content"]
+
+
+def test_web_search_regex_triggers_on_time_sensitive_questions():
+    cases = [
+        "what's the bitcoin price right now?",
+        "current bitcoin price please",
+        "today's headlines on AI",
+        "latest news about openai",
+        "current weather in tokyo",
+        "btc price",
+        "what's happening today in the markets",
+        "what are today's top tech headlines?",
+        "find me a list of recent space launches",
+        "what's the price of ethereum right now?",
+    ]
+    for case in cases:
+        assert chat_route._WEB_SEARCH_RE.search(case), case
+
+
+def test_web_search_regex_skips_general_questions():
+    not_search = [
+        "tell me about bittensor subnet 97",
+        "explain transformers in simple terms",
+        "write me a haiku about clouds",
+    ]
+    for case in not_search:
+        assert not chat_route._WEB_SEARCH_RE.search(case), case
+
+
+def test_parse_duckduckgo_html_extracts_titles_and_snippets():
+    body = """
+    <div class="result"><h2 class="result__title">
+      <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.example%2Fbtc">
+        Bitcoin price today
+      </a>
+    </h2>
+      <a class="result__snippet" href="...">Bitcoin is currently $81,491.41 USD.</a>
+    </div>
+    <div class="result"><h2 class="result__title">
+      <a class="result__a" href="https://b.example/news">Tech news</a>
+    </h2>
+    <div class="result__snippet">Top tech stories today.</div>
+    </div>
+    """
+    rendered = chat_route._parse_duckduckgo_html(body, query="btc", limit=5)
+    assert "Bitcoin price today" in rendered
+    assert "https://a.example/btc" in rendered
+    assert "$81,491.41" in rendered
+    assert "Tech news" in rendered
+    assert "Top tech stories today" in rendered
+
+
+def test_think_stream_splitter_handles_split_chunks():
+    splitter = chat_route._ThinkStreamSplitter()
+    visibles, reasonings = [], []
+    for chunk in ["Hello <thi", "nk>step one ", "step two</think>final ", "answer"]:
+        v, r = splitter.feed(chunk)
+        visibles.append(v)
+        reasonings.append(r)
+    v_tail, r_tail = splitter.flush()
+    visible_total = "".join(visibles) + v_tail
+    reasoning_total = "".join(reasonings) + r_tail
+    assert visible_total.strip() == "Hello final answer"
+    assert "step one" in reasoning_total
+    assert "step two" in reasoning_total
+    # The splitter must not leak the literal tags into either stream.
+    assert "<think" not in visible_total
+    assert "</think>" not in reasoning_total
+    assert "<think" not in reasoning_total

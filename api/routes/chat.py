@@ -236,10 +236,24 @@ _MODEL_PATH_RE = re.compile(
     r"\b([A-Za-z0-9._-]{2,40}/[A-Za-z0-9._-]{2,100})\b"
 )
 _WEB_SEARCH_RE = re.compile(
-    r"\b(search (?:the )?web|web search|look up|google|duckduckgo|latest news|"
-    r"current (?:news|price|weather|release|version))\b",
+    r"(?:"
+    # Explicit search verbs — always trigger.
+    r"\b(?:search\s+(?:the\s+)?web|web\s+search|look\s+up|google\s+for|google\s+the|"
+    r"duckduckgo|find\s+me|fetch\s+(?:the\s+)?(?:latest|news|results?))\b"
+    # Time-sensitive markers anywhere in the question.
+    r"|\b(?:right\s+now|today|tonight|this\s+(?:morning|afternoon|evening|week|month|year))\b"
+    r"|\b(?:latest|breaking|current|today'?s|recent|live|real[-\s]?time)\b"
+    # Categories that are always fresh-info questions.
+    r"|\b(?:weather|forecast|temperature|stock\s+price|share\s+price|exchange\s+rate|"
+    r"headline[s]?|news|score)\b"
+    # Crypto/asset price patterns.
+    r"|\b(?:bitcoin|btc|ethereum|eth|tesla|gold|silver|oil|sp500|s&p\s*500)\b"
+    # "price of X" / "X price" prompts.
+    r"|\bprice\s+of\s+\w+\b|\b\w+\s+price\b"
+    r")",
     re.IGNORECASE,
 )
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 _FIB_INDEX_RE = re.compile(
     r"(?:(\d+)\s*(?:\^|\*\*)\s*(\d+)(?:st|nd|rd|th)?|"
     r"(\d+)\s*(?:to\s+the\s+power\s+of|power\s+of)\s*(?:the\s*)?(\d+)(?:st|nd|rd|th)?|"
@@ -539,26 +553,63 @@ async def _web_search_tool(query: str, *, limit: int = 5) -> str:
     except Exception as exc:
         return f"Web search failed: {type(exc).__name__}: {str(exc)[:200]}"
 
-    results = []
-    for m in re.finditer(
-        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-        body,
+    return _parse_duckduckgo_html(body, query=q, limit=limit)
+
+
+def _resolve_ddg_href(href: str) -> str:
+    href = html.unescape(href)
+    if href.startswith("//duckduckgo.com/l/?uddg="):
+        parsed = urllib.parse.urlparse("https:" + href)
+        href = urllib.parse.parse_qs(parsed.query).get("uddg", [href])[0]
+    elif href.startswith("/l/?uddg="):
+        parsed = urllib.parse.urlparse("https://duckduckgo.com" + href)
+        href = urllib.parse.parse_qs(parsed.query).get("uddg", [href])[0]
+    return href
+
+
+def _parse_duckduckgo_html(body: str, *, query: str, limit: int = 5) -> str:
+    """Extract titled, linked, and snippet'd DuckDuckGo HTML results.
+
+    DuckDuckGo's HTML layout includes a title anchor (``result__a``), a
+    display URL (``result__url``), and a snippet block (``result__snippet``
+    or ``result-snippet``). The snippet often carries the actual fact (a
+    price, a date, a headline) that the model needs in order to answer
+    accurately. We pair them in order so the model gets a richer context.
+    """
+    title_re = re.compile(
+        r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
         flags=re.I | re.S,
-    ):
-        href = html.unescape(m.group(1))
-        title = _strip_html_tags(m.group(2))
-        if href.startswith("//duckduckgo.com/l/?uddg="):
-            parsed = urllib.parse.urlparse("https:" + href)
-            href = urllib.parse.parse_qs(parsed.query).get("uddg", [href])[0]
+    )
+    snippet_re = re.compile(
+        r'<(?:a|div|span)[^>]+class="[^"]*(?:result__snippet|result-snippet|result__body__snippet)[^"]*"[^>]*>(.*?)</(?:a|div|span)>',
+        flags=re.I | re.S,
+    )
+    title_matches = list(title_re.finditer(body))
+    snippet_matches = list(snippet_re.finditer(body))
+    snippets_by_pos = sorted(snippet_matches, key=lambda m: m.start())
+
+    results: list[tuple[str, str, str]] = []
+    for tm in title_matches:
+        href = _resolve_ddg_href(tm.group(1))
+        title = _strip_html_tags(tm.group(2))
+        snippet = ""
+        for sm in snippets_by_pos:
+            if sm.start() > tm.end():
+                snippet = _strip_html_tags(sm.group(1))
+                break
         if title:
-            results.append((title, href))
+            results.append((title, href, snippet))
         if len(results) >= limit:
             break
+
     if not results:
-        return f"No web results parsed for query: {q}"
-    lines = [f"query = {q}"]
-    for i, (title, href) in enumerate(results, 1):
-        lines.append(f"{i}. {title}\n   {href}")
+        return f"No web results parsed for query: {query}"
+    lines = [f"query = {query}"]
+    for i, (title, href, snippet) in enumerate(results, 1):
+        if snippet:
+            lines.append(f"{i}. {title}\n   {href}\n   snippet: {snippet}")
+        else:
+            lines.append(f"{i}. {title}\n   {href}")
     return "\n".join(lines)
 
 
@@ -721,11 +772,164 @@ def _fibonacci_direct_answer(desc: str, out: str, err: str | None) -> str:
 def _tool_reasoning(runtime_trace: list[str], model_reasoning: str = "") -> str:
     parts = []
     if model_reasoning:
-        parts.append(model_reasoning)
+        parts.append(model_reasoning.strip())
     if runtime_trace:
         trace = "\n".join(f"- {line}" for line in runtime_trace)
         parts.append("Tool trace:\n" + trace)
-    return "\n\n".join(parts)
+    return "\n\n".join(p for p in parts if p)
+
+
+class _ThinkStreamSplitter:
+    """Stateful streaming splitter that routes ``<think>`` content to reasoning.
+
+    The splitter buffers just enough trailing text to detect partial
+    ``<think>`` / ``</think>`` tags spanning chunk boundaries. Anything inside
+    the tags becomes a reasoning chunk, anything outside becomes a content
+    chunk. Use ``feed`` for streamed deltas and ``flush`` once the upstream
+    stream ends.
+    """
+
+    _OPEN = "<think"
+    _OPEN_FULL = ">"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._inside = False
+
+    def _trailing_partial_len(self, target: str) -> int:
+        """Return the length of the longest suffix of ``self._buf`` that is
+        also a non-empty prefix of ``target`` (case-insensitive).
+        """
+        max_len = min(len(self._buf), len(target))
+        lower_buf = self._buf.lower()
+        lower_target = target.lower()
+        for k in range(max_len, 0, -1):
+            if lower_buf.endswith(lower_target[:k]):
+                return k
+        return 0
+
+    def feed(self, chunk: str) -> tuple[str, str]:
+        if not chunk:
+            return "", ""
+        self._buf += chunk
+        visible = ""
+        reasoning = ""
+        while self._buf:
+            if not self._inside:
+                idx = self._buf.lower().find(self._OPEN)
+                if idx < 0:
+                    keep = self._trailing_partial_len(self._OPEN)
+                    if keep:
+                        visible += self._buf[:-keep]
+                        self._buf = self._buf[-keep:]
+                    else:
+                        visible += self._buf
+                        self._buf = ""
+                    break
+                visible += self._buf[:idx]
+                rest = self._buf[idx:]
+                close_open = rest.find(self._OPEN_FULL)
+                if close_open < 0:
+                    self._buf = rest
+                    break
+                self._buf = rest[close_open + 1:]
+                self._inside = True
+            else:
+                idx = self._buf.lower().find(self._CLOSE)
+                if idx < 0:
+                    keep = self._trailing_partial_len(self._CLOSE)
+                    if keep:
+                        reasoning += self._buf[:-keep]
+                        self._buf = self._buf[-keep:]
+                    else:
+                        reasoning += self._buf
+                        self._buf = ""
+                    break
+                reasoning += self._buf[:idx]
+                self._buf = self._buf[idx + len(self._CLOSE):]
+                self._inside = False
+        return visible, reasoning
+
+    def flush(self) -> tuple[str, str]:
+        visible = ""
+        reasoning = ""
+        if self._buf:
+            if self._inside:
+                reasoning = self._buf
+            else:
+                visible = self._buf
+            self._buf = ""
+        self._inside = False
+        return visible, reasoning
+
+
+def _split_think_blocks(content: str) -> tuple[str, str]:
+    """Move ``<think>...</think>`` segments from content into a reasoning string.
+
+    Many distilled reasoner kings put their chain of thought in raw
+    ``<think>`` blocks because the chat template does not split them into
+    ``reasoning_content``. The UI only knows how to render the reasoning
+    field, so leaving the tags inline shows them as literal text. Split
+    them here so the chat surface displays the model's thinking the way
+    Open WebUI expects.
+    """
+    if not content or "<think" not in content.lower():
+        return content, ""
+    think_chunks = [m.group(1).strip() for m in _THINK_BLOCK_RE.finditer(content)]
+    cleaned = _THINK_BLOCK_RE.sub("", content).strip()
+    reasoning = "\n\n".join(c for c in think_chunks if c).strip()
+    return cleaned, reasoning
+
+
+_REFUSAL_PATTERNS = (
+    re.compile(r"\bI (?:cannot|can't|am unable|do not have the ability) (?:do that|help|browse|access)", re.IGNORECASE),
+    re.compile(r"\bI (?:do not|don't) have (?:real[-\s]?time|internet|web) access", re.IGNORECASE),
+    re.compile(r"\bI (?:do not|don't) have (?:the ability to|access to) (?:browse|search|run code|execute)", re.IGNORECASE),
+    re.compile(r"\bI'?m sorry,? (?:but )?I (?:can'?t|cannot)", re.IGNORECASE),
+    re.compile(r"\bAs an AI(?: language)? model,? I (?:cannot|can't|do not|don't)", re.IGNORECASE),
+    re.compile(r"\bI'?m unable to (?:do that|help with that|browse|access|search|run|execute)", re.IGNORECASE),
+)
+
+
+def _looks_empty_or_derailed(content: str) -> bool:
+    if not content:
+        return True
+    stripped = content.strip()
+    if not stripped:
+        return True
+    if any(marker in stripped for marker in _DERAIL_MARKERS):
+        return True
+    if any(pat.search(stripped) for pat in _REFUSAL_PATTERNS):
+        return True
+    return False
+
+
+def _model_quoted_numeric_answer(direct_answer: str, model_content: str) -> bool:
+    """Decide whether the model faithfully reproduced a numeric tool result.
+
+    For deterministic numeric tool outputs (Fibonacci, big-power arithmetic),
+    miner models often hallucinate digits even when the runtime supplied the
+    exact answer in a system message. To detect that, we extract the longest
+    pure-digit value from ``direct_answer`` and check that the model output
+    contains both its first and last segments. Short values (< 6 digits)
+    are considered easy enough that we trust the model verbatim.
+    """
+    if not direct_answer or not model_content:
+        return False
+    candidates = re.findall(r"[0-9][0-9,_\s]{2,}", direct_answer)
+    if not candidates:
+        return True
+    longest = max(candidates, key=len)
+    digits = re.sub(r"[^0-9]", "", longest)
+    if len(digits) < 6:
+        return True
+    model_digits = re.sub(r"[^0-9]", "", model_content)
+    if not model_digits:
+        return False
+    if len(digits) <= 24:
+        return digits in model_digits
+    return digits[:8] in model_digits and digits[-8:] in model_digits
 
 
 def _extract_fibonacci_tool(user_text: str) -> tuple[str | None, str]:
@@ -898,11 +1102,33 @@ async def _prepare_orchestrated_chat(
             "PYTHON_EXECUTION_RESULT:\nNo runnable Python code or arithmetic expression was detected."
         )
 
+    king_label = (
+        f"UID {king_uid} ({king_model})" if king_uid is not None and king_model
+        else (king_model or "the current SN97 king model")
+    )
     system = (
-        "You are SN97 chat. Answer the user directly. If tool results are "
-        "provided, use them as authoritative context and do not invent another "
-        "tool name. Do not claim you used a tool unless a tool result is "
-        "present in the context."
+        "You are SN97 chat, the public chat surface for Bittensor Subnet 97. "
+        f"You are powered by {king_label}.\n\n"
+        "The chat runtime gives you these capabilities transparently:\n"
+        "- Web search: when the runtime detects a time-sensitive query it will "
+        "fetch DuckDuckGo results for you.\n"
+        "- Python execution: short Python snippets and arithmetic expressions "
+        "run in a sandbox; you see the stdout.\n"
+        "- Math helpers: large powers, factorials, and Fibonacci numbers are "
+        "computed exactly by the runtime.\n"
+        "- SN97 live state: the runtime can quote the current king, leaderboard, "
+        "and eval round.\n\n"
+        "Important rules for you, the model:\n"
+        "1. Do NOT claim you lack internet access, code execution, math, or "
+        "real-time data — the runtime handles those for you.\n"
+        "2. Whenever a system message contains tool results, treat them as "
+        "the authoritative ground truth and weave them into your answer in "
+        "natural prose.\n"
+        "3. Think step-by-step before answering. Wrap private reasoning in "
+        "<think>...</think> tags so it is shown as the assistant's thinking. "
+        "Put the user-facing answer outside the <think> block.\n"
+        "4. Be concise, specific, and quote tool results verbatim when "
+        "exactness matters (numbers, prices, URLs, code output)."
     )
     clean_messages = _clean_client_messages(messages, system=system)
     if tool_context:
@@ -911,9 +1137,10 @@ async def _prepare_orchestrated_chat(
             {
                 "role": "system",
                 "content": (
-                    "Tool results from the chat runtime:\n\n"
+                    "Authoritative runtime tool results — treat these as ground "
+                    "truth and integrate them naturally into your answer; do not "
+                    "contradict them or claim you cannot use them.\n\n"
                     + "\n\n".join(tool_context)
-                    + "\n\nUse these results when relevant. The final answer should still be your own model output."
                 ),
             },
         )
@@ -944,27 +1171,47 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
     vllm_body, tool_context, runtime_trace, direct_answer = await _prepare_orchestrated_chat(
         body, king_uid, king_model, stream=False,
     )
-    if direct_answer is not None:
-        content = direct_answer
+    pod_unavailable_msg: str | None = None
+    try:
+        raw = await _local_chat_post(vllm_body, timeout=120.0)
+        msg = (raw.get("choices") or [{}])[0].get("message") or {}
+        content = msg.get("content") or ""
+        model_reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+        usage = raw.get("usage")
+    except _ChatPodUnavailable as exc:
+        pod_unavailable_msg = f"chat server unavailable: {str(exc)[:200]}"
+        content = ""
         model_reasoning = ""
         usage = None
-    else:
-        try:
-            raw = await _local_chat_post(vllm_body, timeout=120.0)
-            msg = (raw.get("choices") or [{}])[0].get("message") or {}
-            content = msg.get("content") or ""
-            model_reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
-            usage = raw.get("usage")
-        except _ChatPodUnavailable as exc:
-            content = f"chat server unavailable: {str(exc)[:200]}"
-            model_reasoning = ""
-            usage = None
-    if tool_context and direct_answer is None:
-        content = (
-            _format_tool_context_for_display(tool_context)
-            + "Raw model answer:\n\n"
-            + (content or "(empty)")
+
+    # Promote inline <think> blocks into the reasoning channel so Open WebUI
+    # renders the model's chain of thought instead of literal tags.
+    content, think_reasoning = _split_think_blocks(content)
+    if think_reasoning:
+        model_reasoning = (
+            (model_reasoning + "\n\n" + think_reasoning).strip()
+            if model_reasoning else think_reasoning
         )
+
+    used_direct_fallback = False
+    if pod_unavailable_msg and direct_answer is not None:
+        content = direct_answer
+        runtime_trace.append("Chat pod unavailable; served deterministic tool result.")
+        used_direct_fallback = True
+    elif pod_unavailable_msg:
+        content = pod_unavailable_msg
+    elif direct_answer is not None and _looks_empty_or_derailed(content):
+        content = direct_answer
+        runtime_trace.append(
+            "Model returned no usable answer; served deterministic tool result instead."
+        )
+        used_direct_fallback = True
+    elif direct_answer is not None and not _model_quoted_numeric_answer(direct_answer, content):
+        content = direct_answer
+        runtime_trace.append(
+            "Model did not quote the deterministic tool result; served the runtime result instead."
+        )
+        used_direct_fallback = True
     now = int(time.time())
     response_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
     usage = usage or {
@@ -1109,30 +1356,9 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
                 {"reasoning": trace, "reasoning_content": trace},
             )
 
-        if direct_answer is not None:
-            acc += direct_answer
-            yield _openai_sse_chunk(base, {"content": direct_answer}, finish_reason="stop")
-            finish_sent = True
-            yield "data: [DONE]\n\n"
-            try:
-                _log_chat_turn(vllm_body or body, acc, king_uid, king_model, {
-                    "choices": [{
-                        "message": {
-                            "content": acc,
-                            "reasoning": "\n".join(reasoning_acc),
-                        }
-                    }]
-                })
-            except Exception:
-                pass
-            return
-
-        if tool_context:
-            prefix = _format_tool_context_for_display(tool_context) + "Raw model answer:\n\n"
-            acc += prefix
-            yield _openai_sse_chunk(base, {"content": prefix})
-
+        think_state = _ThinkStreamSplitter()
         client = _get_http_client()
+        pod_failed = False
         try:
             async with client.stream(
                 "POST",
@@ -1142,68 +1368,123 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
             ) as resp:
                 if resp.status_code >= 400:
                     detail = (await resp.aread()).decode("utf-8", "replace")[:300]
-                    yield "data: " + json.dumps({
-                        "error": {
-                            "message": f"chat server returned {resp.status_code}",
-                            "detail": detail,
-                        },
-                    }) + "\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    line = line.strip()
-                    if not line.startswith("data: "):
-                        continue
-                    raw = line[6:]
-                    if raw == "[DONE]":
-                        break
-                    try:
-                        parsed = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    choice = (parsed.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-                    msg = choice.get("message") or {}
-                    out_delta = {}
-                    content = delta.get("content") or msg.get("content") or ""
-                    if content:
-                        acc += content
-                        out_delta["content"] = content
-                    reasoning = _delta_reasoning(delta, msg)
-                    if reasoning:
-                        reasoning_acc.append(reasoning)
-                        out_delta["reasoning"] = reasoning
-                        out_delta["reasoning_content"] = reasoning
-                    if delta.get("tool_calls"):
-                        out_delta["tool_calls"] = delta.get("tool_calls")
-                    finish_reason = choice.get("finish_reason")
-                    if out_delta or finish_reason:
-                        yield _openai_sse_chunk(base, out_delta, finish_reason=finish_reason)
-                    if finish_reason:
-                        finish_sent = True
-            if not finish_sent:
-                yield _openai_sse_chunk(base, {}, finish_reason="stop")
+                    pod_failed = True
+                    if direct_answer is None:
+                        yield "data: " + json.dumps({
+                            "error": {
+                                "message": f"chat server returned {resp.status_code}",
+                                "detail": detail,
+                            },
+                        }) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                else:
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        line = line.strip()
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:]
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            parsed = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        choice = (parsed.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+                        msg = choice.get("message") or {}
+                        out_delta = {}
+                        content = delta.get("content") or msg.get("content") or ""
+                        if content:
+                            visible, reasoning_chunk = think_state.feed(content)
+                            if reasoning_chunk:
+                                reasoning_acc.append(reasoning_chunk)
+                                out_delta["reasoning"] = reasoning_chunk
+                                out_delta["reasoning_content"] = reasoning_chunk
+                            if visible:
+                                acc += visible
+                                out_delta["content"] = visible
+                        reasoning = _delta_reasoning(delta, msg)
+                        if reasoning:
+                            reasoning_acc.append(reasoning)
+                            out_delta["reasoning"] = (
+                                (out_delta.get("reasoning", "") + reasoning) if out_delta.get("reasoning") else reasoning
+                            )
+                            out_delta["reasoning_content"] = out_delta["reasoning"]
+                        if delta.get("tool_calls"):
+                            out_delta["tool_calls"] = delta.get("tool_calls")
+                        finish_reason = choice.get("finish_reason")
+                        if out_delta:
+                            yield _openai_sse_chunk(base, out_delta)
+                        if finish_reason and not pod_failed:
+                            visible_tail, reasoning_tail = think_state.flush()
+                            if reasoning_tail:
+                                reasoning_acc.append(reasoning_tail)
+                                yield _openai_sse_chunk(base, {"reasoning": reasoning_tail, "reasoning_content": reasoning_tail})
+                            if visible_tail:
+                                acc += visible_tail
+                                yield _openai_sse_chunk(base, {"content": visible_tail})
+                            yield _openai_sse_chunk(base, {}, finish_reason=finish_reason)
+                            finish_sent = True
         except (httpx.ConnectError, httpx.ConnectTimeout):
-            yield 'data: {"error": {"message": "chat server unavailable"}}\n\n'
+            pod_failed = True
+            if direct_answer is None:
+                yield 'data: {"error": {"message": "chat server unavailable"}}\n\n'
+                yield "data: [DONE]\n\n"
+                return
         except Exception as exc:
-            yield "data: " + json.dumps({
-                "error": {"message": f"stream interrupted: {str(exc)[:200]}"},
-            }) + "\n\n"
-        finally:
-            yield "data: [DONE]\n\n"
-            try:
-                _log_chat_turn(vllm_body or body, acc, king_uid, king_model, {
-                    "choices": [{
-                        "message": {
-                            "content": acc,
-                            "reasoning": "\n".join(reasoning_acc),
-                        }
-                    }]
-                })
-            except Exception:
-                pass
+            pod_failed = True
+            if direct_answer is None:
+                yield "data: " + json.dumps({
+                    "error": {"message": f"stream interrupted: {str(exc)[:200]}"},
+                }) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        # Final fallback: model returned nothing usable, refused, or hallucinated
+        # past a deterministic numeric result.
+        needs_fallback = direct_answer is not None and (
+            pod_failed
+            or _looks_empty_or_derailed(acc)
+            or not _model_quoted_numeric_answer(direct_answer, acc)
+        )
+        if needs_fallback:
+            visible_tail, reasoning_tail = think_state.flush()
+            if reasoning_tail:
+                yield _openai_sse_chunk(base, {"reasoning": reasoning_tail, "reasoning_content": reasoning_tail})
+            if pod_failed:
+                note = "(chat pod unavailable; falling back to deterministic tool result)\n\n"
+            elif _looks_empty_or_derailed(acc):
+                note = "(model returned no usable answer; falling back to deterministic tool result)\n\n"
+            else:
+                note = "(model did not quote the deterministic tool result; serving runtime answer)\n\n"
+            yield _openai_sse_chunk(base, {"reasoning": note, "reasoning_content": note})
+            acc = direct_answer
+            yield _openai_sse_chunk(base, {"content": direct_answer}, finish_reason="stop")
+            finish_sent = True
+        elif not finish_sent:
+            visible_tail, reasoning_tail = think_state.flush()
+            if reasoning_tail:
+                yield _openai_sse_chunk(base, {"reasoning": reasoning_tail, "reasoning_content": reasoning_tail})
+            if visible_tail:
+                acc += visible_tail
+                yield _openai_sse_chunk(base, {"content": visible_tail})
+            yield _openai_sse_chunk(base, {}, finish_reason="stop")
+
+        yield "data: [DONE]\n\n"
+        try:
+            _log_chat_turn(vllm_body or body, acc, king_uid, king_model, {
+                "choices": [{
+                    "message": {
+                        "content": acc,
+                        "reasoning": "\n".join(reasoning_acc),
+                    }
+                }]
+            })
+        except Exception:
+            pass
 
     return _sse_response(generate())
 
@@ -1220,15 +1501,8 @@ def _stream_orchestrated_chat_response(payload: dict, king_uid: int | None, king
             trace = _tool_reasoning(runtime_trace)
             if trace:
                 yield f"data: {json.dumps({'thinking': trace, 'delta': True})}\n\n"
-            if direct_answer is not None:
-                acc += direct_answer
-                yield f"data: {json.dumps({'response': direct_answer, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
-                return
-            if tool_context:
-                prefix = _format_tool_context_for_display(tool_context) + "Raw model answer:\n\n"
-                acc += prefix
-                yield f"data: {json.dumps({'response': prefix, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
-
+            think_state = _ThinkStreamSplitter()
+            pod_failed = False
             client = _get_http_client()
             async with client.stream(
                 "POST",
@@ -1237,33 +1511,67 @@ def _stream_orchestrated_chat_response(payload: dict, king_uid: int | None, king
                 timeout=httpx.Timeout(connect=3.0, read=300.0, write=10.0, pool=5.0),
             ) as resp:
                 if resp.status_code >= 400:
-                    yield f"data: {json.dumps({'error': f'chat server returned {resp.status_code}'})}\n\n"
-                    return
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    line = line.strip()
-                    if not line.startswith("data: "):
-                        continue
-                    raw = line[6:]
-                    if raw == "[DONE]":
-                        break
-                    try:
-                        parsed = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    choice = (parsed.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-                    msg = choice.get("message") or {}
-                    reasoning = _delta_reasoning(delta, msg)
-                    if reasoning:
-                        yield f"data: {json.dumps({'thinking': reasoning, 'delta': True})}\n\n"
-                    content = delta.get("content") or msg.get("content") or ""
-                    if content:
-                        acc += content
-                        yield f"data: {json.dumps({'response': content, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+                    pod_failed = True
+                    if direct_answer is None:
+                        yield f"data: {json.dumps({'error': f'chat server returned {resp.status_code}'})}\n\n"
+                        return
+                else:
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        line = line.strip()
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:]
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            parsed = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        choice = (parsed.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+                        msg = choice.get("message") or {}
+                        reasoning = _delta_reasoning(delta, msg)
+                        if reasoning:
+                            yield f"data: {json.dumps({'thinking': reasoning, 'delta': True})}\n\n"
+                        content = delta.get("content") or msg.get("content") or ""
+                        if content:
+                            visible, reasoning_chunk = think_state.feed(content)
+                            if reasoning_chunk:
+                                yield f"data: {json.dumps({'thinking': reasoning_chunk, 'delta': True})}\n\n"
+                            if visible:
+                                acc += visible
+                                yield f"data: {json.dumps({'response': visible, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+                    visible_tail, reasoning_tail = think_state.flush()
+                    if reasoning_tail:
+                        yield f"data: {json.dumps({'thinking': reasoning_tail, 'delta': True})}\n\n"
+                    if visible_tail:
+                        acc += visible_tail
+                        yield f"data: {json.dumps({'response': visible_tail, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+
+            needs_fallback = direct_answer is not None and (
+                pod_failed
+                or _looks_empty_or_derailed(acc)
+                or not _model_quoted_numeric_answer(direct_answer, acc)
+            )
+            if needs_fallback:
+                if pod_failed:
+                    note = "(chat pod unavailable; falling back to deterministic tool result)"
+                elif _looks_empty_or_derailed(acc):
+                    note = "(model returned no usable answer; falling back to deterministic tool result)"
+                else:
+                    note = "(model did not quote the deterministic tool result; serving runtime answer)"
+                yield f"data: {json.dumps({'thinking': note, 'delta': True})}\n\n"
+                acc = direct_answer
+                yield f"data: {json.dumps({'response': direct_answer, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            yield f"data: {json.dumps({'error': 'chat server unavailable', 'detail': str(exc)[:200]})}\n\n"
+            if direct_answer is not None:
+                yield f"data: {json.dumps({'thinking': 'chat pod unavailable; falling back to deterministic tool result', 'delta': True})}\n\n"
+                acc = direct_answer
+                yield f"data: {json.dumps({'response': direct_answer, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+            else:
+                yield f"data: {json.dumps({'error': 'chat server unavailable', 'detail': str(exc)[:200]})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'error': str(exc)[:200]})}\n\n"
         finally:
