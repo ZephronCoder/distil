@@ -300,6 +300,50 @@ def _latest_user_text(messages: list[dict]) -> str:
     return ""
 
 
+def _recent_chat_text(messages: list[dict], *, max_messages: int = 6) -> str:
+    parts: list[str] = []
+    for msg in (messages or [])[-max_messages:]:
+        if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        if msg.get("role") == "assistant":
+            content = _strip_client_thinking(content)
+        if content:
+            parts.append(content)
+    return "\n".join(parts)
+
+
+def _contextual_tool_user_text(messages: list[dict], user_text: str) -> str:
+    """Add just enough recent context for deterministic tool extraction.
+
+    Open WebUI sends follow-ups like "yes the 4096th number" after the model
+    asks about a Fibonacci interpretation. The latest user message no longer
+    contains "fib", so the runtime used to miss the tool path and let the
+    weak king hallucinate. If recent chat context is clearly Fibonacci-related
+    and the latest turn is an ordinal/numeric follow-up, synthesize a local
+    tool query without changing the transcript sent to the model.
+    """
+    text = user_text or ""
+    if "fib" in text.lower():
+        return text
+    recent = _recent_chat_text(messages)
+    if "fib" not in recent.lower():
+        return text
+    followup = re.search(
+        r"(?:"
+        r"\b(?:yes|yeah|yep|correct|right|no|not)\b.{0,30})?"
+        r"(\d{1,8}\s*(?:\^|\*\*)\s*\d{1,6}|\d{1,8})(?:st|nd|rd|th)?"
+        r"(?:\s+(?:number|term|index))?\b",
+        text,
+        re.IGNORECASE,
+    )
+    if followup and re.search(r"\b(?:number|term|index|yes|yeah|yep|correct|right|no|not)\b", text, re.IGNORECASE):
+        return f"{text} fibonacci"
+    return text
+
+
 _CLIENT_THINK_RE = re.compile(r"<think\b[^>]*>.*?</think>\s*", re.IGNORECASE | re.DOTALL)
 _RUNTIME_TRACE_LINE_RE = re.compile(
     r"(?im)^Runtime trace, not hidden model reasoning:.*(?:\n|$)"
@@ -627,7 +671,7 @@ def _extract_python_code(user_text: str) -> tuple[str | None, str]:
         return run_py.group(1).strip(), "inline Python request"
 
     inline = re.search(r"`([^`]{3,400})`", user_text)
-    if inline and any(ch in inline.group(1) for ch in "+-*/()%"):
+    if inline and any(ch in inline.group(1) for ch in "+-*/()%^"):
         expr = inline.group(1).strip().replace("^", "**")
         return f"print({expr})", "inline arithmetic expression"
 
@@ -674,6 +718,10 @@ def _extract_python_code(user_text: str) -> tuple[str | None, str]:
         if expr:
             expr = expr.replace("^", "**")
             return f"print({expr})", "arithmetic expression"
+    bare_expr = re.fullmatch(r"\s*(?:yes|yeah|yep|no|not)?\s*([0-9][0-9\s+\-*/%().,_^]{1,200})\s*\??\s*", user_text, re.I)
+    if bare_expr and any(ch in bare_expr.group(1) for ch in "+-*/%^"):
+        expr = bare_expr.group(1).strip(" .?\n\t").replace("^", "**")
+        return f"print({expr})", "bare arithmetic expression"
     return None, ""
 
 
@@ -922,13 +970,21 @@ def _model_quoted_numeric_answer(direct_answer: str, model_content: str) -> bool
         return True
     longest = max(candidates, key=len)
     digits = re.sub(r"[^0-9]", "", longest)
-    if len(digits) < 6:
-        return True
     model_digits = re.sub(r"[^0-9]", "", model_content)
     if not model_digits:
         return False
     if len(digits) <= 24:
-        return digits in model_digits
+        if digits not in model_digits:
+            return False
+        if len(digits) >= 3:
+            # If stdout says "285", an answer that says "385 ... 285" is
+            # still bad. Ignore shorter prompt/index values (like the "10" in
+            # "first 10 integers") but reject same-width contradictory values.
+            for token in re.findall(r"\d[\d,]*", model_content):
+                token_digits = re.sub(r"[^0-9]", "", token)
+                if len(token_digits) >= len(digits) and token_digits != digits:
+                    return False
+        return True
     return digits[:8] in model_digits and digits[-8:] in model_digits
 
 
@@ -1044,6 +1100,7 @@ async def _prepare_orchestrated_chat(
     """
     messages = list(body.get("messages") or [])
     user_text = _latest_user_text(messages)
+    tool_user_text = _contextual_tool_user_text(messages, user_text)
     runtime_trace: list[str] = []
     tool_context: list[str] = []
     direct_answer: str | None = None
@@ -1066,7 +1123,7 @@ async def _prepare_orchestrated_chat(
         if answer:
             tool_context.append(f"SN97_LIVE_RESULT:\n{answer}")
 
-    fib_code, fib_desc = _extract_fibonacci_tool(user_text or "")
+    fib_code, fib_desc = _extract_fibonacci_tool(tool_user_text or "")
     if fib_desc and not fib_code:
         runtime_trace.append(f"Fibonacci runtime rejected the request: {fib_desc}")
         tool_context.append(f"PYTHON_EXECUTION_RESULT:\n{fib_desc}")
@@ -1085,7 +1142,7 @@ async def _prepare_orchestrated_chat(
 
     # Tool execution: Python code / arithmetic.
     code, code_kind = _extract_python_code(user_text or "")
-    if code and _CODE_RE.search(user_text or "") and not fib_code:
+    if code and not fib_code:
         out, err = _run_python_code(code)
         runtime_trace.append(f"Executed a {code_kind} in a short-lived Python sandbox.")
         if err:
@@ -1359,6 +1416,7 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
         think_state = _ThinkStreamSplitter()
         client = _get_http_client()
         pod_failed = False
+        buffer_model_content = direct_answer is not None
         try:
             async with client.stream(
                 "POST",
@@ -1405,7 +1463,8 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
                                 out_delta["reasoning_content"] = reasoning_chunk
                             if visible:
                                 acc += visible
-                                out_delta["content"] = visible
+                                if not buffer_model_content:
+                                    out_delta["content"] = visible
                         reasoning = _delta_reasoning(delta, msg)
                         if reasoning:
                             reasoning_acc.append(reasoning)
@@ -1425,9 +1484,11 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
                                 yield _openai_sse_chunk(base, {"reasoning": reasoning_tail, "reasoning_content": reasoning_tail})
                             if visible_tail:
                                 acc += visible_tail
-                                yield _openai_sse_chunk(base, {"content": visible_tail})
-                            yield _openai_sse_chunk(base, {}, finish_reason=finish_reason)
-                            finish_sent = True
+                                if not buffer_model_content:
+                                    yield _openai_sse_chunk(base, {"content": visible_tail})
+                            if not buffer_model_content:
+                                yield _openai_sse_chunk(base, {}, finish_reason=finish_reason)
+                                finish_sent = True
         except (httpx.ConnectError, httpx.ConnectTimeout):
             pod_failed = True
             if direct_answer is None:
@@ -1470,7 +1531,10 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
                 yield _openai_sse_chunk(base, {"reasoning": reasoning_tail, "reasoning_content": reasoning_tail})
             if visible_tail:
                 acc += visible_tail
-                yield _openai_sse_chunk(base, {"content": visible_tail})
+                if not buffer_model_content:
+                    yield _openai_sse_chunk(base, {"content": visible_tail})
+            if buffer_model_content and acc:
+                yield _openai_sse_chunk(base, {"content": acc})
             yield _openai_sse_chunk(base, {}, finish_reason="stop")
 
         yield "data: [DONE]\n\n"
@@ -1503,6 +1567,7 @@ def _stream_orchestrated_chat_response(payload: dict, king_uid: int | None, king
                 yield f"data: {json.dumps({'thinking': trace, 'delta': True})}\n\n"
             think_state = _ThinkStreamSplitter()
             pod_failed = False
+            buffer_model_content = direct_answer is not None
             client = _get_http_client()
             async with client.stream(
                 "POST",
@@ -1542,13 +1607,15 @@ def _stream_orchestrated_chat_response(payload: dict, king_uid: int | None, king
                                 yield f"data: {json.dumps({'thinking': reasoning_chunk, 'delta': True})}\n\n"
                             if visible:
                                 acc += visible
-                                yield f"data: {json.dumps({'response': visible, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+                                if not buffer_model_content:
+                                    yield f"data: {json.dumps({'response': visible, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
                     visible_tail, reasoning_tail = think_state.flush()
                     if reasoning_tail:
                         yield f"data: {json.dumps({'thinking': reasoning_tail, 'delta': True})}\n\n"
                     if visible_tail:
                         acc += visible_tail
-                        yield f"data: {json.dumps({'response': visible_tail, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+                        if not buffer_model_content:
+                            yield f"data: {json.dumps({'response': visible_tail, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
 
             needs_fallback = direct_answer is not None and (
                 pod_failed
@@ -1565,6 +1632,8 @@ def _stream_orchestrated_chat_response(payload: dict, king_uid: int | None, king
                 yield f"data: {json.dumps({'thinking': note, 'delta': True})}\n\n"
                 acc = direct_answer
                 yield f"data: {json.dumps({'response': direct_answer, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+            elif buffer_model_content and acc:
+                yield f"data: {json.dumps({'response': acc, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             if direct_answer is not None:
                 yield f"data: {json.dumps({'thinking': 'chat pod unavailable; falling back to deterministic tool result', 'delta': True})}\n\n"

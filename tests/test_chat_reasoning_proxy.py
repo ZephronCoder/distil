@@ -197,6 +197,71 @@ def test_orchestrated_chat_falls_back_when_model_hallucinates_fibonacci(monkeypa
     assert "did not quote" in msg["reasoning"]
 
 
+def test_orchestrated_chat_executes_contextual_fibonacci_followup(monkeypatch):
+    captured = {}
+
+    async def hallucinating_model(payload, *, timeout):
+        captured["payload"] = payload
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "[boxed{832}]",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(chat_route, "_local_chat_post", hallucinating_model)
+
+    data = asyncio.run(
+        chat_route._orchestrated_chat_completion(
+            {
+                "messages": [
+                    {"role": "user", "content": "no 4^6th number"},
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "I'll interpret that as the (4^6)th number in the "
+                            "Fibonacci sequence. 4^6 = 4096."
+                        ),
+                    },
+                    {"role": "user", "content": "yes the 4096th number"},
+                ]
+            },
+            king_uid=1,
+            king_model="king/model",
+        )
+    )
+
+    msg = data["choices"][0]["message"]
+    assert "index 4096" in msg["content"]
+    assert "It has 856 digits" in msg["content"]
+    assert "[boxed{832}]" not in msg["content"]
+    assert "did not quote" in msg["reasoning"]
+    sys_msgs = [m for m in captured["payload"]["messages"] if m["role"] == "system"]
+    assert any("PYTHON_EXECUTION_RESULT" in m["content"] for m in sys_msgs)
+
+
+def test_orchestrated_chat_executes_plain_arithmetic_without_keyword(monkeypatch):
+    async def empty_model(_payload, *, timeout):
+        return {"choices": [{"message": {"content": ""}}]}
+
+    monkeypatch.setattr(chat_route, "_local_chat_post", empty_model)
+
+    data = asyncio.run(
+        chat_route._orchestrated_chat_completion(
+            {"messages": [{"role": "user", "content": "what is 4^6?"}]},
+            king_uid=1,
+            king_model="king/model",
+        )
+    )
+
+    msg = data["choices"][0]["message"]
+    assert "4096" in msg["content"]
+    assert "Executed a arithmetic expression" in msg["reasoning"]
+
+
 def test_model_quoted_numeric_answer_helper():
     assert chat_route._model_quoted_numeric_answer("F_32 is 2178309.", "Result: 2178309")
     assert chat_route._model_quoted_numeric_answer(
@@ -204,16 +269,20 @@ def test_model_quoted_numeric_answer_helper():
         "The Fibonacci index 32 result is 2,178,309.",
     )
     assert not chat_route._model_quoted_numeric_answer(
+        "Python stdout:\n285",
+        "The sum is 385. The runtime printed 285.",
+    )
+    assert not chat_route._model_quoted_numeric_answer(
         "Result: 2178309",
         "The number is 1,024,000,000,000.",
     )
     big_value = "26" + "0" * 13700 + "57"
     assert chat_route._model_quoted_numeric_answer(
-        f"F_65536 starts with {big_value[:8]} and ends with {big_value[-8:]}",
+        f"Result: {big_value}",
         f"Approximately {big_value[:8]}…{big_value[-8:]}",
     )
     assert not chat_route._model_quoted_numeric_answer(
-        f"F_65536 starts with {big_value[:8]} and ends with {big_value[-8:]}",
+        f"Result: {big_value}",
         "Approximately 102400000000000000000.",
     )
 
