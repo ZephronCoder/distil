@@ -79,3 +79,43 @@ def test_orchestrated_chat_omits_fake_reasoning_when_model_has_none(monkeypatch)
     assert msg["content"] == "final answer"
     assert "reasoning" not in msg
     assert "reasoning_content" not in msg
+
+
+def test_orchestrated_chat_answers_fibonacci_from_python_tool(monkeypatch):
+    async def fail_if_model_called(_payload, *, timeout):
+        raise AssertionError("deterministic Fibonacci tool should not call the model")
+
+    monkeypatch.setattr(chat_route, "_local_chat_post", fail_if_model_called)
+
+    data = asyncio.run(
+        chat_route._orchestrated_chat_completion(
+            {"messages": [{"role": "user", "content": "what is the 2**5th fibonacci number"}]},
+            king_uid=1,
+            king_model="king/model",
+        )
+    )
+
+    msg = data["choices"][0]["message"]
+    assert "2178309" in msg["content"]
+    assert "index 32" in msg["content"]
+    assert "Tool trace:" in msg["reasoning"]
+    assert "Executed Python" in msg["reasoning"]
+
+
+def test_orchestrated_chat_answers_inline_python_from_tool(monkeypatch):
+    async def fail_if_model_called(_payload, *, timeout):
+        raise AssertionError("deterministic Python tool should not call the model")
+
+    monkeypatch.setattr(chat_route, "_local_chat_post", fail_if_model_called)
+
+    data = asyncio.run(
+        chat_route._orchestrated_chat_completion(
+            {"messages": [{"role": "user", "content": "run python: print(4**8)"}]},
+            king_uid=1,
+            king_model="king/model",
+        )
+    )
+
+    msg = data["choices"][0]["message"]
+    assert "65536" in msg["content"]
+    assert "Tool trace:" in msg["reasoning"]

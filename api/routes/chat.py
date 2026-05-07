@@ -227,7 +227,7 @@ _SN97_RE = re.compile(
 )
 _CODE_RE = re.compile(
     r"\b(run|execute|python|script|code|calculate|compute|evaluate|math|"
-    r"fibonacci|fib(?:onacci)?_?sequence)\b",
+    r"power|fibonacci|fib(?:onacci)?_?sequence)\b",
     re.IGNORECASE,
 )
 _UID_RE = re.compile(r"\buid\s*[:=#]?\s*(\d{1,3})\b", re.IGNORECASE)
@@ -241,8 +241,15 @@ _WEB_SEARCH_RE = re.compile(
     re.IGNORECASE,
 )
 _FIB_INDEX_RE = re.compile(
-    r"(?:(\d+)\s*\^\s*(\d+)(?:st|nd|rd|th)?|\b(\d{1,8})(?:st|nd|rd|th)?)"
+    r"(?:(\d+)\s*(?:\^|\*\*)\s*(\d+)(?:st|nd|rd|th)?|"
+    r"(\d+)\s*(?:to\s+the\s+power\s+of|power\s+of)\s*(?:the\s*)?(\d+)(?:st|nd|rd|th)?|"
+    r"\b(\d{1,8})(?:st|nd|rd|th)?)"
     r".{0,40}\b(?:fib(?:onacci)?|fibonacci)\b",
+    re.IGNORECASE,
+)
+_POWER_PHRASE_RE = re.compile(
+    r"\b(\d{1,9})\s*(?:to\s+the\s+power\s+of|power\s+of)\s*(?:the\s*)?"
+    r"(\d{1,6})(?:st|nd|rd|th)?\b",
     re.IGNORECASE,
 )
 _FACTORIAL_RE = re.compile(
@@ -560,10 +567,24 @@ def _extract_python_code(user_text: str) -> tuple[str | None, str]:
     if fenced:
         return fenced.group(1).strip(), "python code block"
 
+    run_py = re.search(
+        r"\b(?:run|execute)\s+(?:this\s+)?(?:python|py)\s*:?\s*(.+)$",
+        user_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if run_py:
+        return run_py.group(1).strip(), "inline Python request"
+
     inline = re.search(r"`([^`]{3,400})`", user_text)
     if inline and any(ch in inline.group(1) for ch in "+-*/()%"):
-        expr = inline.group(1).strip()
+        expr = inline.group(1).strip().replace("^", "**")
         return f"print({expr})", "inline arithmetic expression"
+
+    power = _POWER_PHRASE_RE.search(user_text)
+    if power:
+        base = int(power.group(1))
+        exp = int(power.group(2))
+        return f"print({base} ** {exp})", f"power expression {base}^{exp}"
 
     factorial = _FACTORIAL_RE.search(user_text)
     if factorial:
@@ -600,6 +621,7 @@ def _extract_python_code(user_text: str) -> tuple[str | None, str]:
     if expr_match:
         expr = expr_match.group(1).strip(" .?\n\t")
         if expr:
+            expr = expr.replace("^", "**")
             return f"print({expr})", "arithmetic expression"
     return None, ""
 
@@ -622,7 +644,7 @@ def _python_code_is_reasonable(code: str) -> bool:
     return True
 
 
-def _run_python_code(code: str) -> tuple[str, str | None]:
+def _run_python_code(code: str, *, max_stdout_chars: int = 4000) -> tuple[str, str | None]:
     if not _python_code_is_reasonable(code):
         return "", "I refused to run that code because it uses unsafe imports or dynamic execution."
     wrapper = (
@@ -649,7 +671,61 @@ def _run_python_code(code: str) -> tuple[str, str | None]:
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:
         return out, f"Python exited with code {proc.returncode}: {err[-800:]}"
-    return out[:4000], None
+    return out[:max_stdout_chars], None
+
+
+def _parse_key_value_lines(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in (text or "").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _python_direct_answer(desc: str, out: str, err: str | None) -> str:
+    if err:
+        body = err
+        if out:
+            body += f"\n\nPartial stdout:\n{out}"
+        return f"I ran Python for {desc}, but it failed:\n\n```text\n{body}\n```"
+    return f"I executed Python for {desc}:\n\n```text\n{out or '(no stdout)'}\n```"
+
+
+def _fibonacci_direct_answer(desc: str, out: str, err: str | None) -> str:
+    if err:
+        return _python_direct_answer(desc, out, err)
+    values = _parse_key_value_lines(out)
+    index = values.get("index", "?")
+    digits = values.get("digits")
+    value = values.get("value")
+    if value:
+        digit_note = f"\n\nIt has {digits} digits." if digits else ""
+        return (
+            f"The Fibonacci number at index {index} ({desc}) is:\n\n"
+            f"```text\n{value}\n```"
+            f"{digit_note}"
+        )
+    head = values.get("value_head_80")
+    tail = values.get("value_tail_80")
+    if head and tail:
+        return (
+            f"The Fibonacci number at index {index} ({desc}) has {digits or 'many'} digits.\n\n"
+            f"It is too long to print in full here, but I computed it exactly with Python fast doubling.\n\n"
+            f"```text\nfirst 80 digits: {head}\nlast 80 digits:  {tail}\n```"
+        )
+    return _python_direct_answer(desc, out, None)
+
+
+def _tool_reasoning(runtime_trace: list[str], model_reasoning: str = "") -> str:
+    parts = []
+    if model_reasoning:
+        parts.append(model_reasoning)
+    if runtime_trace:
+        trace = "\n".join(f"- {line}" for line in runtime_trace)
+        parts.append("Tool trace:\n" + trace)
+    return "\n\n".join(parts)
 
 
 def _extract_fibonacci_tool(user_text: str) -> tuple[str | None, str]:
@@ -661,8 +737,11 @@ def _extract_fibonacci_tool(user_text: str) -> tuple[str | None, str]:
     if m.group(1) and m.group(2):
         n = int(m.group(1)) ** int(m.group(2))
         desc = f"Fibonacci index {m.group(1)}^{m.group(2)} = {n}"
+    elif m.group(3) and m.group(4):
+        n = int(m.group(3)) ** int(m.group(4))
+        desc = f"Fibonacci index {m.group(3)}^{m.group(4)} = {n}"
     else:
-        n = int(m.group(3))
+        n = int(m.group(5))
         desc = f"Fibonacci index {n}"
     if n < 0 or n > 1_000_000:
         return None, f"Requested Fibonacci index {n} is outside the runtime limit (0..1,000,000)."
@@ -686,7 +765,7 @@ value = fib_pair(n)[0]
 s = str(value)
 print("index =", n)
 print("digits =", len(s))
-if len(s) <= 1000:
+if len(s) <= 20000:
     print("value =", s)
 else:
     print("value_head_80 =", s[:80])
@@ -753,7 +832,7 @@ async def _prepare_orchestrated_chat(
     king_model: str | None,
     *,
     stream: bool = False,
-) -> tuple[dict, list[str], list[str]]:
+) -> tuple[dict, list[str], list[str], str | None]:
     """Build the vLLM request plus deterministic runtime tool context.
 
     Tool execution happens before the model call. The streaming path uses this
@@ -763,6 +842,7 @@ async def _prepare_orchestrated_chat(
     user_text = _latest_user_text(messages)
     runtime_trace: list[str] = []
     tool_context: list[str] = []
+    direct_answer: str | None = None
 
     model_info = _model_info_answer(user_text or "")
     if model_info:
@@ -786,8 +866,9 @@ async def _prepare_orchestrated_chat(
     if fib_desc and not fib_code:
         runtime_trace.append(f"Fibonacci runtime rejected the request: {fib_desc}")
         tool_context.append(f"PYTHON_EXECUTION_RESULT:\n{fib_desc}")
+        direct_answer = fib_desc
     elif fib_code:
-        out, err = _run_python_code(fib_code)
+        out, err = _run_python_code(fib_code, max_stdout_chars=25000)
         runtime_trace.append(f"Executed Python for {fib_desc}.")
         if err:
             result = f"Python failed:\n{err}"
@@ -796,6 +877,7 @@ async def _prepare_orchestrated_chat(
         else:
             result = f"Python stdout:\n{out or '(no stdout)'}"
         tool_context.append(f"PYTHON_EXECUTION_RESULT:\n{result}")
+        direct_answer = _fibonacci_direct_answer(fib_desc, out, err)
 
     # Tool execution: Python code / arithmetic.
     code, code_kind = _extract_python_code(user_text or "")
@@ -809,6 +891,7 @@ async def _prepare_orchestrated_chat(
         else:
             result = f"Python stdout:\n{out or '(no stdout)'}"
         tool_context.append(f"PYTHON_EXECUTION_RESULT:\n{result}")
+        direct_answer = _python_direct_answer(code_kind, out, err)
     elif _CODE_RE.search(user_text or "") and "python" in (user_text or "").lower():
         runtime_trace.append("The user asked for Python execution but no runnable code/expression was detected.")
         tool_context.append(
@@ -846,7 +929,7 @@ async def _prepare_orchestrated_chat(
         "repetition_penalty": body.get("repetition_penalty", 1.0),
         "chat_template_kwargs": {"thinking": True, "enable_thinking": True},
     }
-    return vllm_body, tool_context, runtime_trace
+    return vllm_body, tool_context, runtime_trace, direct_answer
 
 
 async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_model: str | None) -> dict:
@@ -858,20 +941,25 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
     if the king derails after seeing useful tool results, that failure should
     remain visible.
     """
-    vllm_body, tool_context, runtime_trace = await _prepare_orchestrated_chat(
+    vllm_body, tool_context, runtime_trace, direct_answer = await _prepare_orchestrated_chat(
         body, king_uid, king_model, stream=False,
     )
-    try:
-        raw = await _local_chat_post(vllm_body, timeout=120.0)
-        msg = (raw.get("choices") or [{}])[0].get("message") or {}
-        content = msg.get("content") or ""
-        model_reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
-        usage = raw.get("usage")
-    except _ChatPodUnavailable as exc:
-        content = f"chat server unavailable: {str(exc)[:200]}"
+    if direct_answer is not None:
+        content = direct_answer
         model_reasoning = ""
         usage = None
-    if tool_context:
+    else:
+        try:
+            raw = await _local_chat_post(vllm_body, timeout=120.0)
+            msg = (raw.get("choices") or [{}])[0].get("message") or {}
+            content = msg.get("content") or ""
+            model_reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+            usage = raw.get("usage")
+        except _ChatPodUnavailable as exc:
+            content = f"chat server unavailable: {str(exc)[:200]}"
+            model_reasoning = ""
+            usage = None
+    if tool_context and direct_answer is None:
         content = (
             _format_tool_context_for_display(tool_context)
             + "Raw model answer:\n\n"
@@ -890,8 +978,13 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
         "tool_calls": [],
     }
     if model_reasoning:
-        message["reasoning"] = model_reasoning
-        message["reasoning_content"] = model_reasoning
+        reasoning = _tool_reasoning(runtime_trace, model_reasoning)
+        message["reasoning"] = reasoning
+        message["reasoning_content"] = reasoning
+    elif runtime_trace:
+        reasoning = _tool_reasoning(runtime_trace)
+        message["reasoning"] = reasoning
+        message["reasoning_content"] = reasoning
     return {
         "id": response_id,
         "object": "chat.completion",
@@ -997,7 +1090,7 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
         vllm_body: dict | None = None
 
         try:
-            vllm_body, tool_context, runtime_trace = await _prepare_orchestrated_chat(
+            vllm_body, tool_context, runtime_trace, direct_answer = await _prepare_orchestrated_chat(
                 body, king_uid, king_model, stream=True,
             )
         except Exception as exc:
@@ -1008,6 +1101,31 @@ def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_
             return
 
         yield _openai_sse_chunk(base, {"role": "assistant"})
+        trace = _tool_reasoning(runtime_trace)
+        if trace:
+            reasoning_acc.append(trace)
+            yield _openai_sse_chunk(
+                base,
+                {"reasoning": trace, "reasoning_content": trace},
+            )
+
+        if direct_answer is not None:
+            acc += direct_answer
+            yield _openai_sse_chunk(base, {"content": direct_answer}, finish_reason="stop")
+            finish_sent = True
+            yield "data: [DONE]\n\n"
+            try:
+                _log_chat_turn(vllm_body or body, acc, king_uid, king_model, {
+                    "choices": [{
+                        "message": {
+                            "content": acc,
+                            "reasoning": "\n".join(reasoning_acc),
+                        }
+                    }]
+                })
+            except Exception:
+                pass
+            return
 
         if tool_context:
             prefix = _format_tool_context_for_display(tool_context) + "Raw model answer:\n\n"
@@ -1096,9 +1214,16 @@ def _stream_orchestrated_chat_response(payload: dict, king_uid: int | None, king
         acc = ""
         vllm_body: dict | None = None
         try:
-            vllm_body, tool_context, runtime_trace = await _prepare_orchestrated_chat(
+            vllm_body, tool_context, runtime_trace, direct_answer = await _prepare_orchestrated_chat(
                 payload, king_uid, king_model, stream=True,
             )
+            trace = _tool_reasoning(runtime_trace)
+            if trace:
+                yield f"data: {json.dumps({'thinking': trace, 'delta': True})}\n\n"
+            if direct_answer is not None:
+                acc += direct_answer
+                yield f"data: {json.dumps({'response': direct_answer, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+                return
             if tool_context:
                 prefix = _format_tool_context_for_display(tool_context) + "Raw model answer:\n\n"
                 acc += prefix
