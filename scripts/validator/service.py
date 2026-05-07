@@ -83,6 +83,32 @@ def _log_git_revision():
         pass
 
 
+def _commitments_from_valid_models(valid_models: dict) -> dict[int, dict]:
+    """Build the UID-keyed commitment view required by king eligibility.
+
+    ``api.state_store.read_commitments()`` is hotkey-keyed for HTTP callers,
+    while ``single_eval._is_kingship_eligible`` expects a UID-keyed mapping.
+    The validator already has the authoritative precheck output in
+    ``valid_models`` at this point, so derive the current commitment view from
+    that instead of depending on API cache shape.
+    """
+    commitments: dict[int, dict] = {}
+    for uid, info in (valid_models or {}).items():
+        try:
+            uid_i = int(uid)
+        except (TypeError, ValueError):
+            continue
+        row = info or {}
+        commitments[uid_i] = {
+            "model": row.get("model"),
+            "revision": row.get("revision"),
+            "block": row.get("commit_block"),
+            "hotkey": row.get("hotkey"),
+            "is_reference": bool(row.get("is_reference")),
+        }
+    return commitments
+
+
 def _resolve_king(valid_models, state):
     """Resolve the current king.
 
@@ -148,16 +174,24 @@ def _resolve_king(valid_models, state):
                             pass
                 except Exception:
                     uid_to_hotkey = {}
-                commitments_cache = {}
+                commitments_cache = _commitments_from_valid_models(valid_models)
                 try:
                     from api.state_store import read_commitments as _rc
-                    commitments_cache = (_rc() or {}).get("commitments", {})
-                    commitments_cache = {
-                        int(k): v for k, v in commitments_cache.items()
-                        if str(k).lstrip("-").isdigit()
-                    }
+                    api_commitments = (_rc() or {}).get("commitments", {})
+                    for uid, hotkey in uid_to_hotkey.items():
+                        if uid in commitments_cache:
+                            continue
+                        row = api_commitments.get(hotkey)
+                        if isinstance(row, dict):
+                            commitments_cache[uid] = {
+                                "model": row.get("model"),
+                                "revision": row.get("revision"),
+                                "block": row.get("block"),
+                                "hotkey": hotkey,
+                                "is_reference": bool(row.get("is_reference")),
+                            }
                 except Exception:
-                    commitments_cache = {}
+                    pass
                 if _is_kingship_eligible(
                     state, persisted_king, state.dq_reasons,
                     uid_to_hotkey, commitments_cache,
