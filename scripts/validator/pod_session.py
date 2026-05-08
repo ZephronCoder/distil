@@ -82,6 +82,130 @@ def _build_remote_paths(run_dir: str, resume: dict | None = None) -> dict[str, s
     }
 
 
+_LOAD_STAGE_PREFIXES: tuple[str, ...] = (
+    "loading_weights",
+    "loading_student",
+    "loading_teacher",
+    "loading_model",
+)
+
+
+class StageStallWatchdog:
+    """Detect a pod_eval that's been pinned in the same stage too long.
+
+    Before this watchdog the only safety net was the 5-hour outer
+    ``eval_timeout``. When a student wedged in ``loading_weights`` (HF
+    download silently stuck, vLLM init deadlock, OOM with no exception),
+    the validator burned the entire 5-hour budget. The May 7 incident
+    sat in ``loading_weights`` for ~4h22m on UID 213 ``const0312/wtbmts09``
+    before the outer loop noticed and replanned. With this watchdog the
+    same condition is detected within ``load_timeout_s`` (default 45 min)
+    and the pod-side worker is killed via the supplied ``kill_action``
+    callback so the outer loop sees ``DISTIL_STATUS:dead`` and replans
+    cleanly.
+
+    The watchdog fingerprints ``(student_idx, student_name, stage,
+    prompts_done, bench_axis_idx, teacher_prompts_done, phase)``. Any
+    change resets the timer. If the fingerprint stays identical past the
+    half-limit, ``warn_action(elapsed)`` fires once. If it stays past the
+    full limit, ``kill_action(elapsed)`` fires once and the watchdog
+    arms itself for the rest of the run (no double-kill).
+    """
+
+    def __init__(
+        self,
+        *,
+        load_timeout_s: int = 2700,
+        default_timeout_s: int = 1500,
+        kill_enabled: bool = True,
+        warn_action=None,
+        kill_action=None,
+        time_fn=time.time,
+    ) -> None:
+        self.load_timeout_s = max(60, int(load_timeout_s))
+        self.default_timeout_s = max(60, int(default_timeout_s))
+        self.kill_enabled = bool(kill_enabled)
+        self._warn_action = warn_action
+        self._kill_action = kill_action
+        self._time_fn = time_fn
+        self.fingerprint: tuple | None = None
+        self.since: float = float(time_fn())
+        self.warned: bool = False
+        self.killed: bool = False
+
+    @staticmethod
+    def _fingerprint_from(pod_progress: dict) -> tuple | None:
+        if not isinstance(pod_progress, dict):
+            return None
+        cur = pod_progress.get("current")
+        if not isinstance(cur, dict):
+            return None
+        return (
+            cur.get("student_idx"),
+            cur.get("student_name"),
+            cur.get("stage"),
+            cur.get("prompts_done"),
+            cur.get("bench_axis_idx"),
+            pod_progress.get("teacher_prompts_done"),
+            pod_progress.get("phase"),
+        )
+
+    def _limit_for(self, stage: str | None) -> int:
+        s = str(stage or "")
+        for prefix in _LOAD_STAGE_PREFIXES:
+            if s.startswith(prefix):
+                return self.load_timeout_s
+        return self.default_timeout_s
+
+    def reset(self) -> None:
+        self.fingerprint = None
+        self.since = float(self._time_fn())
+        self.warned = False
+
+    def check(self, pod_progress: dict) -> str:
+        """Return one of ``"ok"``, ``"warn"``, ``"killed"``.
+
+        Idempotent: once ``"killed"`` is returned, subsequent calls also
+        return ``"killed"`` without re-firing the kill action.
+        """
+        if self.killed:
+            return "killed"
+        fp = self._fingerprint_from(pod_progress)
+        if fp is None:
+            self.reset()
+            return "ok"
+        now = float(self._time_fn())
+        if fp != self.fingerprint:
+            self.fingerprint = fp
+            self.since = now
+            self.warned = False
+            return "ok"
+        cur = pod_progress.get("current") or {}
+        stage = cur.get("stage")
+        limit = self._limit_for(stage)
+        elapsed = now - self.since
+        # Past the hard limit always wins, even if we never fired the warn
+        # (e.g. caller skipped a poll cycle so we jumped straight past
+        # half-limit). The kill is the safety net the watchdog exists for.
+        if elapsed >= limit:
+            if self.kill_enabled and self._kill_action is not None:
+                try:
+                    self._kill_action(elapsed=elapsed, limit=limit, stage=stage, current=cur, pod_progress=pod_progress)
+                except Exception:
+                    pass
+            self.killed = True
+            return "killed"
+        if not self.warned and elapsed >= limit / 2:
+            self.warned = True
+            if self._warn_action is not None:
+                try:
+                    self._warn_action(elapsed=elapsed, limit=limit, stage=stage, current=cur, pod_progress=pod_progress)
+                except Exception:
+                    pass
+            return "warn"
+        return "ok"
+
+
 # Validator-side env vars propagated to the pod inner_eval command. Listed
 # in one place so we don't have to dig through 90 lines of inline bash to
 # add a new tunable. The pod-side script (``scripts/pod_eval_vllm.py``)
@@ -677,6 +801,68 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         _poll_last_err["at"] = now
         logger.info("pod progress poll: %s — %s", kind, msg[:200])
 
+    # 2026-05-08 — stage-stall watchdog. The May 7 incident sat in
+    # ``loading_weights`` for ~4h22m on UID 213 ``const0312/wtbmts09``
+    # before the outer loop noticed and replanned. The watchdog catches
+    # the same shape inside ``DISTIL_STAGE_STALL_LOAD_S`` (default 45 min).
+    # Detection logic is in ``StageStallWatchdog`` at module scope so it
+    # can be unit-tested without spinning up a real pod loop.
+    try:
+        _STAGE_STALL_LOAD_S = int(policy_env("DISTIL_STAGE_STALL_LOAD_S", "2700") or "2700")
+    except (TypeError, ValueError):
+        _STAGE_STALL_LOAD_S = 2700
+    try:
+        _STAGE_STALL_DEFAULT_S = int(policy_env("DISTIL_STAGE_STALL_DEFAULT_S", "1500") or "1500")
+    except (TypeError, ValueError):
+        _STAGE_STALL_DEFAULT_S = 1500
+    _STAGE_STALL_KILL = (policy_env("DISTIL_STAGE_STALL_KILL", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+    def _stall_warn(*, elapsed, limit, stage, current, **_):
+        is_loading = any(str(stage or "").startswith(p) for p in _LOAD_STAGE_PREFIXES)
+        logger.warning(
+            "pod progress stalled: student=%r stage=%r prompts_done=%r idx=%r "
+            "for %.0fs (limit %ds, %s) — will force recovery if it doesn't progress",
+            current.get("student_name"), stage, current.get("prompts_done"),
+            current.get("student_idx"), elapsed, limit,
+            "loading" if is_loading else "scoring",
+        )
+
+    def _stall_kill(*, elapsed, limit, stage, current, **_):
+        logger.error(
+            "pod progress stalled past hard limit: student=%r stage=%r elapsed=%.0fs "
+            "limit=%ds — killing pod_eval to trigger DISTIL_STATUS:dead and let "
+            "the outer loop replan",
+            current.get("student_name"), stage, elapsed, limit,
+        )
+        # Be surgical: kill ONLY pod_eval.py inside this run dir. The
+        # chat-king vLLM lives in a different path and must survive.
+        kill_cmd = (
+            "set -e; "
+            f"PID=$(cat {shlex.quote(pid_remote)} 2>/dev/null || true); "
+            "if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null; then "
+            "  kill -9 \"$PID\" 2>/dev/null && echo killed:$PID || echo kill_failed:$PID; "
+            "else "
+            f"  pkill -9 -f {shlex.quote(run_dir)}/pod_eval.py 2>/dev/null && echo killed_by_pattern || echo no_match; "
+            "fi"
+        )
+        _pod_exec_silent(pod, f"bash -lc {shlex.quote(kill_cmd)}", timeout=20, label="stage_stall_kill")
+        try:
+            log_event(
+                f"pod progress stall watchdog killed pod_eval after {int(elapsed)}s "
+                f"in stage={stage!r} student={current.get('student_name')!r}",
+                state_dir=str(state.state_dir),
+            )
+        except Exception:
+            pass
+
+    _stall_watchdog = StageStallWatchdog(
+        load_timeout_s=_STAGE_STALL_LOAD_S,
+        default_timeout_s=_STAGE_STALL_DEFAULT_S,
+        kill_enabled=_STAGE_STALL_KILL,
+        warn_action=_stall_warn,
+        kill_action=_stall_kill,
+    )
+
     def poll_pod_progress():
         while not poll_stop.is_set():
             tmp_path = None
@@ -738,6 +924,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                     logger.info("pod progress poll: recovered (last error: %s)", _poll_last_err["kind"])
                     _poll_last_err["kind"] = None
                     _poll_last_err["at"] = 0.0
+                _stall_watchdog.check(pod_progress)
             except Exception as exc:
                 if _poll_last_err["kind"] is None:
                     _poll_log_err("unclassified", f"{type(exc).__name__}: {exc}")

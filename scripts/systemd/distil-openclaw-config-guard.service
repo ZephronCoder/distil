@@ -1,0 +1,16 @@
+[Unit]
+Description=Audit OpenClaw config for sn97-bot tool/thread regressions
+After=network-online.target openclaw.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/distil/repo
+# --check-only by default. Flip to --repair if you want auto-restore;
+# the guard preserves a timestamped backup before any rewrite.
+ExecStart=/opt/distil/venv/bin/python /opt/distil/repo/scripts/openclaw_config_guard.py \
+    --quiet \
+    --state-file /opt/distil/repo/state/openclaw_config_health.json
+StandardOutput=journal
+StandardError=journal

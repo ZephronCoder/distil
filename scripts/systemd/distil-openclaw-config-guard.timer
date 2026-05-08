@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically audit OpenClaw config (catches regressions like the 2026-04-28 message-tool drop)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=300s
+AccuracySec=15s
+Persistent=true
+Unit=distil-openclaw-config-guard.service
+
+[Install]
+WantedBy=timers.target
