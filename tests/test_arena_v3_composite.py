@@ -935,13 +935,22 @@ class TestKingHealth(unittest.TestCase):
         # use a SMALL regression: 5pp gap → dock 7.5pp → adjusted axis
         # stays above the 0.20 floor while ``king_worst`` is still
         # below ``base_worst``, so worse_than_base fires alone.
+        #
+        # 2026-05-10 (v31.2): legacy bench axes are now telemetry-only
+        # (composite weight 0) and don't drive king_worst anymore.
+        # Switched to v31 axes that carry composite weight so the
+        # regression actually shows up in king_worst vs base_worst.
         h2h, sd = self._build_h2h(
-            king_bench={"math_bench": 0.45, "code_bench": 0.42,
-                        "reasoning_bench": 0.43, "knowledge_bench": 0.40,
-                        "ifeval_bench": 0.41},
-            base_bench={"math_bench": 0.50, "code_bench": 0.47,
-                        "reasoning_bench": 0.48, "knowledge_bench": 0.45,
-                        "ifeval_bench": 0.46},
+            king_bench={"v31_math_gsm_symbolic": 0.45,
+                        "v31_code_humaneval_plus": 0.42,
+                        "v31_reasoning_logic_grid": 0.43,
+                        "v31_knowledge_multi_hop_kg": 0.40,
+                        "v31_ifeval_verifiable": 0.41},
+            base_bench={"v31_math_gsm_symbolic": 0.50,
+                        "v31_code_humaneval_plus": 0.47,
+                        "v31_reasoning_logic_grid": 0.48,
+                        "v31_knowledge_multi_hop_kg": 0.45,
+                        "v31_ifeval_verifiable": 0.46},
         )
         annotate_h2h_with_composite(h2h, king_kl=0.2, students_data=sd,
             reference_model="base/m", reference_uid=-1)
@@ -1372,29 +1381,41 @@ class TestBaselineRelativePenalty(unittest.TestCase):
             # Both competitors have IDENTICAL relative axes so the test
             # isolates the bench dock effect. Only difference is bench:
             # king regresses 10pp below base, challenger is 5pp above.
+            #
+            # 2026-05-10 (v31.2): switched from legacy bench axes
+            # (math/code/reasoning/knowledge/ifeval, all weight 0 now)
+            # to v31 axes that carry composite weight, so the
+            # per-axis baseline-relative penalty actually moves the
+            # composite worst-mean.
             students_data = {
                 "king/below_base": _make_student(
                     kl=0.10, rkl=0.10, cap_frac=0.85,
                     bench={
-                        "math_bench": 0.40, "code_bench": 0.40,
-                        "reasoning_bench": 0.40, "knowledge_bench": 0.40,
-                        "ifeval_bench": 0.40,
+                        "v31_math_gsm_symbolic": 0.40,
+                        "v31_code_humaneval_plus": 0.40,
+                        "v31_reasoning_logic_grid": 0.40,
+                        "v31_knowledge_multi_hop_kg": 0.40,
+                        "v31_ifeval_verifiable": 0.40,
                     },
                 ),
                 "chall/above_base": _make_student(
                     kl=0.10, rkl=0.10, cap_frac=0.85,
                     bench={
-                        "math_bench": 0.55, "code_bench": 0.55,
-                        "reasoning_bench": 0.55, "knowledge_bench": 0.55,
-                        "ifeval_bench": 0.55,
+                        "v31_math_gsm_symbolic": 0.55,
+                        "v31_code_humaneval_plus": 0.55,
+                        "v31_reasoning_logic_grid": 0.55,
+                        "v31_knowledge_multi_hop_kg": 0.55,
+                        "v31_ifeval_verifiable": 0.55,
                     },
                 ),
                 "base/m": _make_student(
                     kl=0.10, rkl=0.10, cap_frac=0.85,
                     bench={
-                        "math_bench": 0.50, "code_bench": 0.50,
-                        "reasoning_bench": 0.50, "knowledge_bench": 0.50,
-                        "ifeval_bench": 0.50,
+                        "v31_math_gsm_symbolic": 0.50,
+                        "v31_code_humaneval_plus": 0.50,
+                        "v31_reasoning_logic_grid": 0.50,
+                        "v31_knowledge_multi_hop_kg": 0.50,
+                        "v31_ifeval_verifiable": 0.50,
                     },
                 ),
             }

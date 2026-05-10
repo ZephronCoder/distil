@@ -417,13 +417,20 @@ BENCH_GROUP_AXIS_WEIGHTS = {
     # v31 (2026-05-09): skill-group weights reduced. The procedural
     # v31 axes (V31_AXIS_WEIGHTS) sum to 0.50 and are designed to
     # replace the legacy ad-hoc bench surface. We trim 0.10/0.10/0.10
-    # off code/math/reasoning skill groups (matching the
-    # methodologically-superior v31 axes that subsume each domain),
-    # leaving partial overlap weight on code_skill_group only since
-    # the v31 code surface is single-template (C1 EvalPlus-style)
-    # while the legacy skill group covers 5 sub-axes (humaneval +
-    # mbpp + debug + correction + refactor) for broader coverage.
-    "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.05")),
+    # 2026-05-10 (v31.2): all skill groups RETIRED from composite.
+    # Rationale (Discord feedback from `duohuang` 2026-05-09): the
+    # legacy ``code_skill_group`` rolls up sub-axes including
+    # ``debug_bench`` (n=6), ``correction_bench`` (n=6), and
+    # ``refactor_bench`` (n=4) — and the default ``bottom_half_mean``
+    # aggregator picks the lowest k=⌈n/2⌉ values, so the group score
+    # is dominated by the worst noisiest small-n axis. With v31's
+    # ``v31_code_humaneval_plus`` (n=12, w=0.08) carrying clean code
+    # signal at 30% lower per-axis SE, the legacy group is now a
+    # liability, not a hedge: it injects high-variance points into the
+    # composite without adding capability coverage. Sub-axes still run
+    # (telemetry only) and stay visible on the dashboard, but no
+    # longer touch composite or the dethrone gate.
+    "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.0")),
     "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.0")),
     "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.0")),
     "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.0")),
@@ -745,7 +752,7 @@ ARENA_V3_AXIS_WEIGHTS = {
     #     (in BENCH_AXIS_WEIGHTS above, not here)
     "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.0")),  # in math_skill_group
     "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.0")),  # in code_skill_group
-    "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.16")),
+    "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.0")),
     "self_consistency_bench":   float(os.environ.get("BENCH_SC_WEIGHT", "0.0")),
     "arc_bench":                float(os.environ.get("BENCH_ARC_WEIGHT", "0.0")),
     "truthful_bench":           float(os.environ.get("BENCH_TRUTHFUL_WEIGHT", "0.0")),
