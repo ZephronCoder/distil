@@ -261,8 +261,8 @@ export function MinersPanel({
       </table>
 
       <p className="text-[10px] text-meta mt-4 leading-relaxed max-w-2xl">
-        <strong className="text-foreground">Composite.final</strong> = 0.7·worst_5_mean
-        + 0.3·weighted is the v31.2 ranking key (worst_5_mean = mean of the
+        <strong className="text-foreground">Composite.final</strong> = 0.85·worst_5_mean
+        + 0.15·weighted is the v31.3 ranking key (worst_5_mean = mean of the
         5 lowest axes after dropping reference-broken axes).{" "}
         <strong className="text-foreground">Worst</strong> shown here is the
         legacy single-axis min — kept for back-compat, no longer the gate.{" "}

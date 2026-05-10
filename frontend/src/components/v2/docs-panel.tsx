@@ -287,7 +287,7 @@ python -m distil.validator --netuid 97`}</pre>
           <ul>
             <li>
               <strong>Distillation tier (relative axes, ~30%):</strong>{" "}
-              <code>on_policy_rkl 0.30</code> · <code>top_k_overlap 0.18</code>{" "}
+              <code>on_policy_rkl 0.39</code> · <code>top_k_overlap 0.09</code>{" "}
               · <code>kl 0.05</code> · <code>capability 0.05</code> ·{" "}
               <code>length 0.05</code> · <code>degeneracy 0.05</code>.
             </li>
@@ -564,7 +564,7 @@ python -m distil.validator --netuid 97`}</pre>
             <dt>eval prompts (single-eval)</dt>
             <dd>300</dd>
             <dt>policy version</dt>
-            <dd>2026-05-10-v31.2-noisy-axis-retirement</dd>
+            <dd>2026-05-10-v31.3-topk-overlap-halve</dd>
             <dt>weighted axes (live)</dt>
             <dd>25+ (11 v31 procedural + distillation + judge + discipline)</dd>
             <dt>v31 axes share of composite</dt>

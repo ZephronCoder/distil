@@ -222,7 +222,15 @@ AXIS_WEIGHTS = {
     # this axis requires actual access to the (private) teacher's
     # distribution on the student's own outputs. Closest thing the
     # subnet has to a Goodhart-immune distillation signal.
-    "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.30")),
+    # v31.3 (2026-05-10) — bumped 0.30 → 0.39 to absorb the 0.09 freed
+    # by halving ``top_k_overlap`` (which the post-Kimi-K2.6 correlation
+    # audit at n=5 shows anti-correlated with held-out gsm8k at
+    # r = -0.481). RKL is the central distillation signal in the
+    # GKD-style "On-Policy Distillation" lineage (Thinking Machines,
+    # Nov 2025) — moving weight from a teacher-mimicry signal that
+    # has started to Goodhart toward the on-policy generalisation
+    # signal is the most defensible single change in this commit.
+    "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.39")),
     "kl":             float(os.environ.get("BENCH_KL_WEIGHT", "0.05")),
     # 2026-04-29 (v30): top-K overlap axis. Per the 2026 'Rethinking OPD'
     # paper, this is the most predictive single signal of downstream
@@ -242,7 +250,18 @@ AXIS_WEIGHTS = {
     # teacher-distribution matching: a miner has to predict, per token,
     # which K alternatives the (private) teacher considered most
     # likely. There's no shortcut training-set you can scrape for that.
-    "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.18")),
+    # v31.3 (2026-05-10) — halved 0.18 → 0.09 on the back of the
+    # post-Kimi-K2.6 correlation audit. At n=5 paired kings the axis
+    # shows Pearson r = -0.481 with held-out gsm8k — the largest
+    # negative correlation among any non-zero-weight axis. The published
+    # research that motivated 0.18 (Anshumann ACL 2025) demonstrated
+    # the signal at frontier model scale, not 4 B distilled scale where
+    # teacher mimicry is most likely to memorise rather than generalise.
+    # Freed 0.09 reallocated to ``on_policy_rkl`` (above). If at
+    # n >= 12 the correlation stays at or below 0 with a tight CI,
+    # zero this axis entirely; if it recovers above +0.3, restore to
+    # 0.12.
+    "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.09")),
     # 2026-04-29 (v30) — entropy-aware adaptive KL axis. Per the EOPD
     # paper (arXiv 2510.27485), per-token RKL/FKL weighting based on
     # teacher entropy is +1.37 to +5.05 Pass@8 on small-model math
