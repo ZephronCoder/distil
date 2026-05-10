@@ -28,13 +28,7 @@ router = APIRouter()
 
 
 def _failure_matches_commitment(fail_entry: str, commitment: dict) -> bool:
-    """Tolerant match for failure_models entries vs the current commitment.
-
-    failure_models historically stored just the repo name. As of 2026-04-20 we
-    store ``"{repo}@{revision}"`` so that revision pushes reset the counter.
-    Both shapes must be understood when rendering eval_status so we don't show
-    ``skipped_stale`` for a miner who's already pushed a new revision/repo.
-    """
+    """Match failure_models entries (repo or "repo@revision") vs commitment."""
     repo = (commitment or {}).get("model")
     rev = (commitment or {}).get("revision")
     if not repo or not fail_entry:
@@ -46,50 +40,34 @@ def _failure_matches_commitment(fail_entry: str, commitment: dict) -> bool:
 
 
 @router.get("/api/commitments", tags=["Miners"], summary="Miner model commitments",
-         description="""Returns all miner HuggingFace model commitments (on-chain).
-
-Each commitment contains:
-- `model`: HuggingFace repo (e.g. `aceini/q-dist`)
-- `revision`: Git commit SHA of the submitted model
-- `block`: Block number when the commitment was made
-
-**Cached for 60s.**
-""")
+         description="On-chain HuggingFace commitments per miner: `{model, revision, block}`. Cache 60s.")
 def get_commitments():
     return fetch_commitments_data()
 
 
 @router.get("/api/scores", tags=["Miners"], summary="Current KL scores and disqualifications",
-         description="""Returns the latest KL-divergence scores for all evaluated miners, plus disqualification status.
-
-Response includes:
-- `scores`: Map of UID → KL score (lower is better)
-- `ema_scores`: Same as scores (backward compat)
-- `disqualified`: Map of UID → disqualification reason
-- `last_eval`: Details of the most recent evaluation round
-- `last_eval_time`: Unix timestamp of last eval
-- `tempo_seconds`: Seconds between evaluation rounds (currently 600)
-""")
+         description="Latest KL scores + DQ status: `{scores, ema_scores, disqualified, last_eval, last_eval_time, tempo_seconds}`.")
 def get_scores(fields: str = ""):
-    result = {"scores": {}, "ema_scores": {}, "disqualified": {}, "last_eval": None, "last_eval_time": None, "tempo_seconds": 600}
-    scores_path = os.path.join(STATE_DIR, "scores.json")
     s = load_scores()
-    result["scores"] = s
-    result["ema_scores"] = s  # backward compat
-    result["disqualified"] = disqualified()
-    eval_path = os.path.join(STATE_DIR, "last_eval.json")
+    result = {
+        "scores": s,
+        "ema_scores": s,  # backward compat
+        "disqualified": disqualified(),
+        "last_eval": None,
+        "last_eval_time": None,
+        "tempo_seconds": 600,
+    }
     last_eval_data = last_eval()
     if last_eval_data is not None:
         result["last_eval"] = last_eval_data
         try:
-            result["last_eval_time"] = os.path.getmtime(eval_path)
+            result["last_eval_time"] = os.path.getmtime(os.path.join(STATE_DIR, "last_eval.json"))
         except OSError:
             result["last_eval_time"] = last_eval_data.get("timestamp")
         result["last_eval_block"] = last_eval_data.get("block")
         result["last_eval_type"] = last_eval_data.get("type")
-    # Filter fields if requested
     if fields:
-        requested = set(f.strip() for f in fields.split(","))
+        requested = {f.strip() for f in fields.split(",")}
         result = {k: v for k, v in result.items() if k in requested}
     return JSONResponse(
         content=_sanitize_floats(result),
@@ -98,55 +76,22 @@ def get_scores(fields: str = ""):
 
 
 @router.get("/api/model-info/{model_path:path}", tags=["Miners"], summary="HuggingFace model info",
-         description="""Fetches model card metadata from HuggingFace for a given repo.
-
-**Example**: `/api/model-info/aceini/q-dist`
-
-Response includes:
-- `params_b`: Total parameters in billions
-- `is_moe`: Whether the model uses Mixture of Experts
-- `num_experts` / `num_active_experts`: MoE configuration
-- `tags`, `license`, `pipeline_tag`: HuggingFace metadata
-- `downloads`, `likes`: Popularity metrics
-- `base_model`: Parent model (if distilled/fine-tuned)
-
-**Cached for 1 hour.**
-""")
+         description="HuggingFace card metadata: `{params_b, is_moe, num_experts, num_active_experts, tags, license, pipeline_tag, downloads, likes, base_model}`. Cache 1h.")
 def get_model_info(model_path: str):
     return fetch_model_info_data(model_path)
 
 
 @router.get("/api/miner/{uid}", tags=["Miners"], summary="Full miner details by UID",
-         description="""Returns everything known about a specific miner UID.
-
-Response includes:
-- `hotkey` / `coldkey`: On-chain keys
-- `commitment`: Model repo, revision, and commitment block
-- `kl_score`: Current KL-divergence score (lower = better)
-- `disqualified`: Disqualification status and reason (if any)
-- `h2h_history`: Last 10 head-to-head rounds involving this UID
-- `in_top5`: Whether this UID is in the top 5 (king or contender)
-- `is_king`: Whether this UID is the current king
-- `registered`: Whether this UID is registered in the metagraph
-""")
+         description="Everything known about a UID: `{hotkey, coldkey, commitment, kl_score, disqualified, h2h_history (last 10), in_top5, is_king, registered}`.")
 def get_miner(uid: int):
     result = {"uid": uid, "registered": False}
 
-    # Metagraph data
     metagraph = _get_stale("metagraph") or {}
-    neurons = metagraph.get("neurons", [])
-    neuron = None
-    for n in neurons:
-        if n.get("uid") == uid:
-            neuron = n
-            break
+    neuron = next((n for n in metagraph.get("neurons", []) if n.get("uid") == uid), None)
     if neuron:
         result["registered"] = True
-        result["hotkey"] = neuron.get("hotkey")
-        result["coldkey"] = neuron.get("coldkey")
-        result["stake"] = neuron.get("stake")
-        result["incentive"] = neuron.get("incentive")
-        result["emission"] = neuron.get("emission")
+        for k in ("hotkey", "coldkey", "stake", "incentive", "emission"):
+            result[k] = neuron.get(k)
         result["is_validator"] = neuron.get("is_validator", False)
     else:
         result["hotkey"] = None
@@ -156,22 +101,14 @@ def get_miner(uid: int):
     commitments_data = _get_stale("commitments") or {}
     commitments = commitments_data.get("commitments", {})
     hotkey = result.get("hotkey")
-    # Fallback: if metagraph hotkey is stale/missing, try uid_hotkey_map.json
-    # (maintained by the validator every epoch - always current)
+    # Fall back to uid_hotkey_map.json (refreshed every epoch) if metagraph hotkey is stale.
     if not hotkey or hotkey not in commitments:
-        uid_hk_map = uid_hotkey_map()
-        mapped_hk = uid_hk_map.get(str(uid))
+        mapped_hk = uid_hotkey_map().get(str(uid))
         if mapped_hk and mapped_hk in commitments:
             hotkey = mapped_hk
-            result["hotkey"] = hotkey  # update result with fresh hotkey
-    if hotkey and hotkey in commitments:
-        result["commitment"] = commitments[hotkey]
-    else:
-        result["commitment"] = None
+            result["hotkey"] = hotkey
+    result["commitment"] = commitments.get(hotkey) if hotkey else None
 
-    # Shortcut: surface the committed model repo at the top level too.
-    # Previously callers had to dig into `commitment.model`, and the dashboard
-    # kept showing "model: null" for perfectly-registered UIDs. 2026-04-24.
     if isinstance(result.get("commitment"), dict):
         result["model"] = result["commitment"].get("model") or result["commitment"].get("repo")
     else:
@@ -182,23 +119,14 @@ def get_miner(uid: int):
     uid_str = str(uid)
     result["kl_score"] = scores.get(uid_str)
 
-    # Disqualification - check per-commit key first, fall back to legacy keys
-    # only if no commit_block is known (same logic as eval/scoring.py is_disqualified)
     dq = disqualified()
-    dq_reason = _dq_reason_for_commitment(uid, hotkey, result.get("commitment"), dq)
-    result["disqualified"] = dq_reason
+    result["disqualified"] = _dq_reason_for_commitment(uid, hotkey, result.get("commitment"), dq)
 
-    # Top 5 / king status
     top4 = top4_leaderboard()
     king = top4.get("king") or {}
     contenders = top4.get("contenders") or []
     result["is_king"] = king.get("uid") == uid
-    top5_uids = set()
-    if king.get("uid") is not None:
-        top5_uids.add(king["uid"])
-    for c in contenders:
-        if c.get("uid") is not None:
-            top5_uids.add(c["uid"])
+    top5_uids = {c.get("uid") for c in [king, *contenders] if c.get("uid") is not None}
     result["in_top5"] = uid in top5_uids
 
     # Eval status: why (not) evaluated
@@ -217,18 +145,18 @@ def get_miner(uid: int):
     evaluated_uids = set(read_state("evaluated_uids.json", []) or [])
     prog = eval_progress() or {}
     rnd = current_round() or {}
-    active_slot = None
-    for idx, entry in enumerate(prog.get("eval_order") or [], start=1):
-        if str(entry.get("uid")) == uid_str:
-            active_slot = dict(entry)
-            active_slot["position"] = idx
-            break
+    active_slot = next(
+        ({**entry, "position": idx}
+         for idx, entry in enumerate(prog.get("eval_order") or [], start=1)
+         if str(entry.get("uid")) == uid_str),
+        None,
+    )
     backlog = read_state("eval_backlog.json", {})
-    backlog_row = None
-    for row in backlog.get("pending") or []:
-        if isinstance(row, dict) and str(row.get("uid")) == uid_str:
-            backlog_row = row
-            break
+    backlog_row = next(
+        (row for row in backlog.get("pending") or []
+         if isinstance(row, dict) and str(row.get("uid")) == uid_str),
+        None,
+    )
     if result.get("disqualified"):
         eval_status["status"] = "disqualified"
         eval_status["reason"] = "Model is disqualified and won't be evaluated"
@@ -285,21 +213,12 @@ def get_miner(uid: int):
     elif tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
         last_block = tracker_entry["block"]
         epochs_since = (current_block - last_block) // EPOCH_BLOCKS if current_block > last_block else 0
-        # Re-test policy in single-eval mode: a UID is re-evaluated when its
-        # on-chain commitment changes (push a new HF revision OR commit a new
-        # model_repo on-chain). There is NO time-based cooldown — the
-        # ``epochs_since`` counter is informational only. The previous text
-        # ("re-test after 50 epochs") was misleading; multiple miners
-        # (Discord 2026-04-28: crypsick UID 209 retested after 3 rounds, not 50)
-        # asked why models came back to the queue inside the supposed window.
-        # The honest answer: they re-committed, which always re-eligibles them.
+        # Single-eval policy: re-test only when commitment changes (new HF
+        # revision OR new model_repo) or when the king changes. No time cooldown.
         eval_status["status"] = "tested"
         eval_status["reason"] = (
-            f"Already tested against current king at block {last_block} "
-            f"({epochs_since} epoch(s) ago). Single-eval policy: a UID is "
-            f"re-tested when its on-chain commitment changes "
-            f"(push a new HuggingFace revision or commit a new model_repo) "
-            f"or when the king changes. There is no time-based re-test."
+            f"Tested against current king at block {last_block} ({epochs_since} epoch(s) ago). "
+            f"Re-tested only when on-chain commitment changes or king changes."
         )
         eval_status["last_test_block"] = last_block
         eval_status["epochs_since"] = epochs_since
@@ -322,11 +241,8 @@ def get_miner(uid: int):
     ]
     result["h2h_history"] = relevant
 
-    # Composite axes (Arena v3) — per miner request from #distil-97 on
-    # 2026-04-24: miners want to see their per-axis scores without parsing
-    # /api/eval-data. Pull the latest matching entry straight from
-    # h2h_latest.results, which ``annotate_h2h_with_composite`` stamps
-    # every round.
+    # Per-axis composite — prefer the latest H2H row, else last known from history
+    # (keeps the per-miner endpoint stable for dashboards).
     composite_entry = None
     composite_block = latest.get("block")
     for r in (latest.get("results") or []):
@@ -334,9 +250,6 @@ def get_miner(uid: int):
             composite_entry = r["composite"]
             break
     if composite_entry is None:
-        # If the miner was not in the latest H2H, surface the last known
-        # composite from history instead of returning null. This makes the
-        # per-miner endpoint stable for dashboards and miners tracking axes.
         for item in rounds_for_uid(h2h_index, uid, limit=25):
             row = item.get("row") or {}
             comp = row.get("composite")
@@ -346,37 +259,26 @@ def get_miner(uid: int):
                 break
     if composite_entry:
         result["composite"] = {
-            # v30.2 — ``final`` is the canonical ranking key.
             "final": composite_entry.get("final"),
             "worst_3_mean": composite_entry.get("worst_3_mean"),
             "final_alpha": composite_entry.get("final_alpha"),
-            # Legacy fields for back-compat with miner scrapers.
             "worst": composite_entry.get("worst"),
             "weighted": composite_entry.get("weighted"),
             "axes": composite_entry.get("axes", {}),
             "broken_axes": composite_entry.get("broken_axes", []),
             "present_count": composite_entry.get("present_count"),
             "version": composite_entry.get("version"),
-            # v30.2 — surface baseline penalty + raw axes pre-penalty
-            # so miners can see exactly which axes were docked and by
-            # how much.
             "baseline_penalty": composite_entry.get("baseline_penalty"),
             "axes_raw": composite_entry.get("axes_raw"),
             "round_block": composite_block,
             "is_latest_round": composite_block == latest.get("block"),
         }
-        # King health (shadow telemetry, 2026-04-24). Only stamped on
-        # the king's row; surface alongside composite so the dashboard
-        # can render a "king at risk" badge when it's the current king.
         kh = composite_entry.get("king_health")
         if kh:
             streak_file = _safe_json_load(
                 os.path.join(STATE_DIR, "king_regression_streak.json"), {}
             )
-            result["king_health"] = {
-                **kh,
-                "streak": int(streak_file.get(str(uid), 0)),
-            }
+            result["king_health"] = {**kh, "streak": int(streak_file.get(str(uid), 0))}
     else:
         result["composite"] = None
 
@@ -387,10 +289,7 @@ def get_miner(uid: int):
 
 
 @router.get("/api/evaluated_uids", tags=["Miners"], summary="All evaluated UIDs with scores",
-         description="""Returns all UIDs that have been evaluated, with their latest KL scores.
-
-Response: `{uids: [{uid, kl_score, model_id?}], count: int}`
-""")
+         description="`{uids: [{uid, kl_score, model_id?}], count}` for every evaluated UID.")
 def get_evaluated_uids():
     evaluated = _safe_json_load(os.path.join(STATE_DIR, "evaluated_uids.json"), [])
     scores = _safe_json_load(os.path.join(STATE_DIR, "scores.json"), {})
@@ -414,34 +313,8 @@ def get_evaluated_uids():
 
 
 @router.get("/api/composite-scores", tags=["Miners"],
-         summary="All composite scores (v30.2+)",
-         description="""Returns the full ``state/composite_scores.json``
-ranked by ``composite.final`` (the v30.2 ranking key), with ALL fields
-exposed so miners can scrape ranking-relevant signals from a single
-endpoint without dashboards.
-
-Response per UID:
-  - ``final`` (the v30.2 ranking key — replaces ``worst`` as the dethrone gate)
-  - ``worst_3_mean`` (mean of the 3 lowest non-broken axes, the bottom-heavy component)
-  - ``worst`` (legacy single-axis min — still in the record for back-compat)
-  - ``weighted`` (weighted mean of axes)
-  - ``axes`` — full per-axis breakdown including:
-    * v30.2 group axes: code_skill_group, math_skill_group, reasoning_skill_group, knowledge_skill_group
-    * shadow axes: top_k_overlap, kl_is, forking_rkl, teacher_trace_plausibility, entropy_aware_kl, tail_decoupled_kl
-    * sub-axes: math_bench, code_bench, ... (still in axes for telemetry, weight 0 for ranking)
-    * relative axes: kl, on_policy_rkl, capability, length, degeneracy
-    * judge axes: judge_probe, long_form_judge, chat_turns_probe
-  - ``baseline_penalty`` — per-axis dock when the student regresses below Qwen-4B-base
-  - ``axes_raw`` — pre-penalty axis values (only present when penalty was applied)
-  - ``broken_axes`` — axes where the reference 4B scored 0 (eval-setup, not skill)
-  - ``version`` — composite_shadow_version (v29 = v30.2, v28 = pre-v30.2)
-  - ``model``, ``revision``, ``block``, ``ts``
-
-Sorting: by ``final`` desc (v30.2 records), with v28-and-earlier
-records sorted by ``worst`` desc and slotted below all v30.2 records.
-
-Cache: 10s (matches the validator round cadence).
-""")
+         summary="All composite scores",
+         description="Full state/composite_scores.json ranked by composite.final, with per-axis breakdown, baseline_penalty, axes_raw, broken_axes, and version. Cache 10s.")
 def get_composite_scores():
     composite = _safe_json_load(os.path.join(STATE_DIR, "composite_scores.json"), {})
     uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {})
@@ -506,10 +379,7 @@ def get_composite_scores():
 
 
 @router.get("/api/dq_reasons", tags=["Miners"], summary="Disqualified UIDs with reasons",
-         description="""Returns all disqualified entries with reasons.
-
-Entries may be keyed by UID, hotkey, or hotkey:block. Response normalizes to a list.
-""")
+         description="DQ entries normalized to a list. Keys may be UID, hotkey, or `hotkey:block`.")
 def get_dq_reasons():
     dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {})
     uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {})
@@ -538,10 +408,7 @@ def get_dq_reasons():
 
 
 @router.get("/api/model_hashes", tags=["Miners"], summary="Model weight hashes for integrity",
-         description="""Returns model weight hashes (SHA256 of safetensor metadata) for all tracked UIDs.
-
-Used for transparency - anyone can verify a miner's model hasn't changed since evaluation.
-""")
+         description="SHA256 of safetensor metadata per UID so anyone can verify a miner's weights haven't changed since evaluation.")
 def get_model_hashes():
     hashes_raw = _safe_json_load(os.path.join(STATE_DIR, "model_hashes.json"), {})
     # Restructure: group by UID (skip _block and _hotkey auxiliary keys)
@@ -561,20 +428,7 @@ def get_model_hashes():
 
 
 @router.get("/api/miner/{uid}/rounds", tags=["Miners"], summary="H2H rounds for a specific miner",
-         description="""Returns all head-to-head rounds where a specific UID participated.
-
-Supports `?limit=N` (default 50, max 200) and `?page=N` (1-indexed). Newest rounds first.
-
-Each round entry includes:
-- `block`: Block number of the round
-- `timestamp`: Unix timestamp
-- `kl`: This miner's KL score in that round
-- `is_king`: Whether the miner was king during this round
-- `king_changed`: Whether the king was dethroned
-- `type`: Round type (h2h or full_eval)
-- `king_uid`: Who was king that round
-- `n_prompts`: Number of prompts used
-""")
+         description="All H2H rounds for a UID (newest first). `?limit=N` (default 50, max 200), `?page=N`. Each: `{block, timestamp, kl, is_king, king_changed, type, king_uid, n_prompts}`.")
 def get_miner_rounds(uid: int, limit: int = 50, page: int = 1):
     limit = max(1, min(limit, 200))
     page = max(1, page)
@@ -605,15 +459,7 @@ def get_miner_rounds(uid: int, limit: int = 50, page: int = 1):
 
 
 @router.get("/api/commitment/{hotkey}", tags=["Miners"], summary="Lookup commitment by hotkey",
-         description="""Lookup a miner's on-chain model commitment by their hotkey (ss58 address).
-
-Useful for miners to verify the validator sees their commitment after submitting.
-
-Response includes:
-- `commitment`: Model repo, revision, and commitment block (if found)
-- `uid`: Registered UID (if registered in metagraph)
-- `registered`: Whether this hotkey is registered
-""")
+         description="Lookup commitment by ss58 hotkey: `{commitment, uid, registered}`. Useful for verifying the validator sees a fresh submission.")
 def get_commitment_by_hotkey(hotkey: str):
     result = {"hotkey": hotkey, "registered": False, "uid": None, "commitment": None}
 
@@ -641,17 +487,7 @@ def get_commitment_by_hotkey(hotkey: str):
 
 
 @router.get("/api/compare", tags=["Miners"], summary="Compare two or more miners",
-         description="""Compare KL scores and H2H history for multiple UIDs side by side.
-
-Usage: `/api/compare?uids=2,34,36,218`
-
-Returns for each UID:
-- Current KL score
-- Model name
-- Number of H2H rounds participated
-- Best KL ever achieved
-- Win/loss record vs king
-""")
+         description="Side-by-side compare for UIDs (`?uids=2,34,36`). Per UID: KL score, model, H2H round count, best KL, win/loss vs king.")
 def compare_miners(uids: str):
     uid_list = [int(u.strip()) for u in uids.split(",") if u.strip().isdigit()][:MAX_COMPARE_UIDS]
     if not uid_list:
@@ -690,16 +526,7 @@ def compare_miners(uids: str):
 # ── New compact endpoints (Phase 3) ───────────────────────────────────────────
 
 @router.get("/api/miners/batch", tags=["Miners"], summary="Compact cards for a batch of UIDs",
-         description=f"""Returns compact cards (`uid`, `model`, `kl_score`, `composite`, `is_king`, `disqualified`) for each requested UID.
-
-v30.2/v30.5: each miner card includes ``composite`` with the
-v30.2 ranking key (``final``), the legacy ``worst``, ``weighted``,
-the new ``worst_3_mean``, and per-axis values (skill groups,
-shadow axes). Lets miner scrapers track all ranking-relevant
-signals from a single endpoint.
-
-Example: `/api/miners/batch?uids=1,2,3`. Limit: {MAX_BATCH_UIDS} UIDs per call.
-""")
+         description=f"Compact cards per UID with `{{uid, model, kl_score, composite, is_king, disqualified}}`. Composite includes `final`, `worst_3_mean`, `worst`, `weighted`, per-axis. Limit {MAX_BATCH_UIDS} UIDs.")
 def miners_batch(uids: str):
     uid_list = [int(u.strip()) for u in uids.split(",") if u.strip().isdigit()][:MAX_BATCH_UIDS]
     if not uid_list:
@@ -711,8 +538,6 @@ def miners_batch(uids: str):
     commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
     latest = h2h_latest()
     dq = disqualified()
-    # v30.2 — surface composite scores on the batch card too so
-    # miner-side scrapers don't need a second round-trip.
     composite_scores_data = read_state("composite_scores.json", {})
     if not isinstance(composite_scores_data, dict):
         composite_scores_data = {}
@@ -753,10 +578,7 @@ def miners_batch(uids: str):
 
 
 @router.get("/api/cumulative-scores", tags=["Miners"], summary="Cumulative KL deltas per UID",
-         description="""Returns the running cumulative-KL-delta tracker used to rank long-running contenders.
-
-Response: `{miners: [{uid, cumulative_kl_diff, rounds, best_kl?}]}` sorted by largest delta first.
-""")
+         description="Running cumulative-KL-delta tracker: `{miners: [{uid, cumulative_kl_diff, rounds, best_kl?}]}` sorted by largest delta first.")
 def cumulative_scores():
     raw = read_state("cumulative_scores.json", {})
     uid_map = uid_hotkey_map()

@@ -37,7 +37,7 @@ from state_store import (
 router = APIRouter()
 
 @router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
-         description="Returns the top-4 leaderboard - current king and contenders. Under SINGLE_EVAL_MODE (v30.2+) the king is selected cross-round from `state/composite_scores.json` by highest `composite.final` (= 0.7·worst_3_mean + 0.3·weighted; v28-and-earlier records still ranked by `composite.worst`). A challenger dethrones only when its final beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). The legacy paired t-test on KL is retired. The composite axis surface includes group axes (code/math/reasoning/knowledge skill groups) and shadow axes (top_k_overlap, kl_is, forking_rkl, teacher_trace_plausibility, entropy_aware_kl, tail_decoupled_kl).")
+         description="Top-4 leaderboard. Under SINGLE_EVAL_MODE the king is selected cross-round by highest `composite.final` (= 0.85*worst_3_mean + 0.15*weighted); a challenger dethrones only when its final beats the king's by SINGLE_EVAL_DETHRONE_MARGIN (default 5%).")
 def get_leaderboard():
     top4 = top4_leaderboard() or {}
     scores_data = scores()
@@ -47,22 +47,12 @@ def get_leaderboard():
     commitments = commitments_data.get("commitments", {})
     cumulative = read_state("cumulative_scores.json", {})
 
-    # Build UID → composite map from the most recent H2H round. The validator
-    # already attaches ``composite: {axes, worst, weighted}`` to every h2h
-    # result entry via ``annotate_h2h_with_composite`` — surfacing it here is
-    # the miner-facing half of the shadow migration (T0.3). Currently
-    # informational; flips to the ranking key once T2.1 lands.
-    uid_to_composite = {}
-    for r in (latest.get("results") or []):
-        uid = r.get("uid")
-        comp = r.get("composite")
-        if uid is not None and comp:
-            uid_to_composite[uid] = comp
-
-    # Cross-round composite cache (single source of truth for the king under
-    # SINGLE_EVAL_MODE, since the king is rarely a row in the latest H2H
-    # results). Surfacing it on the leaderboard answers the recurring
-    # "stop hiding wavg/axis breakdown" Discord complaint.
+    uid_to_composite = {
+        r["uid"]: r["composite"]
+        for r in (latest.get("results") or [])
+        if r.get("uid") is not None and r.get("composite")
+    }
+    # Cross-round composite cache — canonical king source under SINGLE_EVAL_MODE.
     composite_scores_cache = read_state("composite_scores.json", {})
 
     def _enrich(entry):
@@ -268,38 +258,13 @@ def mark_announcement_posted():
 
 
 @router.get("/api/eval-progress", tags=["Evaluation"], summary="Live evaluation progress",
-         description="""Shows what the validator is currently doing in real-time.
-
-When `active: true`, the response includes:
-- `phase`: Current eval phase (e.g. `teacher_generation`, `student_eval`)
-- `students_total`: How many miners are being evaluated
-- `completed[]`: UIDs that have finished this round
-- `current`: Details on the student being evaluated right now (name, prompts done, running KL mean)
-- `prompts_total`: Total prompts in this round
-
-When `active: false`, the validator is idle between rounds.
-""")
+         description="Live validator state. When `active: true`: `{phase, students_total, completed[], current: {name, prompts_done, kl_running_mean}, prompts_total}`. Otherwise the validator is idle.")
 def get_eval_progress():
     return normalize_eval_progress(eval_progress())
 
 
 @router.get("/api/queue", tags=["Evaluation"], summary="Current eval queue",
-         description="""Returns the current eval round's composition and per-slot status.
-
-Response:
-- `active`: whether a round is in flight (from eval_progress)
-- `phase`: current phase (`teacher_generation`, `student_eval`, idle, …)
-- `block` / `block_hash`: chain context the round was seeded from
-- `king_uid`: current king for this round
-- `started_at` / `estimated_completion`: timestamps (epoch seconds)
-- `students_total` / `students_done` / `prompts_total` / `prompts_done`: progress counters
-- `slots[]`: ordered list of `{uid, model, role, status}` where `status` ∈
-  `running` | `done` | `pending`. `role` is `king` | `challenger` | `reference`.
-- `top4_leaderboard_contenders[]`: UIDs that the H2H leaderboard expects to be
-  in this round. Useful for miners verifying they weren't dropped.
-
-Cache: 5 s.
-""")
+         description="Round composition + per-slot status: `{active, phase, block, block_hash, king_uid, started_at, estimated_completion, students_*, prompts_*, slots: [{uid, model, role, status}], top4_leaderboard_contenders[]}`. Cache 5s.")
 def get_queue():
     prog = normalize_eval_progress(eval_progress()) or {}
     rnd = current_round() or {}
@@ -310,19 +275,11 @@ def get_queue():
 
     lb_contenders = [c.get("uid") for c in (lb.get("contenders") or []) if c.get("uid") is not None]
 
-    # 2026-05-04: surface ``current.stage`` to the dashboard so the UI
-    # can display "running long_form_judge probe" instead of "0/60
-    # prompts" while a student is still in the probe pipeline. Without
-    # this, miners see "0/60" stuck for ~15 min per student during
-    # chat / capability / judge / LFJ / chat-turns / bench probes and
-    # report the round as hung in #distil-97.
+    # current.stage + bench-axis counter let the dashboard render
+    # "running long_form_judge probe" / "running bench: aime (6/17)"
+    # rather than a stale "0/60 prompts" during the ~25 min probe tail.
     cur = prog.get("current") or {}
     current_stage = cur.get("stage") if isinstance(cur, dict) else None
-    # 2026-05-04: bench-battery sub-axis counter (e.g. aime_bench is
-    # axis 6/17 of the battery) so the dashboard can render
-    # "running bench: aime (6/17)" — the bench phase is ~25 min on
-    # eager-attn Kimi 33B and a static "bench_battery" stamp doesn't
-    # tell the user that 11/17 axes are still pending.
     bench_axis_idx = cur.get("bench_axis_idx") if isinstance(cur, dict) else None
     bench_axis_total = cur.get("bench_axis_total") if isinstance(cur, dict) else None
     payload = {
@@ -364,18 +321,7 @@ def get_queue():
 
 
 @router.get("/api/h2h-latest", tags=["Evaluation"], summary="Latest head-to-head round",
-         description="""Returns results from the most recent evaluation round where miners compete against the king.
-
-Response includes:
-- `block`: Block when this round was scored
-- `king_uid`: Current king's UID
-- `king_h2h_kl`: King's KL score in this round
-- `king_global_kl`: King's smoothed global KL
-- `p_value`: Paired t-test p-value for the challenger vs king comparison
-- `n_prompts`: Number of prompts used
-- `results[]`: Array of `{uid, model, kl, is_king, vs_king}` for each evaluated miner
-- `king_changed`: Whether the king was dethroned this round (requires p < 0.05)
-""")
+         description="Latest H2H round: `{block, king_uid, king_h2h_kl, king_global_kl, p_value, n_prompts, results: [{uid, model, kl, is_king, vs_king}], king_changed}`.")
 def get_h2h_latest():
     path = os.path.join(STATE_DIR, "h2h_latest.json")
     if os.path.exists(path):
@@ -504,10 +450,7 @@ def get_king_history():
 
 
 @router.get("/api/eval-stats", tags=["Evaluation"], summary="Eval round statistics",
-         description="""Returns statistics about recent evaluation rounds including timing, model counts, and KL trends.
-
-Useful for monitoring eval pipeline health and performance over time.
-""")
+         description="Recent-round timing, model counts, and KL trends for monitoring pipeline health.")
 def get_eval_stats():
     h2h_history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
     if not h2h_history:
@@ -643,21 +586,7 @@ async def get_eval_data(list: bool = False, file: str = None):
 
 @router.get("/api/private-pool-commit", tags=["Evaluation"],
          summary="Private holdout commit (audit)",
-         description="""Returns the validator's commit-reveal record for the
-private prompt holdout (axis A7).
-
-Fields:
-- `current.block`, `current.root`, `current.n`: sha256 commit root over the
-  private subset chosen for the round at `block`. Published BEFORE eval runs.
-- `latest_reveal.prompt_hashes`: per-prompt sha256 list, published AFTER the
-  round completes. Auditors can verify `sha256(sorted(prompt_hashes)) == root`
-  to confirm the validator did not retro-fit the holdout to results.
-- `latest_reveal.block`: block number the reveal corresponds to.
-
-Per Dwork-Roth reusable-holdout (2015): a prompt's reuse increases the noise
-applied to its score, so even with reveal hashes a miner cannot infer
-high-resolution score deltas on a specific prompt.
-""")
+         description="Commit-reveal record for the private prompt holdout (axis A7). `current` is the pre-eval sha256 root; `latest_reveal.prompt_hashes` is the post-round reveal so auditors can verify `sha256(sorted(prompt_hashes)) == root`.")
 def get_private_pool_commit():
     from api.state_store import read_state
     commit = read_state("private_pool_commit.json", {}) or {}
@@ -681,11 +610,7 @@ def get_benchmarks():
 # ── Phase 3: aggregated dashboard + SSE ─────────────────────────────────────
 
 @router.get("/api/dashboard", tags=["Evaluation"], summary="Aggregated dashboard snapshot",
-         description="""One round-trip snapshot used by the landing page.
-
-Bundles the most commonly-fetched state (king, top-N contenders, eval progress,
-latest H2H, price, health) so clients don't have to fan out 7+ requests.
-""")
+         description="Single-request snapshot bundling king, top-N contenders, eval progress, latest H2H, price, and health for the landing page.")
 def get_dashboard():
     from state_store import disqualified as load_disqualified
 
@@ -762,24 +687,14 @@ def get_dashboard():
 
 
 @router.get("/api/eval-stream", tags=["Evaluation"], summary="Server-sent stream of live eval progress",
-         description="""SSE feed that re-emits `eval_progress.json` whenever it changes.
-
-Clients connect with `new EventSource('/api/eval-stream')` and receive the same
-payload as `GET /api/eval-progress` — but push-driven (poll-free) so dashboards
-stay ~1s behind the validator.
-""")
+         description="SSE feed re-emitting `eval_progress.json` on change so dashboards stay ~1s behind the validator without polling.")
 async def eval_stream(request: Request):
     progress_path = os.path.join(STATE_DIR, "eval_progress.json")
     latest_path = os.path.join(STATE_DIR, "h2h_latest.json")
 
-    # Bound lifetime so a single stuck stream can never squat a task slot forever.
-    # 15 minutes is way more than any real dashboard session needs; the browser's
-    # EventSource transparently reconnects on close, so users see no interruption.
+    # Cap any one stream to 15 min (browser EventSource auto-reconnects); emit
+    # a comment-line keepalive every 20s so idle proxies don't silently drop us.
     MAX_STREAM_SECONDS = 15 * 60
-    # Keepalive on idle: some intermediaries silently drop sockets when the app
-    # is quiet (e.g. between rounds). Emitting a comment line every ~20s keeps
-    # the TCP path warm AND, crucially, lets us notice a broken pipe so we can
-    # exit the generator (freeing the task) instead of spinning forever.
     KEEPALIVE_SECONDS = 20.0
 
     async def gen():
@@ -793,7 +708,6 @@ async def eval_stream(request: Request):
             if await request.is_disconnected():
                 break
             if time.monotonic() - started > MAX_STREAM_SECONDS:
-                # Client can reconnect; this bounds the slot held by any one stream.
                 break
             try:
                 prog_mtime = os.path.getmtime(progress_path) if os.path.exists(progress_path) else 0.0
@@ -812,8 +726,6 @@ async def eval_stream(request: Request):
                         last_keepalive = time.monotonic()
                     last_prog_mtime = prog_mtime
                     last_latest_mtime = latest_mtime
-                # SSE comment keepalive — harmless to clients, but if the socket
-                # is half-closed this yield raises and we fall out of the loop.
                 if time.monotonic() - last_keepalive >= KEEPALIVE_SECONDS:
                     yield ": keepalive\n\n"
                     last_keepalive = time.monotonic()
@@ -847,9 +759,7 @@ async def eval_stream(request: Request):
     "/api/incidents",
     tags=["Evaluation"],
     summary="Recent ops incidents (healthcheck events)",
-    description="""Tail of `state/incidents.jsonl` emitted by the hourly healthcheck.
-Returns the last N entries sorted newest-first. Each entry is a `{ts, type, issue|action, resolved?}` record.
-Use this on the Live tab to surface what the self-repair agent has been doing.""",
+    description="Tail of `state/incidents.jsonl` (newest-first), each `{ts, type, issue|action, resolved?}` — surfaces self-repair agent activity on the Live tab.",
 )
 def get_incidents(limit: int = 50):
     path = os.path.join(STATE_DIR, "incidents.jsonl")

@@ -11,10 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE = "http://127.0.0.1:3710"
-# Eval pod name. Validator's systemd unit sets DISTIL_LIUM_POD_NAME via the
-# kimi-cutover drop-in; we honour that here so the bot's pod-snapshot reads
-# from whichever pod is actually running the current eval. Falls back to the
-# legacy distil-eval pod for safety.
+# Eval pod name. The validator's systemd unit exports DISTIL_LIUM_POD_NAME
+# (kimi-cutover drop-in); we use that so the snapshot follows the live pod.
 POD_NAME = os.environ.get("DISTIL_LIUM_POD_NAME") or os.environ.get(
     "LIUM_POD_NAME"
 ) or "distil-kimi-cutover"
@@ -44,14 +42,8 @@ ALLOWED_STATE_FILES = [
     "private_pool_commit.json",
     "model_hashes.json",
     "score_history.json",
-    # 2026-05-02 (v30.5 hotfix): expose the live multi-king queue and
-    # the dethronement history so the bot can answer "who are the
-    # recent kings?" without web_fetch'ing /api/king-history (which
-    # the openclaw web_fetch sandbox has been 404'ing because LLMs
-    # keep hallucinating ``/api/king/history`` (slash) instead of
-    # the real ``/api/king-history`` (hyphen)). On 2026-05-02 the
-    # bot spent 6 minutes flailing on a "list 5 recent kings"
-    # question because it was looking for these files in the mirror.
+    # Multi-king queue + composite history (so the bot answers
+    # "who are the recent kings?" from the mirror, not via API fetch).
     "recent_kings.json",
     "composite_scores.json",
 ]

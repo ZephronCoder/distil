@@ -1,11 +1,5 @@
-"""Telemetry endpoints — expanded visibility for miners & auditors.
+"""Telemetry endpoints: dashboard-friendly rollups of validator state for miner self-diagnosis."""
 
-Rolls up data from disqualified.json, h2h_latest.json, last_eval.json,
-current_round.json, validator_log.json, private_pool_commit.json, etc.
-into dashboard-friendly payloads so miners can self-diagnose.
-"""
-
-import json
 import os
 import subprocess
 import time
@@ -65,33 +59,35 @@ def _apply_dq_annotation(entry, dq_map, uid_hotkey_map):
     return entry
 
 
+def _dq_entry(key, reason, hk_to_uid):
+    e = {"key": key, "reason": _short_reason(reason)}
+    if ":" in key:
+        hk, blk = key.split(":", 1)
+        e["hotkey"] = hk
+        e["block"] = int(blk) if blk.isdigit() else blk
+        if hk in hk_to_uid:
+            e["uid"] = int(hk_to_uid[hk])
+    elif key in hk_to_uid:
+        e["hotkey"] = key
+        e["uid"] = int(hk_to_uid[key])
+    return e
+
+
 @router.get("/api/telemetry/overview", tags=["Telemetry"],
             summary="Full dashboard telemetry snapshot")
 def telemetry_overview():
-    """Aggregate snapshot: recent DQs, private-pool commit, current round,
-    last validator events, king probe results, composite axes for the latest
-    round."""
+    """Recent DQs + private-pool commit + current round + recent events + king probe + composite axes."""
     now = time.time()
 
     dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {}) or {}
     uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {}) or {}
     hk_to_uid = {v: k for k, v in uid_map.items()}
 
-    recent_dqs = []
-    for key, reason in dq.items():
-        entry = {"key": key, "reason": _short_reason(reason)}
-        if ":" in key:
-            hk, blk = key.split(":", 1)
-            entry["hotkey"] = hk
-            entry["block"] = blk
-            if hk in hk_to_uid:
-                entry["uid"] = int(hk_to_uid[hk])
-        elif key in hk_to_uid:
-            entry["hotkey"] = key
-            entry["uid"] = int(hk_to_uid[key])
-        recent_dqs.append(entry)
-    recent_dqs.sort(key=lambda e: int(e.get("block", 0) or 0), reverse=True)
-    recent_dqs = recent_dqs[:40]
+    recent_dqs = sorted(
+        (_dq_entry(k, r, hk_to_uid) for k, r in dq.items()),
+        key=lambda e: int(e.get("block") or 0),
+        reverse=True,
+    )[:40]
 
     current = read_state("current_round.json", {}) or {}
     commit = read_state("private_pool_commit.json", {}) or {}
@@ -191,14 +187,7 @@ def _compact_think(tp):
 
 
 def _compact_bench(payload):
-    """Compact representation of a *_bench probe payload for the dashboard.
-
-    Handles Session 2 axes (math/code/reasoning/knowledge/ifeval) plus the
-    Session 3 shadow axes (aime/mbpp/tool_use/self_consistency). The
-    tool_use and self_consistency axes emit extra fields per item, which
-    we surface so the dashboard can show the agentic behavior & vote
-    distributions without needing a second round-trip.
-    """
+    """Compact representation of a *_bench probe payload for the dashboard."""
     if not payload:
         return None
     items = payload.get("items") or []
@@ -212,17 +201,14 @@ def _compact_bench(payload):
             "gold": (str(it.get("gold") or "")[:40]) if it.get("gold") is not None else None,
             "task_id": it.get("task_id"),
         }
-        # Session 3 extras — only populated when relevant.
         if "tool_used" in it:
             entry["tool_used"] = bool(it.get("tool_used"))
             tr = it.get("tool_result")
             if tr is not None:
-                entry["tool_result"] = (str(tr) or "")[:120]
+                entry["tool_result"] = str(tr)[:120]
         if "samples" in it and "vote_winner" in it:
-            entry["samples"] = it.get("samples")
-            entry["vote_winner"] = it.get("vote_winner")
-            entry["vote_count"] = it.get("vote_count")
-            entry["k"] = it.get("k")
+            for k in ("samples", "vote_winner", "vote_count", "k"):
+                entry[k] = it.get(k)
         compact.append(entry)
     out = {
         "n": payload.get("n"),
@@ -231,13 +217,9 @@ def _compact_bench(payload):
         "wall_s": payload.get("wall_s"),
         "error": payload.get("error"),
         "items": compact,
-        # Session 3.2 (2026-04-25) — per-bench token stats for the
-        # reasoning_density axis. Populated by _bench_finalize_token_stats
-        # in pod_eval_vllm.py.
         "mean_gen_tokens": payload.get("mean_gen_tokens"),
         "mean_gen_tokens_correct": payload.get("mean_gen_tokens_correct"),
     }
-    # Session 3 axis-level extras.
     if payload.get("tool_used_count") is not None:
         out["tool_used_count"] = payload["tool_used_count"]
     if payload.get("k_samples") is not None:
@@ -245,6 +227,14 @@ def _compact_bench(payload):
         out["temperature"] = payload.get("temperature")
         out["top_p"] = payload.get("top_p")
     return out
+
+
+_BENCH_AXES = (
+    "math_bench", "code_bench", "reasoning_bench", "knowledge_bench", "ifeval_bench",
+    "aime_bench", "mbpp_bench", "tool_use_bench", "self_consistency_bench",
+    "arc_bench", "truthful_bench", "long_context_bench",
+    "procedural_bench", "robustness_bench", "noise_resistance_bench",
+)
 
 
 def _compact_round(h2h, last_eval):
@@ -256,14 +246,13 @@ def _compact_round(h2h, last_eval):
     for r in results:
         model = r.get("model")
         s = students.get(model, {}) if model else {}
-        composite = r.get("composite") or {}
         cap = s.get("capability") or {}
         length = s.get("length_axis") or {}
         tp = s.get("think_probe") or {}
         adv = s.get("adversarial") or {}
         jp = s.get("judge_probe") or {}
         ctp = s.get("chat_turns_probe") or {}
-        rows.append({
+        row = {
             "uid": r.get("uid"),
             "model": model,
             "kl": r.get("kl"),
@@ -276,7 +265,7 @@ def _compact_round(h2h, last_eval):
             "prompts_scored": r.get("prompts_scored"),
             "prompts_total": r.get("prompts_total"),
             "paired_prompts": r.get("paired_prompts"),
-            "composite": composite,
+            "composite": r.get("composite") or {},
             "capability_pass_frac": cap.get("pass_frac"),
             "capability_teacher": cap.get("teacher_pass_frac"),
             "length_ratio": length.get("ratio"),
@@ -285,53 +274,19 @@ def _compact_round(h2h, last_eval):
             "think_reason": tp.get("reason"),
             "adversarial_pass_frac": adv.get("pass_frac"),
             "adversarial_mean_tokens": adv.get("mean_gen_tokens"),
-            # Judge probe (shadow) — teacher-as-judge 1-5 rubric.
-            # 2026-04-23 — in composite only when JUDGE_AXIS_IN_COMPOSITE=1
-            # on the validator side. Dashboard shows it regardless.
             "judge_mean_score": jp.get("mean_score"),
             "judge_normalized": jp.get("normalized"),
             "judge_n_valid": jp.get("n_valid"),
             "judge_n": jp.get("n"),
-            # Session 3.3 (2026-04-25, SHADOW) — multi-turn coherence.
-            # Teacher grades 3-turn transcripts on a 1-5 rubric; mean
-            # normalized to [0, 1]. Directly analogous to judge_probe
-            # but probes conversational ability that single-turn KL
-            # distillation doesn't cover.
             "chat_turns_mean_score": ctp.get("mean_score"),
             "chat_turns_normalized": ctp.get("normalized"),
             "chat_turns_n_valid": ctp.get("n_valid"),
             "chat_turns_n": ctp.get("n"),
             "chat_turns_n_turns": ctp.get("n_turns"),
-            # Arena v3 Session 2 (2026-04-24, PRODUCTION) — five
-            # absolute-correctness bench axes drawn from public held-out
-            # benchmarks.
-            "math_bench": _compact_bench(s.get("math_bench")),
-            "code_bench": _compact_bench(s.get("code_bench")),
-            "reasoning_bench": _compact_bench(s.get("reasoning_bench")),
-            "knowledge_bench": _compact_bench(s.get("knowledge_bench")),
-            "ifeval_bench": _compact_bench(s.get("ifeval_bench")),
-            # Arena v3 Session 3 (2026-04-24, SHADOW → +48h) —
-            # capability-extending axes inspired by Affine Cortex.
-            "aime_bench": _compact_bench(s.get("aime_bench")),
-            "mbpp_bench": _compact_bench(s.get("mbpp_bench")),
-            "tool_use_bench": _compact_bench(s.get("tool_use_bench")),
-            "self_consistency_bench": _compact_bench(s.get("self_consistency_bench")),
-            # Session 3.1 (2026-04-25, SHADOW) — commonsense science MC.
-            "arc_bench": _compact_bench(s.get("arc_bench")),
-            # Session 3.4 (2026-04-25, SHADOW) — TruthfulQA factuality MC.
-            "truthful_bench": _compact_bench(s.get("truthful_bench")),
-            # Session 3.5 (2026-04-25, SHADOW) — procedural needle-in-haystack.
-            "long_context_bench": _compact_bench(s.get("long_context_bench")),
-            # Session 3.6 (2026-04-25, LIVE) — block-seeded synthetic
-            # reasoning / instruction-following / factual retrieval.
-            "procedural_bench": _compact_bench(s.get("procedural_bench")),
-            # Session 3.7 (2026-04-25, LIVE) — paraphrase-robustness on
-            # math items; punishes prompt-pattern memorization.
-            "robustness_bench": _compact_bench(s.get("robustness_bench")),
-            # Session 3.7 (2026-04-25, LIVE) — adversarial-noise sibling
-            # of robustness_bench (typos, distractors, surface-shift).
-            "noise_resistance_bench": _compact_bench(s.get("noise_resistance_bench")),
-        })
+        }
+        for axis in _BENCH_AXES:
+            row[axis] = _compact_bench(s.get(axis))
+        rows.append(row)
     return {
         "block": h2h.get("block"),
         "block_hash": (h2h.get("block_hash") or "")[:16],
@@ -354,32 +309,18 @@ def _compact_round(h2h, last_eval):
 @router.get(
     "/api/telemetry/dqs", tags=["Telemetry"],
     summary="Recent disqualifications",
-    description=(
-        "Tail of `state/disqualified.json` annotated with the on-chain UID and "
-        "hotkey when known. Each entry has a short, paraphrase-safe `reason` "
-        "string copied verbatim from the validator. Sorted by commit block "
-        "descending so the most recent DQs appear first. Cache: `max-age=15`."
-    ),
+    description="Tail of `state/disqualified.json` with UID/hotkey annotations. Sorted newest-first. Cache 15s.",
 )
 def telemetry_dqs(limit: int = 80):
     limit = max(1, min(limit, 300))
     dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {}) or {}
     uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {}) or {}
     hk_to_uid = {v: k for k, v in uid_map.items()}
-    out = []
-    for key, reason in dq.items():
-        e = {"key": key, "reason": _short_reason(reason)}
-        if ":" in key:
-            hk, blk = key.split(":", 1)
-            e["hotkey"] = hk
-            e["block"] = int(blk) if blk.isdigit() else blk
-            if hk in hk_to_uid:
-                e["uid"] = int(hk_to_uid[hk])
-        elif key in hk_to_uid:
-            e["hotkey"] = key
-            e["uid"] = int(hk_to_uid[key])
-        out.append(e)
-    out.sort(key=lambda e: (e.get("block") or 0), reverse=True)
+    out = sorted(
+        (_dq_entry(k, r, hk_to_uid) for k, r in dq.items()),
+        key=lambda e: (e.get("block") or 0),
+        reverse=True,
+    )
     return JSONResponse(
         content={"disqualified": out[:limit], "count": len(out)},
         headers={"Cache-Control": "public, max-age=15"},
