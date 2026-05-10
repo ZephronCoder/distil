@@ -456,23 +456,10 @@ def select_king_by_composite(
                 uid = int(uid_str)
             except (TypeError, ValueError):
                 continue
-            # 2026-05-01 (v30.4 patch v3): kingship pool reverted to
-            # ROUND-PARTICIPANTS-ONLY after Discord pushback (coffieex,
-            # svdeai07, sebastian_020521 on 2026-05-01: "cross-round
-            # comparison isn't meaningful unless all models are
-            # evaluated on the same data — different data can skew
-            # the overall scores"). The 2026-05-01 morning change
-            # that made the kingship pool network-wide caused UIDs
-            # to take the crown despite never being in the round
-            # they "won" — coffieex screenshotted UID 6 winning
-            # against UID 225 even though only UID 225 was in the
-            # round head-to-head against UID 107. Reverting to
-            # round-participants-only restores apples-to-apples
-            # paired comparison; the multi-king payout (top-5 most
-            # recent kings each get 20 percent) addresses the
-            # original a_tensor concern (UIDs with high composite
-            # should still be rewarded) without abandoning paired
-            # comparison.
+            # Kingship pool is round-participants-only (apples-to-apples
+            # paired comparison). Network-wide pools let UIDs claim the
+            # crown without facing the king in their round; the multi-
+            # king payout addresses high-composite reward separately.
             if not _is_eligible_uid(
                 uid, valid_models, state.dq_reasons,
                 uid_to_hotkey, commitments,
@@ -553,19 +540,10 @@ def select_king_by_composite(
     _, _, _, top_uid = candidates[0]
     top_record = composite_scores.get(str(top_uid))
 
-    # Stability bias: dethrone gate. A challenger must beat the prior king
-    # by ``SINGLE_EVAL_DETHRONE_MARGIN`` on either ``worst`` or ``weighted``
-    # (see ``resolve_dethrone``); noise-level differences shouldn't flip
-    # the crown, but a clear win should.
-    #
-    # We deliberately apply the gate even when the prior king isn't in the
-    # active candidate tier (e.g. they're a v12 record after a schema bump
-    # to v13). The version-filter restricts which records *compete* for
-    # kingship, but it shouldn't strip the crown without measurement: if
-    # the prior king has a stored composite at all and is still eligible
-    # to hold the crown (not deregistered/DQ'd), they get a margin check.
-    # Otherwise a single v13 challenger could grab the crown unchecked
-    # during the transition window.
+    # Dethrone gate: a challenger must beat the prior king by
+    # SINGLE_EVAL_DETHRONE_MARGIN on either ``worst`` or ``weighted``.
+    # Applied even when the prior king is below the version filter so
+    # the schema-bump transition can't strip the crown unmeasured.
     if prior_king_uid is not None and top_uid != prior_king_uid:
         prior_record = composite_scores.get(str(prior_king_uid))
         prior_eligible = (

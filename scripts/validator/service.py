@@ -133,15 +133,12 @@ def _resolve_king(valid_models, state):
             except Exception as exc:
                 logger.warning(f"single-eval bootstrap failed (non-fatal): {exc}")
         # Trust h2h_latest's king over a fresh network-wide composite
-        # re-rank: re-ranking at epoch start lets a stored composite
-        # from a different sample beat the in-flight round's fresh
-        # winner (round 8062909, mrchen).
-        # Gate on _is_kingship_eligible, NOT round-membership: in
-        # single-eval mode the king is intentionally excluded from
-        # the challenger pool (so it isn't paired against itself), so
-        # an "in valid_models for THIS round" gate would silently drop
-        # the persisted king at every epoch start (round 188 → king=None,
-        # 2026-05-04 Sebastian).
+        # re-rank — re-ranking at epoch start lets a stored composite
+        # from a different sample beat the in-flight round's winner.
+        # Gate on _is_kingship_eligible (not round membership): in
+        # single-eval mode the king is intentionally excluded from the
+        # challenger pool, so a round-membership check would silently
+        # drop the persisted king every epoch.
         if state.h2h_latest:
             persisted_king = state.h2h_latest.get("king_uid")
             if persisted_king is not None:
@@ -527,16 +524,10 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
     current_block_hash = cr.get("block_hash")
     n_prompts = len(prompt_texts) or (EVAL_PROMPTS_FULL if is_full_eval else EVAL_PROMPTS_H2H)
 
-    # 2026-05-04: ``king_uid`` is allowed to be None for legitimate
-    # "no-king" rounds (e.g. the Kimi cutover dethroned the previous
-    # king; until a Kimi-era model is crowned, every round has
-    # king=None). The previous gate treated king=None as "missing
-    # required fields" and DELETED the in-flight pod eval on every
-    # validator restart — the eval would die after ~10 minutes of GPU
-    # work and the next epoch would re-pay the teacher API cost
-    # ($1+/round on OpenRouter) from scratch. We now only abort if the
-    # more fundamental fields are missing (no models, no prompts, no
-    # block) and let the resume path attach with king_uid=None.
+    # king_uid=None is a legitimate state (no-king round across an
+    # arch cutover) so it doesn't count as missing required fields —
+    # only abort when models / prompts / block are missing, otherwise
+    # we'd kill the in-flight pod and re-pay the teacher API cost.
     if not models_to_eval or not prompt_texts or current_block is None:
         logger.warning(
             "Resume: persisted current_round missing required fields "
@@ -681,25 +672,13 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
                 uid,
             )
     models_to_eval = filtered_models
-    # In SINGLE_EVAL_MODE the king is NEVER seated in models_to_eval (the
-    # whole point of the policy is that the king is determined cross-round
-    # from stored composite scores, not re-paired against challengers each
-    # round). If the king isn't in models_to_eval AND we're in single-eval
-    # mode, that's expected — proceed with applying challenger results and
-    # let `apply_results_and_weights` resolve the king from composite_scores.
-    # Without this guard, every resumed single-eval round throws away
-    # ~90 min of evaluation by aborting here (regression observed
-    # 2026-04-25 18:26 UTC, lost the round that started 16:57 UTC).
+    # The king is often absent from models_to_eval during resume
+    # (single-eval mode never seats it; some normal rounds skip it
+    # too). Discarding a completed GPU eval just because the king
+    # isn't in the student list is wrong — its score lives in
+    # h2h_latest.json / state.scores; let apply_results_and_weights
+    # resolve it from there.
     if king_uid is not None and king_uid not in models_to_eval:
-        # The king is often absent from models_to_eval during resume:
-        # - In single-eval mode the king is never seated as a student
-        # - In normal mode a round may not include the king as a student
-        # Either way, discarding a completed GPU eval (~90 min) just because
-        # the king isn't in the student list is wrong.  The king's score is
-        # already stored in h2h_latest.json / state.scores.  Proceed and let
-        # apply_results_and_weights resolve the king from stored state.
-        # (Regression first observed 2026-04-25 18:26 UTC; previous guards
-        # gated on SINGLE_EVAL_MODE which wasn't always set.)
         logger.info(
             "Resume: king UID %s absent from models_to_eval — expected when "
             "king was not a student this round. Using stored king score. "
@@ -884,9 +863,8 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
         models_to_eval[king_uid] = valid_models[king_uid]
     for uid, info in challengers.items():
         models_to_eval[uid] = info
-    # 2026-04-27: reference baseline removed from per-round eval.
-    # Setting INCLUDE_REFERENCE_IN_ROUND=1 in the env restores the
-    # legacy behaviour for emergency rollback.
+    # Reference baseline runs in scripts/run_teacher_benchmark.sh now;
+    # set INCLUDE_REFERENCE_IN_ROUND=1 for emergency rollback.
     if (
         os.environ.get("INCLUDE_REFERENCE_IN_ROUND", "0") == "1"
         and REFERENCE_MODEL
@@ -1038,14 +1016,10 @@ def apply_results_and_weights(
             commitments=commitments, state=state,
         )
     if winner_uid is not None:
-        # 2026-05-01 (v30.4): record the crown change in
-        # ``state.recent_kings`` BEFORE building weights so the new
-        # king appears in the multi-king payout queue. Three trigger
-        # cases collapsed into one condition: (1) no prior king,
-        # (2) crown changed hands, (3) same king as last round but
-        # not yet in the history (boot phase). _record_king_change
-        # de-dupes internally so re-recording the same king moves
-        # them to the front rather than duplicating.
+        # Record the crown change in ``state.recent_kings`` before
+        # building weights so the new king appears in the multi-king
+        # payout queue. _record_king_change de-dupes (same king is
+        # bumped to the front instead of duplicated).
         if (
             king_uid is None
             or winner_uid != king_uid
@@ -1099,16 +1073,9 @@ def post_round(
         log_event(f"Pod cleanup error: {str(exc)[:100]}", level="warn", state_dir=state_dir)
         logger.warning(f"Pod cleanup error: {exc}")
 
-    # 2026-05-04 — gate now fires on COLD-START crowning too (king_uid
-    # is None and a new winner emerges). The pre-fix condition required
-    # ``king_uid is not None``, which silently skipped the announcement
-    # for the first king of a new era — exactly the case Sebastian
-    # flagged on 2026-05-04 19:00 UTC ("can we get an official king
-    # announcement on the general channel here for everyone to see like
-    # we did with Qwen kings"). Cold-start crownings still hit the same
-    # ``announce_new_king`` codepath; the function tolerates
-    # ``old_uid=None`` / ``old_model="(no prior king)"`` and renders the
-    # announcement headline against the new king alone.
+    # Fire the announcement on cold-start crownings too (king_uid=None ->
+    # new winner). announce_new_king accepts old_uid=None and renders
+    # the headline against the new king alone.
     if winner_uid is not None and winner_uid != king_uid:
         new_king_model = uid_to_model.get(winner_uid, valid_models.get(winner_uid, {}).get("model", "unknown"))
         old_king_model = (
@@ -1119,16 +1086,10 @@ def post_round(
         old_kl = king_h2h_kl if king_h2h_kl is not None else king_kl
         winner_entry = next((row for row in h2h_results if row.get("uid") == winner_uid), {})
         winner_tt = winner_entry.get("t_test") if isinstance(winner_entry.get("t_test"), dict) else {}
-        # Composite for the announcement headline.
-        # 2026-05-01 (v30.4 patch v3): in single-eval mode the dethrone
-        # is decided cross-round from ``state.composite_scores`` (paired
-        # king re-eval in v30.2 means h2h_results carries this round's
-        # composite for the king + new challengers, but the cross-round
-        # composite is the canonical source). Falling back to it when
-        # the round-local row is empty stops the announcement headline
-        # from collapsing to the legacy ``KL:`` format every time —
-        # which is what robert131004 → halen214 just did despite the
-        # composite.final dethrone gate firing correctly.
+        # Composite for the announcement headline. In single-eval mode
+        # dethrones are decided cross-round from state.composite_scores;
+        # fall back to it when the round-local row is empty so the
+        # headline doesn't collapse to legacy ``KL:`` format.
         winner_comp = (
             winner_entry.get("composite")
             if isinstance(winner_entry.get("composite"), dict)

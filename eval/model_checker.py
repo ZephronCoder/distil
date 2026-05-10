@@ -31,14 +31,9 @@ from eval.runtime import (
 logger = logging.getLogger("distillation.model_checker")
 
 
-# 2026-04-24 (distil-97): wrapper around huggingface_hub.model_info that
-# threads ``HF_TOKEN`` through and retries transient 429/5xx with backoff.
-# Prechecks run HEAD+metadata requests against HF for every UID every epoch
-# (~250 per pass); unauthenticated traffic gets rate-limited within minutes
-# and new miners (e.g. UID 77 Nikas982/golden) stay stuck in "TRANSIENT
-# ERROR" purgatory for hours. Authenticated calls get much higher quotas,
-# and the retry layer smooths over the occasional spike so one 429 doesn't
-# drop a model from an entire round.
+# huggingface_hub.model_info wrapper that threads HF_TOKEN through and
+# retries transient 429/5xx. Auth keeps prechecks under HF rate limits
+# (~250 calls/round); the bounded retry smooths transient spikes.
 _HF_TOKEN = os.environ.get("HF_TOKEN") or None
 _MODEL_INFO_RETRY_DELAYS = (0.5, 1.5, 4.0)  # ~6s total, caller can still time-box
 
@@ -589,14 +584,9 @@ def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optio
         logger.warning(f"Tensor metadata hash failed for {model_repo}: {e}")
         return None
 
-# 2026-04-24 (distil-97): precheck hits HF for every UID every epoch
-# (~250 calls / pass). Without auth this trips the rate limiter within
-# minutes and new miners (UID 77 / Nikas982/golden stuck for 3h in
-# Discord) get bumped out of every round with "TRANSIENT ERROR". Cache
-# positive integrity results so the common "model exists, sha matches"
-# case needs at most one HEAD per ``_INTEGRITY_CACHE_TTL`` seconds.
-# We intentionally do NOT cache failures — miners fix config.json and
-# expect fast re-admission.
+# Cache positive integrity results so the common "model exists, sha
+# matches" path needs at most one HEAD per _INTEGRITY_CACHE_TTL.
+# Failures aren't cached (miners fix configs and expect fast re-admit).
 _INTEGRITY_CACHE: dict = {}
 _INTEGRITY_CACHE_TTL = 900  # 15 min; shorter than a typical epoch gap
 
@@ -1176,15 +1166,10 @@ def check_model_architecture(
                 if fname.endswith('.py') and fname != '__init__.py':
                     dangerous_files.append(fname)
             if dangerous_files:
-                # 2026-05-02 (Kimi K2.6 cutover): some teachers (Kimi K2.6)
-                # ship a custom tokenizer / processor / config as .py files
-                # which legitimate students need to copy verbatim to load
-                # the tokenizer. Allow .py files whose SHA256 is
-                # byte-identical to the teacher's copy — these carry no
-                # custom executable code beyond what the teacher itself
-                # ships (and hence is already trusted in this subnet's
-                # context). Any .py that DIFFERS from the teacher or
-                # isn't in the teacher's repo gets fail-closed.
+                # Some teachers (Kimi K2.6) ship custom tokenizer/processor
+                # .py files; students need byte-identical copies to load.
+                # Pass any .py whose SHA256 matches the teacher's; fail-
+                # closed on anything that differs or isn't in the teacher.
                 surviving = _filter_teacher_identical_py_files(
                     model_repo, revision, dangerous_files,
                 )
@@ -1444,15 +1429,10 @@ def check_model_architecture(
         except Exception as embed_err:
             logger.warning(f"Embed shape precheck error for {model_repo}: {embed_err}")
 
-        # 6c. Detect quantized weights even when ``quantization_config``
-        # is absent from config.json. Step 5 already catches honest
-        # quantized models (config.quantization_config set); this step
-        # covers the bypass where the miner strips that field but the
-        # safetensors still contain bitsandbytes / GPTQ / AWQ marker
-        # tensors (.absmax, .quant_map, qweight, qzeros, etc.). Eval-pod
-        # bf16 loader rejects these with "ignore_mismatched_sizes=False"
-        # — wasting an eval slot per fraudulent UID. We probe only the
-        # first shard since quantization is uniform across shards.
+        # 6c. Detect quantized weights even when quantization_config
+        # is stripped from config.json — the safetensors still carry
+        # bitsandbytes/GPTQ/AWQ marker tensors. Probe the first shard
+        # only (quantization is uniform across shards).
         try:
             quant_info = detect_safetensors_quantization(model_repo, revision)
             if quant_info is not None:

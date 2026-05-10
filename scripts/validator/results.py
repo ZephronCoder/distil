@@ -1536,16 +1536,10 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             current_block=current_block,
             is_king=(uid == king_uid),
         )
-        # Deferred-by-CUDA-poison short-circuit (see pod_eval_vllm.py
-        # _cuda_poisoned). When an earlier student in the same pod_eval
-        # run wedged the GPU, every still-pending student is recorded
-        # with status=deferred_cuda_poisoned so the result file still
-        # downloads. Those students were never actually evaluated, so
-        # we must NOT increment the failure counter (which would push
-        # them toward the 3-strikes "stale" DQ for a problem that has
-        # nothing to do with their model). Skip the row entirely; the
-        # next round will pick them up via the normal challenger
-        # selection path.
+        # CUDA-poisoned students were never actually evaluated (an
+        # earlier student wedged the GPU). Skip without incrementing
+        # the failure counter so they don't get stale-DQ'd; the next
+        # round picks them up normally.
         if student_result.get("status") == "deferred_cuda_poisoned":
             logger.info(
                 f"UID {uid} ({model_name}): DEFERRED — CUDA context poisoned "

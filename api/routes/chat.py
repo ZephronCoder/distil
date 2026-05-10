@@ -1,31 +1,11 @@
-"""Chat endpoints: proxy to king model on GPU pod, OpenAI-compatible endpoints.
+"""Chat endpoints: proxy to king model on the chat pod, OpenAI-compatible.
 
-2026-05-04 (Sebastian's "chat doesn't work / Service Unavailable" report):
-The chat router used to spawn an ``ssh root@chat-pod -- curl ...``
-subprocess for every request. Each call carried ~150-300 ms of SSH
-handshake overhead and held a uvicorn worker thread for the duration
-of the model's response (5-60 s on long generations). Combined with
-~1 GET/s polling from /api/chat/status across many dashboard tabs,
-this was saturating the API's ``--limit-concurrency 2000`` budget
-and surfacing as ``503 Service Unavailable`` for chat *and* every
-other dashboard endpoint sharing the same uvicorn worker.
-
-Fix: route everything through the existing ``chat-tunnel.service``
-SSH forward (``localhost:8100 → chat-pod:8100``) using a single
-async httpx client. This:
-
-* Eliminates per-request SSH process spawn (~10 ms instead of
-  ~250 ms steady-state).
-* Frees the uvicorn worker during long generations (httpx async
-  yields control instead of blocking on subprocess.wait).
-* Uses connection pooling — a single TCP keep-alive to localhost
-  serves thousands of requests instead of one ssh socket per call.
-
-The legacy SSH helpers in ``api/helpers/ssh.py`` are retained for
-``chat_pod_admin`` and the chat-keeper script, but the chat router
-no longer touches them on the hot path. If the local tunnel is
-down, ``chat-keeper.timer`` (every 3 min) re-establishes it and
-heals vLLM via ``scripts.validator.chat_pod_admin``.
+Routes through the ``chat-tunnel.service`` SSH forward
+(localhost:8100 -> chat-pod:8100) using a single async httpx client
+for connection pooling (no per-request SSH spawn, no blocked uvicorn
+workers during long generations). When the tunnel is down,
+``chat-keeper.timer`` re-establishes it every 3 minutes and heals
+vLLM via ``scripts.validator.chat_pod_admin``.
 """
 
 import ast
@@ -89,15 +69,9 @@ def _get_king_info():
             return king_uid, info.get("model") if isinstance(info, dict) else info
         return king_uid, None
 
-    # 2026-05-04 (Kimi cutover follow-up): h2h_latest can sit at king_uid=None
-    # for an entire eval generation when the prior king is DQ'd by a hard
-    # arch-cutover (e.g. Qwen→Kimi) and no Kimi-arch student has been
-    # crowned yet. The chat-keeper's vLLM is still serving the *previous*
-    # king (state/chat_pod.json keeps a reference for exactly this
-    # scenario), so we surface that to the chat router instead of going
-    # 503 — chat staying live during the gap is more important than
-    # leaderboard purity in the API surface (the dashboard still reads
-    # h2h_latest directly so the leaderboard correctly shows "no king").
+    # h2h_latest can sit at king_uid=None for an eval generation after
+    # a hard arch cutover. chat-keeper's vLLM still serves the prior
+    # king and we surface that here so chat stays live across the gap.
     chat_pod_state = read_state("chat_pod.json", {}) or {}
     fallback_model = chat_pod_state.get("model")
     if fallback_model:
@@ -107,24 +81,18 @@ def _get_king_info():
 
 # ── Local httpx client ───────────────────────────────────────────────────────
 # chat_server.py always serves the king under the stable name "sn97-king".
-# The HF repo id changes every time a new king is crowned, but vLLM only
-# registers what we boot it with, so any client-sent model name has to be
-# rewritten before forwarding or vLLM 404s with `does not exist`.
+# vLLM is booted with this fixed served-model name so client-supplied
+# model names are rewritten before forwarding (avoids vLLM 404s after
+# a new king is crowned).
 CHAT_POD_SERVED_MODEL = "sn97-king"
 
-# The chat-tunnel.service systemd unit forwards 127.0.0.1:8100 →
-# chat-pod:8100 over autossh. Going through localhost lets us:
-#   1. Reuse a TCP keep-alive instead of opening a fresh ssh socket
-#      per request.
-#   2. Detect tunnel-down conditions in <2 s (connection refused)
-#      instead of waiting for a 10 s ssh ConnectTimeout.
+# chat-tunnel.service forwards 127.0.0.1:8100 -> chat-pod:8100 via
+# autossh — going through localhost reuses a TCP keep-alive and lets
+# us detect tunnel-down in <2 s.
 _LOCAL_CHAT_BASE = f"http://127.0.0.1:{CHAT_POD_PORT}"
 
-# Single shared async client — pooled connections, sane timeouts.
-# We deliberately keep ``connect`` short (3 s) so a dead tunnel
-# fails fast and we can return 503 to the client; vLLM generations
-# can take a while so ``read`` is generous (90 s for sync, the
-# stream paths use their own client without a read cap).
+# Pooled async client. Short connect (3 s) so a dead tunnel fails fast
+# and we return 503; generous read (90 s) for slow generations.
 _chat_http_client: httpx.AsyncClient | None = None
 _chat_http_lock = threading.Lock()
 
@@ -150,30 +118,19 @@ def _get_http_client() -> httpx.AsyncClient:
 def _normalize_chat_payload(payload: dict) -> dict:
     """Rewrite the OpenAI-shaped payload for the chat pod's vLLM.
 
-    1. Force ``model`` to the stable served name. We expose the live king's
-       repo id at ``/v1/models`` and at the response level (so clients can
-       attribute completions correctly), but vLLM is booted with a fixed
-       served name so it can't honor anything else.
-    2. Default ``enable_thinking`` off. Distil's king models are reasoners;
-       leaving thinking on means small ``max_tokens`` budgets get eaten by
-       the reasoning trace and ``content`` comes back null. Clients that
-       want thinking can opt in via ``chat_template_kwargs``.
-    3. Sane anti-derail sampling defaults (2026-04-30): see
-       ``_normalize_chat_payload`` history; rationale unchanged.
+    Forces the served-model name (vLLM only knows ``sn97-king``);
+    defaults thinking off so small ``max_tokens`` aren't consumed by
+    the reasoning trace; defaults ``max_tokens`` to 1024 if absent;
+    injects a math-formatting system prompt when the client didn't
+    provide one.
     """
     payload = dict(payload)
     payload["model"] = CHAT_POD_SERVED_MODEL
     kwargs = dict(payload.get("chat_template_kwargs") or {})
     kwargs.setdefault("enable_thinking", False)
     payload["chat_template_kwargs"] = kwargs
-    # chat.arbos.life is a transparent window — no quality masking.
-    # If the client passes a max_tokens, respect it; otherwise default
-    # to 1024 (enough for a concise reply, bounded so a stuck king
-    # finishes within ~10-15s on a 1xH200).
     if payload.get("max_tokens") is None:
         payload["max_tokens"] = 1024
-    # 2026-05-02 (v30.5 patch): math-formatting system prompt — only
-    # injected when the client did not provide its own system prompt.
     msgs = list(payload.get("messages") or [])
     has_system = any(
         (isinstance(m, dict) and m.get("role") == "system") for m in msgs
@@ -1762,13 +1719,10 @@ def _log_chat_turn(payload, response_text, king_uid, king_model, raw_data=None):
         pass
 
 
-# ── Status caching ───────────────────────────────────────────────────────────
-# /api/chat/status is hit by every dashboard tab on a 30 s polling
-# interval. With ~50 simultaneous viewers and the previous SSH probe
-# (~250 ms each), the endpoint alone consumed ~12 worker-seconds per
-# minute. We now cache the local probe result for 10 s; the king's
-# quality scores already come from h2h_latest (cheap file read), so
-# this is mostly about the live vLLM probe.
+# ── Status caching ───────────────────────────────────────────────────
+# /api/chat/status is polled every 30 s by every dashboard tab. The
+# live vLLM probe is cached for 10 s; quality scores already come
+# from a cheap file read.
 _status_cache: dict | None = None
 _status_cache_ts: float = 0.0
 _STATUS_CACHE_TTL = 10.0
@@ -1807,13 +1761,9 @@ def _store_status_cache(snapshot: dict) -> None:
 )
 async def chat_with_king(request: Request):
     """Proxy chat to the king model running on the GPU pod."""
-    # 2026-05-09: pre-fix this used ``request.client.host`` which is
-    # always 127.0.0.1 behind Caddy, so a single abuser filled the
-    # 10/min bucket for everyone (or, equivalently, no one was ever
-    # rate-limited because the SSR loop on 127.0.0.1 ate the budget).
-    # ``client_real_ip`` returns the cf-connecting-ip / xff / x-real-ip
-    # canonical key; internal callers (Next.js SSR, healthchecks) are
-    # exempt so dashboard polling can't self-DoS.
+    # client_real_ip returns the cf-connecting-ip / xff / x-real-ip key
+    # so a single client behind Caddy can't fill the bucket for all.
+    # Internal callers (SSR, healthchecks) are exempt to avoid self-DoS.
     client_ip, is_internal = client_real_ip(request)
     if not is_internal and not _chat_rate_limiter.is_allowed(client_ip):
         return JSONResponse(
