@@ -41,21 +41,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("check_model")
 
-# ── Constants (must match validator) ────────────────────────────────────
-# 2026-05-02 hard cutover: teacher swapped from Qwen3.5/Qwen3.6-35B-A3B to
-# moonshotai/Kimi-K2.6 (1T total / ~32B active MoE; INT4 compressed-tensors
-# wrapper; text inner is DeepSeek-V3 MoE, vocab 163,840). Student cap
-# stepped 5.25B → 7B → 40B → 33B; the live value lives in
-# frontend/src/lib/subnet-config.json (teacher.maxStudentParams etc.) and
-# we prefer that on disk if available so this script doesn't drift again.
+# Constants stay aligned with the live validator by reading
+# frontend/src/lib/subnet-config.json on disk; defaults below mirror the
+# moonshotai/Kimi-K2.6 teacher cutover.
 
 def _load_subnet_config():
-    """Load /frontend/src/lib/subnet-config.json relative to this file.
-
-    Returns the parsed dict, or None on any error. The validator-side
-    model_checker.py uses the same JSON as its source of truth, so the
-    constants below stay aligned with production whenever the file is
-    reachable."""
+    """Load frontend/src/lib/subnet-config.json next to this file; None on error."""
     try:
         repo_root = Path(__file__).resolve().parent
         # repo layout: <root>/check_model.py and <root>/frontend/src/lib/subnet-config.json
@@ -72,12 +63,10 @@ _SC = _load_subnet_config() or {}
 _SC_TEACHER = _SC.get("teacher") or {}
 
 TEACHER_MODEL = _SC_TEACHER.get("model") or "moonshotai/Kimi-K2.6"
-# Kimi K2.6 is ~1T total / ~32B active. We use the active params for the
-# "teacher size" ratio gate; the absolute cap below dominates anyway.
 TEACHER_TOTAL_PARAMS_B = (
     (_SC_TEACHER.get("activeParams") or 32_000_000_000) / 1_000_000_000
 )
-MAX_PARAM_RATIO = 1.15  # ratio kept for legacy callers; absolute cap dominates
+MAX_PARAM_RATIO = 1.15  # legacy; abs cap below dominates
 MAX_STUDENT_PARAMS_B_ABS = (
     (_SC_TEACHER.get("maxStudentParams") or 33_000_000_000) / 1_000_000_000
 )
@@ -87,11 +76,11 @@ _ARCH_ALLOWLIST = _SC_TEACHER.get("studentArchAllowlist") or [
     {"model_type": "deepseek_v3", "architecture": "DeepseekV3ForCausalLM"},
     {"model_type": "kimi_k25", "architecture": "KimiK25ForConditionalGeneration"},
 ]
-MIN_MODEL_BYTES = 500_000_000     # 500MB minimum
-MAX_STUDENT_VRAM_GB = 20.0        # 4B-class still ~8-10GB; 33B-class needs MP
-MIN_TOKENS_PER_SEC = 50           # 4B on B200 does 100+ tok/s
-KL_FRAUD_THRESHOLD = 1e-6         # KL ≤ this = identical to teacher = fraud
-FINGERPRINT_COSINE_THRESHOLD = 0.99999  # functional copy detection (bumped 2026-04-19, see commit history)
+MIN_MODEL_BYTES = 500_000_000     # 500MB
+MAX_STUDENT_VRAM_GB = 20.0        # 33B-class needs MP
+MIN_TOKENS_PER_SEC = 50
+KL_FRAUD_THRESHOLD = 1e-6         # KL <= threshold => identical to teacher
+FINGERPRINT_COSINE_THRESHOLD = 0.99999
 
 
 def _arch_allowed(model_type: str, archs):
@@ -359,11 +348,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         else:
             check_pass("No quantization")
 
-        # RULE: architecture must be on the live allowlist (Kimi-family
-        # post-2026-05-02 cutover). The allowlist comes from
-        # subnet-config.json::teacher.studentArchAllowlist (or the inline
-        # default). Validator-side enforcement lives in
-        # eval/model_checker.py and uses the same JSON.
+        # Architecture must be on the live allowlist (Kimi-family).
         archs = config.get("architectures", [])
         model_type = config.get("model_type", "")
         if _arch_allowed(model_type, archs):
@@ -376,9 +361,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
                        f"Found: {','.join(archs) or '(none)'} (model_type={model_type or '(none)'}).")
             failures.append(("architecture", f"{','.join(archs)} / {model_type}"))
 
-        # RULE: Vocab size matches teacher (Kimi K2.6 BPE = 163,840;
-        # pre-cutover Qwen3.5/Qwen3.6 was 248,320 — that vocab is rejected
-        # under the new teacher).
+        # Vocab size must match teacher (Kimi K2.6 BPE = 163,840).
         vocab_size = config.get("vocab_size", 0)
         if not vocab_size:
             vocab_size = config.get("text_config", {}).get("vocab_size", 0)
@@ -418,8 +401,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         try:
             student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
         except Exception:
-            # Some tokenizers need trust_remote_code or have custom backends
-            # The validator also allows this with a warning, so we do the same
+            # Some tokenizers need trust_remote_code; validator does the same.
             student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=True)
 
         test_strings = [
@@ -516,12 +498,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         print(f"   python check_model.py --model-repo {model_repo} --eval")
         sys.exit(0)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # OPTIONAL: GPU-based evaluation
-    # ══════════════════════════════════════════════════════════════════════
-    # This matches the production eval pipeline in pod_eval_vllm.py
-    # Key: scores CONTINUATION positions only (not prompt), uses fp32 casting,
-    # uses F.kl_div with log_target=True, and tokenizes full_text as one string.
+    # Optional GPU evaluation; matches the production eval pipeline.
     banner("GPU EVALUATION", char="█")
     print(f"  Running {prompts}-prompt eval against teacher")
     if king_repo:
@@ -605,9 +582,8 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
             teacher_vram = torch.cuda.memory_allocated() / 1024**3
             print(f"  Teacher VRAM: {teacher_vram:.1f}GB")
 
-            # ── Generate teacher continuations & extract logits ────────
-            # Matches production: generate continuation, then forward pass
-            # to get logits, extract continuation-only positions.
+            # Generate teacher continuations + logits (matches production:
+            # generate, then forward pass to get continuation-only logits).
             banner("Generating Teacher Continuations + Logits")
             with torch.no_grad():
                 for i, prompt_text in enumerate(eval_prompts):
@@ -624,8 +600,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
 
                     # Forward pass to get logits for the full sequence
                     logits = teacher(output_ids).logits.float()
-                    # Extract continuation-only logits: positions prompt_len-1 to -1
-                    # (shifted by 1 because logits[t] predicts token[t+1])
+                    # Continuation-only logits (logits[t] predicts token[t+1]).
                     cont_logits = logits[:, prompt_len - 1:-1, :]
 
                     full_sequences.append(output_ids.cpu())
@@ -694,12 +669,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         except Exception as e:
             check_warn("Generation speed", f"Benchmark failed: {e}")
 
-        # ── Score KL divergence (continuation-only, matches production) ──
-        # This matches the production eval pipeline in pod_eval_vllm.py:
-        # - Forward pass on full sequence (prompt + teacher continuation)
-        # - Extract student logits at continuation positions only
-        # - Cast to fp32 before log_softmax
-        # - Use F.kl_div with log_target=True
+        # KL divergence scoring (continuation-only, fp32, matches production).
         banner("CHECK 10: KL Divergence Scoring")
 
         kl_scores = []
@@ -761,16 +731,8 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         else:
             check_pass("KL fraud check", f"KL={kl_global:.6f} (legitimate)")
 
-        # ── CHECK 12: Reasoning-spiral probe ──────────────────────────
-        # KL alone doesn't catch the failure mode that crowned UID 107
-        # on 2026-04-17: a 4B student that mimics the teacher's
-        # `<think>` filler well enough to win KL but loops forever
-        # answering "Hi". The validator runs a fuller version of this
-        # probe with per-round teacher-distribution thresholds; we run
-        # a lighter standalone version against three trivial prompts
-        # so miners can catch the obvious cases before submitting.
-        # See `scripts/probes/spiral.py` for thresholds + provenance,
-        # and `paper/off_policy_cot_collapse.md` for the diagnosis.
+        # Reasoning-spiral probe: KL alone misses students that mimic the
+        # teacher's <think> filler but loop on trivial prompts.
         banner("CHECK 12: Reasoning-Spiral Probe")
         try:
             import sys as _sys
@@ -803,8 +765,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
             else:
                 check_pass("Spiral probe", spiral_result.summary)
         except Exception as exc:
-            # Probe failure is non-fatal — KL fraud + KL score still
-            # caught the obvious cases historically.
+            # Non-fatal -- KL fraud + KL score still catch the obvious cases.
             check_warn(
                 "Spiral probe",
                 f"could not run ({exc}). Submitting anyway is at your own risk; "

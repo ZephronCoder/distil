@@ -11,8 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE = "http://127.0.0.1:3710"
-# Eval pod name. The validator's systemd unit exports DISTIL_LIUM_POD_NAME
-# (kimi-cutover drop-in); we use that so the snapshot follows the live pod.
+# Eval pod name; validator's systemd unit exports DISTIL_LIUM_POD_NAME.
 POD_NAME = os.environ.get("DISTIL_LIUM_POD_NAME") or os.environ.get(
     "LIUM_POD_NAME"
 ) or "distil-kimi-cutover"
@@ -42,8 +41,7 @@ ALLOWED_STATE_FILES = [
     "private_pool_commit.json",
     "model_hashes.json",
     "score_history.json",
-    # Multi-king queue + composite history (so the bot answers
-    # "who are the recent kings?" from the mirror, not via API fetch).
+    # Multi-king queue + composite history.
     "recent_kings.json",
     "composite_scores.json",
 ]
@@ -65,11 +63,7 @@ ALLOWED_CODE_FILES = [
     "setup.py",
     "REWRITE_PLAN.md",
     "SESSION_MEMORY.md",
-    # 2026-05-03: subnet-config.json is the *live source of truth* for
-    # teacher / maxStudentParams / vocabSize / arch allowlist. POLICY.md
-    # tells the bot to cross-check against this file before answering
-    # "what is the cap?" — without it the bot was falling back to stale
-    # POLICY.md prose and parroting "7B/Qwen3" after the Kimi cutover.
+    # subnet-config.json is the live source of truth for teacher/cap/vocab/arch.
     "frontend/src/lib/subnet-config.json",
 ]
 ALLOWED_CODE_DIRS = [
@@ -683,10 +677,8 @@ for name in ALLOWED_CODE_FILES:
 for d in ALLOWED_CODE_DIRS:
     code_count += mirror_tree(REPO, MIRROR_CODE, d)
 
-# Per-UID miner snapshot so the bot can answer "why is UID N X?" from the
-# workspace. The openclaw web_fetch sandbox blocks loopback, and
-# api.arbos.life resolves to 127.0.0.1 on this host, so the bot cannot hit
-# /api/miner/{uid} directly. We pre-materialize the responses here.
+# Per-UID miner snapshot: pre-materialize /api/miner/{uid} for every UID so
+# the bot can answer "why is UID N X?" from the workspace (loopback blocked).
 miners_count = 0
 miners_errors = 0
 miners_out = {}
@@ -700,13 +692,8 @@ for uid in uid_list:
         miners_count += 1
     else:
         miners_errors += 1
-# Only overwrite the mirrored miners.json when we have a "healthy" snapshot —
-# at least 50 UIDs materialized AND error rate below 30%. This prevents a
-# transient API restart (like the one during the sn97-bot-snapshot deploy on
-# 2026-04-20 12:24 UTC) from clobbering a good snapshot with an almost-empty
-# one. If we don't have enough data, we leave the existing file as-is — stale
-# data is better than missing data for the bot's POLICY mandate to always read
-# mirror/state/miners.json first.
+# Overwrite miners.json only when "healthy" (>=50 UIDs, <30% error rate);
+# stale data is preferable to clobbering with an almost-empty snapshot.
 total_attempts = miners_count + miners_errors
 is_healthy = miners_count >= 50 and (total_attempts == 0 or miners_errors / total_attempts < 0.3)
 if miners_out and is_healthy:
@@ -730,15 +717,8 @@ elif miners_out:
         f"(count={miners_count}, errors={miners_errors}) — keeping existing miners.json"
     )
 
-# 2026-05-02 (v30.5 hotfix): pre-materialize the king-history endpoint
-# so the bot can answer "list recent kings" without web_fetch. The
-# openclaw sandbox blocks loopback and the LLM kept hallucinating
-# ``/api/king/history`` (slash) instead of the real
-# ``/api/king-history`` (hyphen), so it 404'd repeatedly. The mirrored
-# file is dethronement records (one entry per king change) — combine
-# with ``recent_kings.json`` (just the UID queue) to render a "who
-# are the recent kings?" answer with timestamps, p-values, and
-# margins. Truncate to last 50 entries to keep size sane.
+# Pre-materialize /api/king-history so the bot can answer "list recent
+# kings" without loopback web_fetch. Truncate to last 50 entries.
 king_history_payload = get("/api/king-history", timeout=8)
 if isinstance(king_history_payload, list) and king_history_payload:
     truncated = king_history_payload[:50]
@@ -800,10 +780,8 @@ lines.append(f"- **Last COMPLETED eval block:** {g(hs,'last_eval_block')} ({g(hs
 lines.append(f"- **Eval active right now (validator view):** {g(hs,'eval_active')}")
 lines.append("")
 
-# 2026-05-03: inline the LIVE subnet config so any answer about
-# teacher / max student / vocab / arch quotes the right numbers
-# without a second read. Reads from the same subnet-config.json
-# shipped into the bot mirror; falls back to defaults if missing.
+# Inline the live subnet config so teacher/cap/vocab/arch answers
+# don't need a second read.
 _subnet_cfg_path = REPO / "frontend" / "src" / "lib" / "subnet-config.json"
 try:
     _cfg = json.loads(_subnet_cfg_path.read_text())
@@ -821,10 +799,7 @@ try:
     _prev = (_cfg.get("teacher", {}).get("previousTeacher")
              or _cfg.get("previousTeacher", {}).get("model")
              or "(none recorded)")
-    # 2026-05-03: how the validator currently fetches teacher logprobs.
-    # ``api`` = OpenAI-compatible cloud inference (no local Kimi K2.6 weights);
-    # ``vllm`` = local vLLM server (legacy / fallback). Read straight from
-    # the validator's process env so the bot reflects reality, not config.
+    # How the validator fetches teacher logprobs (api=cloud, vllm=local).
     _teacher_mode = os.environ.get("DISTIL_TEACHER_MODE", "vllm").lower()
     _teacher_api_provider = os.environ.get("DISTIL_TEACHER_API_PROVIDERS") or "Inceptron"
     _teacher_api_model = os.environ.get("DISTIL_TEACHER_API_MODEL") or _model

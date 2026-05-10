@@ -69,16 +69,11 @@ def maybe_json(text: str) -> Any:
 
 
 def request_url(url: str, timeout: int = 10) -> dict[str, Any]:
-    """Fetch ``url`` with a single try and return a normalized status dict.
+    """Fetch ``url`` once; return a normalized status dict.
 
-    2026-05-09: previously caught only ``URLError`` and ``HTTPError``. When
-    the API listener accepted TCP but never wrote a response (e.g. all
-    workers wedged on a flooded chat surface), urllib raised a bare
-    ``socket.timeout`` / ``TimeoutError`` from inside ``http.client`` —
-    not wrapped in ``URLError`` — and the healthcheck script crashed
-    instead of recording a failure for the affected endpoint. We now
-    fall back to a generic ``Exception`` clause so ANY transport-level
-    failure becomes a structured ``ok=False`` instead of a stack trace.
+    Catches every transport-level exception (HTTPError, URLError, plain
+    OSError/TimeoutError) so the healthcheck never crashes on a flaky
+    endpoint -- failures become ``ok=False`` records.
     """
     req = Request(url, headers={"User-Agent": "sn97-healthcheck/1.0"})
     try:
@@ -269,19 +264,9 @@ def chat_pod_probe(expected_model: str | None) -> dict[str, Any]:
 
 
 def chain_weight_sanity(expected_king_uid: int | None) -> dict[str, Any]:
-    """Probe the on-chain weights for our validator and compare against the
-    expected v30.4 multi-king payout set.
-
-    2026-05-09: previously compared a single ``chain_target_uid`` (returned
-    by :func:`eval.chain.get_validator_weight_target`) to the live king,
-    which is wrong under multi-king splits — every UID in the split
-    shares the same raw weight, so the "target" picks the lowest UID in
-    the row and the live king looks stale forever. Now compare the SET
-    of non-zero on-chain UIDs to the SET we would emit
-    (``state.recent_kings`` + the live king, capped at ``RECENT_KINGS_MAX``).
-    The single ``chain_target_uid`` is still surfaced for back-compat
-    consumers (e.g. dashboards that grep for it).
-    """
+    """Compare the SET of non-zero on-chain UIDs to the SET we would emit
+    (state.recent_kings + live king, capped at RECENT_KINGS_MAX). Surfaces
+    ``chain_target_uid`` for back-compat consumers."""
     if expected_king_uid is None:
         return {"ok": True, "skipped": True, "reason": "no_king"}
     if not os.environ.get("VALIDATOR_UID"):
@@ -307,9 +292,8 @@ def chain_weight_sanity(expected_king_uid: int | None) -> dict[str, Any]:
     pairs = (data or {}).get("pairs") or []
     chain_uids = sorted({int(uid) for uid, w in pairs if int(w) > 0})
 
-    # Read recent_kings + the live king from local validator state. If the
-    # state file is missing (boot or fresh install), fall back to expecting
-    # only the live king (legacy winner-takes-all behaviour).
+    # Read recent_kings + live king; fall back to only the live king if
+    # state file is missing.
     state_dir = os.environ.get("DISTIL_STATE_DIR", "/opt/distil/repo/state")
     recent_kings_path = Path(state_dir) / "recent_kings.json"
     expected: list[int] = [int(expected_king_uid)]
@@ -324,8 +308,7 @@ def chain_weight_sanity(expected_king_uid: int | None) -> dict[str, Any]:
                 if u_i in expected or u_i < 0:
                     continue
                 expected.append(u_i)
-                # RECENT_KINGS_MAX is 5 in eval.state; keep this in sync.
-                if len(expected) >= 5:
+                if len(expected) >= 5:  # keep in sync with eval.state.RECENT_KINGS_MAX
                     break
     except FileNotFoundError:
         pass
@@ -362,13 +345,8 @@ def _cleanup_hf_hub(
     actions: list[str],
     tag: str,
 ) -> dict[str, Any]:
-    """Delete stale ``models--*`` directories in a HuggingFace hub cache.
-
-    Skips the directory matching the currently-scoring student (if any) and
-    any entry whose newest mtime is below ``min_age_h``. Designed for shared
-    use between the always-safe ``/root/.cache`` scratch and the validator
-    cache at ``/home/distil/.cache``.
-    """
+    """Delete stale models--* dirs from an HF hub cache; preserves the
+    currently-scoring student and anything newer than ``min_age_h``."""
     import shutil as _shutil
     now = time.time()
     reclaimed_bytes = 0
@@ -399,9 +377,7 @@ def _cleanup_hf_hub(
                     st = os.lstat(fp)
                     if st.st_mtime > latest:
                         latest = st.st_mtime
-                    # Use the apparent size (st_size) so sparse files in
-                    # tests are counted by their declared length.
-                    size += st.st_size
+                    size += st.st_size  # apparent (declared) size
                 except OSError:
                     pass
         if size < int(min_size_gb * (1024 ** 3)):
@@ -766,22 +742,13 @@ def repair(report: dict[str, Any]) -> list[str]:
             actions.append("failed_repair:openclaw_config")
 
     if any(issue.startswith("openclaw:discord_") for issue in report["issues"]):
-        # Auth/application-id failures need credential/config attention; blind
-        # restarts just burn the budget while the provider keeps receiving 401s.
+        # 401s need credential/config attention; restarts don't help.
         actions.append("notify:openclaw:discord_provider_unhealthy")
 
-    # Disk pressure. Two thresholds:
-    #   disk:      >= DISK_FAIL_PCT  (default 90)  → notify + attempt cleanup
-    #   disk_warn: >= DISK_WARN_PCT  (default 80)  → attempt cleanup only
-    # The cleanup target is ``/root/.cache/huggingface/hub/models--*`` — the
-    # scratch area where ad-hoc downloads for copy/re-save audits accumulate
-    # (each 9GB+). These caches are NOT touched by any service: the validator
-    # uses ``/home/distil/.cache/...`` so wiping /root's HF cache is safe
-    # even during a live eval. Before this hook the warning sat indefinitely
-    # at 82% until a human ran ``rm -rf`` by hand.
+    # Disk pressure -- clean up /root/.cache scratch (always safe) and
+    # the validator HF cache (safe entries only, never the live student).
     disk_issue_keys = [i for i in report["issues"] if i.startswith("disk:") or i.startswith("disk_warn:")]
     if disk_issue_keys:
-        # 1) /root/.cache scratch (always-safe, kept for backwards compat).
         root_reclaimed = _cleanup_hf_hub(
             os.path.expanduser("~/.cache/huggingface/hub"),
             current_student=None,
@@ -790,13 +757,8 @@ def repair(report: dict[str, Any]) -> list[str]:
             actions=actions,
             tag="root",
         )
-        # 2) Validator HF cache. Only delete entries that are clearly stale
-        # (>= DISTIL_HF_HUB_MAX_AGE_H, default 7 days), large enough to matter
-        # (>= DISTIL_HF_HUB_MIN_SIZE_GB, default 1 GB), and never the model
-        # currently being scored. The single-eval architecture means a
-        # commitment cache is unreferenced once its score lands; this is the
-        # actual residual that fills the disk after the /root scratch path
-        # turned out to be a near-empty mirror.
+        # Validator HF cache: stale (>= DISTIL_HF_HUB_MAX_AGE_H), large
+        # (>= DISTIL_HF_HUB_MIN_SIZE_GB), never the live student.
         validator_hub = os.environ.get(
             "DISTIL_VALIDATOR_HF_HUB", "/home/distil/.cache/huggingface/hub"
         )
