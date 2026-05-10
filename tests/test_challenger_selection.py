@@ -45,9 +45,15 @@ class TestChallengerCap(unittest.TestCase):
 
         saved_cap = ch.MAINTENANCE_CHALLENGER_CAP
         saved_protected = ch.PROTECTED_H2H_CONTENDERS
+        # 2026-04-25: SINGLE_EVAL_MODE=1 became the production default and
+        # ``cap_challengers`` early-returns under it. This test exercises
+        # the legacy cap path, so we have to force single-eval off for
+        # the duration of the test.
+        saved_is_single = ch.is_single_eval_mode
         try:
             ch.MAINTENANCE_CHALLENGER_CAP = 8
             ch.PROTECTED_H2H_CONTENDERS = 3
+            ch.is_single_eval_mode = lambda: False
             state = FakeState()
             challengers = {
                 48: {"model": "king", "commit_block": 1000},
@@ -74,6 +80,7 @@ class TestChallengerCap(unittest.TestCase):
         finally:
             ch.MAINTENANCE_CHALLENGER_CAP = saved_cap
             ch.PROTECTED_H2H_CONTENDERS = saved_protected
+            ch.is_single_eval_mode = saved_is_single
 
 
 if __name__ == "__main__":

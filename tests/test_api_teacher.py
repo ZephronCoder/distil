@@ -12,6 +12,28 @@ if str(REPO_ROOT) not in sys.path:
 from scripts import api_teacher
 
 
+# Several other test modules (test_aime_paraphrase, test_math_paraphrase, …)
+# install a torch stub into ``sys.modules`` at *collection* time. By the
+# time pytest instantiates this file, the module-level ``import torch``
+# on line above has captured whatever was in sys.modules at that moment
+# — which may already be the stub. The conftest ``restore_real_modules``
+# fixture re-binds ``sys.modules["torch"]`` to the real torch before
+# each test, but it does not rewrite the already-frozen ``torch`` name
+# in this module's globals. Refresh it ourselves so ``TinyTokenizer``'s
+# ``torch.arange`` call hits the real torch.
+@pytest.fixture(autouse=True)
+def _refresh_real_torch():
+    global torch
+    import importlib
+    real = importlib.import_module("torch")
+    saved = torch
+    torch = real
+    try:
+        yield
+    finally:
+        torch = saved
+
+
 class TinyTokenizer:
     def __call__(self, text, return_tensors=None, truncation=False):
         n = max(1, len(text.split()))

@@ -70,9 +70,23 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from scripts.eval_benchmarks import NOISE_PERTURBATION_TEMPLATES
+    from scripts.eval_benchmarks import (
+        NOISE_PERTURBATION_TEMPLATES,
+        _noise_safe_letter_swap,
+        _noise_case_jitter,
+        _noise_extra_whitespace,
+        _noise_common_misspellings,
+        _noise_drop_sentence_periods,
+    )
 except Exception:
-    from eval_benchmarks import NOISE_PERTURBATION_TEMPLATES
+    from eval_benchmarks import (
+        NOISE_PERTURBATION_TEMPLATES,
+        _noise_safe_letter_swap,
+        _noise_case_jitter,
+        _noise_extra_whitespace,
+        _noise_common_misspellings,
+        _noise_drop_sentence_periods,
+    )
 try:
     from scripts.eval_items import _rot_text
 except Exception:
