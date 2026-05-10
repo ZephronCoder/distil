@@ -69,111 +69,46 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+# Pod-side helpers. ``pod_session.upload_aux_modules`` uploads every
+# ``scripts/eval_*.py`` alongside this script, so the validator path
+# (``scripts.eval_*``) and the pod path (flat ``eval_*``) are both real.
+# We don't keep inline fallback copies: if both arms fail, dozens of
+# other imports also fail and a loud ImportError is more useful than a
+# silent stale duplicate.
 try:
     from scripts.eval_benchmarks import (
         NOISE_PERTURBATION_TEMPLATES,
-        _noise_safe_letter_swap,
-        _noise_case_jitter,
-        _noise_extra_whitespace,
-        _noise_common_misspellings,
-        _noise_drop_sentence_periods,
+        _noise_safe_letter_swap, _noise_case_jitter, _noise_extra_whitespace,
+        _noise_common_misspellings, _noise_drop_sentence_periods,
     )
-except Exception:
-    from eval_benchmarks import (
+except ImportError:
+    from eval_benchmarks import (  # type: ignore
         NOISE_PERTURBATION_TEMPLATES,
-        _noise_safe_letter_swap,
-        _noise_case_jitter,
-        _noise_extra_whitespace,
-        _noise_common_misspellings,
-        _noise_drop_sentence_periods,
+        _noise_safe_letter_swap, _noise_case_jitter, _noise_extra_whitespace,
+        _noise_common_misspellings, _noise_drop_sentence_periods,
     )
 try:
     from scripts.eval_items import _rot_text
-except Exception:
-    from eval_items import _rot_text
+except ImportError:
+    from eval_items import _rot_text  # type: ignore
 try:
     from scripts.eval_prompt_accounting import validate_teacher_logprob_coverage
-except Exception:
-    try:
-        from eval_prompt_accounting import validate_teacher_logprob_coverage
-    except Exception:
-        def validate_teacher_logprob_coverage(total_prompts, usable_prompts):
-            total = max(0, int(total_prompts or 0))
-            usable = max(0, int(usable_prompts or 0))
-            coverage = (usable / total) if total > 0 else 0.0
-            try:
-                min_coverage = float(os.environ.get("DISTIL_MIN_TEACHER_LOGPROB_COVERAGE", "0.5"))
-            except (TypeError, ValueError):
-                min_coverage = 0.5
-            try:
-                min_prompts = int(os.environ.get("DISTIL_MIN_EFFECTIVE_TEACHER_PROMPTS", "30"))
-            except (TypeError, ValueError):
-                min_prompts = 30
-            min_coverage = min(1.0, max(0.0, min_coverage))
-            min_prompts = max(1, min_prompts)
-            stats = {
-                "n_teacher_prompts_total": total,
-                "n_teacher_prompts_with_logprobs": usable,
-                "n_teacher_prompts_dropped_missing_logprobs": max(0, total - usable),
-                "teacher_logprob_coverage": round(coverage, 6),
-            }
-            if usable < min_prompts or coverage < min_coverage:
-                raise RuntimeError(
-                    "API teacher logprob coverage below quality floor: "
-                    f"{usable}/{total} usable ({coverage:.1%}); require at least "
-                    f"{min_prompts} prompts and {min_coverage:.0%} coverage"
-                )
-            return stats
+except ImportError:
+    from eval_prompt_accounting import validate_teacher_logprob_coverage  # type: ignore
 try:
     from scripts.eval_progress_io import (
         DebouncedProgressWriter,
         atomic_json_write as _shared_atomic_json_write,
     )
-except Exception:
-    try:
-        from eval_progress_io import (  # type: ignore
-            DebouncedProgressWriter,
-            atomic_json_write as _shared_atomic_json_write,
-        )
-    except Exception:
-        def _shared_atomic_json_write(path, data):
-            tmp = f"{path}.tmp.{os.getpid()}"
-            try:
-                with open(tmp, "w") as handle:
-                    json.dump(data, handle, default=str, allow_nan=True)
-                    handle.flush()
-                    try:
-                        os.fsync(handle.fileno())
-                    except OSError:
-                        pass
-                os.replace(tmp, path)
-            except Exception:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-
-        class DebouncedProgressWriter:  # type: ignore[no-redef]
-            def __init__(self, path, min_interval_s=0.5):
-                self.path = path
-                self.min_interval_s = max(0.0, float(min_interval_s))
-                self._last_write = 0.0
-
-            def write(self, data, *, force=False):
-                now = time.monotonic()
-                if not force and now - self._last_write < self.min_interval_s:
-                    return False
-                _shared_atomic_json_write(self.path, data)
-                self._last_write = now
-                return True
+except ImportError:
+    from eval_progress_io import (  # type: ignore
+        DebouncedProgressWriter,
+        atomic_json_write as _shared_atomic_json_write,
+    )
 try:
     from scripts.eval_policy import policy_metadata
-except Exception:
-    try:
-        from eval_policy import policy_metadata  # type: ignore
-    except Exception:
-        policy_metadata = None  # type: ignore
+except ImportError:
+    from eval_policy import policy_metadata  # type: ignore
 
 # 2026-05-04: Suppress the spammy ``GenerationMixin`` warning that
 # transformers emits on EVERY ``model.generate()`` call when both

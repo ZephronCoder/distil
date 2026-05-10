@@ -1,27 +1,20 @@
-"""Single-eval mode helpers (one registration → one commitment → one eval).
+"""Single-eval mode helpers — one registration -> one commitment -> one eval.
 
-Background (2026-04-25, distil-97): the previous round model re-evaluated the
-king every round, plus the top-N H2H contenders, plus a dormant rotation, on
-top of new submissions. Round sizes drifted to 12+ models and 90–120 minutes
-of compute. The user policy update is "every commitment is evaluated exactly
-once" — miners pay for the eval via the on-chain registration burn, and the
-validator keeps a canonical per-UID composite that survives across rounds.
+When ``SINGLE_EVAL_MODE=1`` (the production default since 2026-04-25):
 
-This module is the seam where the new policy is enforced. When
-``SINGLE_EVAL_MODE=1`` is set in the validator environment:
-
-* ``select_challengers`` returns only UIDs whose current commitment hasn't
-  been composite-scored yet (driven by ``state.composite_scores``).
-* ``add_top5_contenders`` / ``add_dormant_rotation`` / ``cap_challengers`` /
-  ``assert_top_contenders_present`` are no-ops — there is no "re-eval slot"
-  to fill.
+* ``select_challengers`` only returns UIDs whose current commitment hasn't
+  been composite-scored yet.
+* ``add_top5_contenders`` / ``add_dormant_rotation`` / ``cap_challengers``
+  / ``assert_top_contenders_present`` are no-ops — there is no
+  "re-eval slot" to fill.
 * ``plan_round`` does NOT seat the king. Rounds contain only new
   submissions plus the always-in reference baseline.
-* The crown is selected cross-round from ``state.composite_scores`` by the
-  composite ``final`` score, not from the round's paired t-test.
+* The king is selected cross-round from ``state.composite_scores`` by
+  ``composite.final``, not from a per-round paired t-test.
 
-Anything outside the flag stays on the existing behavior, so the flip is
-reversible.
+Spam is controlled by the on-chain registration burn cost rather than a
+per-round cap. Flipping the flag back falls back to the legacy
+re-eval-every-round path.
 """
 
 from __future__ import annotations
@@ -50,38 +43,25 @@ def is_single_eval_mode() -> bool:
     return policy_env("SINGLE_EVAL_MODE", "0") == "1"
 
 
-# Composite-worst margin a challenger must clear to dethrone the current king
-# in single-eval mode. Mirrors ``EPSILON`` in the legacy KL-paired path so
-# defaults stay symmetric: 3% margin = clearly better, not noise.
+# Composite.final margin a challenger must clear to dethrone the current
+# king. Live default 0.05 (5%) — bumped from 0.03 in v31.2 after the
+# 2026-05-09 variance-reduction sweep showed paired KL noise above the
+# 3% floor. Override via ``SINGLE_EVAL_DETHRONE_MARGIN`` env or policy.
 SINGLE_EVAL_DETHRONE_MARGIN = float(
-    policy_env("SINGLE_EVAL_DETHRONE_MARGIN", "0.03")
+    policy_env("SINGLE_EVAL_DETHRONE_MARGIN", "0.05")
 )
 
 
-# Hard ceiling on how many never-evaluated commitments enter a single round.
-# When a backlog of new commits accumulates faster than rounds can consume
-# them (e.g. after a 12 h restart loop), the planner would otherwise queue
-# 20+ models per round and each round bloats to 8+ hours of pod compute.
-# That hurts everyone: miners can't see results, base-model regression
-# checks slow to a crawl, and a single bad node in the queue takes the
-# whole round down with it. The cap forces FIFO rotation by commit_block
-# (oldest commitment first), so every miner is evaluated within a few
-# rounds without a single round being a multi-hour wallclock fire.
-#
-# Default 10 keeps round target around 60–75 min on H200 with shadow axes
-# off. Override per-deployment with ``SINGLE_EVAL_MAX_PER_ROUND`` env.
-SINGLE_EVAL_MAX_PER_ROUND = int(
-    policy_env("SINGLE_EVAL_MAX_PER_ROUND", "10")
-)
+# Per-round cap on never-evaluated commitments. Forces oldest-first FIFO
+# rotation by ``commit_block`` so a backlog can't bloat any single round
+# into a multi-hour wallclock fire. Default 10 ≈ 60–75 min on H200.
+SINGLE_EVAL_MAX_PER_ROUND = int(policy_env("SINGLE_EVAL_MAX_PER_ROUND", "10"))
 
 
-# When `worst` (min over axes) is at-or-below this epsilon, treat the UID as
-# saturated at the floor and use `weighted` as a tiebreaker. ~45% of stored
-# composite records have worst=0.0 because a *single* zero axis (e.g. mbpp
-# pass_frac=0 for a non-coding model) bottoms the min. Without this floor
-# epsilon, an incumbent at worst=0.0 can never be dethroned by another
-# saturated-floor challenger even if the challenger has a much higher
-# weighted score across the other 19 axes.
+# When ``worst`` (min over axes) is ≤ this epsilon, treat the UID as
+# floor-saturated and use ``weighted`` as the tiebreaker. Without this an
+# incumbent at worst=0.0 (single zero-axis e.g. mbpp pass_frac=0) can
+# never be dethroned by another floor-saturated challenger.
 SINGLE_EVAL_WORST_FLOOR_EPSILON = float(
     policy_env("SINGLE_EVAL_WORST_FLOOR_EPSILON", "0.005")
 )

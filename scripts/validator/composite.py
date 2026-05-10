@@ -357,163 +357,41 @@ JUDGE_AXIS_IN_COMPOSITE = os.environ.get("JUDGE_AXIS_IN_COMPOSITE", "1") != "0"
 # ranking 2026-04-24 after the planned 48h shadow window (see the
 # 2026-04-24-pareto-holistic-eval-v2.md report section 5 + the
 # Discord 48h announcement).
+# Legacy bench + skill-group + super_teacher axes — RETIRED 2026-05-10 (v31.2).
+# All weights default to 0.0; sub-axes still RUN for telemetry/per_src
+# but no longer drive the composite or the dethrone gate. Weight on
+# each axis is re-enabled by setting its env override to a non-zero
+# float (useful for ablations only — the v31 axes are the production
+# surface). Rationale + audit: reports/2026-05-10-axis-correlation-audit.md.
 BENCH_AXIS_WEIGHTS = {
-    # v30.2 (2026-04-29) — Skill-group regrouping. The individual bench
-    # sub-axes (code_bench, math_bench, ...) are now 0 by default; the
-    # composite weight has migrated to the group axes (code_skill_group,
-    # math_skill_group, etc.) defined below in BENCH_GROUP_AXIS_WEIGHTS.
-    # Sub-axes are still computed (for telemetry/per_src/saturation
-    # audit) but don't directly drive ranking. Setting any sub-axis
-    # weight back > 0 via env restores its individual ranking
-    # contribution (useful for ablations).
     "math_bench":      float(os.environ.get("BENCH_MATH_WEIGHT", "0.0")),
     "code_bench":      float(os.environ.get("BENCH_CODE_WEIGHT", "0.0")),
     "reasoning_bench": float(os.environ.get("BENCH_REASONING_WEIGHT", "0.0")),
     "knowledge_bench": float(os.environ.get("BENCH_KNOWLEDGE_WEIGHT", "0.0")),
-    # v31 (2026-05-09): ifeval_bench retired in favor of
-    # v31_ifeval_verifiable (which uses the same Google IFEval
-    # verifier surface but with procedural kwargs that vary per
-    # round, eliminating the surface-form memorization risk).
-    # Legacy weight 0.07 redirected.
     "ifeval_bench":    float(os.environ.get("BENCH_IFEVAL_WEIGHT", "0.0")),
 }
-
-# v30.2 — Skill-group axis weights. These pick up the weight previously
-# distributed across the individual bench sub-axes.
-#
-# Net comparison (v30 → v30.2):
-#   v30: code 0.14 + mbpp 0.06 + debug 0.06 + correction 0.03 + refactor 0.04
-#        = 0.33
-#   v30.2: code_skill_group 0.20 (sub-axes 0). Net cut: 0.13 redirected.
-#
-#   v30: math 0.14 + aime 0.10 + robustness 0.07 = 0.31
-#   v30.2: math_skill_group 0.18. Net cut: 0.13.
-#
-#   v30: reasoning 0.10 + long_context 0.04 + multi_doc 0.05 = 0.19
-#   v30.2: reasoning_skill_group 0.12. Net cut: 0.07.
-#
-#   v30: knowledge 0.05 + pragmatic 0.04 = 0.09
-#   v30.2: knowledge_skill_group 0.07. Net cut: 0.02.
-#
-# Net saved: 0.35 weight redirected. Allocated to:
-#   super_teacher 0.10 (incentivize beyond-teacher)
-#   on_policy_rkl 0.35 → 0.40 (largest signal stays largest)
-#   judge_probe 0.15 (unchanged — short-form quality)
-#   long_form_judge 0.05 → 0.08 (essay quality)
-#   tool_use_bench 0.06 (unchanged — agentic Python distinct)
-#   calibration_bench 0.06 (unchanged — refusal distinct)
-#   ifeval_bench 0.07 (kept separate — instruction following distinct)
-#   chat_turns_probe 0.08 (unchanged — multi-turn distinct)
-#   shadow axes (kl_is etc.) 0.02 → 0.05 each
 BENCH_GROUP_AXIS_WEIGHTS = {
-    # v30.6 (2026-05-09) — bench-group reweighting based on observed
-    # canary correlation (n=4 kings, scripts/audit/axis_correlation.py):
-    #   * ``code_skill_group``      r=+0.29 (mildly positive, but
-    #                                 inflated by saturated sub-axes;
-    #                                 canary_humaneval is a stronger
-    #                                 read of the same skill).
-    #   * ``math_skill_group``      r=-0.39 (anti-correlated; replaced
-    #                                 by canary_gsm8k).
-    #   * ``reasoning_skill_group`` r=-0.95 (worst correlator we have;
-    #                                 climbing it actively predicts
-    #                                 regressing on bbh).
-    #   * ``knowledge_skill_group`` r=-0.45 (anti-correlated; replaced
-    #                                 by canary_mmlu_pro).
-    # Net cut 0.56 → CANARY_AXIS_WEIGHTS + top_k_overlap. Sub-axes
-    # still compute and feed into telemetry / per_src.
-    # v30.7 (2026-05-09) — modest restoration after canary revert.
-    # ``code_skill_group`` was the only positive correlator
-    # (r=+0.29), so it gets the biggest bump (0.12 → 0.15).
-    # ``reasoning_skill_group`` had a catastrophic r=-0.95 in v30.6
-    # but the cure for that was the bottom_half_mean aggregation
-    # (saturated sub-axes can't inflate the group), not deletion.
-    # With saturation patched it's safe to restore a modest weight
-    # (0.06 → 0.10) — but the freed weight predominantly went to
-    # the teacher-anchored axes above, not back to skill groups.
-    # ``knowledge_skill_group`` stays at 0 — its correlation was
-    # both negative and noisy, and we have no reason to think the
-    # group's items map cleanly to mmlu_pro yet.
-    # v31 (2026-05-09): skill-group weights reduced. The procedural
-    # v31 axes (V31_AXIS_WEIGHTS) sum to 0.50 and are designed to
-    # replace the legacy ad-hoc bench surface. We trim 0.10/0.10/0.10
-    # 2026-05-10 (v31.2): all skill groups RETIRED from composite.
-    # Rationale (Discord feedback from `duohuang` 2026-05-09): the
-    # legacy ``code_skill_group`` rolls up sub-axes including
-    # ``debug_bench`` (n=6), ``correction_bench`` (n=6), and
-    # ``refactor_bench`` (n=4) — and the default ``bottom_half_mean``
-    # aggregator picks the lowest k=⌈n/2⌉ values, so the group score
-    # is dominated by the worst noisiest small-n axis. With v31's
-    # ``v31_code_humaneval_plus`` (n=12, w=0.08) carrying clean code
-    # signal at 30% lower per-axis SE, the legacy group is now a
-    # liability, not a hedge: it injects high-variance points into the
-    # composite without adding capability coverage. Sub-axes still run
-    # (telemetry only) and stay visible on the dashboard, but no
-    # longer touch composite or the dethrone gate.
     "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.0")),
     "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.0")),
     "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.0")),
     "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.0")),
-    # 2026-05-02 (v30.5): super_teacher axis REMOVED.
-    # Rationale: the axis was conceptually wrong for distillation — by
-    # construction, a student matching the teacher's distribution
-    # (which is what KL/RKL/top_k_overlap reward) cannot exceed the
-    # teacher on the same skill surface. Empirically every trained
-    # miner sat at exactly 0.00 on this axis since launch, which
-    # (a) ruined the radar-chart visualisation by anchoring one spoke
-    # at zero, and (b) wasted 10% composite weight that should be
-    # rewarding actual capability.
-    # The 0.10 weight is redistributed: math +0.02, reasoning +0.02,
-    # knowledge +0.03, leaving room for the bigger student cap (40B)
-    # to express more capability on the existing axes.
-    # ``_axis_super_teacher`` is kept as a private helper for legacy
-    # composite records that still reference it, but the weight is 0
-    # so it never contributes to the live composite ranking.
+    # ``_axis_super_teacher`` stays as a private helper for legacy records.
     "super_teacher":         float(os.environ.get("SUPER_TEACHER_WEIGHT", "0.0")),
 }
-
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"
 
 
-# ── 2026-05-09 (v30.6) — Held-out canary axes (PRODUCTION) ────────────
-# Single biggest fix in v30.6: the held-out evalscope canary
-# (state/benchmarks/uid_<uid>.json) is now a first-class composite axis
-# set. Previously the canary only fired as a post-hoc dethrone gate
-# (KING_CANARY_GATE) -- a king could climb composite to 0.5+ while
-# regressing on real evalscope, and the gate would only catch them
-# after a 2-round streak. With these axes, the king's actual held-out
-# scores plug into compute_axes every round, so a real-capability gap
-# shows up immediately as a low canary_* axis value, pulling down
-# worst_3_mean and the final composite proportionally.
+# ── Held-out canary axes ──────────────────────────────────────────────
+# Plumbing: ``annotate_h2h_with_composite`` reads
+# ``state/benchmarks/uid_<uid>.json`` per UID and threads it into
+# ``compute_composite(canary_scores=...)``; ``compute_axes`` invokes
+# ``_axis_canary_*`` per axis. Missing canary file → all canary axes
+# return None → axis drops out of ranking (fail-open).
 #
-# Plumbing:
-#   * annotate_h2h_with_composite looks up state/benchmarks/uid_<uid>.json
-#     for each h2h entry's UID, extracts the per-axis benchmarks dict,
-#     and threads it through compute_composite(canary_scores=...).
-#   * compute_axes invokes _axis_canary_*(canary_scores, axis) for each
-#     canary axis, returning the raw pass-fraction in [0, 1].
-#   * Missing canary file (challenger never crowned, or canary not yet
-#     run for a fresh model commit) => canary_scores=None => every
-#     canary axis returns None => axis drops out of ranking. Composite
-#     renormalises over surviving axes -- fail open, no false-negative
-#     dethrones from a probe outage.
-#
-# Total weight 0.50: half the composite is now anchored on real,
-# never-procedural benchmarks. Per the audit (n=4 kings):
-#   gsm8k, humaneval are the cleanest signals (highest correlation
-#     with model quality, narrow item pools where misclassification
-#     rare) -- weight 0.12 each
-#   bbh, mmlu_pro broader but noisier -- weight 0.10 each
-#   ifeval narrow structural -- weight 0.06
-#
-# v30.7 (2026-05-09) — public benchmarks DEFAULT-OUT of the composite.
-# Putting any public benchmark in the score lets miners train to it
-# (paraphrase synthesis, item-format match, train-set contamination)
-# until the canary score is high without the underlying skill
-# transferring. The canary axes are still computed (so the diagnostic
-# loop and king_canary_streak gate keep working) but contribute zero
-# weight to ``worst`` / ``weighted``. Override via the env var if you
-# explicitly want the v30.6 anchoring back, but expect it to be gamed
-# within ~2 weeks of the weights becoming public.
+# All weights DEFAULT-OUT (0.0) since v30.7: any public-benchmark axis
+# becomes a Goodhart target within ~2 weeks of public weight, so the
+# canary set is computed for diagnostics + the king_canary_streak gate
+# only. Override via env if you explicitly want anchoring back.
 CANARY_AXIS_WEIGHTS = {
     "canary_gsm8k":     float(os.environ.get("CANARY_GSM8K_WEIGHT", "0.0")),
     "canary_humaneval": float(os.environ.get("CANARY_HUMANEVAL_WEIGHT", "0.0")),
