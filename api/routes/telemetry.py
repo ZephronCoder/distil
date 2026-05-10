@@ -351,8 +351,16 @@ def _compact_round(h2h, last_eval):
     }
 
 
-@router.get("/api/telemetry/dqs", tags=["Telemetry"],
-            summary="Recent disqualifications")
+@router.get(
+    "/api/telemetry/dqs", tags=["Telemetry"],
+    summary="Recent disqualifications",
+    description=(
+        "Tail of `state/disqualified.json` annotated with the on-chain UID and "
+        "hotkey when known. Each entry has a short, paraphrase-safe `reason` "
+        "string copied verbatim from the validator. Sorted by commit block "
+        "descending so the most recent DQs appear first. Cache: `max-age=15`."
+    ),
+)
 def telemetry_dqs(limit: int = 80):
     limit = max(1, min(limit, 300))
     dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {}) or {}
@@ -378,8 +386,17 @@ def telemetry_dqs(limit: int = 80):
     )
 
 
-@router.get("/api/telemetry/events", tags=["Telemetry"],
-            summary="Validator event stream (info/warn/error)")
+@router.get(
+    "/api/telemetry/events", tags=["Telemetry"],
+    summary="Validator event stream (info/warn/error)",
+    description=(
+        "Returns the tail of `state/validator_log.json` — structured events "
+        "from the live validator (`scripts/validator/service.py`). Filter by "
+        "`level=info|warn|error` to focus on a specific severity. Cache: "
+        "`max-age=5` so the dashboard event feed stays roughly real-time "
+        "without hammering disk."
+    ),
+)
 def telemetry_events(limit: int = 200, level: str = None):
     limit = max(1, min(limit, 500))
     entries = _safe_json_load(os.path.join(STATE_DIR, "validator_log.json"), [])
@@ -393,8 +410,15 @@ def telemetry_events(limit: int = 200, level: str = None):
     )
 
 
-@router.get("/api/telemetry/errors", tags=["Telemetry"],
-            summary="Recent error / warning events")
+@router.get(
+    "/api/telemetry/errors", tags=["Telemetry"],
+    summary="Recent error / warning events",
+    description=(
+        "Convenience wrapper around `/api/telemetry/events` that filters to "
+        "`warn`, `warning`, and `error` levels — the surface the dashboard's "
+        "incidents widget reads. Cache: `max-age=5`."
+    ),
+)
 def telemetry_errors(limit: int = 100):
     limit = max(1, min(limit, 300))
     entries = _safe_json_load(os.path.join(STATE_DIR, "validator_log.json"), [])
@@ -408,8 +432,16 @@ def telemetry_errors(limit: int = 100):
     )
 
 
-@router.get("/api/telemetry/pod-health", tags=["Telemetry"],
-            summary="GPU / pod telemetry")
+@router.get(
+    "/api/telemetry/pod-health", tags=["Telemetry"],
+    summary="GPU / pod telemetry",
+    description=(
+        "Live `nvidia-smi` snapshot (per-GPU util, memory, temp, power) plus "
+        "the validator's systemd state and the current eval phase. Used by "
+        "the dashboard pod-health widget and by `sn97_healthcheck.py`. "
+        "Cache: `max-age=5`."
+    ),
+)
 def telemetry_pod_health():
     out = {"gpu": None, "pod": None, "validator_uptime_s": None}
     nvidia_csv_fmt = "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit"
@@ -471,8 +503,15 @@ def telemetry_pod_health():
     )
 
 
-@router.get("/api/telemetry/king-diagnostic", tags=["Telemetry"],
-            summary="Per-round king probe / status detail")
+@router.get(
+    "/api/telemetry/king-diagnostic", tags=["Telemetry"],
+    summary="Per-round king probe / status detail",
+    description=(
+        "Last `n` rounds of king state derived from `state/h2h_history.json`: "
+        "block, timestamp, king UID/model, dethrone outcome, paired KL, and "
+        "DQ-blocked-dethrone metadata. Newest round first. Cache: `max-age=10`."
+    ),
+)
 def telemetry_king_diagnostic(n: int = 10):
     n = max(1, min(n, 50))
     history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
