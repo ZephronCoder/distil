@@ -1,0 +1,21 @@
+[Unit]
+Description=Run sn97-healthcheck every 5 minutes (autonomous repair watchdog)
+
+[Timer]
+# 2-minute boot delay so distil-validator + distil-api have time to
+# come up cleanly; we don't want the watchdog firing on the
+# orchestration startup race.
+OnBootSec=2min
+# 5-minute cadence is a balance between (a) catching fast-moving
+# failures (chat pod down, vLLM crash, eval stall) and (b) not
+# burning ssh handshakes / nvidia-smi shells on a healthy host.
+# A wedged validator would still be picked up within a single epoch
+# (10 min). Combined with chat-keeper.timer (3 min) we have a
+# defence in depth against most single-component failures.
+OnUnitActiveSec=300s
+AccuracySec=15s
+Persistent=true
+Unit=sn97-healthcheck.service
+
+[Install]
+WantedBy=timers.target

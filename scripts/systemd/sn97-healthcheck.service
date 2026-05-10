@@ -1,0 +1,23 @@
+[Unit]
+Description=SN97 healthcheck + autonomous repair (validator/api/dashboard/openclaw/chat)
+After=network-online.target distil-validator.service distil-api.service distil-dashboard.service
+Wants=network-online.target
+
+[Service]
+# Runs scripts/sn97_healthcheck.py with --repair so safe service-level
+# fixes (restart wedged units, clear stale-eval pod, etc.) happen on
+# every tick. The healthcheck script is itself defensive — it has a
+# restart budget (2 / hour by default) so a flapping service can't
+# self-DoS the host.
+Type=oneshot
+User=root
+WorkingDirectory=/opt/distil/repo
+Environment=DISTIL_REPO_ROOT=/opt/distil/repo
+Environment=DISTIL_STATE_DIR=/opt/distil/repo/state
+# Auto-repair on by default. The script writes structured incidents
+# to ``state/incidents.jsonl`` and the latest snapshot to
+# ``state/healthcheck.json`` for the dashboard to pick up.
+ExecStart=/bin/bash -c '/opt/distil/venv/bin/python /opt/distil/repo/scripts/sn97_healthcheck.py --repair --format json > /opt/distil/repo/state/healthcheck.json 2> /tmp/sn97_healthcheck.err || true; tail -c 4096 /tmp/sn97_healthcheck.err || true'
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=180

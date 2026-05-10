@@ -11,7 +11,7 @@ A Bittensor subnet for competitive model distillation of **moonshotai/Kimi-K2.6*
 
 **Miners** distill the teacher into a smaller model (**≤33B total params**, Kimi-family architecture, vocab 163,840), upload to HuggingFace, and commit the repo link on-chain. **One commitment per hotkey — commitments are permanent and cannot be changed.** However, if disqualified, miners can register a new hotkey and submit a different model.
 
-**Validators** score every committed model on a **25+ axis composite** ([`scripts/validator/composite.py`](scripts/validator/composite.py)) anchored on **11 procedurally-generated v31 axes** (math, code, reasoning, long-context, knowledge, honesty, consistency) plus distillation, judge, and discipline tiers. See [`docs/MINER_FAQ.md`](docs/MINER_FAQ.md) for the full axis-by-axis playbook and [`reports/2026-05-09-v31-axis-promotion.md`](reports/2026-05-09-v31-axis-promotion.md) for the design rationale.
+**Validators** score every committed model on a **25+ axis composite** ([`scripts/validator/composite.py`](scripts/validator/composite.py)) anchored on **11 procedurally-generated v31 axes** (math, code, reasoning, long-context, knowledge, honesty, consistency) plus distillation, judge, and discipline tiers. See [`docs/MINER_FAQ.md`](docs/MINER_FAQ.md) for the full axis-by-axis playbook, [`reports/2026-05-09-v31-axis-promotion.md`](reports/2026-05-09-v31-axis-promotion.md) for the design rationale, [`reports/2026-05-10-axis-correlation-audit.md`](reports/2026-05-10-axis-correlation-audit.md) for the empirical evidence behind the v31.2 noisy-axis retirement, and [`docs/AUTONOMOUS_OPERATIONS.md`](docs/AUTONOMOUS_OPERATIONS.md) for the unattended-operations runbook.
 
 ### Ranking key — `composite.final` (v31.2)
 
