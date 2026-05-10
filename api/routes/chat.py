@@ -166,28 +166,10 @@ def _normalize_chat_payload(payload: dict) -> dict:
     kwargs = dict(payload.get("chat_template_kwargs") or {})
     kwargs.setdefault("enable_thinking", False)
     payload["chat_template_kwargs"] = kwargs
-    # 2026-05-01 (v30.4 patch v3): chat.arbos.life is a transparent
-    # window into the king's behaviour. We do NOT mask poor model
-    # quality. No sampling caps, no derail truncation — clients see
-    # exactly what the model produces.
-    #
-    # 2026-05-02 (v30.5 patch): floor max_tokens to keep Open-WebUI's
-    # restrictive default from cutting Fermi-style answers mid-paragraph.
-    #
-    # 2026-05-04 (chat-recovery patch): the previous floor (24576) was
-    # interacting badly with degraded post-Kimi-cutover kings whose
-    # output never terminates — every Open-WebUI session would hold
-    # the vLLM slot for the full max-model-len and our timeout fired
-    # before the user saw a single token. We now use a tiered approach:
-    #   * if the client explicitly passed any value, respect it (test
-    #     harnesses, agent loops, even Open-WebUI's 1200 — clients
-    #     opting into a small budget want to bail out fast on a
-    #     looping king).
-    #   * if no value was supplied, default to 1024 — enough for a
-    #     concise reply plus a paragraph of explanation, bounded so
-    #     even a stuck king finishes within ~10-15 s on a 1xH200.
-    #     Long-form answers still need an explicit ``max_tokens``;
-    #     that's the OpenAI default contract anyway.
+    # chat.arbos.life is a transparent window — no quality masking.
+    # If the client passes a max_tokens, respect it; otherwise default
+    # to 1024 (enough for a concise reply, bounded so a stuck king
+    # finishes within ~10-15s on a 1xH200).
     if payload.get("max_tokens") is None:
         payload["max_tokens"] = 1024
     # 2026-05-02 (v30.5 patch): math-formatting system prompt — only
@@ -1115,16 +1097,10 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
         runtime_trace.append("Chat pod unavailable; served deterministic tool result.")
         used_direct_fallback = True
     elif pod_unavailable_msg:
-        # 2026-05-09: previously stuffed the raw exception string into
-        # ``content`` and returned a 200 OK with the error as the
-        # assistant's message. Open WebUI / OpenAI clients then surface
-        # ``"chat server unavailable: PoolTimeout: "`` as if the model
-        # said it, which is both a UX regression and a contract
-        # violation (the route's own docstring promises a 503). Re-raise
-        # so the outer handler in ``openai_chat_completions`` /
-        # ``chat_with_king`` maps to the documented 503 with a
-        # structured body. Deterministic fallback above still wins when
-        # we have a non-None ``direct_answer`` (e.g. tool-only queries).
+        # Re-raise so chat_with_king / openai_chat_completions map
+        # this to a documented 503 — never stuff the error into the
+        # assistant's content (which would 200 OK with the error
+        # surfaced as if the model said it).
         raise _ChatPodUnavailable(
             pod_unavailable_msg.removeprefix("chat server unavailable: ")
             or "pod unreachable"
@@ -1702,17 +1678,10 @@ def _stream_chat(payload, king_uid, king_model):
     return _sse_response(generate())
 
 
-# ── Chat turn logging ─────────────────────────────────────────────────────────
-# 2026-04-30: minimal request/response audit log so derail complaints can be
-# diagnosed after the fact. We log to a JSONL file under STATE_DIR with one
-# line per completed turn:
-#   { ts, king_uid, king_model, prompt_chars, response_chars,
-#     non_ascii_frac, top_repeated_50char_count, completion_tokens,
-#     temperature, top_p, repetition_penalty, frequency_penalty,
-#     prompt_preview (first 200 chars), response_preview (first 200 + last 200 chars) }
-# We deliberately do NOT log full conversations — privacy + disk space.
-# When a miner reports "the king derailed", grep this log for high
-# non_ascii_frac or non-zero repeated-substring counts.
+# Per-turn audit log (JSONL under STATE_DIR). We log metadata + a
+# 200-char prompt/response preview, NOT full conversations (privacy +
+# disk). When a derail is reported, grep for high non_ascii_frac or
+# non-zero repeated-substring counts.
 _CHAT_LOG_PATH = os.path.join(STATE_DIR, "chat_turns.jsonl")
 _chat_log_lock = threading.Lock()
 _CHAT_LOG_MAX_BYTES = 50 * 1024 * 1024  # 50MB rotation

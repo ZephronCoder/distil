@@ -132,30 +132,16 @@ def _resolve_king(valid_models, state):
                 bootstrap_composite_from_h2h(state)
             except Exception as exc:
                 logger.warning(f"single-eval bootstrap failed (non-fatal): {exc}")
-        # Trust the king persisted by the previous round's apply_results
-        # over a network-wide composite re-rank. Cross-sample re-ranking
-        # at epoch start is precisely the bug mrchen caught (round
-        # 8062909): a UID 144 stored composite from a different prompt
-        # sample beat UID 123's fresh composite from the in-flight
-        # round, even though UID 144 wasn't in the round.
-        # h2h_latest is the canonical "who won the last actually-run
-        # round?" field, written by ``post_round`` after weights are set.
-        #
-        # 2026-05-04 — DROPPED the ``persisted_king in valid_models``
-        # gate that previously bracketed this return. In single-eval mode
-        # the king is INTENTIONALLY excluded from the per-round challenger
-        # selection (challengers are picked from non-king commitments so
-        # the king isn't paired against itself). The old ``in valid_models``
-        # gate therefore evicted the persisted king at the start of every
-        # single-eval round → ``king_uid=None`` → no defender → whoever
-        # wins crowns automatically with the dethrone gate disabled. This
-        # is the bug Sebastian reported on 2026-05-04 19:00 UTC: UID 188
-        # won round 2 cleanly (KL 2.056), persisted as h2h_latest.king_uid
-        # AND in recent_kings, but round 3 launched with king=None because
-        # 188 wasn't in this round's challenger pool. Fix: gate on
-        # ``_is_kingship_eligible`` (registered + same hotkey + not DQ'd
-        # + not the reference) instead of round-membership. The kingship
-        # eligibility filter exists exactly for this use case.
+        # Trust h2h_latest's king over a fresh network-wide composite
+        # re-rank: re-ranking at epoch start lets a stored composite
+        # from a different sample beat the in-flight round's fresh
+        # winner (round 8062909, mrchen).
+        # Gate on _is_kingship_eligible, NOT round-membership: in
+        # single-eval mode the king is intentionally excluded from
+        # the challenger pool (so it isn't paired against itself), so
+        # an "in valid_models for THIS round" gate would silently drop
+        # the persisted king at every epoch start (round 188 → king=None,
+        # 2026-05-04 Sebastian).
         if state.h2h_latest:
             persisted_king = state.h2h_latest.get("king_uid")
             if persisted_king is not None:
@@ -881,29 +867,14 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
         )
 
     models_to_eval: dict = {}
-    # As of 2026-04-27, the king IS re-evaluated every round on the same
-    # block-seeded prompts as the challengers. The earlier single-eval
-    # design (king isn't re-evaluated, dethrone gate compares cached
-    # composite-worst against fresh challenger composite-worst) was
-    # statistically unsound: prompt-level variance on n=8-12 bench items
-    # produces SE ~0.14 on bench axes, so a challenger that "beats" the
-    # king's cached composite.worst by 3% may just be drawing easier
-    # items. Including the king in every round restores paired
-    # evaluation — challenger and king face the same prompts and same
-    # bench items, so worst-axis comparison is no longer cross-sample.
-    #
-    # The dethrone gate (see ``apply_results_and_weights``) now uses the
-    # king's *fresh* composite from this round when present, falling
-    # back to the stored composite only if the king somehow couldn't
-    # be evaluated (DQ, integrity fail, OOM).
-    #
-    # We dropped the reference baseline (Qwen3.5-4B, UID -1) from the
-    # per-round student list to make room for the king without inflating
-    # round duration. The reference is still useful for the dashboard's
-    # held-out canary, but it doesn't need to be re-evaluated on every
-    # round to serve that purpose. Run ``scripts/run_teacher_benchmark.sh``
-    # / its sibling against an idle pod to refresh held-out reference
-    # numbers when needed.
+    # 2026-04-27: re-evaluate the king every round on the same
+    # block-seeded prompts as challengers. Cross-sample comparison
+    # against a cached composite is unsound at small n (SE ~0.14 on
+    # bench axes), so the dethrone gate now uses the king's fresh
+    # composite from THIS round, falling back to the stored composite
+    # only if the king couldn't be evaluated (DQ / integrity / OOM).
+    # The reference baseline (Qwen3.5-4B, UID -1) is no longer seated
+    # — held-out canary refreshes go through scripts/run_teacher_benchmark.sh.
     seat_king = (
         not is_full_eval
         and king_uid is not None

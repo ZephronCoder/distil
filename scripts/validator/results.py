@@ -32,39 +32,18 @@ logger = logging.getLogger("distillation.remote_validator")
 
 MIN_PROMPTS_DETHRONE = 100
 
-# Mirror of MIN_PROMPTS_FOR_LEADERBOARD in state_manager — when the king's
-# completed prompts are below this, we treat the entire round's scores as
-# untrustworthy for persistent state (global `state.scores`, best_kl
-# history, etc.). The h2h_latest + leaderboard gate lives in state_manager.
-# This constant is the challenger-side score gate so a partial round can't
-# lower a challenger's "best score ever" from a legitimate 0.2 down to the
-# corrupted H2H-scale 0.06, which broke `select_challengers` filtering and
-# forced a full rollback on 2026-04-24.
+# Challenger-side score gate. Mirrors state_manager.MIN_PROMPTS_FOR_LEADERBOARD;
+# below this we treat the round's scores as untrustworthy (a partial
+# round once corrupted "best score ever" from 0.2 → 0.06 and broke
+# select_challengers — 2026-04-24 rollback).
 MIN_PROMPTS_FOR_SCORE_UPDATE = 150
 
-# ── Composite-axis dethronement floor (2026-04-22) ──────────────────────
-# A challenger that passes the KL paired t-test (p<0.05) AND the 3% epsilon
-# margin is still blocked from taking the crown if its worst composite axis
-# is below this floor. Motivation: the 2026-04-22 king (tom9491/distil-32)
-# passes KL handsomely but rambles 3–10x longer than the teacher on trivial
-# "hi"/"2+2=" prompts. Under raw KL that pathology is invisible — on-policy
-# RKL, length ratio, and the think-probe degeneracy axes all see it
-# directly. Without this veto a KL-specialized model can win even as its
-# generations become unusable.
-#
-# Floor choice: 0.20 is the "catastrophic failure" threshold for any axis
-# we care about. Concrete interpretation per axis:
-#
-#   * length   (penalty < 0.20 ⇒ student > 5x teacher tokens; clear ramble)
-#   * on_policy_rkl (score < 0.20 ⇒ on-policy RKL > 5x king; diverged)
-#   * capability (score < 0.20 ⇒ < 20% of teacher pass rate on verifiables)
-#   * degeneracy (score < 0.20 ⇒ half-plus of think prompts degenerate)
-#   * kl       (not applicable to dethroners: by construction their kl
-#              axis is ~1.0 since they beat the king on KL)
-#
-# If the composite isn't populated on enough axes (e.g. chat_probe and
-# think_probe both errored) the gate fails open. The SOTA pressure is in
-# the composite weights/ranking, not a hard per-axis king-quality floor.
+# ── Composite-axis dethronement floor ───────────────────────────────────
+# A challenger that passes the dethrone margin is still blocked if its
+# worst composite axis is below this floor. 0.20 is the
+# "catastrophic-failure" threshold per axis (e.g. on_policy_rkl < 0.20 ⇒
+# > 5x king's RKL; capability < 0.20 ⇒ < 20% of teacher pass rate). The
+# gate fails open if too few axes are populated.
 COMPOSITE_DETHRONE_FLOOR = float(policy_env("COMPOSITE_DETHRONE_FLOOR", "0.20"))
 COMPOSITE_DETHRONE_MIN_AXES = int(policy_env("COMPOSITE_DETHRONE_MIN_AXES", "3"))
 
@@ -1682,19 +1661,11 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     king_model_name = uid_to_model.get(king_uid)
     king_per_prompt = results["students"][king_model_name].get("kl_per_prompt") if king_model_name and king_model_name in results.get("students", {}) else None
 
-    # Resolve KL/RKL anchors and the reference model name once. Both the
-    # dethronement loop (composite-floor veto, COMPOSITE_DETHRONE_FLOOR)
-    # and the late composite ranking need the same anchors and apply the
-    # same normalization that ``annotate_h2h_with_composite`` uses, so
-    # computing them once avoids drift between the two passes.
-    #
-    # Cold-start (``king_h2h_kl`` is None / no king): the resolvers fall
-    # back to the round-wide minimum kl_global_avg / on_policy_rkl so the
-    # axes stay meaningful and the new winner naturally scores 1.0 — the
-    # next round inherits them as the anchor (Sebastian's dashboard fix,
-    # 2026-05-04). All three resolvers fail open: anchor stays None /
-    # falls through to king_h2h_kl and the affected veto silently
-    # disables for that axis without blocking legit dethroners.
+    # KL/RKL anchors + reference model — resolved once so the dethrone
+    # loop and the late composite-ranking pass share the same anchors
+    # (no drift vs annotate_h2h_with_composite). All resolvers fail
+    # open: cold-start (king_h2h_kl is None) falls back to the round-wide
+    # minimum so the new winner naturally scores 1.0.
     students_data = results.get("students", {}) or {}
     try:
         _h2h_stub = [{"uid": king_uid, "model": uid_to_model.get(king_uid), "is_king": True}] if king_uid else []

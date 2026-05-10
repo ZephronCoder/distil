@@ -590,63 +590,12 @@ def _axis_canary(canary_scores: dict[str, Any] | None, axis_name: str) -> float 
     return max(0.0, min(1.0, v))
 
 
-# ── 2026-04-24 — Arena v3 Session 3 (PRODUCTION) ─────────────────────
-# Four capability-extending axes inspired by Affine Cortex's environment
-# suite. Each scores absolute correctness against a public gold source;
-# the ordering gain is in **coverage** — a model that overfits AIME
-# still had to actually learn olympiad math, a model that overfits
-# tool_use_bench still had to actually learn when to write Python.
-# Tuned weights are conservative (3-6%) so Session 2 + the relative
-# axes remain important while hard capability coverage is binding.
+# ── Arena v3 sub-bench axes (mostly retired) ─────────────────────────
+# DEFAULT 0 (telemetry only) — weight is carried by V31_AXIS_WEIGHTS.
+# calibration_bench retains a small weight (0.06) because it measures
+# honest refusal under unsolvable items, which no v31 axis covers.
+# Override any axis via env for ablations only.
 ARENA_V3_AXIS_WEIGHTS = {
-    # 2026-04-26 (v28) — Quality > Quantity (Directive 2).
-    # We dropped six axes that were either redundant or eval-setup-
-    # fragile, and redirected their composite weight to harder, more
-    # discriminating capability axes. Cuts:
-    #   * ``self_consistency_bench`` (was 0.04): same item pool as
-    #     math_bench, just sampled K-way and majority-voted. Miners who
-    #     beat math_bench beat this; miners who fail math_bench
-    #     occasionally pick up free credit when their k=4 sampler hits a
-    #     correct answer by chance. No marginal signal.
-    #   * ``arc_bench`` (was 0.04): commonsense MC. Reference 4B base
-    #     scored 0.50 by random-pick, ceiling for the king is around
-    #     0.75 — small dynamic range, and the signal it carries is
-    #     dominated by knowledge_bench + reasoning_bench. Conceptually
-    #     duplicative.
-    #   * ``truthful_bench`` (was 0.03): adversarial trivia, narrow
-    #     surface (~50 question categories). Top miner saturated with
-    #     refusal-trained heuristics, not real epistemic discipline.
-    #   * ``procedural_bench`` (was 0.05): now covered by the post-v27
-    #     procedural rewrite of math_bench / capability / reasoning.
-    #     Removing avoids triple-counting the same procedural-arithmetic
-    #     signal across three weighted axes.
-    #   * ``noise_resistance_bench`` (was 0.04): sibling of robustness
-    #     that perturbs surface noise (typos / case). After v23/v24
-    #     code-paraphrase + BBH-shuffle + math paraphrase landed, the
-    #     same signal is captured by robustness_bench at half the
-    #     wall-time cost.
-    # Net cut: 0.20 weight + ~24 items per round (~9 min wall-time).
-    # Redirected:
-    #   aime_bench    +0.04  (0.06 → 0.10) — olympiad math, hard, ~zero
-    #                                        memorisation surface post-v21.
-    #   mbpp_bench    +0.02  (0.06 → 0.08) — programming breadth, complement
-    #                                        to code_bench.
-    #   tool_use_bench +0.02 (0.04 → 0.06) — agentic Python, no proxy axis.
-    #   long_context  +0.01  (0.03 → 0.04) — procedural needle-in-haystack,
-    #                                        uniquely tests retrieval.
-    #   robustness    +0.03  (0.04 → 0.07) — absorbs the cut noise axis;
-    #                                        validator now runs paraphrase +
-    #                                        noise perturbations under one
-    #                                        umbrella.
-    # v30.2 — Most bench sub-axes migrated to the skill groups (see
-    # BENCH_GROUP_AXIS_WEIGHTS above). Sub-axes still compute and feed
-    # the groups; their direct composite weight is 0 by default. Three
-    # axes stay separate because they measure orthogonal capabilities
-    # the groups don't cover:
-    #   * tool_use_bench — agentic Python (distinct from write/debug code)
-    #   * calibration_bench — honest refusal under unsolvable items
-    #   * ifeval_bench — instruction following with structural constraints
-    #     (in BENCH_AXIS_WEIGHTS above, not here)
     "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.0")),  # in math_skill_group
     "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.0")),  # in code_skill_group
     "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.0")),
@@ -932,104 +881,45 @@ PARETO_DOMINANCE_MARGIN = float(os.environ.get("PARETO_DOMINANCE_MARGIN", "0.02"
 PARETO_DOMINANCE_MIN_COMPARABLE = int(os.environ.get("PARETO_DOMINANCE_MIN_COMPARABLE", "5"))
 PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "1") != "0"
 
-# ── King regression health (2026-04-24, SHADOW) ──────────────────────────
-# leeroyjkin (distil-97, 2026-04-24): "Why is the king safe when it scores
-# poorly on your axis test, in fact worse than the base model?" The
-# composite-as-veto gate blocks a challenger from *taking* the crown, but
-# nothing forces the king to *defend* its composite. A king can camp the
-# crown while its bench axes regress to the base-model floor because only
-# KL is used for re-promotion.
-#
-# Minimal fix (shadow-first): compute a ``king_health`` summary each round
-# and stamp it on the king's composite row. Two flags:
-#   * ``below_floor``     — king's worst axis < KING_COMPOSITE_FLOOR
-#   * ``worse_than_base`` — king's worst axis < base model's worst axis
-# Consecutive at-risk rounds accumulate in ``state.king_regression_streak``
-# (per king_uid). Dashboard + /api/miner/{uid} surface the streak so
-# miners and spectators can see it; dethronement remains KL-only until we
-# have ≥1 week of telemetry validating the floor choice.
-#
-# When ``KING_REGRESSION_GATE=1`` and streak ≥ ``KING_REGRESSION_MIN_STREAK``,
-# the king is force-dethroned in favor of the highest-composite challenger
-# in the current round that also passed the structural gates.
+# ── King regression health ──────────────────────────────────────────
+# Stamps ``below_floor`` / ``worse_than_base`` flags on the king's
+# composite row each round; consecutive at-risk rounds accumulate in
+# ``state.king_regression_streak``. When KING_REGRESSION_GATE=1 and
+# streak >= KING_REGRESSION_MIN_STREAK the king is force-dethroned in
+# favor of the highest-composite challenger that also passed the
+# structural gates.
 KING_COMPOSITE_FLOOR = float(os.environ.get("KING_COMPOSITE_FLOOR", "0.20"))
 KING_REGRESSION_MIN_STREAK = int(os.environ.get("KING_REGRESSION_MIN_STREAK", "3"))
 KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 
-# ── Canary-regression auto-dethrone (2026-04-28) ──────────────────────────
-# Sibling of KING_REGRESSION_GATE. The internal at-risk check uses the
-# validator's own composite.worst, which is gameable (the whole point
-# of the goodhart canary). This canary gate uses HELD-OUT evalscope
-# benchmarks that are NEVER inside the validator: when the king's
-# average held-out score across {gsm8k, humaneval, bbh, ifeval} drops
-# more than ``KING_CANARY_MARGIN`` pp below the Qwen 4B base reference
-# for ``KING_CANARY_MIN_STREAK`` consecutive canonical rounds, the
-# composite-floor veto is waived (same mechanism as the at-risk gate).
-# This means a challenger who would normally be blocked by composite-
-# floor veto can dethrone a king whose held-out is regressing — the
-# explicit answer to "did the composite eval produce a model that's
-# actually better, or just better at the composite?".
-# v30.7 (2026-05-09) — gate tightened. Now that the canary is the
-# ONLY held-out signal in the system (the score itself is procedural-
-# only), this gate is the safety net that catches a king who's
-# climbed the procedural axes while regressing on real capability.
-# Margin loosened 0.05 → 0.04 (4pp below baseline triggers; was
-# 5pp), min_streak tightened 2 → 1 (immediate waiver; was wait two
-# rounds). The gate now waives the dethrone-veto for ANY challenger
-# the moment the king's canary average drops > 4pp below Qwen3.5-4B
-# on 4 of 5 canary axes. That's 4-axis trip rather than 1-axis
-# false-positive — strict but fast.
+# ── Canary-regression auto-dethrone ─────────────────────────────────
+# Held-out version of KING_REGRESSION_GATE. The validator's own
+# composite.worst is goodhart-gameable; this gate uses HELD-OUT
+# evalscope scores instead. When the king's canary mean drops more
+# than KING_CANARY_MARGIN below the Qwen-4B baseline on 4 of 5
+# canary axes for KING_CANARY_MIN_STREAK rounds, the composite-floor
+# veto is waived so a challenger can dethrone. Strict (4 of 5 axes,
+# not 1) but fast (min_streak=1 since v30.7) — the canary is now the
+# ONLY held-out signal, so this is the safety net that catches a
+# king climbing the procedural axes while regressing on real skill.
 KING_CANARY_MARGIN = float(os.environ.get("KING_CANARY_MARGIN", "0.04"))
 KING_CANARY_MIN_STREAK = int(os.environ.get("KING_CANARY_MIN_STREAK", "1"))
 KING_CANARY_GATE = os.environ.get("KING_CANARY_GATE", "1") != "0"
 KING_CANARY_AXES = ("gsm8k", "humaneval", "bbh", "ifeval")
 KING_CANARY_BASELINE_FILE = os.environ.get("KING_CANARY_BASELINE_FILE", "baseline_qwen35_4b.json")
 
-# ── Per-axis baseline-relative penalty (2026-04-28, v29.1) ────────────
-# The 2026-04-28 audit confirmed every king from 2026-04-17 → today
-# regressed below Qwen3.5-4B base on the held-out canary (-7.4pp gsm8k,
-# -10pp ifeval, -16pp bbh, -12pp humaneval typical). The pre-existing
-# defenses — ``_baseline_floor_dethrone_veto`` (10pp absolute floor) and
-# ``king_canary_streak`` (2-round held-out streak) — both fire AT
-# crowning / streak time, not during scoring. So a model can climb
-# composite.worst and stay there indefinitely while regressing on real
-# capability versus the un-distilled control.
-#
-# The fix is to make the per-axis composite directly reflect "stay
-# above Qwen-4B-base". For each enabled bench axis, we compare each
-# student's pass_frac to the *same-round* reference (REFERENCE_UID = -1,
-# Qwen3.5-4B) score on the SAME block-seeded items. If the student is
-# below the reference, the axis value gets docked by
-# ``alpha * (ref - student)`` clipped to 0, where ``alpha`` is the
-# regression weight.
-#
-# Why this works:
-#   * Same-round paired comparison: both models see identical procedural
-#     items (block_seed-deterministic), so the comparison is sample-
-#     paired and free of cross-round prompt drift.
-#   * Reward parity, punish regression: a student that BEATS base on
-#     math gets full credit. A student that ties gets full credit. A
-#     student that regresses is docked proportionally.
-#   * No artificial ceiling: students who legitimately exceed base on
-#     an axis are unaffected — overfitting in the *good* direction
-#     (genuine skill > base) is encouraged.
-#   * Compatible with worst-axis aggregation: the docked axis flows
-#     into worst() so the dethrone gate naturally favors balanced-and-
-#     above-base students over below-base specialists.
-#
-# Calibration:
-#   * ``BASELINE_RELATIVE_PENALTY_ALPHA = 1.5`` — a 10pp regression below
-#     base docks the axis by 15pp. This makes "stay at parity" the
-#     dominant strategy: it costs the same as a 6.7pp axis-specific
-#     improvement to drop 10pp on another axis. Aligned with the pre-
-#     existing ``BASELINE_FLOOR_MARGIN = 0.10`` veto threshold.
-#   * Penalty applied to bench axes only. Relative axes (kl, on_policy_rkl,
-#     capability, length, degeneracy) are normalized differently and
-#     would double-penalize. The judge_probe / chat_turns_probe axes
-#     are absolute correctness but reference-model-flat (small dynamic
-#     range), so we exclude them too.
-#   * ``BASELINE_RELATIVE_PENALTY_AXES`` is the explicit allow-list of
-#     axes that get the penalty.
+# ── Per-axis baseline-relative penalty ──────────────────────────────
+# In compute_axes, each bench axis with the penalty enabled compares
+# the student to the SAME-round reference (Qwen3.5-4B, UID -1) on the
+# SAME block-seeded items. If the student regresses, the axis is
+# docked by ``ALPHA * (ref - student)`` clipped to [0, axis]. Students
+# at or above base get full credit; legitimate over-base wins are
+# unaffected. Worst-axis aggregation then favors balanced-and-above-
+# base students over below-base specialists. ALPHA=1.5 makes 10pp
+# regression dock 15pp — symmetric with the 10pp BASELINE_FLOOR_MARGIN
+# veto. Applied to bench axes only (relative axes normalise
+# differently and would double-penalise); the allow-list is
+# ``BASELINE_RELATIVE_PENALTY_AXES``.
 BASELINE_RELATIVE_PENALTY_ENABLED = (
     os.environ.get("BASELINE_RELATIVE_PENALTY_ENABLED", "1") != "0"
 )
@@ -1037,25 +927,14 @@ BASELINE_RELATIVE_PENALTY_ALPHA = float(
     os.environ.get("BASELINE_RELATIVE_PENALTY_ALPHA", "1.5")
 )
 # Bench axes where regression below same-round reference docks the axis.
-# All Session-2 + Session-3 bench axes that have a real ground truth and
-# are scored by absolute pass_frac. Do NOT include relative axes.
+# Absolute pass_frac bench axes only — relative axes (kl, rkl, length,
+# capability, degeneracy) are excluded since they'd double-penalise.
 BASELINE_RELATIVE_PENALTY_AXES = frozenset({
     "math_bench", "code_bench", "reasoning_bench", "ifeval_bench",
     "aime_bench", "mbpp_bench", "tool_use_bench",
     "long_context_bench", "robustness_bench",
-    # v29.2 — debug_bench joins the baseline-relative penalty set: a
-    # student that regresses on debugging vs Qwen-4B-base loses ranking
-    # on this axis proportionally.
-    "debug_bench",
-    # v29.4 — four new SOTA-aligned axes, all subject to the
-    # baseline-relative penalty so a model regressing below
-    # Qwen-4B-base on any of them gets docked.
-    "correction_bench", "multi_doc_synthesis_bench",
-    "calibration_bench", "refactor_bench",
-    # v30 — pragmatic_bench. A model regressing on theory-of-mind /
-    # scalar implicature / indirect-request recognition vs the
-    # un-distilled Qwen-4B base loses ranking accordingly.
-    "pragmatic_bench",
+    "debug_bench", "correction_bench", "multi_doc_synthesis_bench",
+    "calibration_bench", "refactor_bench", "pragmatic_bench",
 })
 
 # ── Teacher sanity gate (2026-04-23) ──────────────────────────────────────

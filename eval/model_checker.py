@@ -1390,25 +1390,12 @@ def check_model_architecture(
                 "vocab_size": vocab_size,
             }
 
-        # 6b. Cross-check the actual ``model.embed_tokens.weight`` shape +
-        # dtype against the config. Catches three bypass patterns that
-        # all silently DQ on the eval pod (~50s of pod time wasted each):
-        #
-        #   (a) Wrong vocab — config claims teacher vocab_size but weights
-        #       are an older/smaller embed table (e.g. Llama-3 128256 or
-        #       Qwen2.5 152064). Triggers Reinit-mismatch at load time.
-        #
-        #   (b) Wrong hidden_size — config claims hidden_size=2048 but
-        #       embed table is (vocab, 256) because the miner shipped a
-        #       4-bit-packed table without disclosing it. Triggers the
-        #       same load-time error.
-        #
-        #   (c) Quantized embed dtype — embed dtype is U8/U16/U32 (not
-        #       F16/BF16/F32). bf16 student loaders can't reinterpret a
-        #       packed integer embed table.
-        #
-        # All three are detectable from the safetensors header (a few KB
-        # per shard), so the check is essentially free at precheck time.
+        # 6b. Cross-check the actual embed_tokens.weight shape+dtype
+        # against the config. Catches (a) wrong vocab, (b) wrong
+        # hidden_size (e.g. 4-bit-packed embed not disclosed), and
+        # (c) quantized integer embed dtype — all three would silently
+        # DQ on the eval pod and cost ~50s each. The safetensors header
+        # is a few KB per shard, so the check is free at precheck time.
         try:
             embed_info = get_embed_weight_shape(model_repo, revision)
             if embed_info is not None:
