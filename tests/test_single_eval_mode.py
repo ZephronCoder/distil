@@ -934,8 +934,20 @@ class ResolveDethroneTests(unittest.TestCase):
 
 class IsSingleEvalModeTests(unittest.TestCase):
     def test_default_off(self):
-        os.environ.pop("SINGLE_EVAL_MODE", None)
-        self.assertFalse(single_eval.is_single_eval_mode())
+        # The production policy file (configs/eval_policy.json) sets
+        # SINGLE_EVAL_MODE=1, so absent env override the function reports
+        # True. We patch ``policy_env`` to simulate a clean policy that
+        # doesn't set the value, mirroring the original semantics of
+        # this test (no env, no policy → default off).
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SINGLE_EVAL_MODE", None)
+            with patch(
+                "scripts.validator.single_eval.policy_env",
+                side_effect=lambda name, default=None: (
+                    default if name == "SINGLE_EVAL_MODE" else None
+                ),
+            ):
+                self.assertFalse(single_eval.is_single_eval_mode())
 
     def test_explicit_on(self):
         with patch.dict(os.environ, {"SINGLE_EVAL_MODE": "1"}):
@@ -957,14 +969,24 @@ class BackwardCompatTests(unittest.TestCase):
         os.environ.pop("SINGLE_EVAL_MODE", None)
 
     def test_legacy_select_challengers_unchanged(self):
+        # Force ``is_single_eval_mode`` to return False via a policy_env
+        # patch (the production policy.json sets SINGLE_EVAL_MODE=1 so an
+        # absent process env still resolves to single-eval ON without
+        # this override).
         state = _FakeState()
         state.scores = {"1": 0.1}
         state.evaluated_uids = {"1"}
         valid_models = _commit(1, "miner/a", 100)
         valid_models.update(_commit(2, "miner/b", 200))
-        challengers = ch_mod.select_challengers(
-            valid_models, state, king_uid=1, king_kl=0.1, epoch_count=1,
-        )
+        with patch(
+            "scripts.validator.single_eval.policy_env",
+            side_effect=lambda name, default=None: (
+                "0" if name == "SINGLE_EVAL_MODE" else default
+            ),
+        ):
+            challengers = ch_mod.select_challengers(
+                valid_models, state, king_uid=1, king_kl=0.1, epoch_count=1,
+            )
         # In legacy mode, UID 1 is skipped (already in evaluated+scores) and
         # UID 2 is included as a P3 (never-evaluated). That's the existing
         # behavior; we want to confirm the SINGLE_EVAL gate didn't change it.

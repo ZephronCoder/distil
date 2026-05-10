@@ -247,6 +247,33 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     "BENCH_ROBUSTNESS_PERTURB_K",
     "BENCH_NOISE_PER_ROUND",
     "BENCH_NOISE_PERTURB_K",
+    # ── v31 procedural axes (2026-05-09 promotion + 2026-05-10 variance lift) ──
+    # The pod-side defaults were lifted but we still want to be able to override
+    # them via the policy file (for emergency rollback or one-off ablations) so
+    # they're listed explicitly here. Names follow the pod's short-name
+    # convention (BENCH_V31_<axis>_PER_ROUND / _MAX_TOKENS).
+    "BENCH_V31_GSM_SYMBOLIC_PER_ROUND",
+    "BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS",
+    "BENCH_V31_MATH_COMPETITION_PER_ROUND",
+    "BENCH_V31_MATH_COMPETITION_MAX_TOKENS",
+    "BENCH_V31_MATH_ROBUSTNESS_PER_ROUND",
+    "BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS",
+    "BENCH_V31_CODE_PLUS_PER_ROUND",
+    "BENCH_V31_CODE_PLUS_MAX_TOKENS",
+    "BENCH_V31_LOGIC_GRID_PER_ROUND",
+    "BENCH_V31_LOGIC_GRID_MAX_TOKENS",
+    "BENCH_V31_DYVAL_PER_ROUND",
+    "BENCH_V31_DYVAL_MAX_TOKENS",
+    "BENCH_V31_RULER_PER_ROUND",
+    "BENCH_V31_RULER_MAX_TOKENS",
+    "BENCH_V31_KG_PER_ROUND",
+    "BENCH_V31_KG_MAX_TOKENS",
+    "BENCH_V31_IFEVAL_PER_ROUND",
+    "BENCH_V31_IFEVAL_MAX_TOKENS",
+    "BENCH_V31_TRUTHFULNESS_PER_ROUND",
+    "BENCH_V31_TRUTHFULNESS_MAX_TOKENS",
+    "BENCH_V31_CONSISTENCY_PER_ROUND",
+    "BENCH_V31_CONSISTENCY_MAX_TOKENS",
     # ── Bench max-token budgets ──
     # Added 2026-04-25 17:00 UTC after live round wall-time observation pegged
     # the bench battery at ~11 min/student. The default 1024-token AIME budget

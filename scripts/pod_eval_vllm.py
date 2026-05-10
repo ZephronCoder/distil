@@ -4998,31 +4998,38 @@ BENCH_PRAGMATIC_MAX_TOKENS = int(os.environ.get("BENCH_PRAGMATIC_MAX_TOKENS", "6
 # ``reports/2026-05-09-v31-procedural-redesign.md`` §migration-plan.
 # v31 (2026-05-09 promotion): all 11 v31 axes default to PER_ROUND > 0
 # so they're active in production. Operators can flip any axis back to
-# 0 to disable telemetry without affecting the others. Per-round budgets
-# are sized so the full v31 surface adds < 5 minutes to the typical
-# 12-minute round (verified offline; sandbox-graded code_humaneval_plus
-# is the heaviest at ~90s for 8 items @ 512 tok).
-BENCH_V31_GSM_SYMBOLIC_PER_ROUND = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_PER_ROUND", "16"))
+# 0 to disable telemetry without affecting the others.
+#
+# 2026-05-10 variance hardening: per-axis n was lifted by ~50% across the
+# board so the SE per axis at p=0.5 falls from ~0.14-0.18 to ~0.10-0.13.
+# This makes single-shot dethrones from a copy-with-RNG-luck attack
+# materially harder: composite SE drops below the 3% margin even before
+# the paired-SE gate kicks in. Eval wall time grows by ~5-7 min/student
+# (covered by the bumped POD_PER_MODEL_TIMEOUT). User asked for "longer
+# eval, more confidence", and the variance audit (see
+# reports/2026-05-10-variance-reduction.md) confirmed n=8 axes were the
+# top variance contributors.
+BENCH_V31_GSM_SYMBOLIC_PER_ROUND = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_PER_ROUND", "24"))
 BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS", "384"))
-BENCH_V31_MATH_COMPETITION_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_COMPETITION_PER_ROUND", "12"))
+BENCH_V31_MATH_COMPETITION_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_COMPETITION_PER_ROUND", "18"))
 BENCH_V31_MATH_COMPETITION_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_COMPETITION_MAX_TOKENS", "512"))
-BENCH_V31_MATH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_PER_ROUND", "12"))
+BENCH_V31_MATH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_PER_ROUND", "18"))
 BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS", "384"))
-BENCH_V31_CODE_PLUS_PER_ROUND = int(os.environ.get("BENCH_V31_CODE_PLUS_PER_ROUND", "8"))
+BENCH_V31_CODE_PLUS_PER_ROUND = int(os.environ.get("BENCH_V31_CODE_PLUS_PER_ROUND", "12"))
 BENCH_V31_CODE_PLUS_MAX_TOKENS = int(os.environ.get("BENCH_V31_CODE_PLUS_MAX_TOKENS", "512"))
-BENCH_V31_LOGIC_GRID_PER_ROUND = int(os.environ.get("BENCH_V31_LOGIC_GRID_PER_ROUND", "12"))
+BENCH_V31_LOGIC_GRID_PER_ROUND = int(os.environ.get("BENCH_V31_LOGIC_GRID_PER_ROUND", "18"))
 BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "256"))
-BENCH_V31_DYVAL_PER_ROUND = int(os.environ.get("BENCH_V31_DYVAL_PER_ROUND", "12"))
+BENCH_V31_DYVAL_PER_ROUND = int(os.environ.get("BENCH_V31_DYVAL_PER_ROUND", "18"))
 BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "256"))
-BENCH_V31_RULER_PER_ROUND = int(os.environ.get("BENCH_V31_RULER_PER_ROUND", "8"))
+BENCH_V31_RULER_PER_ROUND = int(os.environ.get("BENCH_V31_RULER_PER_ROUND", "16"))
 BENCH_V31_RULER_MAX_TOKENS = int(os.environ.get("BENCH_V31_RULER_MAX_TOKENS", "96"))
-BENCH_V31_KG_PER_ROUND = int(os.environ.get("BENCH_V31_KG_PER_ROUND", "12"))
+BENCH_V31_KG_PER_ROUND = int(os.environ.get("BENCH_V31_KG_PER_ROUND", "18"))
 BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "128"))
-BENCH_V31_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_V31_IFEVAL_PER_ROUND", "8"))
+BENCH_V31_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_V31_IFEVAL_PER_ROUND", "16"))
 BENCH_V31_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_IFEVAL_MAX_TOKENS", "512"))
-BENCH_V31_TRUTHFULNESS_PER_ROUND = int(os.environ.get("BENCH_V31_TRUTHFULNESS_PER_ROUND", "12"))
+BENCH_V31_TRUTHFULNESS_PER_ROUND = int(os.environ.get("BENCH_V31_TRUTHFULNESS_PER_ROUND", "18"))
 BENCH_V31_TRUTHFULNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_TRUTHFULNESS_MAX_TOKENS", "192"))
-BENCH_V31_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_V31_CONSISTENCY_PER_ROUND", "8"))
+BENCH_V31_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_V31_CONSISTENCY_PER_ROUND", "14"))
 BENCH_V31_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_V31_CONSISTENCY_MAX_TOKENS", "384"))
 
 # Token budgets.

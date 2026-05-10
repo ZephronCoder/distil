@@ -12,6 +12,7 @@ from scripts.validator.composite import (
     BENCH_AXIS_WEIGHTS,
     COMPOSITE_SHADOW_VERSION,
 )
+from scripts.validator.single_eval import SINGLE_EVAL_DETHRONE_MARGIN
 
 logger = logging.getLogger("distillation.remote_validator")
 
@@ -150,7 +151,8 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
         gate_explainer = (
             f"Dethronement uses `composite.final = 0.7 × worst_3_mean + 0.3 × weighted` "
             f"across {n_axes} axes ({axis_list}). Challenger must clear the king on "
-            f"`final` by >3%. KL shown above is one of N axes — not the ranking key. "
+            f"`final` by >{int(round(SINGLE_EVAL_DETHRONE_MARGIN * 100))}%. "
+            f"KL shown above is one of N axes — not the ranking key. "
             f"One eval per commitment; the king is paired-re-evaluated every round "
             f"on the same procedural items as challengers (composite schema "
             f"v{COMPOSITE_SHADOW_VERSION})."
