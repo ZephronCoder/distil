@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import ALLOWED_ORIGINS, API_DESCRIPTION
-from helpers.rate_limit import _rate_limiter
+from helpers.rate_limit import _PROXY_LOCAL, _rate_limiter, client_real_ip
 from helpers.cache import _bg_refresh
 from helpers.fetch import _fetch_metagraph, _fetch_commitments, _fetch_price
 
@@ -55,40 +55,13 @@ app.add_middleware(
 # uvicorn worker pool, surfacing as 503s on chat (api/routes/chat.py) and
 # every other endpoint.
 #
-# Fix: prefer X-Real-Ip (set by Caddy via ``header_up X-Real-Ip {remote_host}``)
-# and fall back to the leftmost X-Forwarded-For for Cloudflare hops; only
-# treat ``127.0.0.1`` as "internal SSR" when no proxy header is present
-# (the dashboard's local Next.js loop hits us without those headers).
-
-_PROXY_LOCAL = {"127.0.0.1", "::1", "localhost"}
-
-
-def _client_key(request) -> tuple[str, bool]:
-    """Return (key, is_internal) for rate limiting.
-
-    Header preference: ``CF-Connecting-IP`` (Cloudflare's verified
-    original client IP — this is the only way to distinguish the real
-    abuser from a flood across Cloudflare edges) → leftmost
-    ``X-Forwarded-For`` (any RFC 7239-shaped proxy chain) → ``X-Real-Ip``
-    (Caddy fallback for non-CF clients) → socket peer.
-
-    ``is_internal`` is True only when the request came from a process on
-    the same host without traversing Caddy — e.g. the Next.js SSR loop
-    or a local curl probe. Those should not be rate-limited.
-    """
-    cf_ip = request.headers.get("cf-connecting-ip")
-    if cf_ip:
-        return cf_ip.strip(), False
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        first = fwd.split(",", 1)[0].strip()
-        if first:
-            return first, False
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip(), False
-    raw_host = request.client.host if request.client else "unknown"
-    return raw_host, raw_host in _PROXY_LOCAL
+# 2026-05-09: the canonical extraction logic now lives in
+# ``helpers.rate_limit.client_real_ip`` so chat.py's per-handler
+# limiters key on the same identity (cf-connecting-ip → xff → x-real-ip
+# → peer). Pre-fix the chat handlers used ``request.client.host`` which
+# was always ``127.0.0.1`` behind Caddy, so a single abuser filled the
+# bucket for *all* clients and the OpenAI surface got a flood + 200%
+# CPU pile-up.
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -99,7 +72,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if path in ("/api/chat", "/v1/chat/completions", "/v1/models"):
             # These endpoints carry their own (stricter) limiter in-handler
             return await call_next(request)
-        key, is_internal = _client_key(request)
+        key, is_internal = client_real_ip(request)
         if is_internal:
             return await call_next(request)
         if not _rate_limiter.is_allowed(key):

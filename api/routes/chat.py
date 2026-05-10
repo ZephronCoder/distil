@@ -50,7 +50,11 @@ from config import (
     STATE_DIR,
 )
 from external import get_model_info as fetch_model_info_data
-from helpers.rate_limit import _chat_rate_limiter, _openai_api_rate_limiter
+from helpers.rate_limit import (
+    _chat_rate_limiter,
+    _openai_api_rate_limiter,
+    client_real_ip,
+)
 from helpers.sanitize import _safe_json_load
 from state_store import (
     eval_progress,
@@ -1256,7 +1260,20 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
         runtime_trace.append("Chat pod unavailable; served deterministic tool result.")
         used_direct_fallback = True
     elif pod_unavailable_msg:
-        content = pod_unavailable_msg
+        # 2026-05-09: previously stuffed the raw exception string into
+        # ``content`` and returned a 200 OK with the error as the
+        # assistant's message. Open WebUI / OpenAI clients then surface
+        # ``"chat server unavailable: PoolTimeout: "`` as if the model
+        # said it, which is both a UX regression and a contract
+        # violation (the route's own docstring promises a 503). Re-raise
+        # so the outer handler in ``openai_chat_completions`` /
+        # ``chat_with_king`` maps to the documented 503 with a
+        # structured body. Deterministic fallback above still wins when
+        # we have a non-None ``direct_answer`` (e.g. tool-only queries).
+        raise _ChatPodUnavailable(
+            pod_unavailable_msg.removeprefix("chat server unavailable: ")
+            or "pod unreachable"
+        )
     elif direct_answer is not None and _looks_empty_or_derailed(content):
         content = direct_answer
         runtime_trace.append(
@@ -1663,8 +1680,16 @@ async def _local_chat_post(payload: dict, *, timeout: float = 90.0) -> dict:
     """Async POST to the local tunnel; returns parsed JSON.
 
     Raises :class:`_ChatPodUnavailable` for connection / DNS / timeout
-    failures so the caller can map to a clean 503. Other exceptions
-    propagate.
+    / pool-exhaustion failures so the caller can map to a clean 503.
+    Other exceptions propagate.
+
+    2026-05-09: catch ``httpx.PoolTimeout`` too. When the chat pod is
+    down and dozens of clients pile on, every connect blocks for 3 s,
+    the pool fills up, and the 65th request hits ``PoolTimeout`` after
+    5 s on the wait queue. Pre-fix this leaked as a 500 with a bare
+    ``Internal Server Error`` body instead of the documented 503; the
+    dashboard then flapped between "available" / "errored" states and
+    the journal was burning ~10k suppressed lines per minute.
     """
     client = _get_http_client()
     try:
@@ -1673,8 +1698,19 @@ async def _local_chat_post(payload: dict, *, timeout: float = 90.0) -> dict:
             json=_normalize_chat_payload(payload),
             timeout=httpx.Timeout(connect=3.0, read=timeout, write=10.0, pool=5.0),
         )
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-        raise _ChatPodUnavailable(str(e)) from e
+    except (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.PoolTimeout,
+        httpx.RemoteProtocolError,
+        httpx.WriteTimeout,
+    ) as e:
+        raise _ChatPodUnavailable(f"{type(e).__name__}: {e}") from e
+    except httpx.HTTPError as e:
+        # Catch-all for any remaining transport-level error so an
+        # unexpected httpx variant cannot 500 the public chat surface.
+        raise _ChatPodUnavailable(f"{type(e).__name__}: {e}") from e
     if resp.status_code >= 500:
         # vLLM crashed or the tunnel is half-open; surface as unavailable
         # so chat-keeper picks it up on the next tick.
@@ -2039,12 +2075,35 @@ def _store_status_cache(snapshot: dict) -> None:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/api/chat")
+@router.post(
+    "/api/chat",
+    tags=["Chat"],
+    summary="Chat with the king model (dashboard surface)",
+    description=(
+        "Send chat-style messages to the current SN97 king. Used by the "
+        "dashboard chat panel. Honors `stream=true` (SSE deltas) and "
+        "`stream=false` (single JSON). Rate-limited to 10/min per client IP. "
+        "Returns 503 (`chat server unavailable`) when the chat pod is "
+        "rebooting, the eval pipeline is holding the GPU, or the upstream "
+        "vLLM is unhealthy. Use `/api/chat/status` to introspect availability."
+    ),
+)
 async def chat_with_king(request: Request):
     """Proxy chat to the king model running on the GPU pod."""
-    client_ip = request.client.host if request.client else "unknown"
-    if not _chat_rate_limiter.is_allowed(client_ip):
-        return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
+    # 2026-05-09: pre-fix this used ``request.client.host`` which is
+    # always 127.0.0.1 behind Caddy, so a single abuser filled the
+    # 10/min bucket for everyone (or, equivalently, no one was ever
+    # rate-limited because the SSR loop on 127.0.0.1 ate the budget).
+    # ``client_real_ip`` returns the cf-connecting-ip / xff / x-real-ip
+    # canonical key; internal callers (Next.js SSR, healthchecks) are
+    # exempt so dashboard polling can't self-DoS.
+    client_ip, is_internal = client_real_ip(request)
+    if not is_internal and not _chat_rate_limiter.is_allowed(client_ip):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate limit exceeded"},
+            headers={"Retry-After": "30"},
+        )
 
     body = await request.json()
     messages = body.get("messages", [])
@@ -2101,10 +2160,39 @@ async def chat_with_king(request: Request):
 
     if stream:
         return _stream_chat(pod_payload, king_uid, king_model)
-    return await _sync_chat(pod_payload, king_uid, king_model)
+    try:
+        return await _sync_chat(pod_payload, king_uid, king_model)
+    except _ChatPodUnavailable as e:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "chat server unavailable", "detail": str(e)[:200]},
+        )
+    except Exception as e:  # pragma: no cover — top-level safety net
+        # Mirrors the safety net on /v1/chat/completions: an unexpected
+        # transport variant or tool failure must not surface as a bare
+        # 500 to the public dashboard chat surface.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "chat orchestration failed",
+                "detail": f"{type(e).__name__}: {str(e)[:200]}",
+            },
+        )
 
 
-@router.get("/api/chat/status")
+@router.get(
+    "/api/chat/status",
+    tags=["Chat"],
+    summary="King chat server availability + quality snapshot",
+    description=(
+        "Reports whether `chat.arbos.life` is currently serving the king. "
+        "Includes the live king UID/model, whether the eval is currently "
+        "holding the GPU, and the latest judge_probe / long_form_judge / "
+        "long_gen_coherence axes from `state/h2h_latest.json` so the "
+        "dashboard chat panel can show a fresh quality summary alongside "
+        "the prompt box. Cached for 10 s."
+    ),
+)
 async def chat_status():
     """Check if the king chat server is available.
 
@@ -2179,7 +2267,19 @@ async def chat_status():
 
 # ── OpenAI-compatible endpoints (for Open WebUI etc.) ─────────────────────────
 
-@router.get("/v1/models")
+@router.get(
+    "/v1/models",
+    tags=["Chat"],
+    summary="OpenAI-compatible model list",
+    description=(
+        "Returns the OpenAI-shaped `{object: list, data: [...]}` payload "
+        "with the stable served name (`sn97-king`) and the current king's "
+        "HuggingFace repo id so OpenAI-compatible clients (Open WebUI, "
+        "Vercel AI SDK, OpenAI Agents SDK, Flue, …) can attribute the "
+        "completion correctly. Both ids resolve to the same vLLM server "
+        "behind the scenes."
+    ),
+)
 def openai_models():
     """OpenAI-compatible models list. Returns the current king model."""
     king_uid, king_model = _get_king_info()
@@ -2203,7 +2303,23 @@ def openai_models():
     }
 
 
-@router.post("/v1/chat/completions")
+@router.post(
+    "/v1/chat/completions",
+    tags=["Chat"],
+    summary="OpenAI-compatible chat completions",
+    description=(
+        "Drop-in replacement for `https://api.openai.com/v1/chat/completions` "
+        "that targets the current SN97 king model. Honors the standard "
+        "OpenAI request body (`messages`, `stream`, `max_tokens`, "
+        "`temperature`, `top_p`, etc.) plus optional `repetition_penalty`. "
+        "Rate-limited to 240/min per client IP (looser than `/api/chat` "
+        "because agent harnesses loop the king for many tool-calling "
+        "rounds). Returns a structured 503 (`chat server unavailable` / "
+        "`chat orchestration failed`) when the chat pod is rebooting, the "
+        "eval pipeline is holding the GPU, or the connection pool is "
+        "saturated — well-behaved clients should retry."
+    ),
+)
 async def openai_chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint. Proxies to the king model.
 
@@ -2214,10 +2330,13 @@ async def openai_chat_completions(request: Request):
     240/min) instead of the strict ``_chat_rate_limiter`` (10/min)
     that throttles direct browser-driven chat.
     """
-    client_ip = request.client.host if request.client else "unknown"
-    if not _openai_api_rate_limiter.is_allowed(client_ip):
+    # 2026-05-09: see chat_with_king above for the per-IP bucket fix.
+    # 240/min/client IP, with internal SSR/healthcheck callers exempt.
+    client_ip, is_internal = client_real_ip(request)
+    if not is_internal and not _openai_api_rate_limiter.is_allowed(client_ip):
         return JSONResponse(
             status_code=429,
+            headers={"Retry-After": "30"},
             content={"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}},
         )
 
@@ -2231,50 +2350,75 @@ async def openai_chat_completions(request: Request):
         return JSONResponse(status_code=503, content={"error": {"message": "no king model available"}})
 
     stream = body.get("stream", False)
-    if _CHAT_ORCHESTRATION_ENABLED:
-        if stream:
-            return _stream_orchestrated_openai_response(body, king_uid, king_model)
-        data = await _orchestrated_chat_completion(body, king_uid, king_model)
-        return JSONResponse(content=data)
-
-    if stream:
-        norm = _normalize_chat_payload(body)
-
-        async def generate():
-            client = _get_http_client()
-            try:
-                async with client.stream(
-                    "POST",
-                    "/v1/chat/completions",
-                    json=norm,
-                    timeout=httpx.Timeout(connect=3.0, read=300.0, write=10.0, pool=5.0),
-                ) as resp:
-                    if resp.status_code >= 500:
-                        yield (
-                            f"data: {json.dumps({'error': {'message': f'chat server returned {resp.status_code}'}})}\n\n"
-                        )
-                        return
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        line = line.strip()
-                        if line.startswith("data: "):
-                            yield f"{line}\n\n"
-                            if line == "data: [DONE]":
-                                break
-            except (httpx.ConnectError, httpx.ConnectTimeout):
-                yield 'data: {"error": {"message": "chat server unavailable"}}\n\n'
-            except Exception:
-                yield 'data: {"error": {"message": "stream interrupted"}}\n\n'
-
-        return _sse_response(generate())
-
     try:
-        data = await _local_chat_post(body, timeout=120.0)
+        if _CHAT_ORCHESTRATION_ENABLED:
+            if stream:
+                return _stream_orchestrated_openai_response(body, king_uid, king_model)
+            data = await _orchestrated_chat_completion(body, king_uid, king_model)
+            return JSONResponse(content=data)
+
+        if stream:
+            norm = _normalize_chat_payload(body)
+
+            async def generate():
+                client = _get_http_client()
+                try:
+                    async with client.stream(
+                        "POST",
+                        "/v1/chat/completions",
+                        json=norm,
+                        timeout=httpx.Timeout(connect=3.0, read=300.0, write=10.0, pool=5.0),
+                    ) as resp:
+                        if resp.status_code >= 500:
+                            yield (
+                                f"data: {json.dumps({'error': {'message': f'chat server returned {resp.status_code}'}})}\n\n"
+                            )
+                            return
+                        async for line in resp.aiter_lines():
+                            if not line:
+                                continue
+                            line = line.strip()
+                            if line.startswith("data: "):
+                                yield f"{line}\n\n"
+                                if line == "data: [DONE]":
+                                    break
+                except (
+                    httpx.ConnectError,
+                    httpx.ConnectTimeout,
+                    httpx.PoolTimeout,
+                    httpx.RemoteProtocolError,
+                ):
+                    yield 'data: {"error": {"message": "chat server unavailable"}}\n\n'
+                except Exception:
+                    yield 'data: {"error": {"message": "stream interrupted"}}\n\n'
+
+            return _sse_response(generate())
+
+        try:
+            data = await _local_chat_post(body, timeout=120.0)
+        except _ChatPodUnavailable as e:
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": "chat server unavailable", "detail": str(e)[:200]}},
+            )
     except _ChatPodUnavailable as e:
+        # Orchestrated path may bubble up the chat-pod-unavailable
+        # signal if a non-transport caller (e.g. tool execution) can't
+        # complete; map it to the documented 503 instead of a 500.
         return JSONResponse(
             status_code=503,
             content={"error": {"message": "chat server unavailable", "detail": str(e)[:200]}},
+        )
+    except Exception as e:  # pragma: no cover — top-level safety net
+        # Anything unexpected (httpx variants, json parse, tool errors)
+        # must not 500 the public OpenAI surface. Log via uvicorn and
+        # return a structured 503 so well-behaved clients retry.
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "message": "chat orchestration failed",
+                "detail": f"{type(e).__name__}: {str(e)[:200]}",
+            }},
         )
     if isinstance(data, dict) and king_model:
         # Stamp the response with the live king's HF repo id so OpenAI

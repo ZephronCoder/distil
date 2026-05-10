@@ -52,11 +52,20 @@ Wiring:
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from transformers import PreTrainedTokenizerBase
 
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+# 2026-05-09: top-level ``from vllm.entrypoints.openai.engine.protocol
+# import DeltaMessage`` triggers a circular import on vLLM 0.20.0+ when
+# this module is loaded from ``vllm.reasoning.__init__`` (which runs
+# during ``vllm.config`` initialization, before openai entrypoints have
+# finished loading). Symptom on chat-king: ``KeyError: Reasoning parser
+# 'distil_kimi' not found`` because the auto-import in __init__.py
+# raised mid-load and the registry never saw the class. Fix: defer the
+# DeltaMessage import to first use inside the streaming hot path. The
+# class object is cached in ``_DeltaMessage`` so subsequent calls are a
+# bare attribute read, not an import.
 from vllm.reasoning.abs_reasoning_parsers import (
     ReasoningParser,
     ReasoningParserManager,
@@ -66,7 +75,26 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
     )
+    from vllm.entrypoints.openai.engine.protocol import DeltaMessage
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+
+_DeltaMessage: Any = None
+
+
+def _delta_message_cls() -> Any:
+    """Lazily resolve and cache ``DeltaMessage`` to break the circular import.
+
+    See module-top comment for the why. The lookup is gated by a global
+    cache so we pay the import cost exactly once per process; in the
+    streaming path a parser instance can be invoked thousands of times
+    per minute and the cache keeps it cheap.
+    """
+    global _DeltaMessage
+    if _DeltaMessage is None:
+        from vllm.entrypoints.openai.engine.protocol import DeltaMessage as _DM
+        _DeltaMessage = _DM
+    return _DeltaMessage
 
 
 @ReasoningParserManager.register_module("distil_kimi")
@@ -241,7 +269,7 @@ class DistilKimiReasoningParser(ReasoningParser):
         previous_token_ids: Sequence[int],
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
-    ) -> DeltaMessage | None:
+    ) -> "DeltaMessage | None":
         """Stream-friendly classifier.
 
         Decision tree per delta:
@@ -261,6 +289,7 @@ class DistilKimiReasoningParser(ReasoningParser):
         end_id = self._end_token_id
         tool_id = self._tool_section_start_token_id
         start_id = self._start_token_id
+        DeltaMessage = _delta_message_cls()
 
         # (1) Already past reasoning end → pure content.
         already_ended = False

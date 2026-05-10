@@ -318,6 +318,64 @@ def test_orchestrated_chat_promotes_inline_think_blocks(monkeypatch):
     assert "<think>" not in msg["content"]
 
 
+def test_local_chat_post_maps_pool_timeout_to_unavailable(monkeypatch):
+    """Regression for the 2026-05-09 Internal Server Error bug.
+
+    When the chat tunnel is up but the upstream vLLM is dead, dozens of
+    concurrent requests pile up on the 64-slot connection pool and the
+    65th hits ``httpx.PoolTimeout`` after 5 s. Pre-fix that leaked as
+    a bare 500. The contract is: any transport-level failure (incl.
+    PoolTimeout, RemoteProtocolError, WriteTimeout) must be mapped to
+    :class:`_ChatPodUnavailable` so callers can return the documented
+    503.
+    """
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, exc):
+            self._exc = exc
+
+        async def post(self, *args, **kwargs):
+            raise self._exc
+
+    cases = [
+        httpx.PoolTimeout("pool full"),
+        httpx.RemoteProtocolError("upstream RST"),
+        httpx.WriteTimeout("write stalled"),
+        httpx.ConnectError("refused"),
+    ]
+    for exc in cases:
+        monkeypatch.setattr(chat_route, "_get_http_client", lambda exc=exc: _FakeClient(exc))
+        try:
+            asyncio.run(chat_route._local_chat_post({"messages": []}, timeout=1.0))
+        except chat_route._ChatPodUnavailable as e:
+            assert exc.__class__.__name__ in str(e)
+        else:
+            raise AssertionError(f"_local_chat_post did not convert {exc!r} to _ChatPodUnavailable")
+
+
+def test_local_chat_post_maps_5xx_response_to_unavailable(monkeypatch):
+    """vLLM 5xx (or a half-open tunnel returning 502) must surface as
+    503, not propagate as a 500. ``chat-keeper`` then notices the pod
+    is down on the next tick and triggers a recovery."""
+    class _Resp:
+        status_code = 503
+        def json(self):  # pragma: no cover — should not be called
+            return {}
+
+    class _FakeClient:
+        async def post(self, *args, **kwargs):
+            return _Resp()
+
+    monkeypatch.setattr(chat_route, "_get_http_client", lambda: _FakeClient())
+    try:
+        asyncio.run(chat_route._local_chat_post({"messages": []}, timeout=1.0))
+    except chat_route._ChatPodUnavailable as e:
+        assert "503" in str(e)
+    else:
+        raise AssertionError("_local_chat_post did not surface 503 as _ChatPodUnavailable")
+
+
 def test_web_search_regex_triggers_on_time_sensitive_questions():
     cases = [
         "what's the bitcoin price right now?",
