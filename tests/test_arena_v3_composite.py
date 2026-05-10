@@ -102,18 +102,25 @@ class TestSession2Promoted(unittest.TestCase):
         _c.CHAT_TURNS_AXIS_IN_COMPOSITE = self._saved_chat
 
     def test_bench_axes_lower_worst(self):
-        """A student passing KL but failing math_bench should have low worst."""
+        """A student passing distillation axes but failing one of the
+        v31 math axes should have low worst.
+
+        Updated 2026-05-09 second pass: ``math_bench`` was retired in
+        v31 (math_skill_group weight 0). The math signal now lives in
+        ``v31_math_gsm_symbolic`` (weight 0.06) and friends, so we
+        test the v31 axis here.
+        """
         from scripts.validator.composite import compute_composite
         student = _make_student(bench={
-            "math_bench": 0.10,     # fails
-            "code_bench": 0.90,
-            "reasoning_bench": 0.80,
-            "knowledge_bench": 0.70,
-            "ifeval_bench": 0.85,
+            "v31_math_gsm_symbolic": 0.10,
+            "v31_code_humaneval_plus": 0.90,
+            "v31_reasoning_logic_grid": 0.80,
+            "v31_knowledge_multi_hop_kg": 0.70,
+            "v31_ifeval_verifiable": 0.85,
         })
         comp = compute_composite(student, king_kl=0.3, king_rkl=0.1)
         self.assertLess(comp["worst"], 0.15,
-            "worst should be dragged down by math_bench=0.10")
+            "worst should be dragged down by v31_math_gsm_symbolic=0.10")
         self.assertTrue(comp["bench_in_composite"])
         self.assertFalse(comp["arena_v3_in_composite"])
 
@@ -132,7 +139,18 @@ class TestSession2Promoted(unittest.TestCase):
         self.assertTrue(comp["judge_in_composite"])
 
     def test_v3_not_in_composite(self):
-        """v3 axes are shown in axes dict but excluded from worst/weighted."""
+        """v3 axes shown in axes dict but excluded from worst/weighted.
+
+        v30.6 (2026-05-09) note: ``aime_bench`` is a sub-axis of
+        ``math_skill_group``, so even when its standalone weight is 0
+        and ARENA_V3 gate is off, a 0.01 score WILL drive math_group
+        down via the bottom_half_mean aggregator. This is intentional
+        (sub-axes feed groups regardless of standalone weight). To
+        isolate the "shadow gate" semantics this test was originally
+        targeting, the bench dict here uses healthy sub-axis values
+        and only puts the catastrophic value on ``self_consistency``,
+        which has no group membership.
+        """
         from scripts.validator.composite import compute_composite
         student = _make_student(bench={
             "math_bench": 0.85,
@@ -140,15 +158,13 @@ class TestSession2Promoted(unittest.TestCase):
             "reasoning_bench": 0.80,
             "knowledge_bench": 0.70,
             "ifeval_bench": 0.80,
-            "aime_bench": 0.01,       # catastrophically bad
-            "tool_use_bench": 0.05,
-            "self_consistency_bench": 0.05,
+            "self_consistency_bench": 0.05,  # not in any group
         })
         comp = compute_composite(student, king_kl=0.3, king_rkl=0.1)
         self.assertGreater(comp["worst"], 0.20,
             "v3 shadow axes must NOT pull down worst")
-        self.assertIn("aime_bench", comp["axes"])
-        self.assertEqual(comp["axes"]["aime_bench"], 0.01)
+        self.assertIn("self_consistency_bench", comp["axes"])
+        self.assertEqual(comp["axes"]["self_consistency_bench"], 0.05)
 
 
 class TestSession3Production(unittest.TestCase):
@@ -282,9 +298,17 @@ class TestSession3Production(unittest.TestCase):
         self.assertEqual(comp["axes"]["long_context_bench"], 0.05)
 
     def test_long_context_bench_gates_worst_when_promoted(self):
-        """long_context_bench is in reasoning_skill_group (v30.2). To
-        pull worst down it has to pull the GROUP down — verified by
-        tanking all reasoning sub-axes."""
+        """long_context_bench was in reasoning_skill_group (v30.2)
+        which is now zero-weight after the v31 promotion. The
+        long-context signal moved to ``v31_long_context_ruler``
+        (weight 0.05) — failing that axis must still pull worst down.
+
+        Updated 2026-05-09 second pass: legacy v30 axes are kept in
+        the bench dict so ``compute_composite`` doesn't crash on
+        operators with stale dashboards, but they no longer drive
+        ranking. The reasoning_skill_group sub-axes are still
+        displayed for telemetry but their group weight is 0.
+        """
         import scripts.validator.composite as _c
         saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
         saved_bench = _c.BENCH_AXES_IN_COMPOSITE
@@ -292,12 +316,18 @@ class TestSession3Production(unittest.TestCase):
             _c.ARENA_V3_AXES_IN_COMPOSITE = True
             _c.BENCH_AXES_IN_COMPOSITE = True
             student = _make_student(bench={
+                # The v31 surface IS in composite — fail RULER.
+                "v31_long_context_ruler": 0.05,
+                "v31_math_gsm_symbolic": 0.8,
+                "v31_code_humaneval_plus": 0.8,
+                "v31_reasoning_logic_grid": 0.8,
+                "v31_knowledge_multi_hop_kg": 0.8,
+                "v31_ifeval_verifiable": 0.8,
+                # Legacy axes kept for telemetry; weights are 0 so
+                # they don't drive worst.
+                "reasoning_bench": 0.8, "multi_doc_synthesis_bench": 0.8,
+                "long_context_bench": 0.8,
                 "math_bench": 0.8, "code_bench": 0.8,
-                # All reasoning_skill_group sub-axes low so the GROUP
-                # is low and pulls worst down.
-                "reasoning_bench": 0.1,
-                "multi_doc_synthesis_bench": 0.1,
-                "long_context_bench": 0.1,
                 "knowledge_bench": 0.8, "ifeval_bench": 0.8,
                 "aime_bench": 0.6, "mbpp_bench": 0.6,
                 "tool_use_bench": 0.6, "self_consistency_bench": 0.6,
@@ -305,13 +335,13 @@ class TestSession3Production(unittest.TestCase):
             })
             comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
             self.assertLessEqual(
-                comp["worst"], 0.11,
-                "reasoning_skill_group=0.1 (sub-axes all 0.1) must pull worst down",
+                comp["worst"], 0.06,
+                "v31_long_context_ruler=0.05 must pull worst down",
             )
-            # Sub-axis values still surfaced for telemetry.
-            self.assertEqual(comp["axes"]["long_context_bench"], 0.1)
-            # Group axis present and reflects the mean.
-            self.assertAlmostEqual(comp["axes"]["reasoning_skill_group"], 0.1, places=2)
+            # Legacy long_context_bench still surfaced for telemetry.
+            self.assertEqual(comp["axes"]["long_context_bench"], 0.8)
+            # v31 RULER axis is the new long-context probe.
+            self.assertEqual(comp["axes"]["v31_long_context_ruler"], 0.05)
         finally:
             _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
             _c.BENCH_AXES_IN_COMPOSITE = saved_bench
@@ -359,13 +389,16 @@ class TestSession3Production(unittest.TestCase):
             "noise_resistance_bench": 0.6,
         })
         comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
-        # math_skill_group = mean(0.95, 0.10, 0.10) = 0.383, which is
-        # the lowest GROUP axis and pulls worst down to that level.
+        # v30.6 — math_skill_group now uses bottom_half_mean by default:
+        # for n=3 sub-axes, bottom k=ceil(3/2)=2, so the score is the
+        # mean of the two LOWEST sub-axes = mean(0.10, 0.10) = 0.10.
+        # This is even more punishing of canonical-wording memorisers
+        # than the legacy mean (which would have given 0.383).
         self.assertAlmostEqual(
-            comp["axes"]["math_skill_group"], 0.383, places=2,
+            comp["axes"]["math_skill_group"], 0.10, places=2,
         )
         self.assertLessEqual(
-            comp["worst"], 0.39,
+            comp["worst"], 0.15,
             "math_skill_group ≈ 0.38 must drag worst below 0.39 — a "
             "canonical-wording memorizer cannot win",
         )
@@ -1394,7 +1427,7 @@ class TestAxisGrouping(unittest.TestCase):
     losing measurement depth.
     """
 
-    def test_code_skill_group_is_mean_of_sub_axes(self):
+    def test_code_skill_group_is_bottom_half_mean_of_sub_axes(self):
         from scripts.validator.composite import _axis_code_skill_group
         student = _make_student(bench={
             "code_bench": 0.6,
@@ -1403,18 +1436,24 @@ class TestAxisGrouping(unittest.TestCase):
             "correction_bench": 0.4,
             "refactor_bench": 0.5,
         })
-        # Mean of present sub-axes = (0.6+0.5+0.7+0.4+0.5)/5 = 0.54
-        self.assertAlmostEqual(_axis_code_skill_group(student), 0.54, places=2)
+        # v30.6 — bottom_half_mean: for n=5 sub-axes, k=ceil(5/2)=3.
+        # Sorted: [0.4, 0.5, 0.5, 0.6, 0.7]; bottom 3 = [0.4, 0.5, 0.5];
+        # mean = 0.4667. Saturation at 1.0 sub-axes can no longer
+        # inflate the group score.
+        self.assertAlmostEqual(
+            _axis_code_skill_group(student), 0.4667, places=3,
+        )
 
-    def test_math_skill_group_is_mean_of_sub_axes(self):
+    def test_math_skill_group_is_bottom_half_mean_of_sub_axes(self):
         from scripts.validator.composite import _axis_math_skill_group
         student = _make_student(bench={
             "math_bench": 0.7,
             "aime_bench": 0.3,
             "robustness_bench": 0.5,
         })
-        # Mean = 0.5
-        self.assertAlmostEqual(_axis_math_skill_group(student), 0.5, places=2)
+        # v30.6 — bottom_half_mean: for n=3 sub-axes, k=ceil(3/2)=2.
+        # Sorted: [0.3, 0.5, 0.7]; bottom 2 = [0.3, 0.5]; mean = 0.4.
+        self.assertAlmostEqual(_axis_math_skill_group(student), 0.4, places=2)
 
     def test_skill_group_drops_when_no_sub_axis_present(self):
         from scripts.validator.composite import _axis_code_skill_group
@@ -1476,13 +1515,15 @@ class TestGroupAxisBrokenHandling(unittest.TestCase):
             "aime_bench": 0.0,    # broken (reference scored 0)
             "robustness_bench": 0.6,
         })
-        # Without broken filtering: mean(0.7, 0.0, 0.6) = 0.43
+        # v30.6 — bottom_half_mean: without broken filtering, sorted
+        # [0.0, 0.6, 0.7], bottom k=2 => mean(0.0, 0.6) = 0.3.
         without_broken = _axis_math_skill_group(student, broken_axes=None)
-        self.assertAlmostEqual(without_broken, 0.433, places=2)
-        # With broken filtering: mean(0.7, 0.6) = 0.65 (aime dropped)
+        self.assertAlmostEqual(without_broken, 0.3, places=2)
+        # With broken filtering, aime_bench dropped, sorted [0.6, 0.7],
+        # bottom k=1 => mean(0.6) = 0.6.
         with_broken = _axis_math_skill_group(student,
                                              broken_axes={"aime_bench"})
-        self.assertAlmostEqual(with_broken, 0.65, places=2)
+        self.assertAlmostEqual(with_broken, 0.6, places=2)
 
     def test_two_students_tie_on_group_when_only_broken_differs(self):
         """Two students that only differ on broken sub-axes should have
@@ -1516,22 +1557,25 @@ class TestGroupAxisBrokenHandling(unittest.TestCase):
             student, king_kl=0.3, king_rkl=0.1,
             broken_axes=broken,
         )
-        # Group axis should reflect broken-aware mean.
+        # v30.6 — group axis with broken-aware bottom_half_mean.
+        # broken={aime_bench} drops aime; sorted [0.6, 0.7]; bottom k=1
+        # => mean(0.6) = 0.6.
         self.assertAlmostEqual(
-            comp["axes"]["math_skill_group"], 0.65, places=2,
+            comp["axes"]["math_skill_group"], 0.6, places=2,
             msg="math_skill_group should drop aime_bench when broken",
         )
 
     def test_group_unchanged_when_no_broken(self):
         """If broken_axes is None (legacy callers / no broken), group
-        axes use the full sub-axis set."""
+        axes use the full sub-axis set with bottom_half_mean (v30.6)."""
         from scripts.validator.composite import _axis_math_skill_group
         student = _make_student(bench={
             "math_bench": 0.7, "aime_bench": 0.0,
             "robustness_bench": 0.6,
         })
+        # v30.6 bottom_half_mean of [0.0, 0.6, 0.7] = mean(0.0, 0.6) = 0.3
         v = _axis_math_skill_group(student, broken_axes=None)
-        self.assertAlmostEqual(v, 0.433, places=2)
+        self.assertAlmostEqual(v, 0.3, places=2)
 
 
 class TestSuperTeacherAxis(unittest.TestCase):
@@ -2138,6 +2182,241 @@ class TestTopKOverlapAxis(unittest.TestCase):
                 "top_k_overlap must count as relative (it's a "
                 "teacher-similarity axis); a gap > 10pp here means "
                 "the axis classification regressed.")
+
+
+class TestCanaryAxes(unittest.TestCase):
+    """v30.7 (2026-05-09) — canary axes are DIAGNOSTIC, not scored.
+
+    Covers:
+      * ``_axis_canary`` returns the raw pass_frac in [0, 1] when the
+        canary scores dict carries the held-out key with a sample
+        count above the per-axis floor.
+      * Returns None when the dict is missing, the key is absent, the
+        sample count is below floor, or the value is non-finite.
+      * ``compute_axes`` populates every canary axis name when
+        canary_scores is threaded in, and leaves them None when not.
+      * ``compute_composite`` no longer USES canary axes in worst-3-mean
+        or weighted aggregation under the v30.7 default
+        (``CANARY_AXES_IN_COMPOSITE = False``). Putting public
+        benchmarks in the score re-introduces Goodhart (miners train
+        to the test). Canary remains read every round but only as a
+        diagnostic + king_canary_streak gate.
+      * If a future operator opts back into the v30.6 anchoring (env:
+        ``CANARY_AXES_IN_COMPOSITE=1`` AND non-zero ``CANARY_*_WEIGHT``),
+        the score does respond — that backstop test is in
+        ``test_canary_in_composite_when_explicitly_enabled``.
+    """
+
+    def _canary(self, **scores):
+        out = {**scores, "__counts__": {k: 50 for k in scores if not k.startswith("__")}}
+        return out
+
+    def test_axis_canary_returns_pass_frac(self):
+        from scripts.validator.composite import _axis_canary
+        canary = self._canary(gsm8k=0.56, humaneval=0.70)
+        self.assertEqual(_axis_canary(canary, "canary_gsm8k"), 0.56)
+        self.assertEqual(_axis_canary(canary, "canary_humaneval"), 0.70)
+
+    def test_axis_canary_none_when_missing(self):
+        from scripts.validator.composite import _axis_canary
+        self.assertIsNone(_axis_canary(None, "canary_gsm8k"))
+        self.assertIsNone(_axis_canary({}, "canary_gsm8k"))
+        self.assertIsNone(_axis_canary({"humaneval": 0.5}, "canary_gsm8k"))
+
+    def test_axis_canary_drops_below_floor(self):
+        from scripts.validator.composite import _axis_canary
+        canary = {"gsm8k": 0.99, "__counts__": {"gsm8k": 5}}
+        self.assertIsNone(
+            _axis_canary(canary, "canary_gsm8k"),
+            "n=5 is below the canary_gsm8k floor of 20",
+        )
+
+    def test_axis_canary_clamps_out_of_range(self):
+        from scripts.validator.composite import _axis_canary
+        self.assertEqual(
+            _axis_canary({"gsm8k": 1.2, "__counts__": {"gsm8k": 50}}, "canary_gsm8k"),
+            1.0,
+        )
+        self.assertEqual(
+            _axis_canary({"gsm8k": -0.1, "__counts__": {"gsm8k": 50}}, "canary_gsm8k"),
+            0.0,
+        )
+
+    def test_compute_axes_populates_all_canary_axes(self):
+        from scripts.validator.composite import (
+            compute_axes, CANARY_AXIS_TO_HELDOUT_KEY,
+        )
+        canary = self._canary(
+            gsm8k=0.56, humaneval=0.70, bbh=0.49,
+            ifeval=0.54, mmlu_pro=0.39,
+        )
+        student = _make_student()
+        axes = compute_axes(student, king_kl=0.3, king_rkl=0.1, canary_scores=canary)
+        for axis in CANARY_AXIS_TO_HELDOUT_KEY:
+            self.assertIn(axis, axes, f"{axis} must be present in compute_axes output")
+        self.assertEqual(axes["canary_gsm8k"], 0.56)
+        self.assertEqual(axes["canary_humaneval"], 0.70)
+        self.assertEqual(axes["canary_mmlu_pro"], 0.39)
+
+    def test_compute_axes_canary_none_when_no_data(self):
+        from scripts.validator.composite import (
+            compute_axes, CANARY_AXIS_TO_HELDOUT_KEY,
+        )
+        student = _make_student()
+        axes = compute_axes(student, king_kl=0.3, king_rkl=0.1)
+        for axis in CANARY_AXIS_TO_HELDOUT_KEY:
+            self.assertIsNone(axes.get(axis))
+
+    def test_canary_low_score_does_not_drive_worst_3_down_v30_7(self):
+        """v30.7: a king with a strong in-validator profile but bad
+        held-out scores keeps its composite — the canary is diagnostic
+        only. Putting public benchmarks in the score would let miners
+        train directly to those benchmarks (Goodhart), so v30.7 leaves
+        the composite procedural-only and surfaces the canary via
+        axis_correlation.json + king_canary_streak gate."""
+        from scripts.validator.composite import compute_composite
+        student = _make_student(
+            kl=0.30, rkl=0.10, cap_frac=0.85, judge_norm=0.70,
+            bench={
+                "math_bench": 0.85, "code_bench": 0.85, "reasoning_bench": 0.85,
+                "knowledge_bench": 0.85, "ifeval_bench": 0.85,
+                "tool_use_bench": 0.85,
+            },
+        )
+        comp_no_canary = compute_composite(student, king_kl=0.30, king_rkl=0.10)
+        canary = self._canary(
+            gsm8k=0.30, humaneval=0.20, bbh=0.30,
+            ifeval=0.25, mmlu_pro=0.25,
+        )
+        comp_canary = compute_composite(
+            student, king_kl=0.30, king_rkl=0.10, canary_scores=canary,
+        )
+        # Canary axes don't change worst_3_mean / final under v30.7.
+        # Tiny floating-point drift is allowed (axes dict layout) but
+        # the magnitude must be << any meaningful score swing.
+        self.assertAlmostEqual(
+            comp_canary["worst_3_mean"], comp_no_canary["worst_3_mean"],
+            places=4,
+            msg="v30.7: canary scores must NOT enter worst_3_mean — "
+                "putting public benchmarks in the score reintroduces Goodhart",
+        )
+        self.assertAlmostEqual(
+            comp_canary["final"], comp_no_canary["final"],
+            places=4,
+            msg="v30.7: canary scores must NOT enter final composite",
+        )
+        # But the canary axes ARE populated in the per-axis dict so the
+        # diagnostic loop + dashboard / axis_correlation can read them.
+        self.assertEqual(comp_canary["axes"]["canary_gsm8k"], 0.30)
+        self.assertEqual(comp_canary["axes"]["canary_humaneval"], 0.20)
+
+    def test_canary_high_score_does_not_inflate(self):
+        """v30.7: high canary scores don't inflate the composite either —
+        canary is symmetrically out of the score, not just on the
+        downside. (Asymmetric inclusion would re-introduce gaming.)"""
+        from scripts.validator.composite import compute_composite
+        student = _make_student(
+            kl=0.30, rkl=0.10, cap_frac=0.85, judge_norm=0.70,
+            bench={
+                "math_bench": 0.85, "code_bench": 0.85, "reasoning_bench": 0.85,
+                "knowledge_bench": 0.85, "ifeval_bench": 0.85,
+                "tool_use_bench": 0.85,
+            },
+        )
+        comp_no_canary = compute_composite(student, king_kl=0.30, king_rkl=0.10)
+        canary = self._canary(
+            gsm8k=0.95, humaneval=0.90, bbh=0.85,
+            ifeval=0.92, mmlu_pro=0.80,
+        )
+        comp = compute_composite(
+            student, king_kl=0.30, king_rkl=0.10, canary_scores=canary,
+        )
+        self.assertAlmostEqual(
+            comp["weighted"], comp_no_canary["weighted"], places=4,
+            msg="v30.7: high canary must not lift weighted",
+        )
+        self.assertLessEqual(comp["worst_3_mean"], 1.0)
+        # Canary axes still populated for diagnostic.
+        self.assertEqual(comp["axes"]["canary_gsm8k"], 0.95)
+
+    def test_canary_in_composite_when_explicitly_enabled(self):
+        """Backstop: if an operator explicitly flips the gate back on
+        AND sets non-zero canary weights, the v30.6 anchoring is
+        recoverable. Documents the escape-hatch path so a future
+        researcher can A/B-test re-enabling without spelunking through
+        Git history."""
+        from scripts.validator import composite as _c
+        saved_gate = _c.CANARY_AXES_IN_COMPOSITE
+        saved_weights = dict(_c.CANARY_AXIS_WEIGHTS)
+        try:
+            _c.CANARY_AXES_IN_COMPOSITE = True
+            _c.CANARY_AXIS_WEIGHTS = {
+                "canary_gsm8k": 0.12, "canary_humaneval": 0.12,
+                "canary_bbh": 0.10, "canary_mmlu_pro": 0.10,
+                "canary_ifeval": 0.06,
+            }
+            student = _make_student(
+                kl=0.30, rkl=0.10, cap_frac=0.85, judge_norm=0.70,
+                bench={
+                    "math_bench": 0.85, "code_bench": 0.85, "reasoning_bench": 0.85,
+                    "knowledge_bench": 0.85, "ifeval_bench": 0.85,
+                    "tool_use_bench": 0.85,
+                },
+            )
+            comp_no_canary = _c.compute_composite(
+                student, king_kl=0.30, king_rkl=0.10,
+            )
+            canary = self._canary(
+                gsm8k=0.30, humaneval=0.20, bbh=0.30,
+                ifeval=0.25, mmlu_pro=0.25,
+            )
+            comp_canary = _c.compute_composite(
+                student, king_kl=0.30, king_rkl=0.10, canary_scores=canary,
+            )
+            self.assertLess(
+                comp_canary["worst_3_mean"],
+                comp_no_canary["worst_3_mean"] - 0.05,
+                "with v30.6 anchoring re-enabled, canary axes must "
+                "depress worst_3_mean when held-out reality is bad",
+            )
+        finally:
+            _c.CANARY_AXES_IN_COMPOSITE = saved_gate
+            _c.CANARY_AXIS_WEIGHTS = saved_weights
+
+
+class TestSkillGroupAggregation(unittest.TestCase):
+    """v30.6 — bottom_half_mean default + env-overridable knob."""
+
+    def test_aggregator_modes_via_env(self):
+        from scripts.validator import composite as _c
+        saved = _c.SKILL_GROUP_AGGREGATION
+        try:
+            vals = [0.1, 0.5, 0.9]
+            _c.SKILL_GROUP_AGGREGATION = "mean"
+            self.assertAlmostEqual(_c._aggregate_skill_group_values(vals), 0.5, places=2)
+            _c.SKILL_GROUP_AGGREGATION = "min"
+            self.assertEqual(_c._aggregate_skill_group_values(vals), 0.1)
+            _c.SKILL_GROUP_AGGREGATION = "bottom_half_mean"
+            # Sorted [0.1, 0.5, 0.9]; n=3, k=ceil(3/2)=2; mean(0.1, 0.5)=0.3
+            self.assertAlmostEqual(_c._aggregate_skill_group_values(vals), 0.3, places=2)
+        finally:
+            _c.SKILL_GROUP_AGGREGATION = saved
+
+    def test_saturated_sub_axes_cant_inflate_group(self):
+        """A code group at [0.78, 1.0, 1.0, 1.0, 1.0] under mean would
+        score 0.96; under bottom_half_mean it scores 0.93 — saturated
+        sub-axes can no longer mask the worst sub-axis."""
+        from scripts.validator import composite as _c
+        saved = _c.SKILL_GROUP_AGGREGATION
+        try:
+            _c.SKILL_GROUP_AGGREGATION = "bottom_half_mean"
+            vals = [0.78, 1.0, 1.0, 1.0, 1.0]
+            agg = _c._aggregate_skill_group_values(vals)
+            self.assertLess(agg, 0.96, "bottom_half_mean must reduce "
+                                       "saturation inflation versus mean")
+            self.assertAlmostEqual(agg, (0.78 + 1.0 + 1.0) / 3, places=3)
+        finally:
+            _c.SKILL_GROUP_AGGREGATION = saved
 
 
 if __name__ == "__main__":

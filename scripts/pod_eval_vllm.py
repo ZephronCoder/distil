@@ -4988,6 +4988,43 @@ BENCH_REFACTOR_MAX_TOKENS = int(os.environ.get("BENCH_REFACTOR_MAX_TOKENS", "512
 BENCH_PRAGMATIC_PER_ROUND = int(os.environ.get("BENCH_PRAGMATIC_PER_ROUND", "8"))
 BENCH_PRAGMATIC_MAX_TOKENS = int(os.environ.get("BENCH_PRAGMATIC_MAX_TOKENS", "64"))
 
+# ── v31 procedural axes ────────────────────────────────────────────────
+# Each v31 axis defaults to PER_ROUND=0 (axis disabled) so the change is
+# fully opt-in. To enable in SHADOW mode for one validator, set the env
+# var to a positive integer (e.g. 10) and restart the service. The
+# corresponding bench axis will appear in ``axes`` with a non-None
+# pass_frac but the composite weight remains 0 until we're satisfied
+# the correlation gate (``r >= 0.5`` vs canary) is met. See
+# ``reports/2026-05-09-v31-procedural-redesign.md`` §migration-plan.
+# v31 (2026-05-09 promotion): all 11 v31 axes default to PER_ROUND > 0
+# so they're active in production. Operators can flip any axis back to
+# 0 to disable telemetry without affecting the others. Per-round budgets
+# are sized so the full v31 surface adds < 5 minutes to the typical
+# 12-minute round (verified offline; sandbox-graded code_humaneval_plus
+# is the heaviest at ~90s for 8 items @ 512 tok).
+BENCH_V31_GSM_SYMBOLIC_PER_ROUND = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_PER_ROUND", "16"))
+BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS", "384"))
+BENCH_V31_MATH_COMPETITION_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_COMPETITION_PER_ROUND", "12"))
+BENCH_V31_MATH_COMPETITION_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_COMPETITION_MAX_TOKENS", "512"))
+BENCH_V31_MATH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_PER_ROUND", "12"))
+BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS", "384"))
+BENCH_V31_CODE_PLUS_PER_ROUND = int(os.environ.get("BENCH_V31_CODE_PLUS_PER_ROUND", "8"))
+BENCH_V31_CODE_PLUS_MAX_TOKENS = int(os.environ.get("BENCH_V31_CODE_PLUS_MAX_TOKENS", "512"))
+BENCH_V31_LOGIC_GRID_PER_ROUND = int(os.environ.get("BENCH_V31_LOGIC_GRID_PER_ROUND", "12"))
+BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "256"))
+BENCH_V31_DYVAL_PER_ROUND = int(os.environ.get("BENCH_V31_DYVAL_PER_ROUND", "12"))
+BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "256"))
+BENCH_V31_RULER_PER_ROUND = int(os.environ.get("BENCH_V31_RULER_PER_ROUND", "8"))
+BENCH_V31_RULER_MAX_TOKENS = int(os.environ.get("BENCH_V31_RULER_MAX_TOKENS", "96"))
+BENCH_V31_KG_PER_ROUND = int(os.environ.get("BENCH_V31_KG_PER_ROUND", "12"))
+BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "128"))
+BENCH_V31_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_V31_IFEVAL_PER_ROUND", "8"))
+BENCH_V31_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_IFEVAL_MAX_TOKENS", "512"))
+BENCH_V31_TRUTHFULNESS_PER_ROUND = int(os.environ.get("BENCH_V31_TRUTHFULNESS_PER_ROUND", "12"))
+BENCH_V31_TRUTHFULNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_TRUTHFULNESS_MAX_TOKENS", "192"))
+BENCH_V31_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_V31_CONSISTENCY_PER_ROUND", "8"))
+BENCH_V31_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_V31_CONSISTENCY_MAX_TOKENS", "384"))
+
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
 BENCH_CODE_MAX_TOKENS = int(os.environ.get("BENCH_CODE_MAX_TOKENS", "512"))
@@ -5054,6 +5091,18 @@ _BENCH_SAMPLES: dict[str, list[dict]] = {
     "robustness": [], "noise": [], "debug": [],
     "correction": [], "multi_doc": [], "calibration": [], "refactor": [],
     "pragmatic": [],
+    # v31 procedural axes (PRODUCTION as of 2026-05-09 promotion).
+    "v31_gsm_symbolic": [],
+    "v31_math_competition": [],
+    "v31_math_robustness": [],
+    "v31_code_plus": [],
+    "v31_logic_grid": [],
+    "v31_dyval": [],
+    "v31_ruler": [],
+    "v31_kg": [],
+    "v31_ifeval": [],
+    "v31_truthfulness": [],
+    "v31_consistency": [],
 }
 
 
@@ -5862,6 +5911,24 @@ _BENCH_SAMPLE_GENERATORS: tuple[tuple[str, str, int, int, tuple], ...] = (
     # v30 — pragmatic_bench (theory-of-mind + scalar implicature +
     # speech-act items).
     ("pragmatic", "_generate_pragmatic_items", 0, BENCH_PRAGMATIC_PER_ROUND, ()),
+    # v31 (2026-05-09 PROMOTED out of SHADOW) — 11-axis procedural
+    # surface. Each generator is a thin wrapper that imports the
+    # corresponding ``scripts/v31/*`` module and calls its
+    # ``generate_items(block_seed, n_items)``. Stream offsets here are
+    # zero; the underlying modules apply their own offsets (0x5631 -
+    # 0x563A) so the v31 pools are statistically independent from each
+    # other AND from the legacy v30 pools.
+    ("v31_gsm_symbolic", "_generate_v31_gsm_symbolic_items", 0, BENCH_V31_GSM_SYMBOLIC_PER_ROUND, ()),
+    ("v31_math_competition", "_generate_v31_math_competition_items", 0, BENCH_V31_MATH_COMPETITION_PER_ROUND, ()),
+    ("v31_math_robustness", "_generate_v31_math_robustness_items", 0, BENCH_V31_MATH_ROBUSTNESS_PER_ROUND, ()),
+    ("v31_code_plus", "_generate_v31_code_plus_items", 0, BENCH_V31_CODE_PLUS_PER_ROUND, ()),
+    ("v31_logic_grid", "_generate_v31_logic_grid_items", 0, BENCH_V31_LOGIC_GRID_PER_ROUND, ()),
+    ("v31_dyval", "_generate_v31_dyval_items", 0, BENCH_V31_DYVAL_PER_ROUND, ()),
+    ("v31_ruler", "_generate_v31_ruler_items", 0, BENCH_V31_RULER_PER_ROUND, ()),
+    ("v31_kg", "_generate_v31_kg_items", 0, BENCH_V31_KG_PER_ROUND, ()),
+    ("v31_ifeval", "_generate_v31_ifeval_items", 0, BENCH_V31_IFEVAL_PER_ROUND, ()),
+    ("v31_truthfulness", "_generate_v31_truthfulness_items", 0, BENCH_V31_TRUTHFULNESS_PER_ROUND, ()),
+    ("v31_consistency", "_generate_v31_consistency_items", 0, BENCH_V31_CONSISTENCY_PER_ROUND, ()),
 )
 
 
@@ -6365,6 +6432,527 @@ def math_bench_probe(model, tokenizer, device="cuda"):
         prompt_fn=lambda it: _math_format_prompt(it["question"], it.get("src", "")),
         grade_fn=_grade,
     )
+
+
+def _v31_import(module_name: str):
+    """Import ``scripts.v31.<module_name>`` with pod-side fallback.
+
+    On the validator side the package layout is ``scripts/v31/<x>.py``
+    and ``from scripts.v31.<x> import generate_items`` works directly.
+    On the pod side the modules are uploaded by ``upload_aux_modules``
+    to ``<run_dir>/scripts/v31/<x>.py`` and the cwd is added to
+    ``sys.path`` so the same import resolves. When the v31 package
+    is missing (e.g. an old eval-pod image), we fall back to the
+    flat path ``v31_<x>.py`` so a manual hot-fix is still possible.
+
+    Returns the imported module's ``generate_items`` symbol.
+    """
+    try:
+        mod = __import__(f"scripts.v31.{module_name}", fromlist=["generate_items"])
+        return mod.generate_items
+    except Exception:
+        pass
+    try:
+        mod = __import__(f"v31_{module_name}", fromlist=["generate_items"])
+        return mod.generate_items
+    except Exception as exc:
+        raise ImportError(
+            f"v31 module {module_name!r} not available on this pod. "
+            "Re-deploy the validator (or run upload_aux_modules) so the "
+            "scripts/v31/ package lands at the eval run dir."
+        ) from exc
+
+
+def _generate_v31_gsm_symbolic_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export for the dispatcher (``globals()[gen_name]`` lookup).
+
+    The actual generator lives in ``scripts/v31/math_gsm_symbolic.py``
+    so it can be unit-tested standalone (no validator deps). This
+    wrapper exists only so the registry's ``globals()[gen_name]``
+    lookup resolves the name from this module's namespace.
+    """
+    return _v31_import("math_gsm_symbolic")(block_seed, n_items)
+
+
+def _generate_v31_ifeval_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export for the dispatcher.
+
+    Generator implementation: ``scripts/v31/ifeval_verifiable.py``.
+    Each item carries the full IFEval ``(instruction_ids, kwargs)``
+    contract, scored by the existing vendored grader at
+    ``scripts/ifeval_vendor.evaluate_item``.
+    """
+    return _v31_import("ifeval_verifiable")(block_seed, n_items)
+
+
+def _generate_v31_math_competition_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/math_competition.py``."""
+    return _v31_import("math_competition")(block_seed, n_items)
+
+
+def _generate_v31_math_robustness_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/math_robustness.py``.
+
+    Applies GSM-Plus 4-perturbation suite (numerical_swap, digit_expand,
+    context_pad, unit_swap) to v31 GSM-Symbolic base templates. Each
+    item is a paraphrase of an M1-style item with mechanically-
+    preserved gold.
+    """
+    return _v31_import("math_robustness")(block_seed, n_items)
+
+
+def _generate_v31_code_plus_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/code_humaneval_plus.py``.
+
+    Returns items in the ``{prompt, test, entry_point, task_id}``
+    shape expected by ``_run_humaneval_sandbox_bench`` (used by
+    code_bench / mbpp_bench / debug_bench). The procedural function
+    name + 30-60 EvalPlus-style augmented test cases mean SOTA-level
+    HumanEval / MBPP memorization confers no advantage.
+    """
+    return _v31_import("code_humaneval_plus")(block_seed, n_items)
+
+
+def _generate_v31_logic_grid_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/reasoning_logic_grid.py``."""
+    return _v31_import("reasoning_logic_grid")(block_seed, n_items)
+
+
+def _generate_v31_dyval_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/reasoning_dyval_arith.py``."""
+    return _v31_import("reasoning_dyval_arith")(block_seed, n_items)
+
+
+def _generate_v31_ruler_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/long_context_ruler.py``."""
+    return _v31_import("long_context_ruler")(block_seed, n_items)
+
+
+def _generate_v31_kg_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/knowledge_multi_hop_kg.py``."""
+    return _v31_import("knowledge_multi_hop_kg")(block_seed, n_items)
+
+
+def _generate_v31_truthfulness_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/truthfulness_calibration.py``.
+
+    Items mix 50% determinate (gold = integer) and 50% indeterminate
+    (gold = "cannot determine") items so the calibration grader can
+    score correct / incorrect / not_attempted per SimpleQA methodology.
+    """
+    return _v31_import("truthfulness_calibration")(block_seed, n_items)
+
+
+def _generate_v31_consistency_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/consistency_paraphrase.py``.
+
+    Each item carries TWO questions (``question`` and ``question_b``).
+    The bench probe generates one response per variant and scores via
+    ``consistency_score`` (3-way: 1.0 / 0.5 / 0.0).
+    """
+    return _v31_import("consistency_paraphrase")(block_seed, n_items)
+
+
+def v31_gsm_symbolic_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural math axis — Apple GSM-Symbolic methodology.
+
+    Items come from ``_BENCH_SAMPLES["v31_gsm_symbolic"]`` (populated
+    per round by ``_generate_v31_gsm_symbolic_items`` via the dispatcher
+    in ``set_bench_block_seed``). Grading reuses ``_math_extract_answer``
+    + ``_math_score_one`` — items emit the standard ``#### N`` answer
+    marker, so the existing math grader scores them unchanged.
+
+    SHADOW status (2026-05-09 v31 sprint 1): this probe runs only when
+    ``BENCH_V31_GSM_SYMBOLIC_PER_ROUND > 0`` AND
+    ``BENCH_BATTERY_SHADOW_AXES=1``. When the per-round count is 0 the
+    sample list stays empty so the probe returns ``n=0`` and the axis
+    drops out of composite scoring. Composite weight is 0 in
+    ``composite.py`` regardless — the axis appears in the axes dict
+    for telemetry / correlation analysis but does not gate ranking.
+
+    See ``reports/2026-05-09-v31-procedural-redesign.md`` §M1 for the
+    promotion gate (Pearson r ≥ 0.5 vs canary_gsm8k on ≥ 4 paired
+    UIDs, reference-floor in [0.30, 0.80], std-dev < 0.10).
+    """
+
+    def _grade(it, text, tok):
+        pred = _math_extract_answer(text, it.get("src", ""))
+        ok = _math_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:80],
+            "gold": it["gold"][:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "difficulty": it.get("difficulty"),
+            "is_noop": it.get("is_noop"),
+            "template": it.get("template"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_gsm_symbolic",
+        BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS,
+        prompt_fn=lambda it: _math_format_prompt(it["question"], it.get("src", "")),
+        grade_fn=_grade,
+    )
+
+
+def v31_ifeval_verifiable_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural instruction-following axis — Google IFEval methodology.
+
+    Items come from ``_BENCH_SAMPLES["v31_ifeval"]`` (populated per
+    round by ``_generate_v31_ifeval_items``). Grading delegates to
+    the vendored Google IFEval grader at
+    ``scripts/ifeval_vendor.evaluate_item`` — the same grader used by
+    ``ifeval_bench_probe``, so cross-axis comparisons are apples-to-apples.
+
+    The v31 generator widens the verifier surface (21 verifiers vs the
+    13 used by the v30 ``ifeval_bench``) and the stack-depth tail
+    (1-4 stacked constraints vs 1-3) to better track the held-out
+    IFEval canary. SHADOW until the promotion gate fires (see
+    ``reports/2026-05-09-v31-procedural-redesign.md`` §I1).
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("v31_ifeval") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import ifeval_vendor as _ifev  # type: ignore
+    except ImportError:
+        out["error"] = "ifeval_vendor not importable on pod"
+        return out
+    try:
+        with _model_eval_no_grad(model):
+            for it in samples:
+                try:
+                    text, tok = _bench_generate(
+                        model, tokenizer, it["prompt"],
+                        BENCH_V31_IFEVAL_MAX_TOKENS, device,
+                        enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "")
+                    all_pass, per = _ifev.evaluate_item(
+                        cleaned, it["instruction_ids"], it.get("kwargs") or [],
+                    )
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "instruction_ids": it["instruction_ids"],
+                        "per_instruction": per,
+                        "stack_depth": it.get("stack_depth"),
+                        "ok": bool(all_pass),
+                        "gen_tokens": int(tok),
+                        "tail": text[-120:],
+                    })
+                    out["n"] += 1
+                    out["correct"] += int(all_pass)
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── v31 procedural axes (PRODUCTION 2026-05-09) ─────────────────────
+
+
+def v31_math_competition_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural competition-math axis (algebra / number theory /
+    combinatorics / geometry / probability). Items emit gold as either
+    integer (most templates) or simplified fraction p/q (probability
+    templates). Grading uses ``scripts.v31.math_competition.grade_response``
+    which canonicalizes fractions to lowest terms before comparison.
+    """
+    from scripts.v31.math_competition import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(text, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "family": it.get("family"),
+            "template": it.get("template"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_math_competition",
+        BENCH_V31_MATH_COMPETITION_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_math_robustness_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural math-robustness axis (GSM-Plus 4-perturbation
+    suite). Items use the same ``#### N`` answer marker as M1, so the
+    existing math grader scores them unchanged. Per-perturbation
+    pass-rate appears in ``per_src`` telemetry.
+    """
+
+    def _grade(it, text, tok):
+        pred = _math_extract_answer(text, it.get("src", ""))
+        ok = _math_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:80],
+            "gold": it["gold"][:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "perturbation": it.get("perturbation"),
+            "template": it.get("template"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_math_robustness",
+        BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS,
+        prompt_fn=lambda it: _math_format_prompt(it["question"], it.get("src", "")),
+        grade_fn=_grade,
+    )
+
+
+def v31_code_humaneval_plus_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural code axis (EvalPlus-style 30-60 augmented tests).
+    Reuses the existing ``_run_humaneval_sandbox_bench`` scaffold; the
+    procedural items have the same {prompt, test, entry_point,
+    task_id} shape as ``code_bench`` so all sandbox infrastructure
+    applies unchanged.
+    """
+    def _build_prompt(it):
+        return (
+            "Complete the following Python function. Output ONLY the "
+            "function body (no extra explanation, no markdown fences, "
+            f"no surrounding code).\n\n{it['prompt']}"
+        )
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="v31_code_plus",
+        max_tokens=BENCH_V31_CODE_PLUS_MAX_TOKENS,
+        build_prompt=_build_prompt,
+        extra_item_fields=("src", "template"),
+    )
+
+
+def v31_reasoning_logic_grid_bench_probe(model, tokenizer, device="cuda"):
+    """v31 Zebra-puzzle reasoning axis. Single-word answer grader."""
+    from scripts.v31.reasoning_logic_grid import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(text, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "num_people": it.get("num_people"),
+            "num_attrs": it.get("num_attrs"),
+            "num_clues": it.get("num_clues"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_logic_grid",
+        BENCH_V31_LOGIC_GRID_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_reasoning_dyval_arith_bench_probe(model, tokenizer, device="cuda"):
+    """v31 DyVal arithmetic-DAG reasoning axis."""
+    from scripts.v31.reasoning_dyval_arith import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(text, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "depth": it.get("depth"),
+            "mode": it.get("mode"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_dyval",
+        BENCH_V31_DYVAL_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_long_context_ruler_bench_probe(model, tokenizer, device="cuda"):
+    """v31 RULER long-context axis (4 of 13 NVIDIA tasks)."""
+    from scripts.v31.long_context_ruler import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(text, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "task": it.get("task"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_ruler",
+        BENCH_V31_RULER_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_knowledge_multi_hop_kg_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural multi-hop KG axis (synthetic-entity, fully
+    procedural, NO real-world fact dependencies)."""
+    from scripts.v31.knowledge_multi_hop_kg import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(
+            text, it["gold"],
+            all_correct=it.get("all_correct_answers") or [],
+        )
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "task": it.get("task"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_kg",
+        BENCH_V31_KG_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_truthfulness_calibration_bench_probe(model, tokenizer, device="cuda"):
+    """v31 SimpleQA-style 3-way calibration axis.
+
+    Per-item classification: correct / incorrect / not_attempted. The
+    axis ``pass_frac`` is the SimpleQA-normalized score
+    ``(num_correct - num_incorrect) / num_items`` mapped to [0, 1] -
+    confidently-wrong responses are penalized vs honest abstentions.
+    """
+    from scripts.v31.truthfulness_calibration import classify_response
+
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("v31_truthfulness") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        n_correct = 0
+        n_incorrect = 0
+        n_not_att = 0
+        with _model_eval_no_grad(model):
+            for it in samples:
+                try:
+                    text, tok = _bench_generate(
+                        model, tokenizer, it["question"],
+                        BENCH_V31_TRUTHFULNESS_MAX_TOKENS, device,
+                        enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "")
+                    cls = classify_response(cleaned, it["gold"])
+                    if cls == "correct":
+                        n_correct += 1
+                    elif cls == "incorrect":
+                        n_incorrect += 1
+                    else:
+                        n_not_att += 1
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "gold": str(it["gold"])[:40],
+                        "classification": cls,
+                        "ok": cls == "correct",
+                        "gen_tokens": int(tok),
+                        "tail": text[-120:],
+                        "family": it.get("family"),
+                    })
+                    out["n"] += 1
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""), "error": str(e)[:120],
+                    })
+        # SimpleQA calibration score, normalized to [0, 1].
+        if out["n"] > 0:
+            raw = (n_correct - n_incorrect) / out["n"]  # in [-1, 1]
+            out["pass_frac"] = max(0.0, min(1.0, (raw + 1.0) / 2.0))
+        out["correct"] = n_correct
+        out["incorrect"] = n_incorrect
+        out["not_attempted"] = n_not_att
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def v31_consistency_paraphrase_bench_probe(model, tokenizer, device="cuda"):
+    """v31 paraphrase-pair consistency axis.
+
+    For each item, generate ONE response per variant (a / b) and score
+    via ``consistency_score`` -- 1.0 if both correct, 0.5 if exactly
+    one correct, 0.0 if neither correct. Per-item scores average to
+    the axis ``pass_frac``.
+    """
+    from scripts.v31.consistency_paraphrase import consistency_score
+
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("v31_consistency") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        total_score = 0.0
+        with _model_eval_no_grad(model):
+            for it in samples:
+                try:
+                    a_text, a_tok = _bench_generate(
+                        model, tokenizer,
+                        _math_format_prompt(it["question"], it.get("src", "")),
+                        BENCH_V31_CONSISTENCY_MAX_TOKENS, device,
+                        enable_thinking=False,
+                    )
+                    b_text, b_tok = _bench_generate(
+                        model, tokenizer,
+                        _math_format_prompt(it["question_b"], it.get("src", "")),
+                        BENCH_V31_CONSISTENCY_MAX_TOKENS, device,
+                        enable_thinking=False,
+                    )
+                    score = consistency_score(a_text, b_text, it["gold"])
+                    total_score += score
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "gold": str(it["gold"])[:40],
+                        "ok": score == 1.0,
+                        "score": score,
+                        "gen_tokens": int(a_tok + b_tok),
+                        "tail_a": a_text[-80:],
+                        "tail_b": b_text[-80:],
+                        "template": it.get("template"),
+                    })
+                    out["n"] += 1
+                    out["correct"] += int(score == 1.0)
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""), "error": str(e)[:120],
+                    })
+        if out["n"] > 0:
+            out["pass_frac"] = total_score / out["n"]
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── code_bench ─────────────────────────────────────────────────────────
@@ -14084,6 +14672,23 @@ def run_bench_battery(model, tokenizer, device="cuda",
         # v30 — pragmatic reasoning (theory-of-mind, scalar
         # implicature, indirect-request recognition).
         ("pragmatic_bench", pragmatic_bench_probe),
+        # v31 procedural axes (PRODUCTION 2026-05-09). The full 11-
+        # axis surface, each carrying a non-zero composite weight per
+        # V31_AXIS_WEIGHTS in composite.py. Probes short-circuit to
+        # n=0 when their PER_ROUND env knob is 0 (axis-level disable
+        # without code change). See reports/2026-05-09-v31-axis-
+        # promotion.md for the per-axis weight rationale.
+        ("v31_math_gsm_symbolic", v31_gsm_symbolic_bench_probe),
+        ("v31_math_competition", v31_math_competition_bench_probe),
+        ("v31_math_robustness", v31_math_robustness_bench_probe),
+        ("v31_code_humaneval_plus", v31_code_humaneval_plus_bench_probe),
+        ("v31_reasoning_logic_grid", v31_reasoning_logic_grid_bench_probe),
+        ("v31_reasoning_dyval_arith", v31_reasoning_dyval_arith_bench_probe),
+        ("v31_long_context_ruler", v31_long_context_ruler_bench_probe),
+        ("v31_knowledge_multi_hop_kg", v31_knowledge_multi_hop_kg_bench_probe),
+        ("v31_ifeval_verifiable", v31_ifeval_verifiable_bench_probe),
+        ("v31_truthfulness_calibration", v31_truthfulness_calibration_bench_probe),
+        ("v31_consistency_paraphrase", v31_consistency_paraphrase_bench_probe),
     )
     _probes = _live_probes + (_shadow_probes if BENCH_BATTERY_SHADOW_AXES else ())
     if not BENCH_BATTERY_SHADOW_AXES:

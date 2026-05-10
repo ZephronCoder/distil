@@ -100,9 +100,79 @@ AXIS_PAIRS: dict[str, tuple[str, str]] = {
     "teacher_trace_plausibility": ("gsm8k", "support coverage — LIMO/s1 catcher"),
     "entropy_aware_kl": ("gsm8k", "EOPD adaptive RKL/FKL blend"),
     "tail_decoupled_kl": ("gsm8k", "v30.3 tail-flatten detector"),
+    # ── v30.6 canary axes (PRODUCTION) ─────────────────────────────
+    # These axes ARE the held-out reading, so their self-correlation
+    # is by construction 1.0 — but tracking them makes the audit
+    # explicit about what's anchoring the composite. A non-1.0
+    # correlation here would mean the canary-axis-loader itself is
+    # broken (caching, schema drift, count floor mismatch).
+    "canary_gsm8k":     ("gsm8k", "v30.6 held-out evalscope gsm8k"),
+    "canary_humaneval": ("humaneval", "v30.6 held-out evalscope humaneval"),
+    "canary_bbh":       ("bbh", "v30.6 held-out evalscope bbh"),
+    "canary_mmlu_pro":  ("mmlu_pro", "v30.6 held-out evalscope mmlu_pro"),
+    "canary_ifeval":    ("ifeval", "v30.6 held-out evalscope ifeval"),
     # pragmatic_bench has no clean canary analog yet; track via post-
     # round king benchmark runs once a held-out theory-of-mind benchmark
     # is wired into the canary set (e.g., FANToM).
+    # ── v31 procedural axes (PRODUCTION 2026-05-09) ──────────────────
+    # These are the procedural counterparts to the held-out canaries.
+    # Each axis was promoted out of SHADOW after the correlation gate
+    # (r ≥ 0.5 with the corresponding canary) fired in pre-promotion
+    # telemetry. We continue tracking r per round so a downward drift
+    # surfaces as an alert before it materially affects ranking.
+    "v31_math_gsm_symbolic": (
+        "gsm8k",
+        "v31 PRODUCTION: GSM-Symbolic procedural counterpart to canary_gsm8k.",
+    ),
+    "v31_math_competition": (
+        "gsm8k",
+        "v31 PRODUCTION: AMPS-Hard / LiveBench-math competition templates. "
+        "Tracks vs gsm8k as the closest held-out math signal.",
+    ),
+    "v31_math_robustness": (
+        "gsm8k",
+        "v31 PRODUCTION: GSM-Plus + GSM-NoOp 5-perturbation robustness suite.",
+    ),
+    "v31_code_humaneval_plus": (
+        "humaneval",
+        "v31 PRODUCTION: EvalPlus 30-60 augmented test cases per problem.",
+    ),
+    "v31_reasoning_logic_grid": (
+        "bbh",
+        "v31 PRODUCTION: Zebra-puzzle constraint solver. Tracks vs bbh as "
+        "the closest held-out logical-deduction signal.",
+    ),
+    "v31_reasoning_dyval_arith": (
+        "bbh",
+        "v31 PRODUCTION: DyVal arithmetic DAG with controllable depth + width.",
+    ),
+    "v31_long_context_ruler": (
+        "bbh",
+        "v31 PRODUCTION: RULER 4-task subset (NIAH single/multi-key, "
+        "multi-hop variable tracking, aggregation count). No direct held-out "
+        "canary so we track vs bbh (the most general reasoning signal).",
+    ),
+    "v31_knowledge_multi_hop_kg": (
+        "mmlu_pro",
+        "v31 PRODUCTION: synthetic-entity multi-hop knowledge graph. "
+        "Tracks vs mmlu_pro as the closest held-out knowledge signal "
+        "(direction, not magnitude — synthetic facts can't directly map).",
+    ),
+    "v31_ifeval_verifiable": (
+        "ifeval",
+        "v31 PRODUCTION: full IFEval kwarg surface (21 verifiers, stack 1-4).",
+    ),
+    "v31_truthfulness_calibration": (
+        "mmlu_pro",
+        "v31 PRODUCTION: SimpleQA 3-way calibration (correct / incorrect / "
+        "not-attempted). Tracks vs mmlu_pro as a proxy for general "
+        "knowledge-correctness; calibration itself has no held-out canary.",
+    ),
+    "v31_consistency_paraphrase": (
+        "gsm8k",
+        "v31 PRODUCTION: paraphrase-pair consistency on M1 templates with "
+        "isomorphic name rotation (IPT defence per arXiv 2604.15149).",
+    ),
 }
 
 

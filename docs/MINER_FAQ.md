@@ -40,6 +40,64 @@ Submit your HuggingFace model repo via the commitment mechanism on-chain.
 
 ---
 
+## v31 — 11 new procedural axes (LIVE 2026-05-09)
+
+Half the composite weight (0.50) now goes to a fresh set of 11
+**research-grounded procedural** axes. They were designed against
+the Goodhart trap — every public benchmark we cite has a known
+contamination signature, and the v31 axes regenerate every round
+from a private RNG seed so there is no static item pool to
+memorise.
+
+| v31 axis | Family | Methodology (paper) | Weight |
+|---|---|---|---|
+| `v31_math_gsm_symbolic` | math | GSM-Symbolic templates + GSM-NoOp variants (Apple, arXiv 2410.05229) | 0.06 |
+| `v31_math_competition` | math | AMPS-Hard / LiveBench-math style closed-form competition problems | 0.05 |
+| `v31_math_robustness` | math | GSM-Plus 4-perturbation suite + GSM-NoOp topical distractors | 0.03 |
+| `v31_code_humaneval_plus` | code | EvalPlus-style 30-60 augmented test cases per problem (Liu et al., NeurIPS 2023) | 0.08 |
+| `v31_reasoning_logic_grid` | reasoning | Procedural Zebra puzzles, programmatic uniqueness check (LiveBench-style) | 0.05 |
+| `v31_reasoning_dyval_arith` | reasoning | DyVal-style arithmetic DAGs with controllable depth + width (Microsoft, ICLR 2024) | 0.04 |
+| `v31_long_context_ruler` | long-context | RULER 4-task subset: NIAH single/multi-key, multi-hop variable tracking, aggregation count (NVIDIA, ICLR 2024) | 0.05 |
+| `v31_knowledge_multi_hop_kg` | knowledge | Fully-synthetic multi-hop KG (family / location / employment); no real-world facts so memorisation impossible | 0.04 |
+| `v31_ifeval_verifiable` | IF | Google IFEval 21-verifier surface, stack depths 1-4 with procedural kwargs | 0.04 |
+| `v31_truthfulness_calibration` | calibration | SimpleQA-style 3-way scoring (correct / incorrect / not-attempted) on procedural math+logic; penalises overconfidence | 0.03 |
+| `v31_consistency_paraphrase` | cross-axis | Paraphrase-pair consistency on M1 templates with **isomorphic name rotation** (IPT defence, arXiv 2604.15149) | 0.03 |
+
+Where to spend training data:
+
+* **Drop the "memorise the public test set" reflex.** v31 axes
+  draw fresh items every round from a private seed; you cannot
+  memorise them.
+* **Math:** train on GSM-Symbolic + GSM-NoOp robustness data, not
+  static GSM8K. The axis explicitly tests whether you treat every
+  number you see as a problem variable (you shouldn't).
+* **Reasoning:** Zebra puzzles + DyVal DAGs are the canonical
+  patterns. You will need actual constraint-satisfaction and DAG
+  evaluation skill — a memorised CoT for one problem won't
+  transfer.
+* **Long-context:** RULER tasks. NIAH single/multi-key are the
+  highest-volume; the multi-hop variable tracking is the hardest
+  for 4 B-class models.
+* **Code:** EvalPlus methodology (30-60 augmented test cases).
+  Your function must pass adversarial corner cases, not just the
+  canonical examples.
+* **Calibration:** the T1 axis explicitly rewards refusal on
+  unanswerable problems. A model that confidently confabulates an
+  answer to "What's 5/0?" will lose more than one that
+  abstains.
+* **Consistency (S1):** if your model learned "given Alice's
+  problem, answer 17", it will fail when we rename Alice → Maya.
+  The paraphrase pair includes a name rotation 85 % of the time.
+
+The full v31 design + research review is in
+[`reports/2026-05-09-v31-procedural-redesign.md`](../reports/2026-05-09-v31-procedural-redesign.md)
+and the promotion notes are in
+[`reports/2026-05-09-v31-axis-promotion.md`](../reports/2026-05-09-v31-axis-promotion.md).
+
+The v31 axis surface freed 0.50 weight by retiring or shrinking
+legacy axes that the v31 axes replace (see the table further down
+under "v30.2 / v30.3 axes — current state of legacy weight").
+
 ## How Evaluation Works (v30.2 / v30.3, live as of 2026-04-29)
 
 Every round the validator pulls the set of new on-chain commitments and evaluates each one on a single GPU pod. The eval policy is:

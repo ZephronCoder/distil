@@ -8,6 +8,95 @@ fix is to score each student on several independent axes and combine them
 with a worst-case rule, so that gaming any single axis penalizes overall
 rank.
 
+  * 2026-05-09 (v30.7 — "no-public-benchmarks-in-score"). v30.6 wired
+    held-out evalscope (gsm8k, humaneval, bbh, ifeval, mmlu_pro) into
+    the composite as first-class axes worth 0.50 total. That fixed
+    the immediate anti-correlation symptom but **re-introduced the
+    Goodhart trap by a different door**: every one of those benchmarks
+    is public. Once a metric the miners can locally evaluate against
+    is a scoring component, the cheapest move is to train *to* it —
+    train-set contamination, paraphrase synthesis, item-format match —
+    until the canary score is high without the underlying skill
+    transferring to anything else. Goodhart's Law unmoved.
+    The correct architecture for an anti-Goodhart distillation subnet
+    is: **the score MUST be procedural** (so miners can't see the
+    items), and the *procedural distribution* itself must be moving
+    + diverse enough that overfitting to it is harder than just
+    distilling well. The canary remains a DIAGNOSTIC — it is read
+    every round, logged into ``axis_correlation.json``, and used as a
+    GATE (``king_canary_streak``) but is no longer a scored component.
+    Changes shipped here:
+
+      1. ``CANARY_AXES_IN_COMPOSITE`` default flipped to ``0``;
+         ``CANARY_AXIS_WEIGHTS`` zeroed defensively. ``compute_axes``
+         still populates ``canary_*`` keys for telemetry / correlation
+         analysis, but they no longer enter ``worst`` / ``weighted``
+         and don't move ranking.
+      2. The 0.50 weight freed by removing canary axes is redirected
+         to procedural/distillation axes that are DEMONSTRABLY HARDER
+         to game without actually building a better model:
+            * ``on_policy_rkl``    0.25 → 0.30 (sample-then-KL needs
+              real teacher access; can't be replicated locally).
+            * ``top_k_overlap``    0.10 → 0.18 (top-K agreement with
+              the private teacher's logits; same property).
+            * ``judge_probe``      0.10 → 0.20 (private LLM-as-judge;
+              gaming requires a model that fools the judge — the
+              cheapest path is genuine quality).
+            * ``long_form_judge``  0.10 → 0.20 (same property at
+              long-context).
+            * ``long_gen_coherence`` 0.15 → 0.25 (statistical coherence
+              over 800-token generations; gameable only by genuinely
+              coherent generation).
+            * ``capability``       0.05 → 0.10 (procedural capability
+              probe; modest bump because it CAN be over-fit if the
+              procedural pool is small).
+            * ``code_skill_group`` 0.12 → 0.15 (only group with
+              positive canary correlation in v30.6).
+            * ``reasoning_skill_group`` 0.06 → 0.10 (modest restore
+              now that bottom_half_mean limits saturation gaming).
+      3. Skill-group aggregation kept at ``bottom_half_mean`` so a
+         saturated sub-axis still can't inflate the group.
+      4. ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` kept at 0.85 — worst-axis
+         dominance is still the right anti-Goodhart pressure even
+         without the canary anchor.
+      5. King-canary-streak gate (``KING_CANARY_GATE``) tightened:
+         margin 0.05 → 0.04, min_streak 2 → 1. A king regressing
+         below Qwen3.5-4B base on the held-out canary now waives
+         its dethrone-veto immediately rather than after two rounds.
+         Canary continues to function as a SAFETY NET, not a SCORE.
+      6. ``COMPOSITE_SHADOW_VERSION`` bumped 30 → 31. v30.6 records
+         auto-quarantined by ``_KING_SELECTION_MIN_VERSION``.
+
+    Open follow-ups (planned for v30.8+) — see
+    ``reports/2026-05-09-anti-goodhart-procedural.md`` for the design:
+
+       * Per-round private distribution shift (``epoch_secret``):
+         the procedural item generator's operator pool, parameter
+         ranges, and difficulty meta-parameters are perturbed by a
+         private secret committed at round start and revealed
+         post-hoc. Miners can't pre-generate the round's distribution.
+       * Adversarial item selection: items where the current king
+         disagrees with teacher get up-weighted at scoring time.
+         Frontier shifts as miners improve, gaming a frozen frontier
+         doesn't help.
+       * Private OOD probe pool: a small private benchmark set we
+         never publish, used as a divergence DETECTOR (not a score).
+         If composite climbs while OOD drops, automatic king veto.
+       * Hidden axis-weight rotation: per-round multinomial sampled
+         from a private prior, smoothed across rounds. Optimizing for
+         any single axis loses ranking on rounds where that axis is
+         weighted low.
+
+  * 2026-05-09 (v30.6, REVERTED above). Original v30.6 attempted
+    to anchor the composite on the held-out evalscope canary set.
+    The audit motivating v30.6 (composite r=-0.71 vs canary,
+    reasoning_skill_group r=-0.95) is correct and the v30.6
+    reweighting of OVER-weighted procedural axes (degeneracy,
+    capability, length, reasoning/knowledge groups) is preserved.
+    What's reverted is specifically *putting the canary in the
+    score*. See the v30.7 block above for the rationale.
+
+
 This module is intentionally pure-Python, no ML deps, safe to import from
 the validator service. It consumes the JSON that ``pod_eval_vllm.py``
 writes per student and emits a ``composite`` score and per-axis breakdown.
@@ -127,7 +216,13 @@ AXIS_WEIGHTS = {
     # 2026-04-29 (v29.7): all relative weights are now env-overridable
     # so the v30 audit rebalance (drop saturated kl/capability/length)
     # can land via distil.env without a code change.
-    "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.25")),
+    # v30.7 (2026-05-09) — on_policy_rkl bumped 0.25 → 0.30 on the back
+    # of the canary-axis revert. RKL is sample-then-KL: the student
+    # samples its own rollouts and the teacher scores them, so gaming
+    # this axis requires actual access to the (private) teacher's
+    # distribution on the student's own outputs. Closest thing the
+    # subnet has to a Goodhart-immune distillation signal.
+    "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.30")),
     "kl":             float(os.environ.get("BENCH_KL_WEIGHT", "0.05")),
     # 2026-04-29 (v30): top-K overlap axis. Per the 2026 'Rethinking OPD'
     # paper, this is the most predictive single signal of downstream
@@ -136,7 +231,18 @@ AXIS_WEIGHTS = {
     # |top_K_t ∩ top_K_s| / K averaged. Add to the weighted
     # aggregation by default; gated env-overridable while we collect
     # 48h of telemetry (see TOP_K_OVERLAP_AXIS_IN_COMPOSITE below).
-    "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.08")),
+    # v30.6 (2026-05-09) — bumped on the back of the 2026-05-09 audit:
+    # top_k_overlap shows r=+0.40 with held-out gsm8k, the strongest
+    # positive correlator we have outside the canary itself. Goodhart-
+    # resistant by construction (tracks token-set overlap with the
+    # private teacher, not probabilities).
+    # v30.7 (2026-05-09) — bumped further 0.10 → 0.18 to absorb the
+    # 0.50 weight freed by removing canary axes from the score.
+    # Top-K overlap is among the hardest to game without genuine
+    # teacher-distribution matching: a miner has to predict, per token,
+    # which K alternatives the (private) teacher considered most
+    # likely. There's no shortcut training-set you can scrape for that.
+    "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.18")),
     # 2026-04-29 (v30) — entropy-aware adaptive KL axis. Per the EOPD
     # paper (arXiv 2510.27485), per-token RKL/FKL weighting based on
     # teacher entropy is +1.37 to +5.05 Pass@8 on small-model math
@@ -176,9 +282,27 @@ AXIS_WEIGHTS = {
     "tail_decoupled_kl": float(
         os.environ.get("TAIL_DECOUPLED_KL_WEIGHT", "0.0")
     ),
-    "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.15")),
-    "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.15")),
-    "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.28")),
+    # v30.6 (2026-05-09) — over-weighted axes trimmed. ``degeneracy`` and
+    # ``length`` measure structural hygiene (does the model terminate?
+    # is it short enough?) — important but not capability. The 28%
+    # degeneracy + 15% length anchor was crowding out actual benches.
+    # v30.7 (2026-05-09) — capability nudged 0.05 → 0.10 to absorb a
+    # slice of the freed canary weight. The procedural ``capability``
+    # axis CAN be over-fit if the procedural pool is small (which is
+    # why it was at 0.15 → 0.05 last round) so the bump is modest;
+    # the real anti-Goodhart weight goes to the teacher-anchored axes
+    # (on_policy_rkl, top_k_overlap, judge_probe, long_form_judge,
+    # long_gen_coherence) that are hard to game without the teacher.
+    # v31 (2026-05-09) — capability trimmed 0.10 → 0.05 (the v31
+    # procedural axes also generalize the "verifiable correctness"
+    # signal that capability tracks; we don't want to double-count
+    # the same procedural skill).
+    # length / degeneracy trimmed 0.08 → 0.05 and 0.10 → 0.05 for
+    # the same reason: the v31 axes already penalize incoherent
+    # generations through the per-task graders.
+    "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.05")),
+    "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.05")),
+    "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.05")),
 }
 
 # v30 — top-K overlap axis gate. Defaults ON; env-flippable for fast
@@ -192,6 +316,14 @@ TOP_K_OVERLAP_AXIS_IN_COMPOSITE = (
 # normalization; callers see a per-axis breakdown and the aggregated
 # worst/weighted, so the absolute number changes slightly but the
 # ordering intent is preserved.
+# v30.7 (2026-05-09) — judge_probe bumped 0.10 → 0.20 on the back of
+# the canary revert. The judge is the (private) teacher LLM rating
+# student greedy responses on a 1-5 rubric. Hard to game without
+# either: (a) actually producing high-quality answers, or (b) reverse-
+# engineering the rubric. Path (b) is bounded — the rubric checks
+# helpfulness/correctness/clarity, which are exactly what we want.
+# Path (a) is the genuine improvement we're trying to incentivize.
+# This axis is a strong fit for the anti-Goodhart half of the score.
 JUDGE_AXIS_WEIGHT = float(os.environ.get("JUDGE_AXIS_WEIGHT", "0.20"))
 
 # Shadow/promote gate. 2026-04-24: PROMOTED to production after the
@@ -219,7 +351,12 @@ BENCH_AXIS_WEIGHTS = {
     "code_bench":      float(os.environ.get("BENCH_CODE_WEIGHT", "0.0")),
     "reasoning_bench": float(os.environ.get("BENCH_REASONING_WEIGHT", "0.0")),
     "knowledge_bench": float(os.environ.get("BENCH_KNOWLEDGE_WEIGHT", "0.0")),
-    "ifeval_bench":    float(os.environ.get("BENCH_IFEVAL_WEIGHT", "0.07")),
+    # v31 (2026-05-09): ifeval_bench retired in favor of
+    # v31_ifeval_verifiable (which uses the same Google IFEval
+    # verifier surface but with procedural kwargs that vary per
+    # round, eliminating the surface-form memorization risk).
+    # Legacy weight 0.07 redirected.
+    "ifeval_bench":    float(os.environ.get("BENCH_IFEVAL_WEIGHT", "0.0")),
 }
 
 # v30.2 — Skill-group axis weights. These pick up the weight previously
@@ -250,10 +387,46 @@ BENCH_AXIS_WEIGHTS = {
 #   chat_turns_probe 0.08 (unchanged — multi-turn distinct)
 #   shadow axes (kl_is etc.) 0.02 → 0.05 each
 BENCH_GROUP_AXIS_WEIGHTS = {
-    "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.28")),
-    "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.24")),
-    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.24")),
-    "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.08")),
+    # v30.6 (2026-05-09) — bench-group reweighting based on observed
+    # canary correlation (n=4 kings, scripts/audit/axis_correlation.py):
+    #   * ``code_skill_group``      r=+0.29 (mildly positive, but
+    #                                 inflated by saturated sub-axes;
+    #                                 canary_humaneval is a stronger
+    #                                 read of the same skill).
+    #   * ``math_skill_group``      r=-0.39 (anti-correlated; replaced
+    #                                 by canary_gsm8k).
+    #   * ``reasoning_skill_group`` r=-0.95 (worst correlator we have;
+    #                                 climbing it actively predicts
+    #                                 regressing on bbh).
+    #   * ``knowledge_skill_group`` r=-0.45 (anti-correlated; replaced
+    #                                 by canary_mmlu_pro).
+    # Net cut 0.56 → CANARY_AXIS_WEIGHTS + top_k_overlap. Sub-axes
+    # still compute and feed into telemetry / per_src.
+    # v30.7 (2026-05-09) — modest restoration after canary revert.
+    # ``code_skill_group`` was the only positive correlator
+    # (r=+0.29), so it gets the biggest bump (0.12 → 0.15).
+    # ``reasoning_skill_group`` had a catastrophic r=-0.95 in v30.6
+    # but the cure for that was the bottom_half_mean aggregation
+    # (saturated sub-axes can't inflate the group), not deletion.
+    # With saturation patched it's safe to restore a modest weight
+    # (0.06 → 0.10) — but the freed weight predominantly went to
+    # the teacher-anchored axes above, not back to skill groups.
+    # ``knowledge_skill_group`` stays at 0 — its correlation was
+    # both negative and noisy, and we have no reason to think the
+    # group's items map cleanly to mmlu_pro yet.
+    # v31 (2026-05-09): skill-group weights reduced. The procedural
+    # v31 axes (V31_AXIS_WEIGHTS) sum to 0.50 and are designed to
+    # replace the legacy ad-hoc bench surface. We trim 0.10/0.10/0.10
+    # off code/math/reasoning skill groups (matching the
+    # methodologically-superior v31 axes that subsume each domain),
+    # leaving partial overlap weight on code_skill_group only since
+    # the v31 code surface is single-template (C1 EvalPlus-style)
+    # while the legacy skill group covers 5 sub-axes (humaneval +
+    # mbpp + debug + correction + refactor) for broader coverage.
+    "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.05")),
+    "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.0")),
+    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.0")),
+    "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.0")),
     # 2026-05-02 (v30.5): super_teacher axis REMOVED.
     # Rationale: the axis was conceptually wrong for distillation — by
     # construction, a student matching the teacher's distribution
@@ -273,6 +446,245 @@ BENCH_GROUP_AXIS_WEIGHTS = {
 }
 
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"
+
+
+# ── 2026-05-09 (v30.6) — Held-out canary axes (PRODUCTION) ────────────
+# Single biggest fix in v30.6: the held-out evalscope canary
+# (state/benchmarks/uid_<uid>.json) is now a first-class composite axis
+# set. Previously the canary only fired as a post-hoc dethrone gate
+# (KING_CANARY_GATE) -- a king could climb composite to 0.5+ while
+# regressing on real evalscope, and the gate would only catch them
+# after a 2-round streak. With these axes, the king's actual held-out
+# scores plug into compute_axes every round, so a real-capability gap
+# shows up immediately as a low canary_* axis value, pulling down
+# worst_3_mean and the final composite proportionally.
+#
+# Plumbing:
+#   * annotate_h2h_with_composite looks up state/benchmarks/uid_<uid>.json
+#     for each h2h entry's UID, extracts the per-axis benchmarks dict,
+#     and threads it through compute_composite(canary_scores=...).
+#   * compute_axes invokes _axis_canary_*(canary_scores, axis) for each
+#     canary axis, returning the raw pass-fraction in [0, 1].
+#   * Missing canary file (challenger never crowned, or canary not yet
+#     run for a fresh model commit) => canary_scores=None => every
+#     canary axis returns None => axis drops out of ranking. Composite
+#     renormalises over surviving axes -- fail open, no false-negative
+#     dethrones from a probe outage.
+#
+# Total weight 0.50: half the composite is now anchored on real,
+# never-procedural benchmarks. Per the audit (n=4 kings):
+#   gsm8k, humaneval are the cleanest signals (highest correlation
+#     with model quality, narrow item pools where misclassification
+#     rare) -- weight 0.12 each
+#   bbh, mmlu_pro broader but noisier -- weight 0.10 each
+#   ifeval narrow structural -- weight 0.06
+#
+# v30.7 (2026-05-09) — public benchmarks DEFAULT-OUT of the composite.
+# Putting any public benchmark in the score lets miners train to it
+# (paraphrase synthesis, item-format match, train-set contamination)
+# until the canary score is high without the underlying skill
+# transferring. The canary axes are still computed (so the diagnostic
+# loop and king_canary_streak gate keep working) but contribute zero
+# weight to ``worst`` / ``weighted``. Override via the env var if you
+# explicitly want the v30.6 anchoring back, but expect it to be gamed
+# within ~2 weeks of the weights becoming public.
+CANARY_AXIS_WEIGHTS = {
+    "canary_gsm8k":     float(os.environ.get("CANARY_GSM8K_WEIGHT", "0.0")),
+    "canary_humaneval": float(os.environ.get("CANARY_HUMANEVAL_WEIGHT", "0.0")),
+    "canary_bbh":       float(os.environ.get("CANARY_BBH_WEIGHT", "0.0")),
+    "canary_mmlu_pro":  float(os.environ.get("CANARY_MMLU_PRO_WEIGHT", "0.0")),
+    "canary_ifeval":    float(os.environ.get("CANARY_IFEVAL_WEIGHT", "0.0")),
+}
+CANARY_AXES_IN_COMPOSITE = os.environ.get("CANARY_AXES_IN_COMPOSITE", "0") != "0"
+
+# Map canary axis name -> key in state/benchmarks/uid_<uid>.json:benchmarks.
+# Sub-axes that never made it into the canary set (aime, mbpp, arc) do
+# not get a canary axis -- they continue to be measured by the
+# in-validator probes.
+CANARY_AXIS_TO_HELDOUT_KEY = {
+    "canary_gsm8k":     "gsm8k",
+    "canary_humaneval": "humaneval",
+    "canary_bbh":       "bbh",
+    "canary_mmlu_pro":  "mmlu_pro",
+    "canary_ifeval":    "ifeval",
+}
+
+# Minimum sample count for a canary axis to count as scored. Mirrors
+# BENCH_MIN_VALID for the in-validator probes. The canary runs at
+# limit=50 by default for the small benchmarks; these floors are well
+# under typical sample counts so a normal canary run never drops the
+# axis, but a botched run with N<10 does.
+CANARY_AXIS_MIN_VALID = {
+    "canary_gsm8k":     20,
+    "canary_humaneval": 20,
+    "canary_bbh":       50,
+    "canary_mmlu_pro":  50,
+    "canary_ifeval":    20,
+}
+
+
+# ── 2026-05-09 (v31) — Procedural axes (PRODUCTION) ──────────────────
+# v31 axis surface, promoted out of SHADOW. See
+# reports/2026-05-09-v31-procedural-redesign.md for the design and
+# reports/2026-05-09-v31-axis-promotion.md for the promotion rationale.
+#
+# These eleven axes replace the ad-hoc legacy bench surface (math_bench,
+# code_bench, reasoning_bench, knowledge_bench, ifeval_bench,
+# aime_bench, mbpp_bench, robustness_bench, calibration_bench,
+# truthful_bench, long_context_bench, multi_doc_synthesis_bench) -
+# the legacy axes still RUN but their composite weight has been
+# transferred to the procedural v31 axes. The legacy axes remain
+# weighted in skill-group form for partial overlap with v31, but
+# at reduced weights (see §weight-redistribution in the design doc).
+#
+# Each v31 axis is procedural by construction:
+#   * v31_math_gsm_symbolic    -- Apple's GSM-Symbolic templates +
+#                                  P0/P1/P2 + GSM-NoOp distractors.
+#   * v31_math_competition     -- AMPS-Hard / LiveBench-math style
+#                                  competition templates (algebra,
+#                                  number theory, combinatorics,
+#                                  geometry, probability).
+#   * v31_math_robustness      -- GSM-Plus 4-perturbation suite
+#                                  applied to v31_math_gsm_symbolic
+#                                  base templates.
+#   * v31_code_humaneval_plus  -- EvalPlus-style 30-60 augmented test
+#                                  cases per problem; templated
+#                                  function names per round.
+#   * v31_reasoning_logic_grid -- LiveBench Zebra puzzles with
+#                                  uniqueness-checked clue sets and
+#                                  forgiving graders.
+#   * v31_reasoning_dyval_arith- DyVal arithmetic DAG generator with
+#                                  controllable depth.
+#   * v31_long_context_ruler   -- 4 of the 13 RULER tasks
+#                                  (NIAH-single, NIAH-multikey,
+#                                  multihop-var, aggregation-count).
+#   * v31_knowledge_multi_hop_kg- Synthetic-entity multi-hop KG;
+#                                  fully procedural (no real-world
+#                                  facts, so unmemorizable).
+#   * v31_ifeval_verifiable    -- Google IFEval 21-verifier surface
+#                                  with procedural kwargs.
+#   * v31_truthfulness_calibration- SimpleQA 3-way (correct /
+#                                  incorrect / not_attempted)
+#                                  calibration scoring.
+#   * v31_consistency_paraphrase- Paraphrase-pair consistency over
+#                                  M1 templates (3-way score).
+#
+# Weight allocation (sums to 0.50, freed from a 0.50 reduction in
+# the legacy bench surface in the same commit):
+V31_AXIS_WEIGHTS = {
+    "v31_math_gsm_symbolic":     float(os.environ.get("V31_MATH_GSM_SYMBOLIC_WEIGHT", "0.06")),
+    "v31_math_competition":      float(os.environ.get("V31_MATH_COMPETITION_WEIGHT", "0.05")),
+    "v31_math_robustness":       float(os.environ.get("V31_MATH_ROBUSTNESS_WEIGHT", "0.03")),
+    "v31_code_humaneval_plus":   float(os.environ.get("V31_CODE_HUMANEVAL_PLUS_WEIGHT", "0.08")),
+    "v31_reasoning_logic_grid":  float(os.environ.get("V31_REASONING_LOGIC_GRID_WEIGHT", "0.05")),
+    "v31_reasoning_dyval_arith": float(os.environ.get("V31_REASONING_DYVAL_ARITH_WEIGHT", "0.04")),
+    "v31_long_context_ruler":    float(os.environ.get("V31_LONG_CONTEXT_RULER_WEIGHT", "0.05")),
+    "v31_knowledge_multi_hop_kg": float(os.environ.get("V31_KNOWLEDGE_MULTI_HOP_KG_WEIGHT", "0.04")),
+    "v31_ifeval_verifiable":     float(os.environ.get("V31_IFEVAL_VERIFIABLE_WEIGHT", "0.04")),
+    "v31_truthfulness_calibration": float(os.environ.get("V31_TRUTHFULNESS_CALIBRATION_WEIGHT", "0.03")),
+    "v31_consistency_paraphrase": float(os.environ.get("V31_CONSISTENCY_PARAPHRASE_WEIGHT", "0.03")),
+}
+# Master gate. Default ON: v31 is now production. Operators with a
+# stability concern can flip to 0 to revert to the v30.7 surface
+# entirely (zero risk of v31 axis weights gating ranking).
+V31_AXES_IN_COMPOSITE = os.environ.get("V31_AXES_IN_COMPOSITE", "1") != "0"
+
+
+def _canary_dir():
+    from pathlib import Path
+    override = os.environ.get("CANARY_BENCHMARKS_DIR", "")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[2] / "state" / "benchmarks"
+
+
+_CANARY_FILE_CACHE: dict[int, tuple[float, dict]] = {}
+
+
+def load_canary_scores_for_uid(uid: Any) -> dict[str, Any] | None:
+    """Load the held-out canary benchmarks for one UID.
+
+    Returns the raw ``benchmarks`` dict augmented with private
+    ``__counts__`` / ``__model__`` / ``__timestamp__`` keys. Returns
+    None if the canary file is missing for this UID or unparseable.
+
+    Cache: keyed by UID with stat-mtime invalidation, so the four
+    composite call sites per round (annotate_h2h, h2h_history append,
+    dashboard backfill, composite_scores cache) all share the same
+    parsed dict instead of re-reading the file each time.
+    """
+    if uid is None:
+        return None
+    try:
+        uid_int = int(uid)
+    except (TypeError, ValueError):
+        return None
+    try:
+        from pathlib import Path
+        import json as _json
+        path = _canary_dir() / f"uid_{uid_int}.json"
+        if not path.exists():
+            return None
+        mtime = path.stat().st_mtime
+        cached = _CANARY_FILE_CACHE.get(uid_int)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        with open(path) as fh:
+            data = _json.load(fh)
+        if data.get("uid") not in (uid_int, str(uid_int)):
+            return None
+        bench = data.get("benchmarks") or {}
+        if not isinstance(bench, dict):
+            return None
+        out = dict(bench)
+        out["__counts__"] = data.get("counts") or {}
+        out["__model__"] = data.get("model") or ""
+        out["__timestamp__"] = data.get("timestamp") or ""
+        _CANARY_FILE_CACHE[uid_int] = (mtime, out)
+        return out
+    except Exception as exc:
+        try:
+            logger.debug(f"composite: canary load for uid={uid} failed (non-fatal): {exc}")
+        except Exception:
+            pass
+        return None
+
+
+def _axis_canary(canary_scores: dict[str, Any] | None, axis_name: str) -> float | None:
+    """Generic [0, 1] canary axis extractor.
+
+    Returns None when:
+      * canary_scores is None (no canary file for this UID).
+      * The held-out key isn't in the canary scores (axis didn't run
+        in the most recent canary).
+      * count is below CANARY_AXIS_MIN_VALID[axis_name] (probe
+        outage / cancelled run).
+      * Value isn't coercible to float.
+
+    Otherwise clamps the raw value into [0, 1]. The canary file already
+    stores fractions in [0, 1] so the clamp is just a defensive guard.
+    """
+    if not canary_scores:
+        return None
+    held_key = CANARY_AXIS_TO_HELDOUT_KEY.get(axis_name)
+    if not held_key:
+        return None
+    raw = canary_scores.get(held_key)
+    if raw is None:
+        return None
+    counts = canary_scores.get("__counts__") or {}
+    cnt = counts.get(held_key)
+    floor = CANARY_AXIS_MIN_VALID.get(axis_name, 10)
+    if cnt is not None and int(cnt or 0) < floor:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, min(1.0, v))
+
 
 # ── 2026-04-24 — Arena v3 Session 3 (PRODUCTION) ─────────────────────
 # Four capability-extending axes inspired by Affine Cortex's environment
@@ -456,7 +868,7 @@ JUDGE_PROBE_MIN_VALID = int(os.environ.get("JUDGE_PROBE_MIN_VALID", "4"))
 # Default alpha = 0.75 (heavy emphasis on the bottom 3, in line with the
 # audit's "high (~75%)" recommendation). Tunable via env.
 COMPOSITE_FINAL_BOTTOM_WEIGHT = float(
-    os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.75")
+    os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.85")
 )
 WORST_3_MEAN_K = int(os.environ.get("WORST_3_MEAN_K", "3"))
 
@@ -478,11 +890,19 @@ LONG_FORM_JUDGE_MIN_VALID = int(os.environ.get("LONG_FORM_JUDGE_MIN_VALID", "2")
 #   • on composite.final = 0.7·worst_3_mean + 0.3·weighted, that's
 #     ~0.15 hit on final — ample to flip the dethrone gate
 # The pure-statistical axis can't be cheated by rubric leniency.
+# v30.7 (2026-05-09) — long-form axes bumped to absorb canary weight.
+# These two cover the same anti-Goodhart property as judge_probe but
+# at long-context (~800 tokens). Gaming requires either coherent long
+# generation (the goal) or fooling a judge that explicitly checks for
+# loops/topic-drift/refusal. The pure-statistical coherence axis
+# (loops, perplexity, vocabulary collapse) can't be cheated by rubric-
+# tuning. Combined weight 0.45 — half of the long-form composite is
+# now the long-form coherence cluster.
 LONG_FORM_JUDGE_AXIS_WEIGHT = float(
-    os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.10")
+    os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.20")
 )
 LONG_GEN_COHERENCE_AXIS_WEIGHT = float(
-    os.environ.get("LONG_GEN_COHERENCE_WEIGHT", "0.15")
+    os.environ.get("LONG_GEN_COHERENCE_WEIGHT", "0.25")
 )
 LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE = bool(
     int(os.environ.get("LONG_GEN_COHERENCE_IN_COMPOSITE", "1") or 1)
@@ -555,6 +975,21 @@ BENCH_MIN_VALID = {
     # v30 — pragmatic_bench. 8 items per round; floor at 4 so a few
     # parse failures don't drop the axis but a sandbox outage does.
     "pragmatic_bench": 4,
+    # v31 (2026-05-09) — procedural axes. All run at 16-32 items per
+    # round per the eval_policy.json defaults; floor at 8 so a few
+    # parse / sandbox glitches don't drop the axis but a probe
+    # outage (n<8) does.
+    "v31_math_gsm_symbolic":     8,
+    "v31_math_competition":      8,
+    "v31_math_robustness":       8,
+    "v31_code_humaneval_plus":   4,  # sandbox is expensive, smaller per-round
+    "v31_reasoning_logic_grid":  8,
+    "v31_reasoning_dyval_arith": 8,
+    "v31_long_context_ruler":    6,  # long context, smaller per-round
+    "v31_knowledge_multi_hop_kg": 8,
+    "v31_ifeval_verifiable":     6,
+    "v31_truthfulness_calibration": 8,
+    "v31_consistency_paraphrase": 6,  # 2 generations per item
 }
 
 # Schema version of the composite ranker. Bumped any time the composite
@@ -580,7 +1015,7 @@ BENCH_MIN_VALID = {
 #             reasoning/knowledge) added; super_teacher axis added;
 #             king re-eval per round; legacy ``worst`` retained as
 #             telemetry but no longer the dethrone gate.
-COMPOSITE_SHADOW_VERSION = 29
+COMPOSITE_SHADOW_VERSION = 32
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a
@@ -630,8 +1065,18 @@ KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 # floor veto can dethrone a king whose held-out is regressing — the
 # explicit answer to "did the composite eval produce a model that's
 # actually better, or just better at the composite?".
-KING_CANARY_MARGIN = float(os.environ.get("KING_CANARY_MARGIN", "0.05"))
-KING_CANARY_MIN_STREAK = int(os.environ.get("KING_CANARY_MIN_STREAK", "2"))
+# v30.7 (2026-05-09) — gate tightened. Now that the canary is the
+# ONLY held-out signal in the system (the score itself is procedural-
+# only), this gate is the safety net that catches a king who's
+# climbed the procedural axes while regressing on real capability.
+# Margin loosened 0.05 → 0.04 (4pp below baseline triggers; was
+# 5pp), min_streak tightened 2 → 1 (immediate waiver; was wait two
+# rounds). The gate now waives the dethrone-veto for ANY challenger
+# the moment the king's canary average drops > 4pp below Qwen3.5-4B
+# on 4 of 5 canary axes. That's 4-axis trip rather than 1-axis
+# false-positive — strict but fast.
+KING_CANARY_MARGIN = float(os.environ.get("KING_CANARY_MARGIN", "0.04"))
+KING_CANARY_MIN_STREAK = int(os.environ.get("KING_CANARY_MIN_STREAK", "1"))
 KING_CANARY_GATE = os.environ.get("KING_CANARY_GATE", "1") != "0"
 KING_CANARY_AXES = ("gsm8k", "humaneval", "bbh", "ifeval")
 KING_CANARY_BASELINE_FILE = os.environ.get("KING_CANARY_BASELINE_FILE", "baseline_qwen35_4b.json")
@@ -1098,6 +1543,24 @@ _BENCH_AXIS_NAMES: tuple[str, ...] = (
     "noise_resistance_bench", "debug_bench", "correction_bench",
     "multi_doc_synthesis_bench", "calibration_bench", "refactor_bench",
     "pragmatic_bench",
+    # v31 procedural axes (PRODUCTION as of 2026-05-09 v31 promotion).
+    # See V31_AXIS_WEIGHTS for active weights. Promoted out of SHADOW
+    # in this commit (reports/2026-05-09-v31-axis-promotion.md).
+    # Legacy axes that v31 replaces (math_bench / code_bench /
+    # reasoning_bench / ifeval_bench / etc.) are zeroed in
+    # BENCH_AXIS_WEIGHTS but still RUN for telemetry & broken-axis
+    # detection.
+    "v31_math_gsm_symbolic",
+    "v31_math_competition",
+    "v31_math_robustness",
+    "v31_code_humaneval_plus",
+    "v31_reasoning_logic_grid",
+    "v31_reasoning_dyval_arith",
+    "v31_long_context_ruler",
+    "v31_knowledge_multi_hop_kg",
+    "v31_ifeval_verifiable",
+    "v31_truthfulness_calibration",
+    "v31_consistency_paraphrase",
 )
 
 
@@ -1163,13 +1626,52 @@ KNOWLEDGE_SKILL_GROUP_SUB_AXES = (
 )
 
 
+SKILL_GROUP_AGGREGATION = os.environ.get("SKILL_GROUP_AGGREGATION", "bottom_half_mean")
+
+
+def _aggregate_skill_group_values(vals: list[float]) -> float:
+    """v30.6 (2026-05-09) — skill-group aggregator with saturation guard.
+
+    The default ``bottom_half_mean`` averages only the lower half of
+    sub-axis values (rounded up so n=5 -> bottom 3, n=3 -> bottom 2,
+    n=2 -> bottom 1). Saturated 1.0 sub-axes can no longer inflate the
+    group score: a code group at [0.78, 1.0, 1.0, 1.0, 1.0] now scores
+    mean(0.78, 1.0, 1.0)=0.93 (was mean(...)=0.96), and as more sub-
+    axes saturate the group converges to the LEAST-saturated sub-axis
+    rather than to 1.0.
+
+    Override via SKILL_GROUP_AGGREGATION:
+      * ``mean`` -- legacy v30.2 equal-weight mean (every sub-axis
+        contributes regardless of saturation).
+      * ``min`` -- the worst sub-axis dominates entirely. Aggressive
+        anti-saturation but unforgiving of probe noise on a single
+        sub-axis.
+      * ``bottom_half_mean`` (default) -- balance between the two.
+    """
+    if not vals:
+        return 0.0
+    mode = SKILL_GROUP_AGGREGATION
+    if mode == "mean":
+        return sum(vals) / len(vals)
+    if mode == "min":
+        return min(vals)
+    sorted_vals = sorted(vals)
+    k = max(1, (len(sorted_vals) + 1) // 2)
+    bottom = sorted_vals[:k]
+    return sum(bottom) / len(bottom)
+
+
 def _axis_skill_group_mean(
     student: dict,
     sub_axes: tuple[str, ...],
     broken_axes: set[str] | None = None,
 ) -> float | None:
-    """Equal-weighted mean of present (non-None) bench sub-axis
-    pass-fracs.
+    """Bottom-half mean (default) of present bench sub-axis pass-fracs.
+
+    See ``_aggregate_skill_group_values`` for the aggregation policy
+    knob. Function name kept as ``_axis_skill_group_mean`` for
+    backwards compat with the existing test suite — the default
+    semantics changed in v30.6 from ``mean`` to ``bottom_half_mean``.
 
     v30.2 (2026-04-29): preserves the broken-axes invariant from the
     pre-grouping era. When a sub-axis is in ``broken_axes`` (the
@@ -1195,7 +1697,7 @@ def _axis_skill_group_mean(
     vals: list[float] = []
     for ax in sub_axes:
         if broken_axes and ax in broken_axes:
-            # Broken sub-axis: drop from group mean to preserve the
+            # Broken sub-axis: drop from group score to preserve the
             # "broken axes don't penalize" invariant.
             continue
         v = _axis_bench_pass_frac(student, ax)
@@ -1204,7 +1706,7 @@ def _axis_skill_group_mean(
         vals.append(float(v))
     if not vals:
         return None
-    return sum(vals) / len(vals)
+    return _aggregate_skill_group_values(vals)
 
 
 # v30.2 — Skill-group registry. Each entry is
@@ -1413,7 +1915,8 @@ def compute_axes(student: dict, king_kl: float | None = None,
                  king_trace_nll: float | None = None,
                  king_kl_tail: float | None = None,
                  teacher_axes: dict[str, float | None] | None = None,
-                 broken_axes: set[str] | None = None) -> dict[str, float | None]:
+                 broken_axes: set[str] | None = None,
+                 canary_scores: dict[str, Any] | None = None) -> dict[str, float | None]:
     """Compute the raw per-axis values for one student dict.
 
     Pulled out of ``compute_composite`` so that the teacher sanity gate
@@ -1461,6 +1964,12 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "super_teacher": _axis_super_teacher(student, teacher_axes),
         "reasoning_density": _axis_reasoning_density(student),
     })
+    # v30.6 — held-out canary axes. Read the per-UID canary file
+    # (loaded by the caller and threaded as canary_scores). Each
+    # canary axis returns the raw pass_frac in [0, 1] or None when
+    # the axis didn't run in the most recent canary for this UID.
+    for canary_axis in CANARY_AXIS_TO_HELDOUT_KEY:
+        out[canary_axis] = _axis_canary(canary_scores, canary_axis)
     return out
 
 
@@ -1538,6 +2047,24 @@ def get_effective_axis_weights() -> dict[str, float]:
     for gate, registry in (
         (BENCH_AXES_IN_COMPOSITE, BENCH_AXIS_WEIGHTS),
         (ARENA_V3_AXES_IN_COMPOSITE, ARENA_V3_AXIS_WEIGHTS),
+        # v30.6 (2026-05-09, REVERTED in v30.7) — held-out canary axes.
+        # Default OFF in v30.7: putting public benchmarks in the score
+        # re-introduces the Goodhart trap (miners train to gsm8k /
+        # humaneval / etc directly). Canary axes are still computed by
+        # compute_axes (so axis_correlation.json + king_canary_streak
+        # gate keep working) but the gate + weights both default to
+        # zero, so they don't enter `worst` / `weighted`. To opt back
+        # in for an experiment, set both
+        # ``CANARY_AXES_IN_COMPOSITE=1`` AND ``CANARY_*_WEIGHT > 0``.
+        (CANARY_AXES_IN_COMPOSITE, CANARY_AXIS_WEIGHTS),
+        # v31 (2026-05-09) — v31 procedural axes promoted out of
+        # SHADOW. Default ON. The 11 v31 axes carry 0.50 of the
+        # composite weight (replacing 0.50 freed from the legacy
+        # ad-hoc bench surface), and are designed to be procedural-by-
+        # construction (no static item pools, no public-benchmark
+        # contamination risk). Set V31_AXES_IN_COMPOSITE=0 to revert
+        # to the v30.7 surface.
+        (V31_AXES_IN_COMPOSITE, V31_AXIS_WEIGHTS),
     ):
         if gate:
             weights.update({k: w for k, w in registry.items() if w > 0})
@@ -1747,7 +2274,8 @@ def compute_composite(student: dict, king_kl: float | None = None,
                       king_forking_rkl: float | None = None,
                       king_trace_nll: float | None = None,
                       king_kl_tail: float | None = None,
-                      teacher_axes: dict[str, float | None] | None = None) -> dict:
+                      teacher_axes: dict[str, float | None] | None = None,
+                      canary_scores: dict[str, Any] | None = None) -> dict:
     """Return per-axis and composite (worst-case + weighted mean) scores.
 
     We emit *both* aggregations so the validator can A/B them offline
@@ -1800,6 +2328,7 @@ def compute_composite(student: dict, king_kl: float | None = None,
         king_kl_tail=king_kl_tail,
         teacher_axes=teacher_axes,
         broken_axes=broken_axes,
+        canary_scores=canary_scores,
     )
     if reference_axes:
         axes = {
@@ -2382,11 +2911,17 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     king_entry = next((r for r in h2h_results if r.get("is_king")), None)
     if king_entry:
         king_model = king_entry.get("model")
+    # v30.6 — load the king's canary scores once so the king row's
+    # composite picks up real held-out axes; per-row canary loads
+    # happen below in the main loop.
+    king_canary = None
+    if king_entry is not None:
+        king_canary = load_canary_scores_for_uid(king_entry.get("uid"))
     king_raw_axes = None
     if king_model and king_model in students_data:
         king_raw_axes = compute_axes(
             students_data[king_model], king_kl, king_rkl,
-            broken_axes=broken, **king_refs_kwargs,
+            broken_axes=broken, canary_scores=king_canary, **king_refs_kwargs,
         )
 
     # 2026-04-29 (v29.3): which bench axes carry per-template breakdown.
@@ -2420,9 +2955,22 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         # reflects raw axis values (it's the anchor by definition).
         is_reference_row = (reference_model is not None and model == reference_model)
         ref_axes_for_call = None if is_reference_row else reference_axes_raw
+        # v30.6 — load this UID's canary scores. Reference row gets
+        # canary_scores=None so the reference's composite isn't anchored
+        # on a random king's canary; reference is the per-axis anchor
+        # for the baseline-relative penalty, NOT a general comparison.
+        # The king reuses the dict already loaded above for symmetry.
+        if is_reference_row:
+            entry_canary = None
+        elif entry is king_entry:
+            entry_canary = king_canary
+        else:
+            entry_canary = load_canary_scores_for_uid(entry.get("uid"))
         comp = compute_composite(
             students_data[model], king_kl, king_rkl,
-            broken, ref_axes_for_call, **king_refs_kwargs,
+            broken, ref_axes_for_call,
+            canary_scores=entry_canary,
+            **king_refs_kwargs,
         )
         # Note: compute_composite passes ``broken`` to compute_axes
         # internally so the group axes drop broken sub-axes.
@@ -2434,7 +2982,7 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         if king_raw_axes is not None and not entry.get("is_king"):
             challenger_raw_axes = compute_axes(
                 students_data[model], king_kl, king_rkl,
-                broken_axes=broken, **king_refs_kwargs,
+                broken_axes=broken, canary_scores=entry_canary, **king_refs_kwargs,
             )
             comp["pareto"] = compute_pareto_dominance(
                 challenger_raw_axes, king_raw_axes, include_shadow=True,
