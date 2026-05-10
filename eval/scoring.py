@@ -1,5 +1,4 @@
-"""
-Scoring logic: winner-take-all weights.
+"""Scoring logic: winner-take-all weights.
 
 - Winner-take-all: best KL miner gets ALL the weight (1.0), everyone else gets 0.0
 - No EMA — models are permanently committed, scores converge naturally
@@ -10,38 +9,14 @@ import json
 import logging
 from pathlib import Path
 
+from eval.state import _load_json, _sanitize_for_json, _save_json
+
 logger = logging.getLogger("distillation.scoring")
 
 STATE_DIR = Path("state")
 DEFAULT_MAX_KL = 2.0
 
-
-def _load_json(path: Path) -> dict:
-    """Load a JSON file, returning empty dict on missing/corrupt files."""
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def _sanitize_for_json(obj):
-    """Replace inf/nan floats with None so JSON serialization never fails."""
-    import math
-    if isinstance(obj, float):
-        return None if (math.isinf(obj) or math.isnan(obj)) else obj
-    if isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
-    return obj
-
-
-def _save_json(path: Path, data: dict):
-    """Save data as JSON, creating parent dirs as needed."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_sanitize_for_json(data), indent=2))
+__all__ = ["_load_json", "_sanitize_for_json", "_save_json"]
 
 
 # ── Scores ────────────────────────────────────────────────────────────────

@@ -27,7 +27,14 @@ def _sanitize_for_json(obj):
 
 
 def atomic_json_write(path, data, indent=None):
-    """Write JSON atomically: write to .tmp then os.replace (atomic on Linux)."""
+    """Write JSON atomically: write to .tmp then os.replace (atomic on Linux).
+
+    Parents are created if they don't exist. Sanitised first so inf/nan
+    floats don't blow up serialisation. Used by every helper in the
+    ``eval`` package and by the validator service for state files.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path = str(path)
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
@@ -36,7 +43,7 @@ def atomic_json_write(path, data, indent=None):
 
 
 def _load_json(path: Path, default=None):
-    """Load a JSON file, returning default on missing/corrupt files."""
+    """Load a JSON file, returning ``default`` (or {}) on missing/corrupt."""
     if default is None:
         default = {}
     if path.exists():
@@ -45,6 +52,11 @@ def _load_json(path: Path, default=None):
         except Exception:
             pass
     return default
+
+
+def _save_json(path: Path, data, indent=2):
+    """Atomic JSON write with default 2-space indent (back-compat alias)."""
+    atomic_json_write(path, data, indent=indent)
 
 
 # ── State file names (constants) ──────────────────────────────────────────

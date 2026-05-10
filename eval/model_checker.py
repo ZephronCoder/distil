@@ -754,9 +754,6 @@ TOKENIZER_TEST_STRINGS = [
     "日本語のテスト文字列です。Unicode handling matters.",
     "KL(P||Q) = Σ P(x) log(P(x)/Q(x)) for all x in vocabulary",
 ]
-_teacher_tokenizer = None
-
-
 def is_allowed_student_arch(
     model_type: str | None,
     archs: list[str] | None,
@@ -822,15 +819,6 @@ def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
         suffix = "no_preproc" if not preproc_present else "with_preproc"
         return True, f"{label}:{suffix}"
     return False, f"unsupported_or_unknown:{model_type}:{','.join(archs) if archs else 'none'}"
-
-
-def _get_teacher_tokenizer():
-    """Lazily load and cache the teacher tokenizer."""
-    global _teacher_tokenizer
-    if _teacher_tokenizer is None:
-        from transformers import AutoTokenizer
-        _teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
-    return _teacher_tokenizer
 
 
 _teacher_py_hashes_cache: Optional[dict[str, str]] = None

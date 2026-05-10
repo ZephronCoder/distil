@@ -537,14 +537,6 @@ JSON_OUT.parent.mkdir(parents=True, exist_ok=True)
 JSON_OUT.write_text(json.dumps(snapshot, indent=2, default=str)[:200000])
 
 
-def _short_json(obj, max_chars=5000):
-    try:
-        text = json.dumps(redact_value(obj), indent=2, default=str)
-    except Exception:
-        text = redact_text(str(obj))
-    return text[:max_chars]
-
-
 eval_log_lines = [
     "# Live Eval Log (auto-updated)",
     "",

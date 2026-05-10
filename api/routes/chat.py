@@ -220,9 +220,6 @@ def _normalize_chat_payload(payload: dict) -> dict:
 _CHAT_ORCHESTRATION_ENABLED = (
     os.environ.get("DISTIL_CHAT_ORCHESTRATION", "1") != "0"
 )
-_CHAT_QUALITY_FALLBACK_ENABLED = (
-    os.environ.get("DISTIL_CHAT_QUALITY_FALLBACK", "1") != "0"
-)
 
 _SN97_RE = re.compile(
     r"\b(sn\s?97|sn-97|subnet|king|leaderboard|miner|uid|eval|round|"
@@ -392,82 +389,6 @@ def _clean_client_messages(messages: list[dict], *, system: str, max_history: in
     return cleaned
 
 
-def _detect_repeated_line_run(text: str) -> bool:
-    lines = [ln.strip().lower() for ln in (text or "").splitlines() if ln.strip()]
-    if len(lines) < 4:
-        return False
-    seen = {}
-    for line in lines:
-        if len(line) < 18:
-            continue
-        seen[line] = seen.get(line, 0) + 1
-        if seen[line] >= 3:
-            return True
-    return False
-
-
-def _detect_repeated_short_tokens(text: str) -> bool:
-    tokens = re.findall(r"[A-Za-z]{3,24}", text.lower())
-    if len(tokens) < 24:
-        return False
-    for n in (1, 2, 3):
-        grams = {}
-        for i in range(0, len(tokens) - n + 1):
-            gram = tuple(tokens[i:i + n])
-            grams[gram] = grams.get(gram, 0) + 1
-            if grams[gram] >= 8:
-                return True
-    return False
-
-
-def _answer_looks_bad(text: str) -> bool:
-    if not text or len(text.strip()) < 8:
-        return True
-    if sum(1 for c in text if ord(c) > 127) / max(1, len(text)) > 0.03:
-        return True
-    if "</return>" in text or "```text\nsteady" in text.lower():
-        return True
-    if any(marker.lower() in text.lower() for marker in _DERAIL_MARKERS):
-        return True
-    if _detect_repeated_substring(text, win=60, step=20) >= 2:
-        return True
-    if _detect_repeated_line_run(text):
-        return True
-    if _detect_repeated_short_tokens(text):
-        return True
-    # The current weak kings often drift into all-caps first-person snippets.
-    words = re.findall(r"[A-Za-z]{2,}", text)
-    if len(words) >= 20:
-        upper = sum(1 for w in words if w.isupper())
-        if upper / max(1, len(words)) > 0.35:
-            return True
-    return False
-
-
-def _trim_derail(text: str, *, max_chars: int = 2400) -> str:
-    text = (text or "").strip()
-    for marker in _DERAIL_MARKERS:
-        idx = text.lower().find(marker.lower())
-        if idx > 80:
-            text = text[:idx].rstrip()
-    # Drop repeated lines while preserving the first occurrence.
-    out = []
-    seen = set()
-    for line in text.splitlines():
-        key = line.strip().lower()
-        if len(key) > 20 and key in seen:
-            continue
-        if key:
-            seen.add(key)
-        out.append(line.rstrip())
-    text = "\n".join(out).strip()
-    if len(text) > max_chars:
-        cut = text[:max_chars]
-        stop = max(cut.rfind("\n"), cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
-        text = (cut[: stop + 1] if stop > 400 else cut).rstrip()
-    return text
-
-
 def _live_sn97_context(user_text: str, king_uid: int | None, king_model: str | None) -> tuple[str, str | None]:
     """Return (thinking, deterministic answer if obvious)."""
     top4 = top4_leaderboard() or {}
@@ -560,20 +481,6 @@ def _model_info_answer(user_text: str) -> tuple[str, str] | None:
     if not fields:
         fields.append("- No detailed metadata was available in the cache/provider response.")
     return thought, f"Model info for `{model_path}`:\n" + "\n".join(fields)
-
-
-def _format_tool_context_for_display(tool_context: list[str], *, max_chars: int = 5000) -> str:
-    if not tool_context:
-        return ""
-    text = "\n\n".join(tool_context).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "\n... [tool output truncated]"
-    return (
-        "Runtime tool output (not model text):\n\n"
-        "```text\n"
-        f"{text}\n"
-        "```\n\n"
-    )
 
 
 def _strip_html_tags(text: str) -> str:
@@ -1038,58 +945,6 @@ else:
     return code.strip(), desc
 
 
-async def _call_quality_fallback(messages: list[dict], *, max_tokens: int = 700) -> str | None:
-    if not _CHAT_QUALITY_FALLBACK_ENABLED:
-        return None
-    key = (
-        os.environ.get("CHAT_FALLBACK_API_KEY")
-        or os.environ.get("DISTIL_TEACHER_API_KEY")
-        or os.environ.get("OPENROUTER_API_KEY")
-    )
-    if not key:
-        return None
-    base = (
-        os.environ.get("CHAT_FALLBACK_API_BASE")
-        or os.environ.get("DISTIL_TEACHER_API_BASE")
-        or "https://openrouter.ai/api"
-    ).rstrip("/")
-    model = (
-        os.environ.get("CHAT_FALLBACK_API_MODEL")
-        or os.environ.get("DISTIL_TEACHER_API_MODEL")
-        or "moonshotai/kimi-k2.6"
-    )
-    payload = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.25,
-        "top_p": 0.9,
-    }
-    if "openrouter" in base:
-        providers = tuple(
-            p.strip()
-            for p in os.environ.get("DISTIL_TEACHER_API_PROVIDERS", "").split(",")
-            if p.strip()
-        )
-        if providers:
-            payload["provider"] = {"only": list(providers)}
-        payload["reasoning"] = {"enabled": False}
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
-            resp = await client.post(f"{base}/v1/chat/completions", json=payload, headers=headers)
-            if resp.status_code >= 400:
-                return None
-            data = resp.json()
-            msg = (data.get("choices") or [{}])[0].get("message") or {}
-            return msg.get("content") or None
-    except Exception:
-        return None
-
-
 async def _prepare_orchestrated_chat(
     body: dict,
     king_uid: int | None,
@@ -1321,46 +1176,6 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
         ],
         "usage": usage,
     }
-
-
-def _stream_openai_response(data: dict):
-    async def generate():
-        choice = (data.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
-        base = {
-            "id": data.get("id"),
-            "object": "chat.completion.chunk",
-            "created": data.get("created"),
-            "model": data.get("model"),
-        }
-        reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
-        if reasoning:
-            yield "data: " + json.dumps({
-                **base,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "role": "assistant",
-                        "reasoning": reasoning,
-                        "reasoning_content": reasoning,
-                    },
-                    "finish_reason": None,
-                }],
-            }) + "\n\n"
-        content = msg.get("content") or ""
-        # Coarse chunks keep the implementation simple while preserving
-        # streaming semantics for Open-WebUI.
-        for i in range(0, len(content), 240):
-            yield "data: " + json.dumps({
-                **base,
-                "choices": [{"index": 0, "delta": {"content": content[i:i + 240]}, "finish_reason": None}],
-            }) + "\n\n"
-        yield "data: " + json.dumps({
-            **base,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        }) + "\n\n"
-        yield "data: [DONE]\n\n"
-    return _sse_response(generate())
 
 
 def _openai_sse_chunk(base: dict, delta: dict, *, finish_reason=None) -> str:
@@ -1756,73 +1571,6 @@ def _sse_response(generator) -> StreamingResponse:
         generator, media_type="text/event-stream",
         headers=_SSE_RESPONSE_HEADERS,
     )
-
-
-# ── Chat-side coherence helper (eval-side parity, kept for reference) ────────
-# These helpers used to feed an in-proxy truncator that we removed on
-# 2026-05-01 (chat.arbos.life is a transparent window — derail belongs
-# in the eval). Retained verbatim so any future re-enable can flip the
-# call site, and so the eval-side detector in pod_eval_vllm.py has a
-# textually identical sibling for cross-reference when tuning signals.
-
-def _coherence_factor_chat(text: str) -> float:
-    if not text:
-        return 1.0
-    text_len = len(text)
-    if text_len < 50:
-        return 1.0
-    non_ascii = sum(1 for c in text if ord(c) > 127)
-    non_ascii_frac = non_ascii / text_len
-    non_ascii_factor = max(0.0, 1.0 - min(1.0, non_ascii_frac * 4.0))
-    seen = set()
-    repeats = 0
-    for i in range(0, text_len - 50, 25):
-        s = text[i:i + 50]
-        if s in seen:
-            repeats += 1
-        seen.add(s)
-    repeats_factor = max(0.0, 1.0 - min(1.0, repeats * 0.05))
-    words = text.split()
-    n_words = len(words)
-    if n_words == 0:
-        return 0.0
-    long_words = sum(1 for w in words if len(w) > 50)
-    word_list_factor = max(
-        0.0, 1.0 - min(1.0, (long_words / n_words) * 1.5),
-    )
-    word_lens = [len(w) for w in words[:1000]]
-    mean_word_len = sum(word_lens) / max(1, len(word_lens))
-    meaningful_factor = max(
-        0.0, 1.0 - max(0.0, (mean_word_len - 20.0) * 0.1),
-    )
-    punct_chars = sum(1 for c in text if c in ".,;:?!\"'()[]{}—–-")
-    punct_frac = punct_chars / max(1, text_len)
-    if text_len < 600:
-        punctuation_factor = 1.0
-    elif punct_frac >= 0.015:
-        punctuation_factor = 1.0
-    else:
-        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.015))
-    norm_words = [w.strip(".,;:?!\"'()[]{}").lower() for w in words]
-    norm_words = [
-        w for w in norm_words
-        if w and w.replace("-", "").isalpha()
-    ]
-    if len(norm_words) >= 150:
-        unique_frac = len(set(norm_words)) / len(norm_words)
-        if unique_frac < 0.85:
-            unique_word_factor = 1.0
-        else:
-            unique_word_factor = max(
-                0.0, 1.0 - (unique_frac - 0.85) / 0.10,
-            )
-    else:
-        unique_word_factor = 1.0
-    coh = (
-        non_ascii_factor * repeats_factor * word_list_factor
-        * meaningful_factor * punctuation_factor * unique_word_factor
-    )
-    return max(0.05, min(1.0, coh))
 
 
 # ── Chat helpers ──────────────────────────────────────────────────────────────
