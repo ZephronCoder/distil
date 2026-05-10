@@ -1,50 +1,17 @@
-"""long_context_ruler - v31 procedural long-context axis (RULER).
+"""long_context_ruler - v31 long-context axis (RULER subset).
 
-Implements four of the **RULER** task families (Hsieh et al.,
-NVIDIA, ICLR 2024 spotlight; arXiv:2404.06654;
-github.com/NVIDIA/RULER, BSD-3-Clause). RULER's full suite has 13
-task families across 4 categories (Retrieval, Multi-hop Tracing,
-Aggregation, QA). We adopt the 4 that fit our 4-8K context budget
-and have mechanically computable gold:
+Four RULER tasks (Hsieh et al. NVIDIA, ICLR 2024; arXiv 2404.06654)
+chosen because they fit the 4-8K context budget our distilled models
+operate in:
 
-* ``niah_single`` (RULER's "single needle in haystack"):
-  hide one (key, value) pair in random distractor text; ask for
-  the value of the key.
-* ``niah_multikey`` (RULER's "multi-key needle"): hide N (key,
-  value) pairs; ask for the value of one specific key.
-* ``multihop_var`` (RULER's "variable tracking"): chain of
-  variable assignments A=X, B=A, C=B, ..., asks for the final
-  variable's value.
-* ``aggregation_count`` (RULER's "frequent words"): count the
-  occurrences of a specific keyword across distractor text.
+* ``niah_single``     - 1 (key, value) pair hidden in distractors.
+* ``niah_multikey``   - N pairs; ask for the value of one key.
+* ``multihop_var``    - variable-assignment chain; final value.
+* ``aggregation_count`` - count occurrences of a keyword.
 
-Why this is fully procedural and Goodhart-resistant:
-
-* Every haystack is freshly drawn from a procedural distractor
-  pool at validator round time. No two miners ever see the same
-  haystack.
-* Keys, values, variable chains are fresh per item. No
-  memorisation possible.
-* Distractor pool is a deliberately bland sentence pool (no
-  factual content); a model can't pattern-match its way to the
-  answer.
-
-Why we pick this subset of RULER:
-
-* The NVIDIA paper shows that even 4B-class models score 60-80%
-  on these 4 tasks at 4K context, dropping to 20-40% at 32K.
-  This range - 4-8K - is exactly where our distilled models
-  live, so the signal is meaningful.
-* The other RULER tasks (variable tracking >5 hops, common-words
-  aggregation in >32K context) don't fit our model's working
-  memory - including them would just measure refusal, not
-  capability.
-
-Validation methodology:
-* Run as SHADOW for ≥ 1 round.
-* Compute per-task pass rate (each task is independent).
-* Aggregate via mean.
-* Promote when correlation with held-out canary >= 0.5.
+Goodhart-resistant: haystacks/keys/values/chains are freshly sampled
+per round from a bland distractor pool, so memorisation is impossible
+and pattern-matching can't cheat.
 
 References:
 * Hsieh, C.-P., et al. (2024). "RULER: What's the Real Context

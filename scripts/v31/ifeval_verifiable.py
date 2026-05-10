@@ -1,49 +1,16 @@
-"""ifeval_verifiable — v31 procedural instruction-following axis.
+"""ifeval_verifiable - v31 instruction-following axis.
 
-Adopts the **full** Google IFEval kwarg surface (Zhou et al., 2023;
-arXiv 2311.07911) via the vendored grader at
-``scripts/ifeval_vendor.py`` (21 supported verifier types — covers all
-non-deprecated IFEval categories). Each round, items are composed by
-sampling 1-4 verifiers, generating procedural kwargs for each, and
-asking the model to answer a topic prompt that satisfies all
-constraints simultaneously.
+Composes 1-4 random verifiers from the Google IFEval kwarg surface
+(arXiv 2311.07911) via ``scripts/ifeval_vendor.py`` (21 verifier
+types). Each round samples kwargs and a topic prompt; the response is
+graded programmatically against every active constraint. With 21
+verifiers x kwarg ranges x topics x stack-depth (1-4), the per-round
+item space is ~10^8 — unmemorisable.
 
-Why this is fully procedural:
-
-* IFEval was designed from the start as **verifiable instructions**:
-  every constraint has a parametric kwargs spec (``num_words``,
-  ``forbidden_words``, ``num_paragraphs``, …) and a programmatic
-  checker. There's no "ground-truth answer" to memorise — the gold
-  is whether the response satisfies the constraints, which is
-  recomputed per-item from procedurally sampled kwargs.
-* The 21 verifier types × random kwarg ranges × random topic prompts
-  × random stack-depth (1-4 constraints) gives a per-round item space
-  on the order of 10^8 items. Memorisation is impossible.
-
-Why this is better than the existing ``_generate_ifeval_items``:
-
-* Current ``ifeval_bench`` uses 13 of the 21 verifiers with stack
-  depths {1, 2, 3}. This module uses **all 21 verifiers** with stack
-  depths {1, 2, 3, 4} — wider surface and harder tail.
-* Stack-depth weighted by frequency: 25 % single, 30 % 2-stack,
-  25 % 3-stack, 20 % 4-stack. The 4-stack tier matches IFEval's
-  toughest "compound" items.
-* Constraint conflict checking via ``ifeval_vendor`` (e.g., "all
-  lowercase" + "all uppercase" can't both be required).
-
-Validation methodology:
-* Run as SHADOW for ≥ 1 round.
-* Compute Pearson r between this axis's pass_frac and the held-out
-  ``canary_ifeval`` pass_frac across ≥ 4 paired UIDs.
-* Promote (set composite weight > 0) only if r ≥ 0.5.
-
-References:
-* Zhou, J., et al. (2023). "Instruction-Following Evaluation for Large
-  Language Models." arXiv:2311.07911 (Google).
-* IFEval reference impl:
-  github.com/google-research/google-research/tree/master/instruction_following_eval
-* Verifier conflict matrix: same paper's INSTRUCTION_CONFLICTS table,
-  ported in ``scripts/ifeval_vendor.py``.
+Stack-depth distribution: 25 % single, 30 % 2-stack, 25 % 3-stack,
+20 % 4-stack (matches IFEval's compound tail). Conflict checking via
+``ifeval_vendor.INSTRUCTION_CONFLICTS`` rejects e.g. "all lowercase"
++ "all uppercase".
 """
 
 from __future__ import annotations

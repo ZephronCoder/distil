@@ -1,52 +1,25 @@
-"""math_robustness - v31 procedural math-robustness axis (GSM-Plus + GSM-NoOp).
+"""math_robustness - v31 GSM-Plus + GSM-NoOp axis.
 
-Implements the **GSM-Plus** methodology (Li et al., ACL 2024;
-arXiv 2402.19255) **and** the **GSM-NoOp** methodology (Mirzadeh
-et al., Apple, 2024; arXiv 2410.05229) on top of our v31
-GSM-Symbolic generator. The two papers together cover the full
-robustness surface that frontier models still fail on:
+Five mechanically-graded perturbations layered on top of
+``v31_math_gsm_symbolic`` so a memoriser of canonical GSM wording
+fails here. References: GSM-Plus (Li et al., ACL 2024) and GSM-NoOp
+(Mirzadeh et al., Apple 2024).
 
-* GSM-Plus: 5-15 pp drop on perturbed variants (i.e. the model
-  was pattern-matching surface form, not doing maths).
-* GSM-NoOp: up to 65 pp drop when an irrelevant but
-  topically-aligned clause is injected (i.e. the model is
-  reading any number it sees as a problem variable, regardless
-  of whether the prose says so).
+Perturbations (all with mechanically derivable gold):
+* ``numerical_swap``: re-sample variable values; template recomputes
+  gold. Tests robustness to specific number choices.
+* ``digit_expand``: multiply all numbers by 10x/100x; gold scales.
+  Tests larger-magnitude digits.
+* ``context_pad``: prepend irrelevant story sentences. Gold unchanged.
+* ``unit_swap``: relabel units (dollars->euros, miles->km, ...).
+  Gold unchanged.
+* ``topical_distractor``: inject a topically-relevant but math-
+  irrelevant clause carrying a number that should NOT participate
+  (the GSM-NoOp signal — up to 65 pp drop on frontier models).
 
-We pick five perturbations that have **mechanically derivable
-gold** (so we don't need an LLM judge or manual annotation):
-
-* ``numerical_swap``: re-sample all variable values from a
-  shifted distribution; gold is recomputed by the template.
-  Tests robustness to specific number choices.
-* ``digit_expand``: multiply all numbers by 10x or 100x; gold
-  scales accordingly (templates are linear in counts/prices for
-  the most part, so the gold scales). Tests robustness to
-  larger-magnitude digits.
-* ``context_pad``: prepend 1-2 irrelevant story sentences before
-  the actual problem. Gold unchanged. Tests robustness to
-  context expansion (a known failure mode for short-context
-  4B models).
-* ``unit_swap``: change "dollars" to "euros" / "pounds",
-  "miles" to "kilometres", etc. Gold unchanged. Tests
-  robustness to unit relabeling.
-* ``topical_distractor`` (GSM-NoOp methodology, added 2026-05-09
-  second pass): inject a topically-relevant but mathematically
-  irrelevant clause that introduces a number which should NOT
-  participate in the calculation. E.g. "The bagels are typically
-  sold in packs of 4" appended to a problem about counting
-  bagels — a model that reads "any number = a problem
-  variable" will get the wrong answer. Apple's GSM-NoOp paper
-  reports up to 65 pp drop on frontier models for this
-  perturbation; it is the single most important robustness
-  signal in the literature.
-
-We deliberately *do not* implement the GSM-Plus "critical thinking"
-variant (where the answer is sometimes "cannot be determined" -
-that requires hand-annotation per template; it lives instead in
-``v31_truthfulness_calibration``) and "problem reversal" (which
-requires inverting the gold expression - more work for limited
-gain).
+GSM-Plus "critical thinking" lives in ``v31_truthfulness_calibration``
+(needs hand-annotation per template); "problem reversal" excluded as
+high-effort / low-yield.
 
 References:
 * Li, Q., et al. (2024). "GSM-Plus: A Comprehensive Benchmark

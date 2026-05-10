@@ -1,49 +1,19 @@
-"""knowledge_multi_hop_kg - v31 procedural multi-hop knowledge axis.
+"""knowledge_multi_hop_kg - v31 multi-hop KG axis.
 
-Per user directive: "if it can be memorized, it can be gamed".
-This axis is fully procedural - each item contains its own
-self-contained synthetic knowledge graph rendered as inline
-facts, and asks a multi-hop question that can only be answered
-by chaining through those facts. There is no reliance on the
-model's parametric world knowledge.
+Each item contains its own synthetic knowledge graph rendered as
+inline facts; the question can only be answered by chaining through
+those facts (no reliance on parametric world knowledge). Inspired by
+MuSiQue (Trivedi et al. TACL 2022) bottom-up chain composition and
+RULER's variable tracking generalised to relation names.
 
-Methodology, modeled after:
-
-* **MuSiQue** (Trivedi et al., TACL 2022; arXiv:2108.00573):
-  multi-hop QA constructed by chaining single-hop questions.
-  We adopt their **bottom-up chain composition**: build the
-  graph first, then derive the question from a chosen path.
-* **RULER multi-hop tracing** (Hsieh et al., NVIDIA, ICLR 2024):
-  variable assignment chains. We generalize from "v_a = v_b" to
-  arbitrary relation names ("parent_of", "located_in"), giving
-  more realistic surface form.
-* **AutoBencher** (Liu et al., Stanford 2024) and
-  **BenchAgents** (Shaikh et al., Microsoft, ICLR 2025):
-  declarative benchmark generation. Our generator declares
-  desired hop count, branching factor, and distractor density.
-
-Concretely, each item is built as follows:
-
-1. Generate N=12-20 entities with synthetic, non-real names
-   (so a 4B model can't pattern-match to a real-world fact
-   about Paris or Marie Curie).
+Per item:
+1. 12-20 entities with synthetic names.
 2. Pick a relation schema (family / location / employment).
-3. Build a connected graph of facts: for family,
-   parent_of/sibling_of, etc. The graph is acyclic for parent_of
-   and reflexively-symmetric for sibling_of.
-4. Pick a random "start" entity and walk a path of length 2-5
-   along the graph; the endpoint is the gold.
-5. Insert 5-15 distractor facts that don't lie on the chosen
-   path (procedurally generated and connected to other entities).
-6. Render all facts in randomized order; ask "Starting from X,
-   following the relations Y, Z, W, who/where is the result?"
-
-References:
-* Trivedi, H., et al. (2022). "MuSiQue: Multihop Questions via
-  Single-hop Question Composition." TACL.
-* Hsieh, C.-P., et al. (2024). RULER (NVIDIA). arXiv:2404.06654.
-* Liu, X., et al. (2024). AutoBencher.
-* Shaikh, A., et al. (2025). BenchAgents.
+3. Build a connected fact graph (acyclic for parent_of, symmetric for
+   sibling_of, etc.).
+4. Walk a 2-5 hop path; the endpoint is the gold.
+5. Add 5-15 off-path distractor facts.
+6. Render facts in random order; ask the chained question.
 """
 
 from __future__ import annotations

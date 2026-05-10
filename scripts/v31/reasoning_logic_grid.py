@@ -1,34 +1,11 @@
-"""reasoning_logic_grid - v31 procedural multi-attribute deduction axis.
+"""reasoning_logic_grid - v31 Zebra puzzle axis.
 
-Implements **Zebra puzzles** (a.k.a. Einstein puzzles, logic grids)
-as a procedural reasoning benchmark. Methodology follows LiveBench
-(White et al., ICLR 2025) and the original Zebra puzzle SAT
-generator (Heule, 2018).
-
-Why this is fully procedural:
-
-* Each puzzle samples (num_people, num_attributes,
-  attribute_domains) and a random permutation assigning attribute
-  values to positions in a 1D grid.
-* A small fixed set of ``num_clues`` constraint templates is filled
-  in with the actual ground-truth assignment, then a few are flipped
-  to negative ("X is NOT in position 3"). The set of clues yielded
-  is *just enough* for a unique solution; ambiguous draws are
-  rejected via a brute-force solver check.
-* The result has > 10^9 distinct items per smallest 4x3 config,
-  > 10^14 for 5x4. Memorisation is impossible.
-
-Validation methodology:
-* Run as SHADOW for >= 1 round.
-* Compute Pearson r between this axis and held-out canary_bbh.
-* Promote (assign composite weight) only if r >= 0.5.
-
-References:
-* Suzgun, M., et al. (2022). "Challenging BIG-Bench Tasks and
-  Whether Chain-of-Thought Can Solve Them." arXiv:2210.09261.
-* White, C., et al. (2024). "LiveBench: A Challenging,
-  Contamination-Limited LLM Benchmark." arXiv:2406.19314.
-* Heule, M. J. H. (2018). Zebra puzzle SAT generator (public).
+LiveBench-style Zebra (Einstein) puzzles. Each item samples
+(people, attributes, domains) and a ground-truth permutation, then
+emits a clue set that yields a unique solution (ambiguity rejected
+by a brute-force solver). Clue templates include negated forms
+("X is NOT in position 3"). Item space ~10^9 at 4x3, ~10^14 at 5x4
+— memorisation is impossible.
 """
 
 from __future__ import annotations

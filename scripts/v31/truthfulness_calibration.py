@@ -1,53 +1,18 @@
-"""truthfulness_calibration - v31 procedural calibration axis.
+"""truthfulness_calibration - v31 calibration axis.
 
-Implements **SimpleQA-style calibration scoring** (Wei et al.,
-OpenAI, Nov 2024; cdn.openai.com/papers/simpleqa.pdf and
-arXiv:2411.04368) on a fully procedural math+logic question
-distribution. The key innovation we adopt is the **three-way
-grading** (correct / incorrect / not-attempted), which directly
-penalizes the overconfidence failure mode that all frontier
-2025-2026 models exhibit on factuality benchmarks (HLE, SimpleQA
-Verified, etc).
+SimpleQA-style three-way grading (correct / incorrect / not-attempted)
+on procedural arithmetic items, applied to penalise the overconfidence
+failure mode (Wei et al., OpenAI 2024 — arXiv 2411.04368).
 
-Why this is fully procedural:
+Three families of items:
+* Determinate: one-step arithmetic from M1 vocab; gold is an integer.
+* Indeterminate: a key quantity is omitted; correct answer is
+  "cannot determine" (mirrors GSM-Plus critical-thinking).
+* Mixed: relevant + irrelevant numerical facts; only relevant used.
 
-* Items are sampled from three families of *procedurally
-  generated* problems where the gold can be (a) a definite integer
-  answer or (b) explicitly indeterminate (no answer / depends).
-  This mirrors GSM-Plus's "critical thinking" perturbation (Li et
-  al. 2024) where some problems have insufficient information and
-  the correct answer is "cannot be determined".
-
-* Determinate items: standard one-step arithmetic from M1 vocab.
-* Indeterminate items: missing-info variants where a key
-  quantity is omitted from the question, so the answer cannot
-  be derived without guessing.
-* Mixed items: a question with both relevant and irrelevant
-  numerical facts; correct answer requires using only relevant.
-
-Calibration scoring (per SimpleQA / Wei 2024):
-
-  score = correct_attempted - incorrect_attempted
-
-A model that abstains on hard items (says "I don't know" /
-explicit "cannot determine") gets ZERO on that item - not
-penalized for not knowing, but not rewarded either. A model that
-confidently produces a wrong answer is *penalized*.
-
-Empirical motivation (2026 research):
-* Wei et al. (OpenAI 2024) show GPT-4o is 10-15 pp overconfident
-  on factual questions vs. its actual accuracy.
-* The 2026 contamination audit (arXiv 2603.16197) found 72.5% of
-  MMLU questions trigger memorization signals - direct evidence
-  that "looks confident" != "actually knows".
-* HLE (Nature Jan 2026) explicitly reports "uncalibrated
-  overconfidence" as a central failure mode of frontier models.
-
-References:
-* Wei, J., et al. (2024). "Measuring short-form factuality in
-  large language models." OpenAI; arXiv:2411.04368.
-* Li, Q., et al. (2024). "GSM-Plus: A Comprehensive Benchmark
-  for Evaluating the Robustness of LLMs." ACL 2024.
+Score = correct_attempted - incorrect_attempted. Abstaining on hard
+items scores zero (not penalised); a confident wrong answer is
+penalised.
 * Phan, L., et al. (2026). "Humanity's Last Exam." Nature 649,
   1139-1146.
 * Lin, S., et al. (2022). "TruthfulQA: Measuring How Models

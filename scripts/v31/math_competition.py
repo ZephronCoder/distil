@@ -1,52 +1,13 @@
-"""math_competition - v31 procedural competition-math axis.
+"""math_competition - v31 competition-math axis.
 
-Implements **competition-style math problems** in the spirit of
-AMPS (Hendrycks et al., 2021), LiveBench-math (White et al.,
-ICLR 2025), and the 2026 MathArena methodology (Balunovic et al.,
-NeurIPS 2025; arXiv:2505.23281). Frontier models like Kimi K2.6
-report 96.4% on AIME 2026 and DeepSeek-R1 reports 79.8% on AIME
-2024 - so the competition-math signal is what separates SOTA
-reasoning models from baseline ones.
-
-We can't host the actual AIME / Putnam problems (they're public
-and contaminated). Instead we generate **procedural items in the
-same skill families** so the per-axis pass rate tracks the
-underlying capability without contamination risk.
-
-Skill families covered:
-
-* ``algebra/quadratic`` - solve ax^2 + bx + c = 0 for integer
-  roots; compute their sum or product.
-* ``algebra/system_2x2`` - solve a 2-variable linear system with
-  integer coefficients and integer solutions.
-* ``number_theory/divisibility`` - given N, find the smallest
-  k such that N+k is divisible by some d.
-* ``number_theory/gcd_lcm`` - compute gcd or lcm of 2-3
-  procedurally chosen integers.
-* ``combinatorics/permutations`` - count arrangements with
-  parametric constraints.
-* ``combinatorics/binomial`` - compute C(n, k) for small n, k.
-* ``geometry/area_perimeter`` - compute area or perimeter of a
-  composite figure with parametric dimensions.
-* ``probability/dice_coin`` - compute integer-numerator
-  probability of a parametric event.
-
-All gold answers are computed in Python so verification is exact.
-The gold space is integer-only or rational with small denominators
-(formatted as p/q for clarity).
-
-Note on AIME-style answers: AIME requires integer answers in
-[0, 999]. We respect this convention for items where it's natural
-(divisibility, gcd, combinatorics) and otherwise allow the natural
-integer answer.
-
-References:
-* Hendrycks, D., et al. (2021). "Measuring Mathematical Problem
-  Solving with the MATH Dataset." NeurIPS 2021.
-* Balunovic, M., et al. (2025). "MathArena: Evaluating LLMs on
-  Uncontaminated Math Competitions." NeurIPS 2025; arXiv:2505.23281.
-* White, C., et al. (2024). "LiveBench: A Challenging,
-  Contamination-Limited LLM Benchmark." arXiv:2406.19314.
+Procedural items in the AMPS / LiveBench-math / MathArena spirit
+(real AIME/Putnam problems are public and contaminated, so we
+generate skill-family items instead). Skill families:
+algebra (quadratic, 2x2 system), number theory (divisibility,
+gcd/lcm), combinatorics (permutations, binomial), geometry
+(area/perimeter), probability (dice/coin). Gold computed in Python,
+integer or small-denominator rationals (p/q). AIME-style answers in
+[0, 999] are respected where natural.
 """
 
 from __future__ import annotations

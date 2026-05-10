@@ -1,53 +1,15 @@
-"""math_gsm_symbolic — v31 procedural math axis (GSM-Symbolic methodology).
+"""math_gsm_symbolic - v31 GSM-Symbolic axis.
 
-Ports the GSM-Symbolic methodology (Mirzadeh et al., Apple, 2024;
-arXiv 2410.05229; github.com/apple/ml-gsm-symbolic) to our procedural
-bench-axis pipeline. The Apple paper's three core ideas are:
+Apple's GSM-Symbolic methodology (Mirzadeh et al. 2024, arXiv 2410.05229)
+re-implemented over our own template store:
+* Symbolic templates with named placeholders + variable-spec
+  constraints; gold computed in Python for exact cross-validator
+  agreement.
+* P0 / P1 / P2 difficulty knobs (extra independent sub-calculations).
+* Optional GSM-NoOp topical distractor (math-irrelevant clause).
 
-1. **Symbolic templates with named placeholders.** Each template is a
-   triple ``(question_text, variable_specs, gold_expression)``. The
-   variable specs name the placeholders (``{name}``, ``{x}``, ``{y}``,
-   ``{z}``…), declare each one's domain, and (optionally) declare
-   inter-variable constraints (``y < x``, ``z % gcd(x,y) == 0`` …).
-   The gold answer is computed in Python from the sampled variables,
-   so cross-validator agreement is exact (no rounding ambiguity).
-
-2. **P0 / P1 / P2 difficulty knobs.** Each template optionally provides
-   "extra clauses" that add 1 (P1) or 2 (P2) additional independent
-   sub-calculations. The gold answer scales accordingly. The Apple
-   paper showed SOTA models drop ~5–15 pp from P0 to P2.
-
-3. **GSM-NoOp distractor variant.** Inject a sentence that is
-   topically relevant but mathematically irrelevant. The correct
-   answer is unchanged; a model that pattern-matches "see number → use
-   number" gets the wrong answer. Apple reports up to 65 % drop on
-   GSM-NoOp for some SOTA models.
-
-This module exports ``generate_items(block_seed, n_items)`` returning a
-list of ``{src, question, gold}`` dicts compatible with the existing
-``_math_extract_answer`` / ``_math_score_one`` grading pipeline (gold
-is the string form of an integer; the prompt ends with the standard
-"#### N" answer-marker instruction).
-
-Why we re-implement instead of importing Apple's repo:
-
-* Apple's repo ships templates, not a Python API; bringing in the
-  template store wholesale is an 80 KB diff that depends on their
-  exact JSON schema. Re-implementing the methodology with our own
-  curated template set (~30 templates) is cleaner and keeps the
-  template store in our codebase under our own license.
-* Our existing ``_realistic_name`` / ``_synth_shop`` / ``_synth_item``
-  infrastructure (see ``scripts/pod_eval_vllm.py``) is reusable but
-  we avoid coupling to it here so this module is unit-testable
-  standalone. The wrapper in ``pod_eval_vllm.py`` re-exports our
-  realistic-name helpers if needed.
-
-Validation methodology (for the SHADOW → promote gate):
-
-* Run as SHADOW for ≥ 1 round.
-* Compute Pearson r between this axis's pass_frac and the held-out
-  ``canary_gsm8k`` pass_frac across ≥ 4 paired UIDs.
-* Promote (set composite weight > 0) only if r ≥ 0.5.
+Exports ``generate_items(block_seed, n_items)`` returning a list of
+``{src, question, gold}`` compatible with ``_math_score_one``.
 
 References:
 * Mirzadeh, I., Alizadeh, K., et al. (2024). "GSM-Symbolic:
@@ -113,20 +75,10 @@ def _item_plural(rng: random.Random) -> str:
     return rng.choice(_ITEMS_PRICED)[1]
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Template engine: each template is a function that takes an RNG and
-#  a difficulty level (0/1/2) and returns ``(question, gold_int)``.
-#
-#  The Apple repo uses a declarative JSON schema where the variable
-#  domain and the gold expression are fields on the template. We use
-#  Python closures instead because:
-#   1. Constraints between variables are expressed as Python ``if``
-#      statements during sampling (much more flexible than declarative
-#      domain rules);
-#   2. The P1/P2 extra clauses are most cleanly expressed as imperative
-#      "now also do X to the running total" statements.
-#  Both representations are isomorphic; the choice is ergonomic.
-# ─────────────────────────────────────────────────────────────────────
+# Template engine: each template is a Python closure taking
+# (rng, difficulty) and returning (question, gold_int). Closures over
+# JSON specs so inter-variable constraints and P1/P2 extras can use
+# imperative branching.
 
 
 GsmSymTemplate = Callable[[random.Random, int], tuple[str, int]]

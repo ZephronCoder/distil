@@ -1,53 +1,17 @@
-"""consistency_paraphrase - v31 cross-axis consistency axis.
+"""consistency_paraphrase - v31 paraphrase-pair consistency axis.
 
-Tests whether the model gives the **same answer** when the same
-underlying problem is rendered in two different surface forms.
-This directly probes the failure mode that GSM-Plus (Li et al.,
-ACL 2024) and the 2026 contamination audit (arXiv 2603.16197)
-identified: SOTA models drop 7-20 pp on average when surface
-wording changes, and DeepSeek-R1 specifically shows "anomalous
-distributed memorization" (76.6% partial reconstruction signature)
-- meaning the parametric knowledge is brittle to paraphrase.
+Each item is a (base, paraphrased) pair built from M1 GSM-Symbolic
+templates so the gold is mechanically computable. Score: 1.0 if the
+model answers both correctly, 0.5 if only one, 0.0 if neither.
 
-Methodology (post 2026-05-09 second-pass refinement):
-
-* Each item is a *pair*: a base problem and a paraphrased variant
-  that should have the same gold answer.
-* The model is asked to solve both. The axis score for the item
-  is 1.0 if the model gives the same (correct) answer to both,
-  0.5 if it answers correctly only on one, 0.0 if it fails both.
-* Crucially, *consistency-correctness* is more demanding than
-  per-item correctness: a model that flukes the right answer on
-  one phrasing but not the other gets penalised.
-
-We use M1 (GSM-Symbolic) templates as the base problem source
-because:
-* gold is mechanically computable, so we know consistency
-  doesn't need an LLM judge.
-* M1 templates are simple enough that paraphrase is mechanically
-  applicable (swap nouns, reorder clauses, add filler).
-* If a model gets M1 right but fails the paraphrase, that's a
-  pure surface-form-brittleness signal.
-
-The paraphrase generator applies a randomized combination of
-* **isomorphic name rotation** — replace each first name in the
-  base question with a different name from the same gender
-  inventory (added 2026-05-09 second pass; aligns with the
-  Isomorphic Perturbation Testing (IPT) defence proposed in the
-  RLVR reward-hacking paper, arXiv 2604.15149, which finds
-  RLVR-trained models do "instance enumeration over rule
-  learning" that fails under name swaps even when the maths is
-  unchanged);
-* unit relabeling (dollars -> euros, miles -> kilometres);
-* connector swaps ("then" -> "after that", "but" -> "however");
-* irrelevant context insertion at the start of the question;
-* word-order changes for the final question phrase.
-
-References:
-* Li, Q., et al. (2024). "GSM-Plus: A Comprehensive Benchmark
-  for Evaluating the Robustness of LLMs as Mathematical Problem
-  Solvers." ACL 2024; arXiv:2402.19255.
-* Mirzadeh, I., et al. (2024). "GSM-Symbolic." Apple.
+Paraphrase generator combines (randomized):
+* **Isomorphic name rotation** (IPT defence, RLVR reward-hacking paper
+  arXiv 2604.15149) — swap each first name with another from the same
+  gender inventory.
+* Unit relabeling (dollars -> euros, miles -> km).
+* Connector swaps ("then" -> "after that").
+* Irrelevant context prepended.
+* Word-order changes on the final question.
 * arXiv:2603.16197 (Mar 2026): "Lexical and behavioural
   contamination signatures across SOTA frontier models" -
   finding paraphrase-induced accuracy drops as evidence of

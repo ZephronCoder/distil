@@ -1,33 +1,11 @@
-"""reasoning_dyval_arith - v31 procedural DAG-arithmetic axis.
+"""reasoning_dyval_arith - v31 DyVal arithmetic-DAG axis.
 
-Implements the **DyVal** methodology (Zhu et al., ICLR 2024) for
-generating arbitrary-difficulty arithmetic / logic problems via
-random directed acyclic graphs of operations. Each problem is a
-DAG where leaf nodes hold concrete values and interior nodes apply
-a chosen op to their children, producing a new value. The "depth"
-and "width" of the DAG control difficulty independently.
-
-Why this is fully procedural and Goodhart-resistant:
-
-* Every problem is a fresh DAG sampled at validator round time.
-  The space of DAGs grows super-exponentially in (depth, width):
-  for d=4 width=2 there are > 10^12 distinct ASCII-encoded DAGs,
-  for d=6 there are > 10^20. Memorisation is impossible.
-* Difficulty is *fine-grained controllable*: we can ask "show me
-  problems at depth=5 width=2 only" and compare 4B-models on
-  exactly that capability slice. Useful for curriculum / sliced
-  promotion analysis.
-* Gold is computed programmatically (Python eval over the DAG),
-  giving exact ground truth without LLM-judge noise.
-* Surface form is intentionally rendered in two ways (math expr
-  and natural-language) per item to test surface invariance.
-
-References:
-* Zhu, K., et al. (2024). "DyVal: Dynamic Evaluation of Large
-  Language Models for Reasoning Tasks." ICLR 2024 spotlight.
-  arXiv:2309.17167.
-* Zhu, K., et al. (2024). "PromptBench" (Microsoft Research).
-* Validates against held-out canary_bbh and canary_gsm8k.
+DyVal methodology (Zhu et al. ICLR 2024 spotlight; arXiv 2309.17167):
+random DAGs of integer ops with leaf values; interior nodes apply an
+op to their children. Depth / width control difficulty. Gold is
+computed programmatically over the DAG; problems are rendered in both
+math-expression and natural-language form. Memorisation-impossible:
+DAG space grows ~10^12 at d=4/width=2 and >10^20 at d=6.
 """
 
 from __future__ import annotations
