@@ -6,26 +6,27 @@ import { CLIENT_API_BASE } from "@/lib/subnet";
 /**
  * Axes panel — composite breakdown for the king + top contenders.
  *
- * Data source rationale (REVISED 2026-04-27, pass #4): the previous
- * version fetched ``/api/h2h-latest``, which under single-eval mode
- * does NOT include the king (kings aren't re-scored each round). The
- * king (UID 123 today) was therefore missing from the dropdown and
- * the panel rendered empty for the operator's screenshot. Switched
- * to ``/api/leaderboard`` which returns the king + 4 contenders, all
- * with full per-axis composite. This is the canonical "five most
- * relevant miners right now" set — exactly what miners want to
- * compare themselves against.
+ * Data source: ``/api/leaderboard`` — king + 4 contenders with full
+ * per-axis composite. (We picked this over ``/api/h2h-latest``
+ * because under single-eval mode kings aren't re-scored every round,
+ * so they fall out of h2h-latest the moment they reign.)
+ *
+ * 2026-05-10 (v31.2): macro axes rebuilt around the 11 v31
+ * procedural axes (~50% of composite weight). The legacy v30.2
+ * skill-group lens is retired (the groups are now weight 0); v31's
+ * domain-aligned axes (math/code/reasoning/long-context/
+ * knowledge/truthfulness/calibration/consistency/IFEval) replace
+ * them at 30% lower per-axis SE.
  *
  * Tabs:
- *   RADIAL    — 6-spoke macro chart, primary + optional compare
- *   SCORES    — full 17-axis breakdown grouped by concern
+ *   RADIAL    — 7-spoke macro chart, primary + optional compare
+ *   SCORES    — full per-axis breakdown grouped by concern
  *   SAMPLES   — placeholder for per-prompt sample export (roadmap)
  *   BENCHMARKS — pointer to Bench tab
  *
- * Default primary = the current king. The Pareto chart from the
- * previous design is retired — too many dots, too little explanation.
- * The radial answers the question "where is THIS miner strong?"
- * which is what most users actually want.
+ * Default primary = the current king. The radial answers the
+ * question "where is THIS miner strong?" which is what most users
+ * actually want.
  */
 interface CompositePayload {
   // v30.2 ranking key (replaces ``worst`` as the dethrone gate).
@@ -77,21 +78,29 @@ interface LeaderboardResponse {
 }
 
 /**
- * v30.5 macro axis groups for the radial chart. These reflect the
- * current composite where:
- *  - FOUR SKILL GROUPS replace per-bench-axis weights (sub-axes still
- *    computed for telemetry but the GROUP is the ranking driver).
- *  - DISTILL: teacher-similarity cluster (KL, RKL, top_k_overlap, etc.)
- *  - QUALITY: judge_probe + long_form_judge + chat_turns_probe.
- *  - DISCIPLINE: length, degeneracy, capability, reasoning_density.
- *  - STAND-ALONE: tool_use, ifeval, calibration (orthogonal to groups).
+ * v31.2 macro axis groups for the radial chart.
  *
- * 2026-05-02 (v30.5): EXCEEDS-TEACHER (super_teacher) removed. By
- * construction a student matching the teacher's distribution cannot
- * exceed the teacher; every trained miner sat at exactly 0.00 since
- * launch, which both ruined the radar visualisation and wasted 10%
- * composite weight. Weight redistributed to math/reasoning/knowledge
- * skill groups.
+ * The radial is keyed to the 11 v31 procedural axes that now
+ * carry ~50% of composite weight. Each spoke aggregates the v31
+ * axis(es) for that domain plus any orthogonal probes (judge
+ * series, RKL/KL distillation, length/degeneracy discipline) that
+ * touch the same capability surface. Legacy v30.2 skill-group
+ * spokes have been retired alongside their composite weight.
+ *
+ *  - DISTILL: teacher-similarity cluster (KL, RKL, top_k_overlap).
+ *  - MATH: gsm_symbolic + competition + robustness (GSM-Plus +
+ *    GSM-NoOp distractor methodology).
+ *  - CODE: HumanEval+ (EvalPlus-style) + IFEval (structural
+ *    instruction-following).
+ *  - REASONING: logic_grid (zebra-puzzle) + dyval_arith (DAG
+ *    arithmetic) + long_context_ruler (NIAH).
+ *  - KNOWLEDGE: multi_hop_kg (procedural KG, 2-3 hop) +
+ *    consistency_paraphrase (IPT name-rotation).
+ *  - QUALITY: judge_probe + long_form_judge + chat_turns_probe.
+ *  - HONESTY: truthfulness_calibration (confidence calibration,
+ *    Brier score) + calibration_bench (refusal under unsolvable).
+ *  - DISCIPLINE: length + degeneracy + reasoning_density +
+ *    capability (generation hygiene).
  */
 const MACRO_AXES: { label: string; members: string[]; description: string }[] = [
   {
@@ -100,63 +109,63 @@ const MACRO_AXES: { label: string; members: string[]; description: string }[] = 
       "on_policy_rkl",
       "kl",
       "top_k_overlap",
-      "kl_is",
-      "forking_rkl",
-      "teacher_trace_plausibility",
-      "entropy_aware_kl",
-      "tail_decoupled_kl",
       "capability",
     ],
     description:
-      "How closely the student matches the teacher's distribution. Includes the canonical KL/RKL signals + v30/v30.3 research-backed shadow signals (top_k_overlap, IS-KL, forking-RKL, teacher-trace plausibility, entropy-aware KL, tail-decoupled KL).",
+      "How closely the student matches the teacher's distribution. Canonical KL + reverse-KL on student rollouts + top-K overlap. The largest single block of composite weight (~30%).",
   },
   {
     label: "MATH",
-    members: ["math_skill_group", "math_bench", "aime_bench", "robustness_bench"],
+    members: [
+      "v31_math_gsm_symbolic",
+      "v31_math_competition",
+      "v31_math_robustness",
+    ],
     description:
-      "v30.2 math_skill_group = mean of {math_bench, aime_bench, robustness_bench}. Sub-axes shown for transparency. The GROUP is what gates ranking.",
+      "v31 procedural math: gsm_symbolic (numeric/name/operand variants), competition (AMC/AIME-style + answer integrity), robustness (GSM-Plus + GSM-NoOp topical distractor injection).",
   },
   {
     label: "CODE",
     members: [
-      "code_skill_group",
-      "code_bench",
-      "mbpp_bench",
-      "debug_bench",
-      "correction_bench",
-      "refactor_bench",
+      "v31_code_humaneval_plus",
+      "v31_ifeval_verifiable",
     ],
     description:
-      "v30.2 code_skill_group = mean of {code_bench, mbpp_bench, debug_bench, correction_bench, refactor_bench}. Covers write-from-scratch + bug fixing + behavior-preserving refactor.",
+      "v31 code + verifiable instruction-following. humaneval_plus = EvalPlus-augmented test cases (sandbox-graded). ifeval_verifiable = constraint-driven IFEval (verifiable instruction adherence).",
   },
   {
     label: "REASONING",
     members: [
-      "reasoning_skill_group",
-      "reasoning_bench",
-      "multi_doc_synthesis_bench",
-      "long_context_bench",
+      "v31_reasoning_logic_grid",
+      "v31_reasoning_dyval_arith",
+      "v31_long_context_ruler",
     ],
     description:
-      "v30.2 reasoning_skill_group = mean of {reasoning_bench, multi_doc_synthesis_bench, long_context_bench}. Multi-step deduction + cross-document synthesis + needle-in-haystack.",
+      "v31 deductive + multi-step reasoning. logic_grid = zebra-puzzle constraint satisfaction. dyval_arith = arithmetic-on-DAG dynamic graphs (anti-memorisation). long_context_ruler = needle-in-haystack at variable context length.",
   },
   {
     label: "KNOWLEDGE",
-    members: ["knowledge_skill_group", "knowledge_bench", "pragmatic_bench"],
+    members: [
+      "v31_knowledge_multi_hop_kg",
+      "v31_consistency_paraphrase",
+    ],
     description:
-      "v30.2 knowledge_skill_group = mean of {knowledge_bench v2 (procedural fact-like reasoning), pragmatic_bench (theory-of-mind / scalar implicature / indirect-request)}.",
+      "v31 knowledge + cross-axis consistency. multi_hop_kg = procedural 2-3 hop knowledge graphs. consistency_paraphrase = isomorphic perturbation (IPT) name-rotation pairs to detect template-overfit.",
   },
   {
     label: "QUALITY",
     members: ["judge_probe", "long_form_judge", "chat_turns_probe"],
     description:
-      "Conversational quality. judge_probe: short-answer rubric (1-5 → [0,1]). long_form_judge: 300-500 word essay rubric (structure / depth / coherence / length). chat_turns_probe: 3-turn coherence.",
+      "Conversational quality. judge_probe: short-answer rubric (1-5 → [0,1]). long_form_judge: 300-500 word essay rubric (structure/depth/coherence/length). chat_turns_probe: 3-turn coherence.",
   },
   {
-    label: "STAND-ALONE",
-    members: ["tool_use_bench", "ifeval_bench", "calibration_bench"],
+    label: "HONESTY",
+    members: [
+      "v31_truthfulness_calibration",
+      "calibration_bench",
+    ],
     description:
-      "Capabilities kept separate from groups because they measure orthogonal skills: agentic Python (tool_use), instruction-following with structural constraints (ifeval), honest refusal under unsolvable items (calibration).",
+      "Honesty under uncertainty. truthfulness_calibration: confidence-calibrated answers (Brier score). calibration_bench: honest refusal on unsolvable items (50% of items have no valid answer).",
   },
   {
     label: "DISCIPLINE",
@@ -390,25 +399,26 @@ function RadialView({
       {/* Inline explainer */}
       <div className="mb-6 px-4 py-3 border border-border bg-[var(--surface-soft)] text-[12px] leading-relaxed max-w-3xl">
         <div className="text-[10px] uppercase tracking-[0.18em] text-meta mb-1">
-          How to read this — v30.2 scoring
+          How to read this — v31.2 scoring
         </div>
         <div className="text-foreground">
-          Each spoke is a <strong>macro-axis</strong> rolling up the v30.2
-          composite (skill groups + super_teacher + shadow axes). Outer
+          Each spoke is a <strong>macro-axis</strong> rolling up the v31.2
+          composite (11 procedural v31 axes + distillation + judge series + discipline). Outer
           ring = 1.0 (best), centre = 0 (worst). The amber polygon is{" "}
           {isKing ? <strong>the current king</strong> : "the selected miner"} (
           ♛ #{primary.uid}). The grey dashed polygon is the
           {compare ? " comparison miner" : " compare-target (pick one above to overlay)"}.
         </div>
         <div className="text-meta mt-2">
-          The v30.2 ranking key is{" "}
+          The v31.2 ranking key is{" "}
           <strong className="text-foreground num">composite.final</strong>{" "}
-          = {finalAlpha.toFixed(2)} × <code>worst_3_mean</code> +{" "}
+          = {finalAlpha.toFixed(2)} × <code>worst_5_mean</code> +{" "}
           {(1 - finalAlpha).toFixed(2)} × <code>weighted</code>. For this
           miner: final = {finalScore != null ? <strong className="text-foreground num">{finalScore.toFixed(3)}</strong> : "—"}{" "}
-          (worst_3_mean = {worst3 != null ? <span className="num">{worst3.toFixed(3)}</span> : "—"},{" "}
+          (worst_5_mean = {worst3 != null ? <span className="num">{worst3.toFixed(3)}</span> : "—"},{" "}
           weighted = {weighted != null ? <span className="num">{weighted.toFixed(3)}</span> : "—"}).
-          Legacy <code>worst</code> (single-axis min) ={" "}
+          Dethrone margin = 5% (v31.1 raised from 3% after the variance
+          reduction sweep). Legacy <code>worst</code> (single-axis min) ={" "}
           {worst != null ? <span className="num">{worst.toFixed(3)}</span> : "—"}{" "}
           (kept for back-compat — no longer the gate).
         </div>
@@ -662,14 +672,14 @@ function RadialLegend({
           </dt>
           <dd className="font-medium">
             {finalScore != null ? finalScore.toFixed(3) : "—"}{" "}
-            <span className="text-meta text-[10px]">v30.2 ranking key</span>
+            <span className="text-meta text-[10px]">v31.2 ranking key</span>
           </dd>
           <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
-            worst_3
+            worst_5
           </dt>
           <dd>
             {worst3 != null ? worst3.toFixed(3) : "—"}{" "}
-            <span className="text-meta text-[10px]">mean of 3 lowest</span>
+            <span className="text-meta text-[10px]">mean of 5 lowest (was 3 in v30.7)</span>
           </dd>
           <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
             weighted
@@ -722,7 +732,7 @@ function RadialLegend({
               {compFinal != null ? compFinal.toFixed(3) : "—"}
             </dd>
             <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
-              worst_3
+              worst_5
             </dt>
             <dd>{compWorst3 != null ? compWorst3.toFixed(3) : "—"}</dd>
             <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
@@ -741,8 +751,8 @@ function RadialLegend({
 
       <p className="text-[10px] text-meta leading-relaxed pt-3 border-t border-border">
         Macro-axis values are <strong className="text-foreground">means</strong>{" "}
-        of their constituent v30.2 sub-axes. The v30.2 ranker uses{" "}
-        <code>composite.final</code> = α·worst_3_mean + (1−α)·weighted
+        of their constituent v31.2 sub-axes. The v31.2 ranker uses{" "}
+        <code>composite.final</code> = α·worst_5_mean + (1−α)·weighted
         — see Scores tab for per-axis breakdown.
       </p>
     </div>
@@ -754,33 +764,32 @@ function RadialLegend({
 // ────────────────────────────────────────────────────────────────────
 
 /**
- * v30.2/v30.3 full axis breakdown organised by ranking-relevance:
- * - SKILL GROUPS (the v30.2 ranking drivers — sub-axes feed these but
- *   don't directly drive ranking)
- * - SUPER-TEACHER (v30.2 — incentivises beyond-teacher capability)
- * - TEACHER-SIMILARITY (production + research-paper shadow signals)
- * - QUALITY (judge probes, chat coherence)
- * - DISCIPLINE (length/degeneracy/density)
- * - STAND-ALONE CAPABILITY (kept separate from groups)
- * - SUB-AXES (still computed for telemetry — no direct ranking weight)
+ * v31.2 full axis breakdown organised by ranking-relevance.
+ *
+ * Top of the page: the 11 v31 procedural axes promoted into the
+ * composite on 2026-05-09 (~50% of weight). Then the distillation
+ * tier, judge series, discipline group, and the legacy/telemetry
+ * tail. Each axis row tells the user what its current composite
+ * weight does AND how to think about it.
  */
 const ALL_AXES: { key: string; group: string }[] = [
-  // Skill groups (v30.2)
-  { key: "code_skill_group", group: "Skill Groups" },
-  { key: "math_skill_group", group: "Skill Groups" },
-  { key: "reasoning_skill_group", group: "Skill Groups" },
-  { key: "knowledge_skill_group", group: "Skill Groups" },
-  // Teacher-similarity (live ranking axes)
+  // v31 procedural axes (promoted 2026-05-09; ~50% of composite)
+  { key: "v31_math_gsm_symbolic", group: "v31 · Math (procedural)" },
+  { key: "v31_math_competition", group: "v31 · Math (procedural)" },
+  { key: "v31_math_robustness", group: "v31 · Math (procedural)" },
+  { key: "v31_code_humaneval_plus", group: "v31 · Code (procedural)" },
+  { key: "v31_ifeval_verifiable", group: "v31 · Code (procedural)" },
+  { key: "v31_reasoning_logic_grid", group: "v31 · Reasoning (procedural)" },
+  { key: "v31_reasoning_dyval_arith", group: "v31 · Reasoning (procedural)" },
+  { key: "v31_long_context_ruler", group: "v31 · Reasoning (procedural)" },
+  { key: "v31_knowledge_multi_hop_kg", group: "v31 · Knowledge (procedural)" },
+  { key: "v31_truthfulness_calibration", group: "v31 · Honesty (procedural)" },
+  { key: "v31_consistency_paraphrase", group: "v31 · Honesty (procedural)" },
+  // Distillation tier (largest single block of composite weight)
   { key: "on_policy_rkl", group: "Teacher-Similarity" },
   { key: "kl", group: "Teacher-Similarity" },
   { key: "top_k_overlap", group: "Teacher-Similarity" },
   { key: "capability", group: "Teacher-Similarity" },
-  // Teacher-similarity (shadow axes — research-validated)
-  { key: "kl_is", group: "Shadow Distillation Axes" },
-  { key: "forking_rkl", group: "Shadow Distillation Axes" },
-  { key: "teacher_trace_plausibility", group: "Shadow Distillation Axes" },
-  { key: "entropy_aware_kl", group: "Shadow Distillation Axes" },
-  { key: "tail_decoupled_kl", group: "Shadow Distillation Axes" },
   // Quality
   { key: "judge_probe", group: "Quality" },
   { key: "long_form_judge", group: "Quality" },
@@ -789,11 +798,16 @@ const ALL_AXES: { key: string; group: string }[] = [
   { key: "length", group: "Discipline" },
   { key: "degeneracy", group: "Discipline" },
   { key: "reasoning_density", group: "Discipline" },
-  // Stand-alone capability
-  { key: "tool_use_bench", group: "Capability (Stand-Alone)" },
-  { key: "ifeval_bench", group: "Capability (Stand-Alone)" },
+  // Standalone calibration (still in composite at 0.05)
   { key: "calibration_bench", group: "Capability (Stand-Alone)" },
-  // Sub-axes (telemetry — fold into groups for ranking)
+  // Telemetry tier — RUN but composite weight 0
+  { key: "tool_use_bench", group: "Telemetry (composite weight 0)" },
+  { key: "ifeval_bench", group: "Telemetry (composite weight 0)" },
+  { key: "code_skill_group", group: "Telemetry (composite weight 0)" },
+  { key: "math_skill_group", group: "Telemetry (composite weight 0)" },
+  { key: "reasoning_skill_group", group: "Telemetry (composite weight 0)" },
+  { key: "knowledge_skill_group", group: "Telemetry (composite weight 0)" },
+  // Sub-axes (rolled up into telemetry skill groups)
   { key: "math_bench", group: "Sub-Axes (Telemetry)" },
   { key: "aime_bench", group: "Sub-Axes (Telemetry)" },
   { key: "robustness_bench", group: "Sub-Axes (Telemetry)" },
@@ -825,16 +839,17 @@ function ScoresView({
   return (
     <>
       <div className="mb-6 max-w-3xl text-[12px] text-meta leading-relaxed">
-        Full v30.2/v30.3 composite axis breakdown for{" "}
+        Full v31.2 composite axis breakdown for{" "}
         <strong className="text-foreground">
           {isKing && "♛ "}#{primary.uid}
         </strong>
         . The amber bar = primary; the grey marker = compare. The
         ranking key is{" "}
-          <code>composite.final = 0.7 × worst_3_mean + 0.3 × weighted</code>{" "}
-          — see the <strong>Skill Groups</strong> section first (those
-          are the ranking-relevant axes), then{" "}
-          <strong>Teacher-Similarity</strong>, then the rest.
+          <code>composite.final = 0.7 × worst_5_mean + 0.3 × weighted</code>{" "}
+          — see the <strong>v31 · Math/Code/Reasoning/Knowledge/Honesty</strong>{" "}
+          sections first (those carry ~50% of composite weight), then{" "}
+          <strong>Teacher-Similarity</strong>, then the rest. The{" "}
+          <strong>Telemetry</strong> tier still RUNS but composite weight is 0.
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-12 gap-y-6">
         {Array.from(new Set(ALL_AXES.map((a) => a.group))).map((grp) => (
@@ -869,33 +884,32 @@ function ScoresView({
  * when ``primary`` is null AND the axis isn't flagged eval-broken,
  * so users on the Axes tab don't have to guess whether a blank
  * score means "axis off" vs "data missing" vs "scoring error".
- *
- * Sebastian's report 2026-05-04: "kl and on policy rkl show blank
- * on the dashboard." Both have legitimate-but-non-obvious reasons
- * to be null right now (cold-start anchor missing for kl;
- * OpenRouter API teacher mode skips Phase B for on_policy_rkl
- * because the API only exposes top-K logprobs, not full token
- * distributions). The hints make that explicit.
  */
 const AXIS_NULL_HINTS: Record<string, string> = {
   on_policy_rkl:
-    "Disabled under the OpenRouter API teacher mode (Kimi-K2.6 cutover, 2026-05-02). On-policy reverse-KL needs the teacher's full per-token distribution to score the student's rollouts; the OpenAI logprobs spec only exposes top-K, which is enough for KL distillation but not for true RKL. Will become measurable again if/when we move back to a self-hosted teacher vLLM.",
+    "Disabled under the OpenRouter API teacher mode (Kimi-K2.6 cutover, 2026-05-02). On-policy reverse-KL needs the teacher's full per-token distribution to score the student's rollouts; the OpenAI logprobs spec only exposes top-K. Will become measurable again if/when we move back to a self-hosted teacher vLLM.",
   kl:
     "No king reference for this round yet (cold-start). The kl axis normalises against the king's KL; until a king is crowned this round, the axis is undefined. The next round will inherit the freshly-crowned king as the anchor.",
   degeneracy:
     "No degeneracy probe data — the round either disabled the probe or the student errored before the probe ran.",
   long_gen_coherence:
     "Long-form coherence probe not run for this row (probe disabled, student errored, or pre-probe-version snapshot).",
-  self_consistency_bench:
-    "Bench axis muted to weight 0 (v28 quality > quantity rebalance). Still computed for telemetry — appears as null when the round skipped this axis or the bench didn't return a value.",
-  arc_bench:
-    "Bench axis muted to weight 0 (v28). Telemetry-only.",
-  truthful_bench:
-    "Bench axis muted to weight 0 (v28). Telemetry-only.",
-  procedural_bench:
-    "Bench axis muted to weight 0 (v28). Telemetry-only.",
-  noise_resistance_bench:
-    "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  // Legacy bench axes (composite weight 0, telemetry-only)
+  self_consistency_bench: "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  arc_bench: "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  truthful_bench: "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  procedural_bench: "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  noise_resistance_bench: "Bench axis muted to weight 0 (v28). Telemetry-only.",
+  tool_use_bench:
+    "Retired from composite in v31.2 (2026-05-10) — the agentic-Python surface is already covered by v31_code_humaneval_plus + v31_math_competition. Still RUN as telemetry, but no longer touches composite or the dethrone gate.",
+  code_skill_group:
+    "Retired from composite in v31.2 (2026-05-10) after Discord feedback flagged its bottom_half_mean aggregation pulling in tiny-n axes (refactor n=4, debug n=6, correction n=6). Sub-axes still RUN as telemetry; v31_code_humaneval_plus replaces the group at 30% lower per-axis SE.",
+  math_skill_group:
+    "Retired in v31 (2026-05-09); v31_math_gsm_symbolic + v31_math_competition + v31_math_robustness replace it at higher per-axis n.",
+  reasoning_skill_group:
+    "Retired in v31 (2026-05-09); v31_reasoning_logic_grid + v31_reasoning_dyval_arith + v31_long_context_ruler replace it.",
+  knowledge_skill_group:
+    "Retired in v31 (2026-05-09); v31_knowledge_multi_hop_kg + v31_consistency_paraphrase replace it.",
   super_teacher:
     "Super-teacher axis removed in v30.5 (2026-05-02). Kept in the schema for backward compatibility with old snapshots.",
 };
@@ -1007,10 +1021,12 @@ function BenchmarksView({ primary }: { primary: MinerSummary }) {
       </p>
       <p className="text-meta text-[12px]">
         Those benches are <strong className="text-foreground">not</strong>{" "}
-        used by the validator&apos;s composite. The composite&apos;s bench
-        axes (math_bench, code_bench, etc.) are generated procedurally per
-        round from the block-seed and never use public datasets. See{" "}
-        <code>paper/benchmarks_as_north_star.md</code>.
+        used by the validator&apos;s composite. The composite&apos;s 11
+        v31 axes (gsm_symbolic, code_humaneval_plus, logic_grid, etc.)
+        generate items procedurally per round from the block-seed and
+        never use public datasets — that&apos;s the anti-Goodhart
+        defence. See <code>reports/2026-05-09-v31-axis-promotion.md</code>{" "}
+        and <code>docs/MINER_FAQ.md</code>.
       </p>
       <p className="text-meta text-[12px]">
         Currently selected: #{primary.uid} · {primary.model}.

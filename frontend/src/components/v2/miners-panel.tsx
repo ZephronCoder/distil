@@ -149,17 +149,17 @@ export function MinersPanel({
             <Th>#</Th>
             <Th>UID</Th>
             <Th>Model · revision</Th>
-            <Th align="right" title="composite.worst — the ranking key (lowest of 17 axes)">
+            <Th align="right" title="composite.worst — legacy single-axis min (kept for back-compat). The actual ranking key is composite.final = 0.7·worst_5_mean + 0.3·weighted.">
               Worst
             </Th>
-            <Th align="right" title="composite.weighted — the soft tiebreaker (Σ wᵢ·axisᵢ / Σ wᵢ)">
+            <Th align="right" title="composite.weighted — the weighted tier (Σ wᵢ·axisᵢ / Σ wᵢ)">
               Weighted
             </Th>
-            <Th title="The single axis bottlenecking this miner's composite.worst. Train data here to push it up.">
+            <Th title="The single axis bottlenecking this miner. Train data here to push it up — and into the worst_5_mean band.">
               Limiting axis
             </Th>
-            <Th align="right" title="KL axis only — one of 17, never the gate">
-              KL <span className="opacity-60">(1/17)</span>
+            <Th align="right" title="KL axis only — one of 25+, never the gate">
+              KL <span className="opacity-60">(1/25+)</span>
             </Th>
             <Th align="right">Age</Th>
           </tr>
@@ -261,12 +261,15 @@ export function MinersPanel({
       </table>
 
       <p className="text-[10px] text-meta mt-4 leading-relaxed max-w-2xl">
-        <strong className="text-foreground">Worst</strong> is the ranking key
-        (lowest of the 17 axes after dropping reference-broken axes).{" "}
-        <strong className="text-foreground">KL (1/17)</strong> is the
-        forward-KL axis only — one of seventeen, useful for sanity-checking
-        distillation but never the gate. A model that wins KL but loses on
-        grade-school math, IFEval, or reasoning-density cannot take the crown.
+        <strong className="text-foreground">Composite.final</strong> = 0.7·worst_5_mean
+        + 0.3·weighted is the v31.2 ranking key (worst_5_mean = mean of the
+        5 lowest axes after dropping reference-broken axes).{" "}
+        <strong className="text-foreground">Worst</strong> shown here is the
+        legacy single-axis min — kept for back-compat, no longer the gate.{" "}
+        <strong className="text-foreground">KL (1/25+)</strong> is the
+        forward-KL axis only — useful for sanity-checking distillation but
+        never the gate. A model that wins KL but loses on math, code,
+        reasoning, or IFEval cannot take the crown.
         Click any UID for the per-axis drill-down.
       </p>
     </div>

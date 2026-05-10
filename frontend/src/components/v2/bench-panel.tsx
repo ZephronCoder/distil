@@ -32,14 +32,15 @@ interface BenchmarkPayload {
    */
   composite_worst?: number | null;
   composite_weighted?: number | null;
-  /** v30.2 — composite.final is the new canonical ranking key
-   * (0.7·worst_3_mean + 0.3·weighted). Surfaced here so the dashboard
-   * shows ranking-relevant scores rather than the legacy worst-only.
+  /** v31.2 — composite.final is the canonical ranking key
+   * (0.7·worst_5_mean + 0.3·weighted). The API field is still
+   * named ``composite_worst_3_mean`` for back-compat but the math
+   * uses K=5 since v31.1.
    */
   composite_final?: number | null;
   composite_worst_3_mean?: number | null;
-  /** v30.2 — group axes (bench-axis collapses) and super_teacher
-   * (incentivize beyond-teacher). All in [0, 1], higher is better.
+  /** Legacy v30.2 group axes — composite weight 0 since v31.2.
+   * Kept on the API surface for back-compat with old snapshots.
    */
   axis_code_skill_group?: number | null;
   axis_math_skill_group?: number | null;
@@ -269,17 +270,21 @@ export function BenchPanel() {
         );
       })}
       <div className="col-span-2 sm:col-span-3 px-6 sm:px-9 py-4 border-t border-border text-[10px] text-meta leading-relaxed">
-        Auto-bench (lm-evaluation-harness, {limit ? `${limit}-item` : "subset"} cut)
-        on the current king. <strong className="text-foreground">None of these benches are inside the validator</strong> — pure transfer measurement. The composite eval runs different items (procedurally generated, block-seeded).
+        {king?.is_evalscope_full
+          ? "Full held-out evalscope sweep"
+          : `Auto-bench (lm-evaluation-harness, ${limit ? `${limit}-item` : "subset"} cut)`}
+        {" "}on the most recent king-tagged model.{" "}
+        <strong className="text-foreground">None of these benches are inside the validator</strong> — pure transfer measurement. The composite eval runs different items (procedurally generated, block-seeded).
         {king?.uid != null && (
           <>
             {" "}King: <strong className="text-foreground">UID {king.uid}</strong>{" "}
-            <span className="num">{king.model}</span>.
+            <span className="num">{king.model}</span>
+            {king.label ? ` (${king.label})` : ""}.
           </>
         )}
-        {evalscope && (
+        {evalscope && evalscope.uid !== king?.uid && (
           <>
-            {" "}Where the auto-bench couldn&apos;t complete a task, we fall back to the{" "}
+            {" "}Where this run couldn&apos;t complete a task, we fall back to the{" "}
             <strong className="text-foreground">{evalscope.label ?? "v28-full evalscope"}</strong>{" "}
             run on{" "}
             <span className="num">
@@ -289,8 +294,18 @@ export function BenchPanel() {
           </>
         )}
         {" "}A bench shown as <strong className="text-foreground">n/a</strong> means
-        neither source has data for it. The full held-out evalscope reports
-        live at <code className="font-mono">benchmark_results/v28-full/</code>.
+        no source has data for it (e.g. ARC + MMLU-Pro on the v18-full sweep, MMLU-Pro on the Qwen3.5-4B baseline).
+        Latest archived results live under{" "}
+        <code className="font-mono">benchmark_results/uid208_bench_20260509_160630/</code>;{" "}
+        run <code className="font-mono">scripts/run_king_benchmark.py</code> on a fresh king to refresh.
+        {teacher == null && (
+          <>
+            {" "}<strong className="text-foreground">Note:</strong> no teacher canary
+            is available post-cutover (Kimi K2.6 33B). Run{" "}
+            <code className="font-mono">scripts/run_teacher_benchmark.sh</code> against
+            an idle teacher pod to populate the Teacher row.
+          </>
+        )}
         {teacher?.label && /placeholder/i.test(teacher.label) && (
           <>
             {" "}<strong className="text-foreground">Note:</strong> the teacher
@@ -345,7 +360,7 @@ function CanaryStrip({ kings, reference }: CanaryStripProps) {
           </div>
         </div>
         <div className="text-[10px] text-meta italic max-w-[260px] text-right">
-          solid = held-out · dotted = composite.final (v30.2; falls back to .worst).
+          solid = held-out · dotted = composite.final (v31.2; falls back to .worst).
           ↯ flag = composite climbing while held-out drops below baseline.
         </div>
       </div>
@@ -378,10 +393,10 @@ function CanaryCell({
   const points: { score: number | null; uid: number | null; composite: number | null }[] = kings.map(
     (k) => {
       const s = pickScoreAndCount(k.benchmarks, k.counts, benchKey);
-      // v30.2 — prefer composite.final (the v30.2 ranking key) over
+      // v31.2 — prefer composite.final (the current ranking key) over
       // legacy composite.worst when both are present. The Goodhart
       // co-plot tracks the SAME score the validator uses to pick the
-      // king, so it must reflect ``final`` post-v30.2.
+      // king.
       const composite =
         typeof k.composite_final === "number"
           ? k.composite_final

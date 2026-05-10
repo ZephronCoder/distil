@@ -114,13 +114,13 @@ const PHASE_EXPLAINERS: Record<string, string> = {
   loading_student:
     "Loading the next student into vLLM (~1 min). Students score sequentially, one at a time.",
   scoring:
-    "Scoring the current student against the cached teacher logits. ~3 min/student typical. KL is one of 17 axes — the bench battery follows.",
+    "Scoring the current student against the cached teacher logits. ~3 min/student typical. KL is one of 25+ axes — the v31 procedural bench battery follows.",
   bench:
-    "Running the bench battery: math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness. Procedural items, block-seeded.",
+    "Running the bench battery: 11 v31 procedural axes (math gsm_symbolic / competition / robustness, code humaneval_plus, ifeval_verifiable, logic_grid, dyval_arith, long_context_ruler, knowledge_multi_hop_kg, truthfulness_calibration, consistency_paraphrase) + legacy telemetry axes. All items block-seeded.",
   composite:
-    "Computing composite.worst across 17 axes for every student. composite.worst is the ranking key.",
+    "Computing composite.final = 0.7·worst_5_mean + 0.3·weighted across 25+ axes. The v31 procedural axes carry ~50% of weight; v31.1 widened the worst-K mean from 3 to 5 for variance reduction.",
   king_select:
-    "Selecting the king (highest composite.worst, 3% margin to dethrone the incumbent).",
+    "Selecting the king (highest composite.final, 5% margin to dethrone — v31.1 raised from 3% on 2026-05-10).",
   weights:
     "Setting weights on chain. King gets 1.0, everyone else 0.0.",
   cleanup:

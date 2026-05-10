@@ -40,14 +40,15 @@ export const SCORE_EPSILON = subnetConfig.validator.epsilon;
 /**
  * Legacy KL-headline factor — kept for callers that haven't migrated to
  * the composite-first framing. The production ranking key is
- * `composite.worst` (see `scripts/validator/composite.py`); KL is one of
- * 17 axes, not the gate.
+ * `composite.final = 0.7·worst_5_mean + 0.3·weighted` (see
+ * `scripts/validator/composite.py`); KL is one of 25+ axes, not the gate.
  *
- * To dethrone the king under v28, a challenger must beat
- * `king.composite.worst` by at least `SCORE_EPSILON` (3% by default).
- * Use `compositeFloorToBeat(kingWorst)` for new code.
+ * To dethrone the king under v31.2, a challenger must beat
+ * `king.composite.final` by at least `SCORE_EPSILON` (5% as of
+ * 2026-05-10, raised from 3% in v31.1's variance-reduction sweep).
+ * Use `compositeFloorToBeat(kingFinal)` for new code.
  *
- * @deprecated Prefer composite-worst framing. Will be removed once all
+ * @deprecated Prefer composite-final framing. Will be removed once all
  * callers have migrated.
  */
 export const SCORE_TO_BEAT_FACTOR = 1 - SCORE_EPSILON;
