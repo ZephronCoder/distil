@@ -18,26 +18,13 @@ from scripts.validator.config import (
 logger = logging.getLogger("distillation.remote_validator")
 
 
-# Minimum number of prompts the king must have completed for a round's
-# results to be trusted for persistent state updates (top-4 leaderboard,
-# state.scores, model_score_history, h2h_tested_against_king).
-#
-# Background (2026-04-24): the round at block 8037177 ran on HuggingFace
-# fallback with the old PER_MODEL_TIMEOUT=600 and the king early-stopped
-# at 129/300 prompts. Because every write-path unconditionally stamped
-# `h2h_results` into persistent state, the broken round's partial-prompt
-# KLs (~0.06 scale, measured against ONLY 129 paired prompts) overwrote
-# the correct global scores (~0.2 scale) and the top-4 leaderboard picked
-# challengers by those corrupted KLs. Pete warned us to kill the round
-# before it wrote — we didn't, and the cleanup was painful. This gate
-# prevents a repeat: any round where the king's n_prompts_scored is below
-# this threshold is allowed to exist in h2h_history (marked `_invalid`)
-# but CANNOT overwrite the leaderboard or rewrite scores. The paired
-# t-test gate in results.py already enforces the same threshold for
-# dethronement (see MIN_PROMPTS_DETHRONE=100); this is a stricter gate
-# because the full-round leaderboard needs a higher bar than "eligible to
-# dethrone on one round" — partial pipes through composite axes amplify
-# noise on fewer axes.
+# Minimum prompts the king must complete for a round's results to be
+# trusted for persistent state updates (top-4 leaderboard, state.scores,
+# score_history, h2h_tested_against_king). Partial rounds are written to
+# h2h_history with ``_invalid`` but cannot overwrite the leaderboard or
+# scores. Stricter than the dethronement gate in results.py because the
+# full-round leaderboard needs a higher bar than single-round
+# dethronement.
 MIN_PROMPTS_FOR_LEADERBOARD = 150
 
 
@@ -116,15 +103,8 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
     """Update H2H state files: latest, history, tested-against-king."""
 
     n_challenger_results = sum(1 for r in h2h_results if not r.get("is_king"))
-    # 2026-05-04 — cold-start crowning is also a king change. Pre-fix
-    # this expression returned False whenever ``king_uid is None`` (the
-    # cold-start case after the Kimi cutover), which prevented the
-    # post-round path from announcing the first crown of a new era and
-    # left ``h2h_latest.king_changed=False`` / ``new_king_uid=None``,
-    # which the API surfaces as ``is_king=false`` on the dashboard even
-    # though the winner is in fact the live king. Fix: any transition
-    # to a non-None winner counts as a king change, regardless of
-    # whether there was a prior king to dethrone.
+    # Cold-start crowning (king_uid=None) is also a king change so the
+    # post-round path announces the first crown of a new era.
     if king_uid is None:
         king_changed = winner_uid is not None
     else:
@@ -145,7 +125,7 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                 found_kl = True
                 break
         if not found_kl:
-            # Winner not in h2h_results (e.g. king-failed promotion) — use global score
+            # Winner not in h2h_results (e.g. king-failed promotion).
             winner_kl_from_scores = state.scores.get(str(winner_uid))
             if winner_kl_from_scores and winner_kl_from_scores > 0:
                 effective_king_kl = winner_kl_from_scores
@@ -185,32 +165,18 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                 f"but DQ'd — {entry['dq_reason']}"
             )
 
-    # Determine if the king's paired-prompt count is sufficient for this
-    # round to be treated as canonical. king_per_prompt is None when the
-    # king failed entirely; otherwise it's a list of per-prompt KL means
-    # whose length is the number of prompts the king actually completed.
-    # See MIN_PROMPTS_FOR_LEADERBOARD docstring above for the 2026-04-24
-    # Pete-warned-us incident this prevents.
+    # Round canonicality: king must complete enough paired prompts.
     king_prompts_completed = len(king_per_prompt) if king_per_prompt else 0
-    # SINGLE_EVAL_MODE: the king is intentionally absent from this round
-    # (cross-round composite selector instead). king_uid is None and king
-    # never gets paired prompts — so the legacy "king must complete N
-    # prompts" canonicality check would mark every single-eval round as
-    # PARTIAL, refuse to advance h2h_latest.block, and trick
-    # _detect_resumable_round into treating the *just-applied* round as
-    # still in flight on the next epoch (the 2026-04-25 abort loop).
+    # SINGLE_EVAL_MODE: the previous king is intentionally absent (the
+    # cross-round composite selector picks next king); skip the paired
+    # threshold or every single-eval round would be flagged PARTIAL.
     try:
         from scripts.validator.single_eval import is_single_eval_mode as _is_single
         single_eval_active = bool(_is_single())
     except Exception:
         single_eval_active = bool(int(os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
-    # In single-eval mode the previous-round king is *intentionally* absent
-    # from this round's prompt evaluation (cross-round composite picks the
-    # next king). The legacy paired-prompt threshold is meaningless here, so
-    # treat the round as canonical as long as the actual challengers
-    # produced results. Detection: single-eval on AND king has zero paired
-    # prompts (which is exactly the deliberate-absence signal because
-    # process_results would have nulled king_uid before scoring).
+    # single-eval round with no king prompts -> canonical if any challenger
+    # results came back.
     single_eval_kingless = single_eval_active and king_prompts_completed == 0
     if single_eval_kingless:
         round_is_canonical = bool(h2h_results)
@@ -259,9 +225,8 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         "_min_prompts_for_leaderboard": MIN_PROMPTS_FOR_LEADERBOARD,
     }
 
-    # Only overwrite the canonical `h2h_latest` when the round is trustworthy.
-    # We still append to h2h_history so the dashboard can show the partial
-    # round (with a loud "invalid" flag) — useful for debugging and transparency.
+    # Overwrite canonical h2h_latest only on trustworthy rounds; partial
+    # rounds still get appended to h2h_history with the invalid flag.
     if round_is_canonical:
         state.h2h_latest = h2h_round
     state.h2h_history = [h for h in state.h2h_history if not (h.get("block") == current_block and h.get("_preliminary"))]
@@ -269,9 +234,7 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
     state.h2h_history = state.h2h_history[-50:]
     state.save_h2h()
 
-    # Only update "tested against king" tracker on canonical rounds — a partial
-    # round shouldn't mark a challenger as "already tested this king" because
-    # the paired test wasn't meaningful.
+    # Tested-against-king tracker only on canonical rounds.
     if round_is_canonical and king_uid is not None:
         for uid in challengers:
             uid_str = str(uid)
@@ -284,14 +247,9 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         atomic_json_write(state._path("h2h_tested_against_king.json"),
                           state.h2h_tested_against_king, indent=2)
 
-    # ── King regression streak (2026-04-24, SHADOW) ────────────────────
-    # leeroyjkin / distil-97: king camps the crown when it regresses on
-    # bench axes because the composite is only a veto, never a defense.
-    # Track consecutive "at risk" rounds (king.worst < floor OR <
-    # base model.worst). Purely telemetry today; flips to force
-    # dethronement once ``KING_REGRESSION_GATE=1`` after we have data.
-    # Only run on canonical rounds — a partial round's composite is
-    # meaningless for this check.
+    # King regression streak: count consecutive "at risk" rounds (king.worst
+    # below floor or below base.worst). Telemetry-only until KING_REGRESSION_
+    # GATE=1; canonical rounds only.
     if round_is_canonical and effective_king_uid is not None:
         try:
             king_row = next(
@@ -309,30 +267,10 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                     if k in (king_key, str(king_uid) if king_uid is not None else None)
                 }
                 if king_changed:
-                    # 2026-05-04 (Sebastian's "scores worse than 4B" report):
-                    # the cold-start crowning path picks the best-by-worst
-                    # candidate even when nobody clears KING_COMPOSITE_FLOOR
-                    # — exactly what happens after the Kimi cutover, where
-                    # the entire cohort scores judge_probe ≈ 0 and the
-                    # winning king has worst = 0.000. Pre-fix this would
-                    # then START the regression streak at 0 + 1 = 1, so it
-                    # took THREE more at-risk rounds before the floor
-                    # waived and a slightly-better challenger could
-                    # dethrone — meanwhile the chat king produced word-
-                    # salad loops the whole time and the dashboard's
-                    # composite numbers stayed pinned to 0.0.
-                    #
-                    # Fix: when we crown a king who is ALREADY at-risk,
-                    # seed the streak at MIN_STREAK − 1 so this round's
-                    # at_risk increment immediately reaches MIN_STREAK
-                    # and ``_king_regression_floor_waived`` returns True
-                    # next round. A genuinely-improved challenger (e.g.
-                    # UID 125 worst=0.125 vs UID 190 worst=0.000) can
-                    # then dethrone after a single round of regression,
-                    # not four. Healthy fresh kings still start at 0
-                    # (no waiver) — only the bad-king cold-start case is
-                    # short-circuited. Min-streak floor of 0 keeps this
-                    # safe even if the env var is set to 1.
+                    # When crowning a king that is ALREADY at-risk (cold-start
+                    # cohort score=0 case), seed the streak at MIN_STREAK-1 so
+                    # the next at_risk increment immediately reaches the floor
+                    # waiver. Healthy fresh kings still start at 0.
                     if at_risk:
                         try:
                             from scripts.validator.composite import (
@@ -360,9 +298,7 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                         f"worst={health.get('king_worst'):.3f} "
                         f"(floor={health.get('floor')}) — streak reset."
                     )
-                # Persist the streak. save_h2h() above ran before this block
-                # so the in-memory mutation wouldn't hit disk without this
-                # second write. atomic_json_write is cheap on a 2-key dict.
+                # Persist the streak (save_h2h ran above; this second write is cheap).
                 atomic_json_write(
                     state._path("king_regression_streak.json"),
                     state.king_regression_streak,
@@ -371,12 +307,9 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         except Exception as exc:
             logger.warning(f"king_regression_streak update failed (non-fatal): {exc}")
 
-    # ── King canary streak (2026-04-28) ────────────────────────────────
-    # Held-out evalscope regression tracker. Sibling of king_regression_
-    # streak above; reads benchmark JSONs (out-of-band canary) instead
-    # of validator-internal composite. When both gates are active and
-    # either streak >= its min, the composite-floor veto is waived for
-    # this king (results.py::_king_regression_floor_waived).
+    # King canary streak: held-out evalscope regression tracker (sibling of
+    # king_regression_streak above). Either streak >= its min waives the
+    # composite-floor veto when both gates are active.
     if round_is_canonical and effective_king_uid is not None:
         try:
             from scripts.validator.composite import (
@@ -435,12 +368,8 @@ _COPY_LIKE_DQ_PATTERNS = (
 
 
 def _is_copy_like_dq(reason: str) -> bool:
-    """Return True when a DQ reason indicates a "copy" of another model (same
-    weights or near-identical activation fingerprint), as opposed to a genuine
-    quality/integrity failure. Copy DQs should not auto-ban the model itself
-    from future consideration — only the specific late-committed duplicate is
-    penalised in the round.
-    """
+    """True iff ``reason`` reads like a copy-of-another-model DQ (same weights
+    or near-identical activations), rather than a quality/integrity failure."""
     if not isinstance(reason, str):
         return False
     lowered = reason.lower()
@@ -468,13 +397,9 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
         if uid_str in state.scores and state.scores[uid_str] > 0:
             kl = state.scores[uid_str]
             prev = state.model_score_history.get(model_name, {})
-            # 2026-04-24 (distil-97): a past rollback persisted {"best_kl": null,
-            # "best_kl_before_rollback_*": <float>} for ~500 entries. Plain
-            # ``prev.get("best_kl", float("inf"))`` returned None (default is
-            # only used for missing keys, not for explicit None values), and
-            # ``kl < None`` blew up every epoch with the infamous EPOCH ERROR:
-            # '<' not supported between instances of 'float' and 'NoneType'.
-            # Collapse None to inf/0 sentinels so the comparisons stay total.
+            # Collapse explicit-None best_kl/worst_kl to inf/0 sentinels so
+            # ``kl < None`` comparisons stay total (a past rollback persisted
+            # nulls).
             if kl <= MAX_KL_THRESHOLD:
                 prev_best_raw = prev.get("best_kl")
                 prev_best = float("inf") if prev_best_raw is None else prev_best_raw
@@ -506,12 +431,8 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
                     continue
                 dq_reason = _get_dq_reason_for_uid(uid, info, state.dq_reasons)
                 if dq_reason and _is_copy_like_dq(dq_reason):
-                    # Copy-like DQs (activation-space duplicate, identical weights) set
-                    # score=3.0 as a penalty, but the model itself may be perfectly valid
-                    # — it's just the same as a previously-submitted one. Banning the
-                    # model permanently here was the side-effect that wrongly-DQ'd
-                    # previous kings (UID 174/183/165 on 2026-04-18) from ever being
-                    # re-evaluated after the DQ was cleared. Skip it.
+                    # Copy-like DQs set score=3.0 as a penalty but the model
+                    # itself may be valid; don't perm-ban it.
                     logger.info(
                         f"  skipping perm-ban of {model_name} (UID {uid}) — "
                         f"DQ is copy-like: '{dq_reason[:80]}...'"
@@ -528,15 +449,10 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
 def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl,
                             h2h_results, uid_to_model, valid_models, current_block,
                             epoch_count, disqualified):
-    """Update the top-4 leaderboard (initial eval → maintenance transition).
+    """Update the top-4 leaderboard (initial eval -> maintenance transition).
 
-    Guard (2026-04-24): if the round that produced ``h2h_results`` is flagged
-    ``_invalid_for_leaderboard`` on ``state.h2h_latest`` (see
-    ``MIN_PROMPTS_FOR_LEADERBOARD`` above), skip the leaderboard overwrite
-    entirely. Partial-prompt KLs are on a different scale than full-round
-    KLs and silently clobbering the leaderboard with them is exactly what
-    caused the 2026-04-24 contender-selection regression.
-    """
+    Skips the overwrite when ``state.h2h_latest._invalid_for_leaderboard`` is
+    set (partial-prompt KLs would silently clobber the leaderboard scale)."""
     latest = getattr(state, "h2h_latest", None) or {}
     if latest.get("_invalid_for_leaderboard"):
         logger.warning(
@@ -548,22 +464,9 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
 
     try:
         if state.top4_leaderboard.get("phase") == "initial_eval":
-            # 2026-05-04 — auto-promote to maintenance as soon as a winner
-            # actually emerges from a canonical round. The legacy
-            # "wait until 4 tested + zero untested" gate was designed
-            # for a stable network-wide pool and never fires after a
-            # teacher cutover (post-Kimi the network has hundreds of
-            # untested commitments because everyone needs to retrain
-            # from scratch — `untested_count` is permanently in the
-            # hundreds). The symptom Sebastian reported on 2026-05-04:
-            # h2h_latest.king_uid=188 (correctly persisted) AND
-            # recent_kings=[188] (correctly emitting weights), but
-            # top4_leaderboard.king=None (still phase=initial_eval), so
-            # the API endpoint at `/api/miners/{uid}` reads
-            # `top4.king.uid` and reports `is_king=false` for UID 188
-            # → the dashboard never crowns the first Kimi-era king.
-            # Auto-promotion fires when there's a real winner with a
-            # real KL.
+            # Auto-promote to maintenance as soon as a canonical round
+            # produces a real winner; the legacy "wait for 4 tested + zero
+            # untested" gate never fires post-teacher-cutover.
             if winner_uid is not None:
                 winner_kl_for_lb = next(
                     (r.get("kl") for r in h2h_results if r.get("uid") == winner_uid),
@@ -624,11 +527,7 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
                     "uid": int(tested_results[0][0]), "model": tested_results[0][2],
                     "h2h_kl": round(tested_results[0][1], 6), "block": current_block,
                 }
-                # Track up to TOP_N_ALWAYS_INCLUDE-1 contenders (slot 0 is the king).
-                # Bumped from 4 → 6 (TOP_N=7) on 2026-04-24 after leeroyjkin pointed
-                # out that only 4 contenders + king left too few "sticky" slots,
-                # which meant older good models rotated out of the leaderboard too
-                # fast and never came back for re-evaluation.
+                # Up to TOP_N_ALWAYS_INCLUDE-1 contenders (slot 0 is the king).
                 contender_cap = max(1, TOP_N_ALWAYS_INCLUDE - 1)
                 state.top4_leaderboard["contenders"] = [
                     {"uid": int(tested_results[i][0]), "model": tested_results[i][2],

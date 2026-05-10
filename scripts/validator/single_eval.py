@@ -1,21 +1,9 @@
-"""Single-eval mode helpers — one registration -> one commitment -> one eval.
+"""Single-eval mode: one registration -> one commitment -> one eval.
 
-When ``SINGLE_EVAL_MODE=1`` (the production default since 2026-04-25):
-
-* ``select_challengers`` only returns UIDs whose current commitment hasn't
-  been composite-scored yet.
-* ``add_top5_contenders`` / ``add_dormant_rotation`` / ``cap_challengers``
-  / ``assert_top_contenders_present`` are no-ops — there is no
-  "re-eval slot" to fill.
-* ``plan_round`` does NOT seat the king. Rounds contain only new
-  submissions plus the always-in reference baseline.
-* The king is selected cross-round from ``state.composite_scores`` by
-  ``composite.final``, not from a per-round paired t-test.
-
-Spam is controlled by the on-chain registration burn cost rather than a
-per-round cap. Flipping the flag back falls back to the legacy
-re-eval-every-round path.
-"""
+When SINGLE_EVAL_MODE=1 (production default), rounds contain only new
+submissions + the reference baseline; the king is picked cross-round
+from state.composite_scores by composite.final. The legacy re-eval
+path is restored by flipping the flag back off."""
 
 from __future__ import annotations
 
@@ -35,33 +23,23 @@ logger = logging.getLogger("distillation.remote_validator")
 
 
 def is_single_eval_mode() -> bool:
-    """Return True when the env flag enables single-eval policy.
-
-    Read each call rather than at import time so we can unit-test the on/off
-    paths via ``monkeypatch.setenv`` without re-importing the module.
-    """
+    """True when SINGLE_EVAL_MODE=1 (read each call so tests can flip it)."""
     return policy_env("SINGLE_EVAL_MODE", "0") == "1"
 
 
-# Composite.final margin a challenger must clear to dethrone the current
-# king. Live default 0.05 (5%) — bumped from 0.03 in v31.2 after the
-# 2026-05-09 variance-reduction sweep showed paired KL noise above the
-# 3% floor. Override via ``SINGLE_EVAL_DETHRONE_MARGIN`` env or policy.
+# Composite.final margin a challenger must clear to dethrone the king
+# (live default 0.05; variance-reduction sweep raised the floor above 3%).
 SINGLE_EVAL_DETHRONE_MARGIN = float(
     policy_env("SINGLE_EVAL_DETHRONE_MARGIN", "0.05")
 )
 
 
-# Per-round cap on never-evaluated commitments. Forces oldest-first FIFO
-# rotation by ``commit_block`` so a backlog can't bloat any single round
-# into a multi-hour wallclock fire. Default 10 ≈ 60–75 min on H200.
+# Per-round cap on never-evaluated commitments (FIFO by commit_block).
 SINGLE_EVAL_MAX_PER_ROUND = int(policy_env("SINGLE_EVAL_MAX_PER_ROUND", "10"))
 
 
-# When ``worst`` (min over axes) is ≤ this epsilon, treat the UID as
-# floor-saturated and use ``weighted`` as the tiebreaker. Without this an
-# incumbent at worst=0.0 (single zero-axis e.g. mbpp pass_frac=0) can
-# never be dethroned by another floor-saturated challenger.
+# When worst <= this epsilon, treat the UID as floor-saturated and break
+# ties on ``weighted`` (otherwise a floor-saturated incumbent is unbeatable).
 SINGLE_EVAL_WORST_FLOOR_EPSILON = float(
     policy_env("SINGLE_EVAL_WORST_FLOOR_EPSILON", "0.005")
 )
@@ -75,20 +53,8 @@ def _composite_record_from_payload(
     block: int | None,
     extras: dict | None = None,
 ) -> dict:
-    """Build a normalised composite record from an h2h ``composite`` payload.
-
-    Both ``merge_composite_scores`` (live round results) and
-    ``_seed_one_h2h_round`` (bootstrap from saved H2H rounds) need to
-    project the on-the-wire ``composite`` dict into the canonical
-    on-disk record shape. Centralising the projection keeps the two
-    paths in lockstep — a new field added to one is automatically
-    visible in the other and on every record we persist.
-
-    ``extras`` is merged in last so callers can stamp path-specific
-    fields (``broken_axes`` / ``version`` / ``present_count`` for the
-    live path, ``_bootstrapped`` for the seed path) without
-    duplicating the float-coercion boilerplate.
-    """
+    """Project an h2h ``composite`` payload into the canonical on-disk record.
+    ``extras`` is merged in last so callers can stamp path-specific fields."""
     def _maybe_float(value):
         if value is None:
             return None
@@ -119,12 +85,7 @@ def _composite_record_from_payload(
 
 
 def _commit_signature(info: dict | None) -> tuple:
-    """Return a tuple that uniquely identifies a commitment.
-
-    Two commitments at the same UID are considered "different" if any of
-    (model, revision, commit_block) changes. Used to decide whether a stored
-    composite score is still valid for the current on-chain commitment.
-    """
+    """Unique-commitment tuple (model, revision, commit_block)."""
     if not info:
         return ("", "", None)
     return (
@@ -138,22 +99,7 @@ def commitment_changed(
     composite_record: dict | None, current_info: dict | None
 ) -> bool:
     """True iff the stored composite record describes a different commitment.
-
-    Missing record → "changed" (we have nothing on file).
-
-    Records produced by ``merge_composite_scores`` carry the UID's actual
-    on-chain ``commit_block`` and ``revision`` — strict tuple match.
-
-    Records produced by ``bootstrap_composite_from_h2h`` come from
-    ``state.h2h_latest`` which only records the H2H round block (not the
-    miner's commit_block) and frequently has ``revision=None`` for
-    commitments that were stored without an explicit pin. We can only
-    trust the **model name** for bootstrap records — comparing on block
-    or revision evicts every seeded UID on first restart, which is what
-    happened during round 8045570 (2026-04-25): all 8 prior-king-era
-    UIDs were re-queued for evaluation and the round ballooned to 30+
-    students. A model swap is still detected and re-eval'd.
-    """
+    Bootstrap records (no commit_block/revision) compare on model name only."""
     if not composite_record:
         return True
     cur = _commit_signature(current_info)
@@ -169,20 +115,8 @@ def commitment_changed(
 
 
 def evict_stale_evaluated_uids(state, valid_models: dict) -> list[str]:
-    """Remove stale composite + evaluated_uids entries when on-chain
-    commitments have moved since the last eval.
-
-    Iterates **every** UID in ``valid_models`` that has either an
-    ``evaluated_uids`` flag or a ``composite_scores`` row, and drops the
-    bookkeeping if the stored commitment no longer matches. Without
-    this, a UID whose only stored row is a bootstrapped composite (no
-    evaluated_uids entry) silently stays "filtered" forever even after
-    the miner re-uploads — exactly the bug surfaced 2026-04-25 round
-    8046286, where UID 12 re-committed natrium43/p1 → natrium43/t2 but
-    the stale bootstrap record kept it out of the queue.
-
-    Returns the list of evicted UID strings (for logging).
-    """
+    """Drop ``evaluated_uids`` + ``composite_scores`` rows whose on-chain
+    commitment has moved since the last eval. Returns evicted UID strs."""
     evicted: list[str] = []
     composite_scores = state.composite_scores or {}
     for uid, info in valid_models.items():
@@ -193,10 +127,8 @@ def evict_stale_evaluated_uids(state, valid_models: dict) -> list[str]:
             continue
         stored = composite_scores.get(uid_str)
         if stored is None and in_eu:
-            # No composite to compare against — leave evaluated_uids alone.
-            # Edge case: precheck-DQ'd UIDs that never got a composite row.
-            # Re-commits will still be picked up because the DQ row carries
-            # the new commit_block; the planner ignores DQ'd UIDs anyway.
+            # precheck-DQ'd UIDs have no composite row; re-commits are still
+            # picked up via the DQ row's commit_block.
             continue
         if stored is not None and commitment_changed(stored, info):
             state.evaluated_uids.discard(uid_str)
@@ -255,14 +187,9 @@ def merge_composite_scores(
         )
         state.composite_scores[uid_str] = record
         n_updated += 1
-        # 2026-05-01 (v30.4): one-eval-per-registration tracker.
-        # Mark this hotkey as having spent its eval slot so the next
-        # commit from the same hotkey gets rejected at precheck. The
-        # commit must have produced a real composite (we already
-        # filtered DQ + reference rows above), so this is a "real"
-        # eval that should consume the registration's one shot.
-        # 2026-05-01 (v30.4 patch): also persist coldkey for the
-        # Sybil-mitigation check on cross-hotkey re-eval attempts.
+        # One-eval-per-registration tracker (precheck rejects further
+        # commits from the same hotkey). Persist coldkey for the Sybil
+        # guard on cross-hotkey re-eval attempts.
         hotkey = info.get("hotkey") or ""
         if hotkey:
             if not isinstance(getattr(state, "evaluated_hotkeys", None), dict):
@@ -292,11 +219,8 @@ def _is_eligible_uid(
     uid_to_hotkey: dict | None,
     commitments: dict | None,
 ) -> bool:
-    """Return True iff this UID is currently eligible to hold weights.
-
-    Filters: must be in valid_models, not disqualified at its current
-    commit_block, and not flagged as the always-in reference row.
-    """
+    """True iff UID is eligible to hold weights (valid_models, not DQ'd at its
+    commit_block, not the reference row)."""
     from eval.scoring import is_disqualified
 
     if uid not in valid_models:
@@ -318,34 +242,10 @@ def _is_kingship_eligible(
     uid_to_hotkey: dict | None,
     commitments: dict | None,
 ) -> bool:
-    """Return True iff this UID may hold the crown right now.
+    """True iff this UID may hold the crown (weaker than _is_eligible_uid).
 
-    Strictly weaker filter than ``_is_eligible_uid`` — it does NOT
-    require the UID to be a participant in the current eval round.
-    Any UID with a stored composite, a current on-chain commitment,
-    and no active DQ is eligible.
-
-    Why: the 2026-04-27 ``models_to_eval``-only restriction was
-    introduced to prevent cross-round-sample drift from inflating
-    a stale UID's composite past the current king. With v30.2's
-    paired king re-eval (king is rerun on the SAME procedural
-    items as challengers every round) AND v30.4's per-axis
-    [0,1]-normalised aggregate, the cross-sample noise is bounded
-    enough that "highest stored composite wins" is the correct
-    semantics. The old restriction was making honest miners with
-    high prior composites (e.g. UID 16 final=0.6039) ineligible
-    even though king UID 95 final=0.5825 is measurably worse —
-    they were stuck waiting for a re-eval slot they could never
-    earn under one-eval-per-commit.
-
-    The eligibility filter requires:
-      • UID is on the current metagraph (we have an entry in
-        ``commitments`` keyed by this UID).
-      • The hotkey on chain matches the hotkey we evaluated under
-        (re-registration with a different hotkey at the same UID
-        invalidates the stored composite).
-      • The UID is not currently DQ'd.
-      • The UID isn't the reference baseline.
+    Requires: on the current metagraph, hotkey matches the row we evaluated,
+    not currently DQ'd, not the reference baseline.
     """
     from eval.scoring import is_disqualified
 
@@ -357,11 +257,8 @@ def _is_kingship_eligible(
     chain_hotkey = (uid_to_hotkey or {}).get(uid) or commit.get("hotkey", "")
     if not chain_hotkey:
         return False
-    # Hotkey-drift guard: composite was earned by a hotkey at this UID
-    # slot. If a different miner now holds the slot (UID was
-    # deregistered + re-registered), the stored composite is no longer
-    # earned by the current owner — they must commit + be evaluated
-    # under their own (model, revision) like everyone else.
+    # Drop the stored composite if a different miner now holds the slot
+    # (UID was deregistered + re-registered under a new hotkey/model).
     composite_scores = getattr(state, "composite_scores", {}) or {}
     rec = composite_scores.get(str(uid)) or {}
     rec_model = rec.get("model")
@@ -375,23 +272,14 @@ def _is_kingship_eligible(
     return True
 
 
-# Apples-to-apples king comparison floor: legacy bootstrap records
-# (n=3-4) carry artificially high ``composite.worst`` because they
-# never faced the harder benches (AIME / MBPP / tool-use / etc.). 12
-# is the safe floor under the current schema (~16 active axes after
-# the v28 zero-weight mutes, with headroom for reference-broken
-# drops on aime / tool_use). Records below the floor are tracked
-# but not eligible for kingship; legacy UIDs re-enter by submitting
-# a new on-chain commitment that triggers a fresh full-schema eval.
+# Legacy bootstrap records (n=3-4) skip the harder benches and so
+# carry inflated worst; 12 is the safe floor under the current schema.
+# Records below the floor are tracked but not kingship-eligible.
 _KING_SELECTION_MIN_AXES = 12
 
-# Schema-version gate. Records stamped ``version >= MIN_VERSION`` were
-# graded by the current scoring code; older records may have inflated
-# scores under stale graders that closed memorisation/Goodhart vectors
-# we've since patched (the v13–v26 history is in git log + reports/).
-# select_king_by_composite filters to v_current first and only falls
-# back to legacy records when no v_current candidate exists, so we
-# don't go kingless during transitions.
+# Schema-version gate. ``select_king_by_composite`` prefers records
+# graded by the current scoring code and falls back to legacy records
+# only when no v_current candidate exists.
 _KING_SELECTION_MIN_VERSION = COMPOSITE_SHADOW_VERSION
 
 
@@ -401,39 +289,13 @@ def select_king_by_composite(
     uid_to_hotkey: dict | None = None,
     commitments: dict | None = None,
 ) -> tuple[int | None, dict | None]:
-    """Pick the network's king from stored composite scores.
+    """Pick the king from stored composite scores.
 
-    Returns (uid, record) or (None, None) when no eligible composite-scored
-    UID remains. ``record`` is the entry from ``state.composite_scores``.
-
-    Algorithm (revised 2026-04-26 to make the prior-king preference a
-    *stability bias* rather than a hard lock — the previous fast path
-    returned the prior king unconditionally on eligibility, which silently
-    locked the crown forever once any king was crowned):
-
-    1. Build candidate list with a three-tier fallback:
-       - Tier 1: ``n_axes >= _KING_SELECTION_MIN_AXES`` AND
-         ``version >= _KING_SELECTION_MIN_VERSION`` — schema-current AND
-         graded by the current scoring code. Strongly preferred.
-       - Tier 2: ``n_axes >= _KING_SELECTION_MIN_AXES`` (any version) —
-         bridges the transition window after a schema bump.
-       - Tier 3: any record with a ``worst`` score — bootstrap.
-    2. Sort candidates by ``(worst desc, weighted desc, prior_bonus desc,
-       uid desc)``. The prior-king bonus is a tiebreaker that activates
-       only on exact ties — it never overrides a measurably-better
-       challenger. ``weighted`` before ``prior_bonus`` so the ~45% of
-       UIDs sitting at saturated worst=0.0 still rank by how good they
-       are on the other axes.
-    3. Best candidate = candidates[0]. If best is the prior king, return.
-    4. If best is a different UID, run ``resolve_dethrone`` against the
-       prior king with the same margin the apply-path dethrone gate
-       uses (``SINGLE_EVAL_DETHRONE_MARGIN``, default 3%). Best wins
-       only if they clear the margin; otherwise the prior king holds.
-       This blocks pure-noise dethrones while permitting clear wins.
-    5. If the prior king isn't in the candidate pool (deregistered,
-       DQ'd, or the bootstrap state lacks them), the best candidate
-       wins outright.
-    """
+    Returns (uid, record) or (None, None). Prior-king is a stability
+    tiebreaker, not a hard lock; a measurably-better challenger must
+    clear SINGLE_EVAL_DETHRONE_MARGIN to take the crown. Three-tier
+    candidate fallback: schema-current v_current first, then any
+    version with enough axes, then any record with a worst score."""
     composite_scores = getattr(state, "composite_scores", {}) or {}
     prior_king_uid = None
     h2h_latest = getattr(state, "h2h_latest", None) or {}
@@ -456,10 +318,7 @@ def select_king_by_composite(
                 uid = int(uid_str)
             except (TypeError, ValueError):
                 continue
-            # Kingship pool is round-participants-only (apples-to-apples
-            # paired comparison). Network-wide pools let UIDs claim the
-            # crown without facing the king in their round; the multi-
-            # king payout addresses high-composite reward separately.
+            # Kingship pool is round-participants-only (apples-to-apples).
             if not _is_eligible_uid(
                 uid, valid_models, state.dq_reasons,
                 uid_to_hotkey, commitments,
@@ -480,13 +339,10 @@ def select_king_by_composite(
                 n_axes_i = 0
             if n_axes_i < min_axes:
                 continue
-            # v30.2 — primary sort key is ``final`` (blended worst_3_mean
-            # + weighted), with ``worst`` and ``weighted`` as fallbacks
-            # for legacy v28-and-earlier records that lack ``final``.
+            # Primary sort key is ``final``; synthesize from worst+weighted
+            # for legacy records using the current alpha.
             final_v = rec.get("final")
             if final_v is None:
-                # Legacy record: synthesize a final from worst+weighted
-                # using the current alpha so the comparison is consistent.
                 worst_v = rec.get("worst")
                 weighted_v = rec.get("weighted")
                 if worst_v is None and weighted_v is None:
