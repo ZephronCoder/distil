@@ -28,6 +28,8 @@ from scripts.eval_policy import policy_env
 logger = logging.getLogger(__name__)
 
 
+# Route legacy ``os.environ.get`` policy reads through eval_policy so a
+# distil.env change picks up without a code edit.
 class _PolicyEnvironProxy:
     def __init__(self, real_environ):
         self._real_environ = real_environ
@@ -40,8 +42,6 @@ class _PolicyEnvironProxy:
 
 
 class _PolicyOSProxy:
-    """Route legacy ``os.environ.get`` policy reads through eval_policy."""
-
     def __init__(self, real_os):
         self._real_os = real_os
         self.environ = _PolicyEnvironProxy(real_os.environ)
@@ -53,63 +53,38 @@ class _PolicyOSProxy:
 os = _PolicyOSProxy(os)
 
 
-# Composite axis weights. on_policy_rkl is the primary distillation
-# signal (rollouts come from the student's own policy, so memorisation
-# can't game it). KL is retained as a transparency axis but heavily
-# down-weighted because of saturation. Capability + structural axes
-# guard against degenerate / over-long generations.
+# Tier-1 relative axes (teacher-referenced). Used only by the
+# ``weighted`` aggregation; ranking goes through ``final``. All weights
+# are env-overridable. Latest rebalance v31.3 (reports/2026-05-09-axis-
+# correlation-audit.md).
+#
+# on_policy_rkl is the primary distillation signal: student samples,
+# teacher scores -- gaming requires the (private) teacher's distribution
+# on the student's own outputs. KL is kept as a transparency axis but
+# down-weighted (saturated). Capability + structural axes guard against
+# degenerate / over-long generations.
+#
+# Shadow axes default 0; promoted on correlation. All cheap (computed
+# from the existing top-128 sparse cache).
 AXIS_WEIGHTS = {
-    # Tier-1 relative (teacher-referenced) axes. Used only by the
-    # ``weighted`` aggregation; the production ranking key is ``worst``.
-    # All weights are env-overridable so the rebalance audits can land
-    # via distil.env without a code change. Latest rebalance v31.3
-    # (2026-05-10) — see reports/2026-05-09-axis-correlation-audit.md.
-    # on_policy_rkl: GKD-style sample-then-KL — student samples,
-    # teacher scores. Closest thing to a Goodhart-immune distillation
-    # signal because gaming requires the (private) teacher's
-    # distribution on the student's own outputs.
     "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.39")),
     "kl":             float(os.environ.get("BENCH_KL_WEIGHT", "0.05")),
-    # top_k_overlap: tracks |top_K_t ∩ top_K_s| / K averaged. Halved at
-    # v31.3 after n=5 audit showed r=-0.481 vs held-out gsm8k. Restore
-    # if correlation recovers above +0.3 at n>=12; zero if it stays at
-    # or below 0 with a tight CI.
     "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.09")),
-    # Research-paper shadow axes (default 0; promoted on correlation):
-    #   entropy_aware_kl  — EOPD entropy-weighted RKL/FKL.
-    #   kl_is             — Anshumann importance-sampled KL.
-    #   forking_rkl       — Wang fork-token RKL at high-entropy spots.
-    #   teacher_trace_plausibility — NLL on teacher-emitted tokens.
-    #   tail_decoupled_kl — head/tail-decoupled KL.
-    # All cheap (computed from the existing top-128 sparse cache).
     "entropy_aware_kl": float(os.environ.get("ENTROPY_AWARE_KL_WEIGHT", "0.0")),
     "kl_is":          float(os.environ.get("KL_IS_AXIS_WEIGHT", "0.0")),
     "forking_rkl":    float(os.environ.get("FORKING_RKL_AXIS_WEIGHT", "0.0")),
-    "teacher_trace_plausibility": float(
-        os.environ.get("TEACHER_TRACE_PLAUSIBILITY_WEIGHT", "0.0")
-    ),
-    "tail_decoupled_kl": float(
-        os.environ.get("TAIL_DECOUPLED_KL_WEIGHT", "0.0")
-    ),
-    # Structural hygiene + capability axes. Trimmed at v31 because the
-    # procedural axes already penalise incoherent / mis-terminating
-    # generations; we don't want to double-count.
+    "teacher_trace_plausibility": float(os.environ.get("TEACHER_TRACE_PLAUSIBILITY_WEIGHT", "0.0")),
+    "tail_decoupled_kl": float(os.environ.get("TAIL_DECOUPLED_KL_WEIGHT", "0.0")),
     "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.05")),
     "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.05")),
     "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.05")),
 }
 
-# v30 — top-K overlap axis gate. Defaults ON; env-flippable for fast
-# rollback if the 48h shadow window flags any issue with the new axis.
-TOP_K_OVERLAP_AXIS_IN_COMPOSITE = (
-    os.environ.get("TOP_K_OVERLAP_AXIS_IN_COMPOSITE", "1") != "0"
-)
+TOP_K_OVERLAP_AXIS_IN_COMPOSITE = os.environ.get("TOP_K_OVERLAP_AXIS_IN_COMPOSITE", "1") != "0"
 
-# judge_probe: the (private) teacher LLM rating student greedy
-# responses on a 1-5 rubric. Hard to game without either (a) genuinely
-# producing high-quality answers (the goal) or (b) reverse-engineering
-# the rubric (bounded — checks helpfulness/correctness/clarity).
-# Promoted 2026-04-24; flip JUDGE_AXIS_IN_COMPOSITE=0 for rollback.
+# judge_probe: teacher LLM rates student greedy responses on a 1-5 rubric.
+# Gaming requires either genuinely good answers (the goal) or
+# reverse-engineering a rubric that itself checks helpfulness/correctness.
 JUDGE_AXIS_WEIGHT = float(os.environ.get("JUDGE_AXIS_WEIGHT", "0.20"))
 JUDGE_AXIS_IN_COMPOSITE = os.environ.get("JUDGE_AXIS_IN_COMPOSITE", "1") != "0"
 
@@ -137,13 +112,9 @@ BENCH_GROUP_AXIS_WEIGHTS = {
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"
 
 
-# ── Held-out canary axes ─────────────────────────────────────────────
-# Computed for diagnostics + the king_canary_streak gate. Weights
-# DEFAULT-OUT (0.0) since v30.7 because any public-benchmark axis
-# Goodharts within ~2 weeks of being weighted. Plumbing:
-# ``annotate_h2h_with_composite`` reads state/benchmarks/uid_<uid>.json
-# and threads into ``compute_composite(canary_scores=...)``.
-# Missing canary -> axis drops out (fail-open).
+# Held-out canary axes. Weight 0 by default (any weighted public-bench
+# axis Goodharts within ~2 weeks); used for diagnostics + king_canary_streak.
+# Missing canary -> axis drops (fail-open).
 CANARY_AXIS_WEIGHTS = {
     "canary_gsm8k":     float(os.environ.get("CANARY_GSM8K_WEIGHT", "0.0")),
     "canary_humaneval": float(os.environ.get("CANARY_HUMANEVAL_WEIGHT", "0.0")),
@@ -154,9 +125,6 @@ CANARY_AXIS_WEIGHTS = {
 CANARY_AXES_IN_COMPOSITE = os.environ.get("CANARY_AXES_IN_COMPOSITE", "0") != "0"
 
 # Map canary axis name -> key in state/benchmarks/uid_<uid>.json:benchmarks.
-# Sub-axes that never made it into the canary set (aime, mbpp, arc) do
-# not get a canary axis -- they continue to be measured by the
-# in-validator probes.
 CANARY_AXIS_TO_HELDOUT_KEY = {
     "canary_gsm8k":     "gsm8k",
     "canary_humaneval": "humaneval",
@@ -165,11 +133,7 @@ CANARY_AXIS_TO_HELDOUT_KEY = {
     "canary_ifeval":    "ifeval",
 }
 
-# Minimum sample count for a canary axis to count as scored. Mirrors
-# BENCH_MIN_VALID for the in-validator probes. The canary runs at
-# limit=50 by default for the small benchmarks; these floors are well
-# under typical sample counts so a normal canary run never drops the
-# axis, but a botched run with N<10 does.
+# Min sample count per canary axis (botched runs with N<floor drop the axis).
 CANARY_AXIS_MIN_VALID = {
     "canary_gsm8k":     20,
     "canary_humaneval": 20,
@@ -179,20 +143,9 @@ CANARY_AXIS_MIN_VALID = {
 }
 
 
-# ── v31 procedural axes (PRODUCTION) ─────────────────────────────────
-# Eleven procedural axes that replace the legacy bench surface as the
-# primary skill signal (legacy axes still run with reduced weights).
-# See reports/2026-05-09-v31-procedural-redesign.md for the design and
-# reports/2026-05-09-v31-axis-promotion.md for the promotion. Axes:
-#   gsm_symbolic / math_competition / math_robustness (math)
-#   code_humaneval_plus (code)
-#   reasoning_logic_grid / reasoning_dyval_arith (reasoning)
-#   long_context_ruler (RULER subset)
-#   knowledge_multi_hop_kg (synthetic KG, no real-world facts)
-#   ifeval_verifiable (Google IFEval 21-verifier)
-#   truthfulness_calibration (SimpleQA 3-way)
-#   consistency_paraphrase (paraphrase-pair 3-way)
-# Weights sum to 0.50 (offset by a 0.50 reduction in legacy bench).
+# v31 procedural axes (PRODUCTION) -- procedurally generated skill probes
+# that replace the legacy bench surface as the primary skill signal.
+# Design: reports/2026-05-09-v31-procedural-redesign.md. Weights sum to ~0.50.
 V31_AXIS_WEIGHTS = {
     "v31_math_gsm_symbolic":     float(os.environ.get("V31_MATH_GSM_SYMBOLIC_WEIGHT", "0.06")),
     "v31_math_competition":      float(os.environ.get("V31_MATH_COMPETITION_WEIGHT", "0.05")),
@@ -206,9 +159,6 @@ V31_AXIS_WEIGHTS = {
     "v31_truthfulness_calibration": float(os.environ.get("V31_TRUTHFULNESS_CALIBRATION_WEIGHT", "0.03")),
     "v31_consistency_paraphrase": float(os.environ.get("V31_CONSISTENCY_PARAPHRASE_WEIGHT", "0.03")),
 }
-# Master gate. Default ON: v31 is now production. Operators with a
-# stability concern can flip to 0 to revert to the v30.7 surface
-# entirely (zero risk of v31 axis weights gating ranking).
 V31_AXES_IN_COMPOSITE = os.environ.get("V31_AXES_IN_COMPOSITE", "1") != "0"
 
 
@@ -224,17 +174,7 @@ _CANARY_FILE_CACHE: dict[int, tuple[float, dict]] = {}
 
 
 def load_canary_scores_for_uid(uid: Any) -> dict[str, Any] | None:
-    """Load the held-out canary benchmarks for one UID.
-
-    Returns the raw ``benchmarks`` dict augmented with private
-    ``__counts__`` / ``__model__`` / ``__timestamp__`` keys. Returns
-    None if the canary file is missing for this UID or unparseable.
-
-    Cache: keyed by UID with stat-mtime invalidation, so the four
-    composite call sites per round (annotate_h2h, h2h_history append,
-    dashboard backfill, composite_scores cache) all share the same
-    parsed dict instead of re-reading the file each time.
-    """
+    """Load held-out canary benchmarks for one UID (mtime-invalidated cache)."""
     if uid is None:
         return None
     try:
@@ -273,19 +213,7 @@ def load_canary_scores_for_uid(uid: Any) -> dict[str, Any] | None:
 
 
 def _axis_canary(canary_scores: dict[str, Any] | None, axis_name: str) -> float | None:
-    """Generic [0, 1] canary axis extractor.
-
-    Returns None when:
-      * canary_scores is None (no canary file for this UID).
-      * The held-out key isn't in the canary scores (axis didn't run
-        in the most recent canary).
-      * count is below CANARY_AXIS_MIN_VALID[axis_name] (probe
-        outage / cancelled run).
-      * Value isn't coercible to float.
-
-    Otherwise clamps the raw value into [0, 1]. The canary file already
-    stores fractions in [0, 1] so the clamp is just a defensive guard.
-    """
+    """Extract a [0, 1] canary axis value (None when the axis is missing or below the count floor)."""
     if not canary_scores:
         return None
     held_key = CANARY_AXIS_TO_HELDOUT_KEY.get(axis_name)
@@ -308,11 +236,9 @@ def _axis_canary(canary_scores: dict[str, Any] | None, axis_name: str) -> float 
     return max(0.0, min(1.0, v))
 
 
-# ── Arena v3 sub-bench axes (mostly retired) ─────────────────────────
-# DEFAULT 0 (telemetry only) — weight is carried by V31_AXIS_WEIGHTS.
-# calibration_bench retains a small weight (0.06) because it measures
-# honest refusal under unsolvable items, which no v31 axis covers.
-# Override any axis via env for ablations only.
+# Arena v3 sub-bench axes. Default 0 (telemetry only); skill weight
+# is carried by V31_AXIS_WEIGHTS. calibration_bench keeps a small
+# weight since no v31 axis covers honest refusal under unsolvable items.
 ARENA_V3_AXIS_WEIGHTS = {
     "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.0")),  # in math_skill_group
     "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.0")),  # in code_skill_group
@@ -334,24 +260,10 @@ ARENA_V3_AXIS_WEIGHTS = {
 
 ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "1") != "0"
 
-# ── 2026-04-25 — Session 3.2 reasoning_density axis (PRODUCTION) ─────
-# User-reported pathology: "models are too distilled and think for too
-# long about simple questions." The existing ``length`` axis addresses
-# chat-probe length only. Bench probes give us per-axis mean_gen_tokens
-# (see ``_bench_finalize_token_stats`` in pod_eval_vllm.py), so we can
-# now score bench-level efficiency: pass_frac × length_bonus per bench,
-# averaged across whichever benches emitted valid data.
-#
-# Target token counts are calibrated to the teacher's typical bench
-# output lengths (empirical, April 2026). When a student gets the
-# answer right in ≤ target tokens → length_bonus = 1.0. When they use
-# 2× target → bonus ≈ 0.5. 4× target → bonus ≈ 0.25. This directly
-# penalizes both the "over-think simple questions" failure mode and
-# the "memorize answer-only training data" failure mode (a model that
-# outputs "42" with 5 tokens still needs to get the answer right on a
-# rotating pool; if it does, fine — the axis is neutral).
-#
-# Live with low weight so it is an auxiliary signal, not a dominant one.
+# reasoning_density: bench-level efficiency = pass_frac * length_bonus.
+# length_bonus = 1.0 at <=target tokens, ~0.5 at 2x, ~0.25 at 4x.
+# Penalises both over-thinking simple questions and answer-only memorisation.
+# Targets are empirical (calibrated to teacher's typical bench lengths).
 REASONING_DENSITY_TARGET_TOKENS = {
     "math_bench":            float(os.environ.get("RD_MATH_TARGET", "400")),
     "code_bench":            float(os.environ.get("RD_CODE_TARGET", "300")),
@@ -393,203 +305,110 @@ REASONING_DENSITY_IN_COMPOSITE = (
     os.environ.get("REASONING_DENSITY_IN_COMPOSITE", "1") != "0"
 )
 
-# ── 2026-04-25 — Session 3.3 chat_turns_probe axis (PRODUCTION) ──────
-# Multi-turn coherence probe. Teacher grades a 3-turn transcript on a
-# 1-5 rubric (coherence + consistency + helpfulness). Normalized to
-# [0, 1]; identical shape to judge_probe so axis values are directly
-# comparable in telemetry. A model that aces single-turn KL but can't
-# hold context gets flagged by this axis — directly addressing the
-# user-reported "models are too distilled, forget context" pathology.
-#
-# Live: single-turn KL specialists should not dethrone if they cannot
-# maintain coherence over a short dialogue.
+# chat_turns_probe: teacher grades a 3-turn transcript on a 1-5 rubric
+# (coherence + consistency + helpfulness). Catches single-turn KL specialists
+# that can't hold context across a short dialogue.
 CHAT_TURNS_AXIS_WEIGHT = float(os.environ.get("CHAT_TURNS_AXIS_WEIGHT", "0.14"))
-CHAT_TURNS_AXIS_IN_COMPOSITE = (
-    os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "1") != "0"
-)
+CHAT_TURNS_AXIS_IN_COMPOSITE = os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "1") != "0"
 CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "2"))
-# Judge-probe min-valid threshold. Default 4 lets it work with reduced
-# budgets (we currently run JUDGE_PROBE_PER_ROUND=6 for speed) without
-# silently dropping the axis. Bug-discovered 2026-04-26: the previous
-# hardcoded 8 was higher than the configured budget, so judge_probe
-# was always None in production.
 JUDGE_PROBE_MIN_VALID = int(os.environ.get("JUDGE_PROBE_MIN_VALID", "4"))
 
-# composite.final = alpha * worst_3_mean + (1 - alpha) * weighted is
-# the canonical dethrone gate. Replaces the legacy ``worst`` because
-# min(axes) was dominated by noise on the lowest-data axis. Mean of
-# the bottom-3 smooths variance while keeping anti-Goodhart pressure;
-# blending with ``weighted`` keeps all-axis information.
-COMPOSITE_FINAL_BOTTOM_WEIGHT = float(
-    os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.85")
-)
+# Canonical dethrone gate: composite.final = alpha * worst_3_mean + (1-alpha) * weighted.
+# Bottom-K mean keeps anti-Goodhart pressure; blending with weighted retains all-axis info.
+COMPOSITE_FINAL_BOTTOM_WEIGHT = float(os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.85"))
 WORST_3_MEAN_K = int(os.environ.get("WORST_3_MEAN_K", "3"))
 
-# v30 — long-form judge axis. Default per-round budget is 4 prompts so
-# the floor is set at 2 (half the budget) — matches the JUDGE_PROBE
-# floor convention. Operators bumping ``LONG_FORM_JUDGE_PER_ROUND`` on
-# the eval side can raise this floor accordingly.
+# Long-form axes (combined weight ~0.45). long_form_judge is rubric-graded;
+# long_gen_coherence is pure-statistical (loops / perplexity / vocab collapse)
+# and can't be cheated by rubric leniency. Gaming either requires coherent
+# long generation, which is the goal.
 LONG_FORM_JUDGE_MIN_VALID = int(os.environ.get("LONG_FORM_JUDGE_MIN_VALID", "2"))
-# Long-form axes (combined weight 0.45). long_form_judge is rubric-
-# graded; long_gen_coherence is pure-statistical (loops / perplexity /
-# vocabulary collapse) and can't be cheated by rubric leniency. Gaming
-# either requires coherent long generation, which is the goal.
-LONG_FORM_JUDGE_AXIS_WEIGHT = float(
-    os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.20")
-)
-LONG_GEN_COHERENCE_AXIS_WEIGHT = float(
-    os.environ.get("LONG_GEN_COHERENCE_WEIGHT", "0.25")
-)
-LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE = bool(
-    int(os.environ.get("LONG_GEN_COHERENCE_IN_COMPOSITE", "1") or 1)
-)
-LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = (
-    os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
-)
-# Hard-DQ floor on long-form coherence. When more than
-# LONG_FORM_DERAIL_DQ_RATIO of a round's responses score below
-# LONG_FORM_DERAIL_DQ_THRESHOLD coherence, the model is permanently
-# DQ'd at the commit-block. Soft-weight degradation alone wasn't
-# enough — bench scores compensated; long-form word salad means the
-# model cannot sustain coherent generation (a core deployment
-# capability). Re-eval requires a fresh hotkey.
-LONG_FORM_DERAIL_DQ_RATIO = float(
-    os.environ.get("LONG_FORM_DERAIL_DQ_RATIO", "0.5")
-)
-LONG_FORM_DERAIL_DQ_THRESHOLD = float(
-    os.environ.get("LONG_FORM_DERAIL_DQ_THRESHOLD", "0.30")
-)
-LONG_FORM_DERAIL_DQ_ENABLED = bool(
-    int(os.environ.get("LONG_FORM_DERAIL_DQ_ENABLED", "1") or 1)
-)
+LONG_FORM_JUDGE_AXIS_WEIGHT = float(os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.20"))
+LONG_GEN_COHERENCE_AXIS_WEIGHT = float(os.environ.get("LONG_GEN_COHERENCE_WEIGHT", "0.25"))
+LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE = bool(int(os.environ.get("LONG_GEN_COHERENCE_IN_COMPOSITE", "1") or 1))
+LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
 
-# Per-axis minimum valid-item count below which the axis drops as
-# "insufficient sample". Small pools (code_bench samples only 4 items
-# per round by design) get a lower floor so rounding noise doesn't
-# exclude them unnecessarily.
+# Hard-DQ floor: when >LONG_FORM_DERAIL_DQ_RATIO of a round scores below
+# LONG_FORM_DERAIL_DQ_THRESHOLD coherence, the model is permanently DQ'd at
+# commit_block. Soft-weight wasn't enough -- bench scores compensated for
+# long-form word salad. Re-eval requires a fresh hotkey.
+LONG_FORM_DERAIL_DQ_RATIO = float(os.environ.get("LONG_FORM_DERAIL_DQ_RATIO", "0.5"))
+LONG_FORM_DERAIL_DQ_THRESHOLD = float(os.environ.get("LONG_FORM_DERAIL_DQ_THRESHOLD", "0.30"))
+LONG_FORM_DERAIL_DQ_ENABLED = bool(int(os.environ.get("LONG_FORM_DERAIL_DQ_ENABLED", "1") or 1))
+
+# Min valid-item count per axis (below this the axis drops as
+# "insufficient sample"). Tighter floors for small per-round pools.
 BENCH_MIN_VALID = {
     "math_bench": 4,
     "code_bench": 2,
     "reasoning_bench": 4,
     "knowledge_bench": 4,
     "ifeval_bench": 4,
-    # Session 3 axes — now live, so require enough items to dampen lucky
-    # pass_frac spikes while still failing open on probe outages.
     "aime_bench": 3,
     "mbpp_bench": 3,
     "tool_use_bench": 3,
     "self_consistency_bench": 3,
-    # Session 3.1 — ARC larger budget (6 per round), keep floor at 4
-    # so one parse failure doesn't drop the axis.
     "arc_bench": 4,
-    # Session 3.4 — TruthfulQA 4 per round, tight floor at 2.
     "truthful_bench": 3,
-    # Session 3.5 — long-context 3 per round, tight floor at 2 since
-    # each item is expensive (~1400 input tokens).
     "long_context_bench": 2,
     "procedural_bench": 4,
-    # Session 3.7 — robustness draws K_perturb generations per item, so
-    # a 4-item budget yields 8+ generations: hold the min_valid floor
-    # at K_perturb so a single item drop doesn't kill the axis.
     "robustness_bench": 2,
-    # Session 3.7 — noise_resistance has the same shape as robustness
-    # (K perturbations × N items); use the same floor so a single
-    # tokenization or grader edge case can't drop the axis.
     "noise_resistance_bench": 2,
-    # v29.2 — debug_bench. 6 items per round; floor at 3 so a
-    # single sandbox glitch doesn't drop the axis but most parse
-    # failures do.
     "debug_bench": 3,
-    # v29.4 — same conservative floors as the other coding-style axes
-    # so a sandbox outage on a few items doesn't drop the axis entirely.
     "correction_bench": 3,
     "multi_doc_synthesis_bench": 3,
     "calibration_bench": 4,
     "refactor_bench": 2,
-    # v30 — pragmatic_bench. 8 items per round; floor at 4 so a few
-    # parse failures don't drop the axis but a sandbox outage does.
     "pragmatic_bench": 4,
-    # v31 (2026-05-09) — procedural axes. All run at 16-32 items per
-    # round per the eval_policy.json defaults; floor at 8 so a few
-    # parse / sandbox glitches don't drop the axis but a probe
-    # outage (n<8) does.
     "v31_math_gsm_symbolic":     8,
     "v31_math_competition":      8,
     "v31_math_robustness":       8,
-    "v31_code_humaneval_plus":   4,  # sandbox is expensive, smaller per-round
+    "v31_code_humaneval_plus":   4,
     "v31_reasoning_logic_grid":  8,
     "v31_reasoning_dyval_arith": 8,
-    "v31_long_context_ruler":    6,  # long context, smaller per-round
+    "v31_long_context_ruler":    6,
     "v31_knowledge_multi_hop_kg": 8,
     "v31_ifeval_verifiable":     6,
     "v31_truthfulness_calibration": 8,
-    "v31_consistency_paraphrase": 6,  # 2 generations per item
+    "v31_consistency_paraphrase": 6,
 }
 
-# Schema version of the composite ranker. Bump whenever composite
-# computation, axis weights or per-axis grading change in a way that
-# would let an old record keep an inflated floor under new grading.
-# ``_KING_SELECTION_MIN_VERSION`` quarantines older records so the
-# dethrone gate never compares stale to honest grading. Per-version
-# changelog: reports/2026-*-*.md.
+# Schema version. Bump whenever axis weights or grading change in a
+# way that would let an old record keep an inflated floor under new
+# grading. _KING_SELECTION_MIN_VERSION quarantines older records.
 COMPOSITE_SHADOW_VERSION = 32
 
-# ── Pareto majority dominance (Session 3 shadow) ──────────────────────
-# An extra dethrone consideration: a challenger must beat the king on a
-# majority of scorable axes, not just the single worst axis. Inspired
-# by Affine Cortex's environment-level Pareto dominance. Starts as an
-# informational score logged + surfaced in telemetry; promotion to
-# dethrone gate flips via ``PARETO_DOMINANCE_GATE=1`` after the 48h
-# public notice.
+# Pareto-majority dethrone gate: a challenger must beat the king on a
+# majority of scorable axes by at least PARETO_DOMINANCE_MARGIN, not
+# just the single worst axis.
 PARETO_DOMINANCE_MARGIN = float(os.environ.get("PARETO_DOMINANCE_MARGIN", "0.02"))
 PARETO_DOMINANCE_MIN_COMPARABLE = int(os.environ.get("PARETO_DOMINANCE_MIN_COMPARABLE", "5"))
 PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "1") != "0"
 
-# ── King regression health ──────────────────────────────────────────
-# Stamps ``below_floor`` / ``worse_than_base`` flags on the king's
-# composite row each round; consecutive at-risk rounds accumulate in
-# ``state.king_regression_streak``. When KING_REGRESSION_GATE=1 and
-# streak >= KING_REGRESSION_MIN_STREAK the king is force-dethroned in
-# favor of the highest-composite challenger that also passed the
-# structural gates.
+# King regression health: stamps below_floor/worse_than_base on the
+# king's row; streak >= MIN_STREAK with the gate on force-dethrones to
+# the best gate-passing challenger.
 KING_COMPOSITE_FLOOR = float(os.environ.get("KING_COMPOSITE_FLOOR", "0.20"))
 KING_REGRESSION_MIN_STREAK = int(os.environ.get("KING_REGRESSION_MIN_STREAK", "3"))
 KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 
-# ── Canary-regression auto-dethrone ─────────────────────────────────
-# Held-out version of KING_REGRESSION_GATE. The validator's own
-# composite.worst is goodhart-gameable; this gate uses HELD-OUT
-# evalscope scores instead. When the king's canary mean drops more
-# than KING_CANARY_MARGIN below the Qwen-4B baseline on 4 of 5
-# canary axes for KING_CANARY_MIN_STREAK rounds, the composite-floor
-# veto is waived so a challenger can dethrone. Strict (4 of 5 axes,
-# not 1) but fast (min_streak=1 since v30.7) — the canary is now the
-# ONLY held-out signal, so this is the safety net that catches a
-# king climbing the procedural axes while regressing on real skill.
+# Canary-regression auto-dethrone: held-out version of KING_REGRESSION_GATE.
+# When the king's canary mean drops >MARGIN below the Qwen-4B baseline on
+# >=4 of 5 canary axes for MIN_STREAK rounds, the composite-floor veto is
+# waived so a challenger can dethrone. Safety net for kings climbing the
+# procedural axes while regressing on held-out skill.
 KING_CANARY_MARGIN = float(os.environ.get("KING_CANARY_MARGIN", "0.04"))
 KING_CANARY_MIN_STREAK = int(os.environ.get("KING_CANARY_MIN_STREAK", "1"))
 KING_CANARY_GATE = os.environ.get("KING_CANARY_GATE", "1") != "0"
 KING_CANARY_AXES = ("gsm8k", "humaneval", "bbh", "ifeval")
 KING_CANARY_BASELINE_FILE = os.environ.get("KING_CANARY_BASELINE_FILE", "baseline_qwen35_4b.json")
 
-# ── Per-axis baseline-relative penalty ──────────────────────────────
-# In compute_axes, each bench axis with the penalty enabled compares
-# the student to the SAME-round reference (Qwen3.5-4B, UID -1) on the
-# SAME block-seeded items. If the student regresses, the axis is
-# docked by ``ALPHA * (ref - student)`` clipped to [0, axis]. Students
-# at or above base get full credit; legitimate over-base wins are
-# unaffected. Worst-axis aggregation then favors balanced-and-above-
-# base students over below-base specialists. ALPHA=1.5 makes 10pp
-# regression dock 15pp — symmetric with the 10pp BASELINE_FLOOR_MARGIN
-# veto. Applied to bench axes only (relative axes normalise
-# differently and would double-penalise); the allow-list is
-# ``BASELINE_RELATIVE_PENALTY_AXES``.
-BASELINE_RELATIVE_PENALTY_ENABLED = (
-    os.environ.get("BASELINE_RELATIVE_PENALTY_ENABLED", "1") != "0"
-)
-BASELINE_RELATIVE_PENALTY_ALPHA = float(
-    os.environ.get("BASELINE_RELATIVE_PENALTY_ALPHA", "1.5")
-)
+# Per-axis baseline-relative penalty: bench axis is docked by
+# ALPHA * (ref - student) clipped to [0, axis] when the student
+# regresses below same-round Qwen3.5-4B. Worst-axis aggregation then
+# favors balanced-and-above-base over below-base specialists.
+BASELINE_RELATIVE_PENALTY_ENABLED = os.environ.get("BASELINE_RELATIVE_PENALTY_ENABLED", "1") != "0"
+BASELINE_RELATIVE_PENALTY_ALPHA = float(os.environ.get("BASELINE_RELATIVE_PENALTY_ALPHA", "1.5"))
 # Bench axes where regression below same-round reference docks the axis.
 # Absolute pass_frac bench axes only — relative axes (kl, rkl, length,
 # capability, degeneracy) are excluded since they'd double-penalise.
@@ -730,53 +549,12 @@ def _axis_entropy_aware_kl(student: dict,
 
 
 def _axis_top_k_overlap(student: dict) -> float | None:
-    """Top-K token overlap between teacher and student distributions.
+    """Mean |top_K_teacher ∩ top_K_student| / K across positions and prompts.
 
-    Definition: at each generated position, count how many of the
-    teacher's top-K predicted tokens also appear in the student's top-K
-    predicted tokens. Average this fraction across positions, then
-    across prompts. Returns the model-level mean, already in [0, 1],
-    higher is better.
-
-    Why this axis matters (v30, 2026-04-29):
-
-    Per the 2026 'Rethinking On-Policy Distillation' paper (arXiv
-    2604.13016), top-K agreement between teacher and student
-    distributions is the single most predictive signal of downstream
-    OPD success — more predictive than raw KL or capability pass-rate.
-    Successful OPD runs converge to 97-99% top-K overlap with the
-    teacher, while failed runs (mode collapse, teacher hacking) sit
-    at 60-80% even when KL looks acceptable.
-
-    Dynamic range:
-      * Random student: ~K/vocab_size ≈ 128/248320 ≈ 0.05% per slot,
-        with 128 slots ≈ 7% expected overlap by chance alone.
-      * Decent distillation student: 70-90%.
-      * SOTA distilled student: 97-99%.
-
-    So the axis has natural dynamic range from ~7% (random) to ~99%
-    (SOTA), which maps cleanly onto the [0, 1] composite scale without
-    further normalization.
-
-    Goodhart resistance:
-      * Cannot be gamed by per-token probability calibration (only the
-        SET of top-K matters, not the probabilities on those K tokens).
-      * Cannot be gamed by prompt-pool memorisation (top-K depends on
-        the entire generated trajectory; off-policy memorisation
-        doesn't help on-policy continuations).
-      * Cannot be gamed by length collapse (positions are evaluated
-        per-token; a 1-token early stop would only sample 1 position).
-
-    Edge cases:
-      * Returns ``None`` if no prompt had a valid overlap (e.g. all
-        cache entries were sparse-empty / continuation length 0).
-      * Returns ``None`` for rows that lack the field (teacher row,
-        legacy records).
-
-    The K used in production is 128 (matches the vLLM
-    ``--max-logprobs 128`` cap that produces the teacher's sparse
-    cache). Override via ``TOP_K_OVERLAP_K`` in the eval script for
-    research replays.
+    K=128 in production (matches vLLM --max-logprobs cap). Random
+    students sit at ~7%; SOTA distilled students hit 97-99%. Resists
+    gaming because only the SET of top-K matters (not probabilities),
+    and the trajectory is on-policy.
     """
     val = student.get("top_k_overlap_mean")
     if val is None:
@@ -791,35 +569,11 @@ def _axis_top_k_overlap(student: dict) -> float | None:
 
 
 def _axis_capability(student: dict) -> float:
-    """Verifiable-rewards pass fraction with absolute-correctness floor.
+    """0.5 * absolute + 0.5 * (frac / max(teacher, 0.5), clipped).
 
-    Before 2026-04-23 this axis was purely ``frac / teacher_frac``, which
-    hit 1.0 whenever a student matched the teacher — *including on the
-    teacher's wrong answers*. Empirically this was mild because the
-    teacher got ~85-90% on the capability pool, but in principle it
-    rewards teacher-hacking: a student that learns to echo teacher's
-    mistakes scores identically to one that actually learned to answer.
-    The 2026-04-23 Goodhart-immune eval design (see
-    ``reports/2026-04-23-goodhart-immune-eval.md``) adds an absolute
-    term so matching the teacher at a low absolute accuracy is not
-    credited as full marks.
-
-    Shape:
-      score = (absolute_accuracy + min(frac / max(teacher, 0.5), 1.0)) / 2
-
-    Properties:
-      * Monotonic in both absolute (frac) and relative (frac / teacher)
-        correctness.
-      * Student at 100%, teacher at 100% → 1.0 (unchanged).
-      * Student and teacher both at 30% → 0.65 (was 1.0).
-      * Student at 50%, teacher at 100% → 0.50 (was 0.50; unchanged).
-      * Student at 80%, teacher at 80% → 0.90 (was 1.0).
-      * Student at 100%, teacher at 60% → (1.0 + 1.0) / 2 = 1.0.
-      * Floor of 0.5 in the relative denominator prevents a flaky
-        round (teacher errored on many items) from saturating the
-        axis.
-
-    Returns ``None`` if the probe didn't run.
+    Anti-teacher-hacking: pure frac/teacher saturates whenever the
+    student matches a wrong teacher. The 0.5 floor on the denominator
+    stops a flaky teacher round from inflating the axis.
     """
     cap = student.get("capability") or {}
     frac = cap.get("pass_frac")
@@ -871,20 +625,7 @@ def _judge_probe_axis(
     score_field: str,
     min_valid: int,
 ) -> float | None:
-    """Generic ``probe.<score_field>`` extractor with ``n_valid`` floor.
-
-    Used by every teacher-rubric axis (``judge_probe``,
-    ``long_form_judge``, ``long_gen_coherence``, ``chat_turns_probe``,
-    and skill-group-specific variants): the eval payload always carries
-    ``{ <score_field>: float in [0,1], n_valid: int, ... }``; we drop
-    the axis when fewer than ``min_valid`` prompts parsed cleanly so a
-    rubric/teacher drift signal doesn't silently bleed into composite
-    rankings.
-
-    Returns ``None`` when the probe didn't run, the score field is
-    absent, or ``n_valid`` is below the floor. Otherwise clamps the
-    raw value into [0, 1].
-    """
+    """Pull ``probe.<score_field>`` clamped to [0, 1]; drop if n_valid < floor."""
     payload = student.get(probe_key) or {}
     if not payload:
         return None
@@ -912,14 +653,9 @@ def _axis_judge_probe(student: dict) -> float | None:
 
 
 def _axis_long_form_judge(student: dict) -> float | None:
-    """v30 — long-form judge axis.
-
-    Teacher rubric grades each student's 300-500 word essay-style
-    response on STRUCTURE / DEPTH / COHERENCE / LENGTH. Per-prompt
-    score is multiplied by the six-signal statistical coherence factor
-    in ``long_form_judge_teacher_score`` BEFORE aggregation, so a
-    derailed response cannot earn a high rubric grade even if the
-    teacher was lenient (v30.4, 2026-05-01)."""
+    """Teacher rubric on 300-500 word essay (structure/depth/coherence/length),
+    multiplied per-prompt by a 6-signal statistical coherence factor so a
+    derailed response can't earn a high grade from a lenient teacher."""
     return _judge_probe_axis(
         student, "long_form_judge_probe", "normalized",
         LONG_FORM_JUDGE_MIN_VALID,
@@ -927,14 +663,9 @@ def _axis_long_form_judge(student: dict) -> float | None:
 
 
 def _axis_long_gen_coherence(student: dict) -> float | None:
-    """v30.4 — long-form-generation coherence axis (zero teacher involvement).
-
-    Returns the mean per-prompt coherence factor from the long-form
-    judge probe — exactly the multiplier already applied to the
-    ``long_form_judge`` axis grade. Pure statistical signal (six
-    surface signals on the 2048-token response): the composite
-    directly penalises derail even if a miner gamed the teacher
-    rubric to score 5/5 on a derailed response."""
+    """Pure-statistical (no teacher) mean per-prompt coherence factor:
+    the same multiplier applied to the long_form_judge axis. Penalises
+    derail directly even if a miner gamed the teacher rubric."""
     return _judge_probe_axis(
         student, "long_form_judge_probe", "coherence_factor",
         LONG_FORM_JUDGE_MIN_VALID,
@@ -942,27 +673,16 @@ def _axis_long_gen_coherence(student: dict) -> float | None:
 
 
 def _axis_chat_turns_probe(student: dict) -> float | None:
-    """Multi-turn coherence axis (2026-04-25 Session 3.3, SHADOW).
-
-    Teacher judges 6 rotated 3-turn transcripts on a 1-5 rubric
-    (coherence / consistency / helpfulness). Forces miners to keep
-    multi-turn coherence in the loss tent — KL distillation only
-    optimises single-turn climbmix-style prompts, so a model can ace
-    KL yet fall apart on multi-turn dialogue."""
+    """Teacher 1-5 rubric on 3-turn transcripts (coherence/consistency/helpfulness).
+    Forces multi-turn coherence into the loss tent (KL alone optimises single-turn)."""
     return _judge_probe_axis(
         student, "chat_turns_probe", "normalized", CHAT_TURNS_MIN_VALID,
     )
 
 
 def _axis_bench_pass_frac(student: dict, axis_name: str) -> float | None:
-    """Generic [0, 1] pass-fraction extractor for Pareto holistic eval v2.
-
-    Each ``*_bench`` key in the student result has the same schema:
-    ``{"n": int, "correct": int, "pass_frac": float, "items": [...]}``.
-    Returns the raw ``pass_frac`` if there are at least ``BENCH_MIN_VALID``
-    items; otherwise ``None`` so the axis drops out for the round.
-    Errored probes are also mapped to None (fail-open).
-    """
+    """Pull ``pass_frac`` (clamped [0, 1]) from a ``*_bench`` payload,
+    or None if n < BENCH_MIN_VALID or the probe errored (fail-open)."""
     payload = student.get(axis_name) or {}
     if not payload or payload.get("error"):
         return None
@@ -978,10 +698,8 @@ def _axis_bench_pass_frac(student: dict, axis_name: str) -> float | None:
         return None
 
 
-# Bench axes are uniform thin wrappers around _axis_bench_pass_frac.
-# Each name is exposed as ``_axis_<name>`` for symmetry with hand-written
-# axes and so external callers / tests can ``from composite import
-# _axis_<name>``. The actual logic lives in _axis_bench_pass_frac.
+# Thin wrappers around _axis_bench_pass_frac, exposed as ``_axis_<name>``
+# so external callers can ``from composite import _axis_<name>``.
 _BENCH_AXIS_NAMES: tuple[str, ...] = (
     "math_bench", "code_bench", "reasoning_bench", "knowledge_bench",
     "ifeval_bench", "aime_bench", "mbpp_bench", "tool_use_bench",
@@ -990,13 +708,6 @@ _BENCH_AXIS_NAMES: tuple[str, ...] = (
     "noise_resistance_bench", "debug_bench", "correction_bench",
     "multi_doc_synthesis_bench", "calibration_bench", "refactor_bench",
     "pragmatic_bench",
-    # v31 procedural axes (PRODUCTION as of 2026-05-09 v31 promotion).
-    # See V31_AXIS_WEIGHTS for active weights. Promoted out of SHADOW
-    # in this commit (reports/2026-05-09-v31-axis-promotion.md).
-    # Legacy axes that v31 replaces (math_bench / code_bench /
-    # reasoning_bench / ifeval_bench / etc.) are zeroed in
-    # BENCH_AXIS_WEIGHTS but still RUN for telemetry & broken-axis
-    # detection.
     "v31_math_gsm_symbolic",
     "v31_math_competition",
     "v31_math_robustness",
@@ -1090,57 +801,24 @@ def _axis_skill_group_mean(
     sub_axes: tuple[str, ...],
     broken_axes: set[str] | None = None,
 ) -> float | None:
-    """Bottom-half mean (default) of present bench sub-axis pass-fracs.
+    """Aggregate present sub-axis pass-fracs (default: bottom-half mean).
 
-    See ``_aggregate_skill_group_values`` for the aggregation policy
-    knob. Function name kept as ``_axis_skill_group_mean`` for
-    backwards compat with the existing test suite — the default
-    semantics changed in v30.6 from ``mean`` to ``bottom_half_mean``.
-
-    v30.2 (2026-04-29): preserves the broken-axes invariant from the
-    pre-grouping era. When a sub-axis is in ``broken_axes`` (the
-    reference 4B scored 0 — eval-setup signal, not skill), it is
-    excluded from the group computation. This means a student who
-    just happens to score 0 on aime_bench (because the reference
-    couldn't either) doesn't get docked in math_skill_group, while
-    a student who SOLVED aime items the reference couldn't solve also
-    doesn't get an inflated lift via the broken sub-axis. The group
-    score reflects only the eval-valid sub-axes.
-
-    When broken_axes is None (legacy callers), all non-None sub-axes
-    are included — same as v30.2 release behaviour.
-
-    Returns None when no eval-valid sub-axis has data — graceful
-    drop so the composite renormalises over surviving axes.
-
-    We use the RAW pass_frac (``_axis_bench_pass_frac``), not the
-    baseline-relative-penalty-adjusted value, because the per-axis
-    penalty already lives on each sub-axis when applicable. Stacking
-    penalties on a group score would double-penalise.
+    Sub-axes in ``broken_axes`` (reference 4B scored 0 == eval-setup
+    issue, not skill) are dropped so a broken sub-axis can't dock the
+    group. None when no sub-axis has data; the composite renormalises.
     """
-    vals: list[float] = []
-    for ax in sub_axes:
-        if broken_axes and ax in broken_axes:
-            # Broken sub-axis: drop from group score to preserve the
-            # "broken axes don't penalize" invariant.
-            continue
-        v = _axis_bench_pass_frac(student, ax)
-        if v is None:
-            continue
-        vals.append(float(v))
-    if not vals:
-        return None
-    return _aggregate_skill_group_values(vals)
+    vals = [
+        float(v)
+        for ax in sub_axes
+        if not (broken_axes and ax in broken_axes)
+        and (v := _axis_bench_pass_frac(student, ax)) is not None
+    ]
+    return _aggregate_skill_group_values(vals) if vals else None
 
 
-# v30.2 — Skill-group registry. Each entry is
-# ``(group_axis_name, sub_axes)``. The composite ``axes`` dict is
-# populated for every group via a loop in compute_axes; consumers
-# (composite weights, telemetry, broken-axis sanity) reference the
-# group axis name directly. Per-group wrapper functions
-# (``_axis_<group>_skill_group``) are defined right below for
-# backwards-compat with the existing test suite — they all delegate
-# to ``_axis_skill_group_mean``.
+# Skill-group registry: (group_axis_name, sub_axes). Consumed by
+# compute_axes; per-group ``_axis_<group>_skill_group`` wrappers below
+# exist for the test suite, all delegating to _axis_skill_group_mean.
 _SKILL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("code_skill_group", CODE_SKILL_GROUP_SUB_AXES),
     ("math_skill_group", MATH_SKILL_GROUP_SUB_AXES),
@@ -1161,19 +839,12 @@ _axis_reasoning_skill_group = _make_skill_group_axis(REASONING_SKILL_GROUP_SUB_A
 _axis_knowledge_skill_group = _make_skill_group_axis(KNOWLEDGE_SKILL_GROUP_SUB_AXES)
 
 
-# ── Super-teacher axis ───────────────────────────────────────────────
-# Rewards exceeding the teacher on verifiable benches so miners are
-# incentivised to push past distillation (Stage-4 GRPO + curated SFT).
-# Per-axis lift = max(0, student_frac - teacher_frac); axis value is
-# the mean lift mapped through a soft tanh ([0, 1]; lift ~0.05 -> 0.5,
-# lift ~0.20 -> 0.95). Teacher pass_frac threaded via ``teacher_axes``
-# from ``students_data``.
-
+# Super-teacher axis: rewards exceeding the teacher on verifiable
+# benches (incentivises pushing past distillation via GRPO + curated SFT).
+# axis = soft-tanh(mean per-axis lift). lift ~0.05 -> 0.5, ~0.20 -> 0.95.
+# Excludes pure teacher-similarity axes (kl/rkl/top_k) and judge-rubric
+# axes (above-teacher ill-defined).
 SUPER_TEACHER_AXES = (
-    # Verifiable benches where the teacher's pass_frac is meaningful.
-    # Excludes pure teacher-similarity axes (kl, rkl, top_k_overlap)
-    # and judge-rubric axes (judge_probe, long_form_judge,
-    # chat_turns_probe) where "above teacher" isn't well-defined.
     "math_bench", "code_bench", "reasoning_bench", "ifeval_bench",
     "aime_bench", "mbpp_bench", "tool_use_bench", "long_context_bench",
     "robustness_bench",
@@ -1190,17 +861,8 @@ def _axis_super_teacher(
     student: dict,
     teacher_axes: dict[str, float | None] | None,
 ) -> float | None:
-    """Reward student for exceeding the teacher on verifiable bench axes.
-
-    Returns ``mean(per_axis_lift)`` mapped through a soft tanh to [0, 1]:
-    a student that exactly matches the teacher on every axis scores 0;
-    a student that beats the teacher by ~0.20 on average scores ~0.95.
-
-    Returns ``None`` when:
-      * teacher_axes is None / empty (we can't compute lift without
-        the teacher's score).
-      * The student reports no super-teacher-eligible axes.
-    """
+    """soft-tanh(mean(max(0, student - teacher))) over SUPER_TEACHER_AXES.
+    None when teacher_axes is missing or no eligible axes have data."""
     if not teacher_axes:
         return None
     lifts: list[float] = []
@@ -1224,33 +886,10 @@ def _axis_super_teacher(
 
 
 def _axis_reasoning_density(student: dict) -> float | None:
-    """Reasoning-density axis (Session 3.2, 2026-04-25).
-
-    For each bench axis the student actually ran, compute
-    ``efficiency = pass_frac * length_bonus`` where ``length_bonus`` is a
-    soft penalty around the per-bench target token count:
-
-        ratio   = mean_gen_tokens_correct / target
-        bonus   = 1.0                             (ratio <= 1)
-                  1 / (1 + (ratio-1))              (1 < ratio)
-
-    So at ratio=1 we get 1.0, at ratio=2 we get 0.5, at ratio=4 we get
-    0.25. No bonus below ratio=1 so a concise correct model gets the
-    same credit as one that matches target exactly; this rewards
-    efficiency without penalizing further.
-
-    The axis value is the mean of per-bench efficiencies over whichever
-    benches emitted ``mean_gen_tokens_correct`` > 0. Returns None if
-    no bench reported correct tokens (e.g. a shadow round where every
-    bench was skipped or the student got zero correct — then the axis
-    has nothing to say and falls back to other capability axes).
-
-    Rationale for absolute targets (not teacher-relative): the teacher
-    currently doesn't run the full bench battery. Absolute targets
-    drawn from observed teacher behavior (April 2026) avoid needing a
-    teacher-bench pass and are easy to recalibrate as the teacher
-    changes. See composite.py REASONING_DENSITY_TARGET_TOKENS.
-    """
+    """Mean per-bench pass_frac * length_bonus, where
+    length_bonus = 1 / (1 + max(0, mean_correct_tokens/target - 1)).
+    Caps at 1 below target (concise correct == matches target); ratio
+    2 -> 0.5, ratio 4 -> 0.25."""
     per_bench_scores: list[float] = []
     for axis_name, target in REASONING_DENSITY_TARGET_TOKENS.items():
         payload = student.get(axis_name) or {}
@@ -1284,20 +923,9 @@ def _axis_reasoning_density(student: dict) -> float | None:
 
 
 def _axis_on_policy_rkl(student: dict, king_rkl: float | None) -> float:
-    """Normalize on-policy reverse KL to [0, 1] higher-is-better.
-
-    On-policy RKL is the primary distillation signal under the new
-    framework: it is computed on the student's *own* rollouts, so the
-    student cannot hide behind teacher-forced memorization. Lower RKL
-    means the student's policy is closer to the teacher in the mode-
-    seeking direction, which is the actual objective of distillation.
-
-    We normalize against the king's RKL: a student tied with the king
-    scores 1.0; RKL at 2× king → ~0.5; at 10× king → ~0.1. If RKL
-    numbers are missing (old snapshot, probe disabled, probe errored),
-    return None so the axis drops out and the weighted mean
-    renormalizes over the remaining axes.
-    """
+    """king_rkl / student_rkl (clamped to [0, 1]).
+    On-policy RKL: student samples its own rollouts, teacher scores them,
+    so teacher-forced memorisation can't game it. None when missing."""
     opr = student.get("on_policy_rkl") or {}
     if not opr:
         return None
@@ -1325,19 +953,9 @@ def compute_axes(student: dict, king_kl: float | None = None,
                  teacher_axes: dict[str, float | None] | None = None,
                  broken_axes: set[str] | None = None,
                  canary_scores: dict[str, Any] | None = None) -> dict[str, float | None]:
-    """Compute the raw per-axis values for one student dict.
-
-    Pulled out of ``compute_composite`` so that the teacher sanity gate
-    can score the teacher itself on the same axes (by passing the teacher
-    row from ``results['students']``). Returns a dict keyed by axis name;
-    values are floats in [0, 1] or None if the axis couldn't be computed.
-
-    Session 3 axes (``aime_bench``, ``mbpp_bench``, ``tool_use_bench``,
-    ``self_consistency_bench``) are always computed when the probe
-    reported, but only included in ``worst`` / ``weighted`` aggregation
-    by ``compute_composite`` when ``ARENA_V3_AXES_IN_COMPOSITE`` is
-    truthy. Same shadow-then-promote pattern as Session 2.
-    """
+    """Raw per-axis values for one student. Values in [0, 1] or None
+    when the axis didn't run / couldn't be computed. Shared by the
+    composite path and the teacher-sanity gate."""
     out: dict[str, float | None] = {
         "on_policy_rkl": _axis_on_policy_rkl(student, king_rkl),
         "kl": _axis_kl(student, king_kl),
@@ -1360,52 +978,20 @@ def compute_axes(student: dict, king_kl: float | None = None,
     }
     for _bench in _BENCH_AXIS_NAMES:
         out[_bench] = _axis_bench_pass_frac(student, _bench)
-    # v30.2 — skill-group axes (mean of non-broken sub-axes; sub-axes
-    # still populated above for telemetry). Driven by ``_SKILL_GROUPS``
-    # so adding a new group is a one-line registry edit.
     for group_name, sub_axes in _SKILL_GROUPS:
         out[group_name] = _axis_skill_group_mean(student, sub_axes, broken_axes)
-    out.update({
-        # v30.2 — incentivize exceeding the teacher on verifiable
-        # benches. Reads the teacher's per-axis scores (None when
-        # teacher_axes not threaded through).
-        "super_teacher": _axis_super_teacher(student, teacher_axes),
-        "reasoning_density": _axis_reasoning_density(student),
-    })
-    # v30.6 — held-out canary axes. Read the per-UID canary file
-    # (loaded by the caller and threaded as canary_scores). Each
-    # canary axis returns the raw pass_frac in [0, 1] or None when
-    # the axis didn't run in the most recent canary for this UID.
+    out["super_teacher"] = _axis_super_teacher(student, teacher_axes)
+    out["reasoning_density"] = _axis_reasoning_density(student)
     for canary_axis in CANARY_AXIS_TO_HELDOUT_KEY:
         out[canary_axis] = _axis_canary(canary_scores, canary_axis)
     return out
 
 
 def resolve_reference_broken_axes(reference_student_row: dict | None) -> set[str]:
-    """Identify bench axes where the reference base model itself scored 0.
-
-    The reference model (Qwen3.5-4B base, ``REFERENCE_UID = -1``) is the
-    undistilled control we run every round. It is a small 4B base model,
-    so we expect it to fail some hard items — that's *real* signal a
-    distilled student can pick up. But if the reference scores
-    ``pass_frac == 0`` on a bench axis, the axis is broken at the
-    eval-setup level (token truncation, malformed prompt, unsolvable
-    items): the *base* model can't even partially attempt it, so any
-    student score on that axis is noise.
-
-    Audit 2026-04-26 found:
-      * aime_bench: reference 0/3 — 256-token cap truncates derivations
-      * code_bench: reference 0/3 — also token-bound
-      * tool_use_bench: reference 0/3 — 192-token cap + tool format
-      * noise_resistance_bench: reference 0/6 — perturbation strength
-
-    These four axes alone caused 100 % of current-schema records to sit
-    at ``worst == 0``, breaking the dethrone gate. Dropping them from
-    ``worst()`` (but keeping them in ``weighted`` and the per-axis
-    dashboard) restores signal without giving miners a free pass.
-
-    Returns the set of axis names to exclude. Empty set if the
-    reference row is absent (round didn't include reference) or all
+    """Set of bench axes where the reference Qwen3.5-4B scored 0
+    (eval-setup signal, not skill -- e.g. token truncation, malformed
+    prompt). Excluded from ``worst()`` so a broken axis can't peg
+    every record at worst==0. Empty when reference is absent or all
     reference scores are non-zero.
     """
     if not reference_student_row:
