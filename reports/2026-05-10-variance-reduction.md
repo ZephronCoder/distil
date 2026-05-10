@@ -120,6 +120,24 @@ The auto-generated "new king" announcement now reads `final by >5%` instead
 of the hardcoded "by >3%". The literal margin is read from
 `SINGLE_EVAL_DETHRONE_MARGIN` so the next bump won't drift.
 
+### 7. Probe-side sample-count lifts (second pass)
+
+After the v31 pass, the remaining variance hot-spots in the composite were
+the high-weight non-v31 probes:
+
+| Probe | Old n | New n | Composite weight |
+|-------|------:|------:|-----------------:|
+| `long_form_judge` | 8  | 12 | 0.20 |
+| `judge_probe`     | 16 | 20 | 0.20 |
+| `chat_turns_probe`| 10 | 14 | 0.10 |
+| `calibration_bench` | 8 | 12 | 0.05 |
+
+`bench_tool_use` was left at n=16 (already at the SE knee). Time impact:
+~+2-3 minutes per student (long_form_judge is the most expensive, ~30 s
+per item at 6144 max tokens; judge_probe is much cheaper at 256 max
+tokens). Combined v31 + probe-side bumps lift the per-student wall time
+by ~7-10 min, comfortably inside the new 40-minute timeout.
+
 ## What was *not* changed (deferred)
 
 * **Paired-bootstrap CI on the dethrone gate.** Computing per-axis SE
@@ -132,10 +150,12 @@ of the hardcoded "by >3%". The literal margin is read from
   secondary defence — but it also delays legitimate dethrones by one
   round. Defer until we see whether the n + K + margin combo is
   enough.
-* **Probe-side n bumps** (judge\_probe, chat\_turns, long\_form\_judge,
-  bench\_calibration). These are LLM-judged and quite expensive per
-  item; their variance is dominated by judge stochasticity, not item
-  count. Out of scope for this sweep.
+* **Tighter MIN_VALID floors** (JUDGE_PROBE_MIN_VALID, etc.). Bumping
+  the per-probe floors so they reflect the new n risks dropping the
+  axis entirely under transient pod errors. Keep permissive defaults
+  for now.
+* **bench_tool_use lift.** Already at SE knee (n=16, SE 0.125). Marginal
+  gain from further bumps; the sandbox cost is non-trivial.
 
 ## Acceptance
 

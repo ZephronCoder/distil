@@ -1617,7 +1617,7 @@ JUDGE_PROBE_POOL = (
     "What's a respectful way to disagree with a senior colleague's design choice? One short paragraph.",
     "Why is over-fitting in machine learning analogous to a student memorizing past exams? One short sentence.",
 )
-JUDGE_PROBE_PER_ROUND = int(os.environ.get("JUDGE_PROBE_PER_ROUND", "16"))
+JUDGE_PROBE_PER_ROUND = int(os.environ.get("JUDGE_PROBE_PER_ROUND", "20"))
 JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
 
 # v30 (2026-04-29) — long_form_judge_probe. Same architecture as the short-
@@ -1634,7 +1634,7 @@ JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
 # tighter mean and exposes intermittent derailers (the king fails on
 # only some long-form prompts depending on topic). Doubles long-form
 # judge wall-clock per round (~30s → ~60s phase B), worth it.
-LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "8"))
+LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "12"))
 # 2026-05-01 (v30.4 patch v2): raised 2048 → 6144 — essentially the
 # model's full usable context window minus prompt headroom. The
 # cap is asymmetric in cost:
@@ -3077,7 +3077,7 @@ CHAT_TURNS_PROBE_POOL = (
         "Boil your phrasing down to a single one-sentence message I can use as the opening line.",
     ),
 )
-CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "10"))
+CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "14"))
 CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "260"))
 # v29.6 (2026-04-29): N-turn chain length for procedural synthesis.
 # Default 3 matches the historical legacy pool.
@@ -4974,7 +4974,7 @@ BENCH_MULTI_DOC_MAX_TOKENS = int(os.environ.get("BENCH_MULTI_DOC_MAX_TOKENS", "6
 # v29.4 — calibration_bench. Mix solvable + intentionally unsolvable
 # items; reward correct answers AND correct refusals. Discourages
 # confabulation.
-BENCH_CALIBRATION_PER_ROUND = int(os.environ.get("BENCH_CALIBRATION_PER_ROUND", "8"))
+BENCH_CALIBRATION_PER_ROUND = int(os.environ.get("BENCH_CALIBRATION_PER_ROUND", "12"))
 BENCH_CALIBRATION_UNSOLVABLE_FRACTION = float(
     os.environ.get("BENCH_CALIBRATION_UNSOLVABLE_FRACTION", "0.5"),
 )
