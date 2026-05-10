@@ -51,18 +51,10 @@ COMPOSITE_DETHRONE_MIN_AXES = int(policy_env("COMPOSITE_DETHRONE_MIN_AXES", "3")
 def _log_finetune_probe_telemetry(
     state_dir, uid, model_name, student_result, current_block, is_king,
 ):
-    """Append one row per evaluated model to state/finetune_probe_telemetry.jsonl.
+    """Append one finetune-probe row to state/finetune_probe_telemetry.jsonl.
 
-    Requested by manta.llm on Discord (2026-04-20): "monitor the anti-finetune
-    threshold values… my values are pure heuristic. Some miners will try to
-    modify their anti-finetune method to pass it (as outlier)." Persisting ALL
-    probe values (pass AND fail, king AND challengers) lets us build an
-    empirical distribution and later replace static thresholds with calibrated
-    ones — same playbook as the activation-threshold bump from 0.9999 to
-    0.99999.
-
-    Writes to JSONL so it's cheap to append, easy to tail, and trivial to load
-    with pandas when we're ready to calibrate.
+    Persists every probe value (pass AND fail, king AND challengers) so
+    we can later replace heuristic thresholds with calibrated ones.
     """
     probe = student_result.get("finetune_probe") or {}
     if not probe:
@@ -353,15 +345,7 @@ def _pareto_dethrone_veto(
 def _student_id(
     models_to_eval: dict, uid: int, uid_to_hotkey: dict,
 ) -> tuple[str, int | None]:
-    """(hotkey, commit_block) lookup with the canonical fallback chain.
-
-    The pattern ``models_to_eval[uid].get("hotkey", uid_to_hotkey[uid])``
-    + ``models_to_eval[uid].get("commit_block")`` was inlined ~14 times
-    in process_results before this helper. Centralising avoids "uid X
-    DQ'd against the wrong hotkey" bugs when models_to_eval is missing
-    a key (which happens during the cross-round king fallback path
-    where models_to_eval may not contain the prior king).
-    """
+    """(hotkey, commit_block) lookup with canonical fallback."""
     info = models_to_eval.get(uid, {}) or {}
     hotkey = info.get("hotkey") or uid_to_hotkey.get(uid, str(uid))
     commit_block = info.get("commit_block")
@@ -369,18 +353,7 @@ def _student_id(
 
 
 def _can_persist_kl_score(early_stopped: bool, scored_prompts: int) -> bool:
-    """Gate: should we overwrite a global score with this round's KL?
-
-    A round that died before reaching ``MIN_PROMPTS_FOR_SCORE_UPDATE``
-    prompts has a noisy KL estimate that can drift dramatically from
-    the model's true KL (2026-04-24 incident: a king died at 129/300
-    prompts and its kl=0.06 overwrote the prior canonical kl=0.20,
-    silently propagating a corrupt score everywhere). Skip the score
-    write in that case and preserve the prior global score.
-
-    Used for both king and challenger paths so they apply the same
-    threshold; only the log messaging differs between them.
-    """
+    """Skip overwrite when an early-stopped round's KL is too noisy."""
     return (not early_stopped) or scored_prompts >= MIN_PROMPTS_FOR_SCORE_UPDATE
 
 
@@ -391,20 +364,7 @@ def _dq_student(
     log_event_msg: str | None = None, log_event_level: str = "warning",
     mark_evaluated: bool = True,
 ) -> None:
-    """Centralised "DQ this student now" cascade.
-
-    Standardises the four side-effects every per-student DQ branch in
-    ``process_results`` performs: emit a structured log line, optionally
-    persist a state-event entry, call ``disqualify``, push the student
-    to the MAX_KL_THRESHOLD+1 sentinel score, and add it to
-    ``evaluated_uids`` so the round-loop bookkeeping is consistent.
-
-    ``label`` is the human-readable failure category that goes into the
-    log (``ANTI-FINETUNE``, ``COPY``, ``LONG_FORM_INCOHERENCE``, ...).
-    Pass ``mark_evaluated=False`` to skip the evaluated-uids add — only
-    used by paths that intentionally want the student retried next
-    round (none currently, but kept for future use).
-    """
+    """DQ a student: log, disqualify, sentinel-score, mark evaluated."""
     logger.info(f"UID {uid} ({model_name}): {label} — {reason}")
     if log_event_msg:
         log_event(log_event_msg, level=log_event_level, state_dir=str(state.state_dir))
@@ -422,18 +382,7 @@ def _dq_student_by_uid(
     log_event_msg: str | None = None, log_event_level: str = "warning",
     mark_evaluated: bool = True,
 ) -> None:
-    """Resolve (hotkey, commit_block) via :func:`_student_id` and DQ.
-
-    Convenience wrapper for the per-student DQ branches in
-    ``process_results`` that don't already have hotkey / commit_block in
-    scope. Cuts out the boilerplate two-call ``_student_id`` →
-    ``_dq_student`` pattern at every fraud / copy / derail branch.
-
-    Use :func:`_dq_student` directly when an alternative commit_block is
-    needed (e.g. the activation-copy branch that wants
-    ``this_commit_block`` from outer scope rather than the one stored on
-    the round entry).
-    """
+    """Like _dq_student but resolves (hotkey, commit_block) via _student_id."""
     hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
     _dq_student(
         state=state, uid=uid, model_name=model_name,

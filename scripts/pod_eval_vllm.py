@@ -1,47 +1,18 @@
 #!/usr/bin/env python3
-"""
-vLLM-accelerated GPU evaluation script for SN97 validation (v3.0.0).
+"""vLLM-accelerated GPU evaluation script for SN97 validation.
 
-Architecture & VRAM timeline (single B200 = 192GB):
-  Phase 1 — Teacher generation via vLLM:
-    [vLLM teacher ~70GB] → generate continuations → kill server
-    Time: ~3-5 min (vs 25 min with HF)
+Three phases on a single B200 (192GB VRAM):
+  Phase 1 — Teacher generation via vLLM (~70 GB, ~3-5 min).
+  Phase 2 — Teacher logit extraction via HF forward (~67 GB, 8-10 min).
+  Phase 3 — Per-student scoring (~18 GB; king stays loaded, challenger
+            rotates ~2-3 min each).
 
-  Phase 2 — Teacher logit extraction via HF:
-    [HF teacher ~67GB] → forward passes (no autoregressive) → cache logits → unload
-    Time: ~8-10 min (forward-only, ~3x faster than generate)
+The vLLM path is 5-10x faster than HF generate(); the king staying in
+VRAM saves the load/cleanup tax; teacher-prefetch overlaps download
+with scoring. Falls back to pure HF if vLLM fails.
 
-  Phase 3 — Student scoring:
-    [teacher logits on CPU ~2GB] + [king ~8GB stays loaded] + [challenger ~8GB rotates]
-    Total VRAM: ~18GB (king + challenger + overhead)
-    Time: ~2-3 min per student
-
-Optimizations:
-  1. vLLM teacher generation: 5-10x faster than HF generate()
-  2. King stays in VRAM: no download/load/cleanup between rounds (~3-5 min saved)
-  3. Prefetch next student: download while current student scores
-  4. Teacher unloaded after logits cached: frees ~67GB for student scoring
-  5. Graceful fallback: if vLLM fails, falls back to pure HF path
-
-Usage:
-    python3 pod_eval_vllm.py \\
-        --teacher Qwen/Qwen3.5-35B-A3B \\
-        --students user/king,user/challenger1,user/challenger2 \\
-        --prompts prompts.json \\
-        --output results.json \\
-        --king user/king
-
-File layout (single-file — uploaded to remote GPU pod via SCP):
-  1. Imports & Constants
-  2. GPU & Disk Utilities
-  3. Model Utilities (load, prefetch, cache, fingerprint)
-  4. KL Computation (core, sparse, precomputed)
-  5. vLLM Server Management (start, stop, health)
-  6. vLLM Generation (teacher generation, logprobs parsing)
-  7. vLLM Student Scoring
-  8. HF Batched Forward Pass
-  9. Progress Reporting
-  10. Main
+Uploaded to the remote GPU pod via SCP as a single file alongside
+``scripts/eval_*.py`` helpers (see pod_session.upload_aux_modules).
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════

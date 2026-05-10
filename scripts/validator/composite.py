@@ -1,167 +1,21 @@
-"""Multi-axis composite score computation — production ranking + dethrone gate.
+"""Multi-axis composite score — production ranking + dethrone gate.
 
-Core idea: a single scalar like KL can be over-optimized until the model is
-useless under autoregressive sampling (the Tiapkin 2025 "Teacher Hacking"
-pathology, empirically visible on the 2026-04-22 SN97 king, which rambles
-3–10x longer than the teacher on trivial prompts while passing KL). The
-fix is to score each student on several independent axes and combine them
-with a worst-case rule, so that gaming any single axis penalizes overall
-rank.
+A single scalar like KL can be over-optimised into models that ramble
+or hallucinate while still passing the metric (Tiapkin 2025 "Teacher
+Hacking"). We score each student on several independent axes and
+combine them with a worst-case rule so gaming any single axis hurts
+overall rank.
 
-  * 2026-05-09 (v30.7 — "no-public-benchmarks-in-score"). v30.6 wired
-    held-out evalscope (gsm8k, humaneval, bbh, ifeval, mmlu_pro) into
-    the composite as first-class axes worth 0.50 total. That fixed
-    the immediate anti-correlation symptom but **re-introduced the
-    Goodhart trap by a different door**: every one of those benchmarks
-    is public. Once a metric the miners can locally evaluate against
-    is a scoring component, the cheapest move is to train *to* it —
-    train-set contamination, paraphrase synthesis, item-format match —
-    until the canary score is high without the underlying skill
-    transferring to anything else. Goodhart's Law unmoved.
-    The correct architecture for an anti-Goodhart distillation subnet
-    is: **the score MUST be procedural** (so miners can't see the
-    items), and the *procedural distribution* itself must be moving
-    + diverse enough that overfitting to it is harder than just
-    distilling well. The canary remains a DIAGNOSTIC — it is read
-    every round, logged into ``axis_correlation.json``, and used as a
-    GATE (``king_canary_streak``) but is no longer a scored component.
-    Changes shipped here:
+Anti-Goodhart contract: scored axes must be PROCEDURAL (miners can't
+see the items). Public benchmarks are read for diagnostic purposes
+(canary correlation, king_canary_streak gate) but never enter the
+score itself. See reports/2026-05-09-anti-goodhart-procedural.md.
 
-      1. ``CANARY_AXES_IN_COMPOSITE`` default flipped to ``0``;
-         ``CANARY_AXIS_WEIGHTS`` zeroed defensively. ``compute_axes``
-         still populates ``canary_*`` keys for telemetry / correlation
-         analysis, but they no longer enter ``worst`` / ``weighted``
-         and don't move ranking.
-      2. The 0.50 weight freed by removing canary axes is redirected
-         to procedural/distillation axes that are DEMONSTRABLY HARDER
-         to game without actually building a better model:
-            * ``on_policy_rkl``    0.25 → 0.30 (sample-then-KL needs
-              real teacher access; can't be replicated locally).
-            * ``top_k_overlap``    0.10 → 0.18 (top-K agreement with
-              the private teacher's logits; same property).
-            * ``judge_probe``      0.10 → 0.20 (private LLM-as-judge;
-              gaming requires a model that fools the judge — the
-              cheapest path is genuine quality).
-            * ``long_form_judge``  0.10 → 0.20 (same property at
-              long-context).
-            * ``long_gen_coherence`` 0.15 → 0.25 (statistical coherence
-              over 800-token generations; gameable only by genuinely
-              coherent generation).
-            * ``capability``       0.05 → 0.10 (procedural capability
-              probe; modest bump because it CAN be over-fit if the
-              procedural pool is small).
-            * ``code_skill_group`` 0.12 → 0.15 (only group with
-              positive canary correlation in v30.6).
-            * ``reasoning_skill_group`` 0.06 → 0.10 (modest restore
-              now that bottom_half_mean limits saturation gaming).
-      3. Skill-group aggregation kept at ``bottom_half_mean`` so a
-         saturated sub-axis still can't inflate the group.
-      4. ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` kept at 0.85 — worst-axis
-         dominance is still the right anti-Goodhart pressure even
-         without the canary anchor.
-      5. King-canary-streak gate (``KING_CANARY_GATE``) tightened:
-         margin 0.05 → 0.04, min_streak 2 → 1. A king regressing
-         below Qwen3.5-4B base on the held-out canary now waives
-         its dethrone-veto immediately rather than after two rounds.
-         Canary continues to function as a SAFETY NET, not a SCORE.
-      6. ``COMPOSITE_SHADOW_VERSION`` bumped 30 → 31. v30.6 records
-         auto-quarantined by ``_KING_SELECTION_MIN_VERSION``.
-
-    Open follow-ups (planned for v30.8+) — see
-    ``reports/2026-05-09-anti-goodhart-procedural.md`` for the design:
-
-       * Per-round private distribution shift (``epoch_secret``):
-         the procedural item generator's operator pool, parameter
-         ranges, and difficulty meta-parameters are perturbed by a
-         private secret committed at round start and revealed
-         post-hoc. Miners can't pre-generate the round's distribution.
-       * Adversarial item selection: items where the current king
-         disagrees with teacher get up-weighted at scoring time.
-         Frontier shifts as miners improve, gaming a frozen frontier
-         doesn't help.
-       * Private OOD probe pool: a small private benchmark set we
-         never publish, used as a divergence DETECTOR (not a score).
-         If composite climbs while OOD drops, automatic king veto.
-       * Hidden axis-weight rotation: per-round multinomial sampled
-         from a private prior, smoothed across rounds. Optimizing for
-         any single axis loses ranking on rounds where that axis is
-         weighted low.
-
-  * 2026-05-09 (v30.6, REVERTED above). Original v30.6 attempted
-    to anchor the composite on the held-out evalscope canary set.
-    The audit motivating v30.6 (composite r=-0.71 vs canary,
-    reasoning_skill_group r=-0.95) is correct and the v30.6
-    reweighting of OVER-weighted procedural axes (degeneracy,
-    capability, length, reasoning/knowledge groups) is preserved.
-    What's reverted is specifically *putting the canary in the
-    score*. See the v30.7 block above for the rationale.
-
-
-This module is intentionally pure-Python, no ML deps, safe to import from
-the validator service. It consumes the JSON that ``pod_eval_vllm.py``
-writes per student and emits a ``composite`` score and per-axis breakdown.
-
-Status: PRODUCTION — ranking + dethrone veto.
-  * 2026-04-19 (commit 8eec9a2): promoted from shadow to production
-    ranking key. ``composite.worst`` orders the leaderboard and selects
-    the canonical challenger for display.
-  * 2026-04-22: ``composite.worst`` is now ALSO a dethrone gate. A
-    challenger that passes the KL paired t-test + 3% epsilon is still
-    blocked from taking the crown if its worst composite axis is below
-    ``COMPOSITE_DETHRONE_FLOOR`` (currently 0.20). See
-    ``scripts/validator/results.py::_composite_dethrone_veto``.
-  * Same commit: the ``length`` axis is now always populated even when
-    ``THINK_COLLAPSE_PROBE=0``. It falls back to the always-on
-    ``chat_probe`` length vs a teacher anchor captured in
-    ``prepare_teacher_probe_refs_*``. This closes the gap that let a
-    KL-specialized-but-rambling model keep the crown unopposed.
-  * 2026-04-23: judge-probe axis added in SHADOW mode. The teacher
-    scores each student's greedy response to 16 rotated realistic
-    prompts on a 1-5 rubric, normalized to [0, 1]. Computed + logged
-    per round but excluded from ``worst`` / ``weighted`` aggregation
-    until the ``JUDGE_AXIS_IN_COMPOSITE`` gate flips (Session 2). See
-    ``reports/2026-04-23-goodhart-immune-eval.md``.
-  * 2026-04-24: **Arena v3 — comprehensive eval**. Session 2 promoted:
-    the five absolute-correctness bench axes (``math_bench``,
-    ``code_bench``, ``reasoning_bench``, ``knowledge_bench``,
-    ``ifeval_bench``) and ``judge_probe`` are now all IN the composite
-    ranking by default. These break the last Goodhart hole — the old
-    six axes all scored *relative* to the teacher, so a perfectly-
-    distilled model of a non-SOTA teacher ranked #1 but couldn't do
-    grade-school math. New axes score against ground truth so
-    overfitting them ⇒ SOTA small model.
-  * 2026-04-24: **Session 3 axes promoted live**:
-    ``aime_bench`` (AIME olympiad math), ``mbpp_bench`` (MBPP+ code),
-    ``tool_use_bench`` (agentic Python tool use), and
-    ``self_consistency_bench`` (majority-vote over sampled generations).
-    These give miners more surface area to optimize against, each
-    pointing towards a genuinely valuable capability. See
-    ``reports/2026-04-24-arena-v3.md`` for the full Affine-Cortex-
-    inspired design.
-  * 2026-04-24: **Pareto majority dominance**: in addition
-    to the worst-axis floor, a challenger that beats the king on KL
-    but loses on a majority of axes is blocked. This is part of the
-    dethrone gate by default after the public telemetry window.
-  * 2026-04-25: Session 3.1 ``arc_bench`` (AI2 ARC-Challenge
-    commonsense science MC), 3.2 ``reasoning_density`` (pass_frac ×
-    length_bonus — explicitly penalizes over-think-on-trivia),
-    3.3 ``chat_turns_probe`` (teacher-graded 3-turn dialogues),
-    3.4 ``truthful_bench`` (TruthfulQA adversarial factuality),
-    3.5 ``long_context_bench`` (procedural needle-in-haystack
-    over ~1400 tokens — literally uncheatable because items are
-    generated fresh every round from the block_seed, no fixed
-    dataset exists), and 3.6 ``procedural_bench`` (block-seeded
-    synthetic reasoning / instruction following / factual retrieval).
-    Each targets a capability that Session 2 + relative axes don't
-    already reward, so climbing them requires genuine model improvement. See
-    ``reports/2026-04-24-arena-v3.md`` and the ``MINER_FAQ.md``
-    playbook.
-
-Axes that are missing for a given round (e.g. ``degeneracy`` while
-``THINK_COLLAPSE_PROBE=0``) drop out and the weighted mean renormalizes
-over the surviving axes. The veto fails open if fewer than
-``COMPOSITE_DETHRONE_MIN_AXES`` axes are populated — we don't want a pod
-probe outage to freeze the crown.
+Pure-Python, no ML deps. Reads the per-student JSON that
+``pod_eval_vllm.py`` writes and emits a composite + per-axis breakdown.
+Missing axes drop out and the weighted mean renormalises over the
+surviving axes. The dethrone veto fails open if fewer than
+``COMPOSITE_DETHRONE_MIN_AXES`` axes are populated.
 """
 from __future__ import annotations
 

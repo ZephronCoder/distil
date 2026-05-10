@@ -256,15 +256,8 @@ def _recent_chat_text(messages: list[dict], *, max_messages: int = 6) -> str:
 
 
 def _contextual_tool_user_text(messages: list[dict], user_text: str) -> str:
-    """Add just enough recent context for deterministic tool extraction.
-
-    Open WebUI sends follow-ups like "yes the 4096th number" after the model
-    asks about a Fibonacci interpretation. The latest user message no longer
-    contains "fib", so the runtime used to miss the tool path and let the
-    weak king hallucinate. If recent chat context is clearly Fibonacci-related
-    and the latest turn is an ordinal/numeric follow-up, synthesize a local
-    tool query without changing the transcript sent to the model.
-    """
+    """Synthesize a local tool query when a numeric follow-up references
+    a Fibonacci context already established earlier in the chat."""
     text = user_text or ""
     if "fib" in text.lower():
         return text
@@ -291,26 +284,14 @@ _RUNTIME_TRACE_LINE_RE = re.compile(
 
 
 def _strip_client_thinking(content: str) -> str:
-    """Remove previously displayed thinking blocks from assistant history.
-
-    Open WebUI can fold streamed ``reasoning_content`` back into the next
-    assistant message as ``<think>...</think>``. That is display metadata, not
-    conversational content, and forwarding it makes the current king imitate
-    stale runtime traces on later turns.
-    """
+    """Drop previously displayed <think>/runtime-trace blocks from history."""
     content = _CLIENT_THINK_RE.sub("", content or "")
     content = _RUNTIME_TRACE_LINE_RE.sub("", content)
     return content.strip()
 
 
 def _clean_client_messages(messages: list[dict], *, system: str, max_history: int = 8) -> list[dict]:
-    """Keep recent user/assistant text only; never forward tool specs/messages.
-
-    Open-WebUI native function calling sends ``tools`` outside the messages,
-    but failed turns can leave tool-like prose in assistant history. The weak
-    king tends to imitate that, so the proxy feeds vLLM a clean chat transcript
-    and handles tools itself.
-    """
+    """Keep recent user/assistant text only; tools are handled by the proxy."""
     cleaned = [{"role": "system", "content": system}]
     for msg in (messages or [])[-max_history:]:
         if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
@@ -462,14 +443,7 @@ def _resolve_ddg_href(href: str) -> str:
 
 
 def _parse_duckduckgo_html(body: str, *, query: str, limit: int = 5) -> str:
-    """Extract titled, linked, and snippet'd DuckDuckGo HTML results.
-
-    DuckDuckGo's HTML layout includes a title anchor (``result__a``), a
-    display URL (``result__url``), and a snippet block (``result__snippet``
-    or ``result-snippet``). The snippet often carries the actual fact (a
-    price, a date, a headline) that the model needs in order to answer
-    accurately. We pair them in order so the model gets a richer context.
-    """
+    """Pair (title, href, snippet) from DDG HTML for the model context."""
     title_re = re.compile(
         r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
         flags=re.I | re.S,
