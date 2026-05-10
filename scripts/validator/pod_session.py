@@ -26,23 +26,13 @@ logger = logging.getLogger("distillation.remote_validator")
 
 
 def _is_api_teacher_mode() -> bool:
-    """Return True iff DISTIL_TEACHER_MODE=api in the validator env.
-
-    Routed through one helper so the (lower-cased, env-driven) check stays
-    consistent across ETA computation, vLLM startup gating, and any future
-    caller. The pod-side equivalent lives in ``scripts/api_teacher.py``.
-    """
+    """True iff DISTIL_TEACHER_MODE=api in the validator env."""
     return (policy_env("DISTIL_TEACHER_MODE", "") or "").lower() == "api"
 
 
 def _pod_exec_silent(pod, cmd: str, *, timeout: int = 30, label: str | None = None) -> None:
-    """Run ``pod.exec(cmd)`` swallowing any exception.
-
-    Used for best-effort cleanup / kill commands where a failure must not
-    abort the surrounding flow (network blip, pod just rebooted, target
-    process already gone, etc.). Optionally logs ``label: <exc>`` at debug
-    so we keep visibility without spamming WARN.
-    """
+    """Best-effort ``pod.exec(cmd)`` for cleanup/kill commands; swallows
+    any exception (debug-logs ``label: <exc>`` when label is provided)."""
     try:
         pod.exec(cmd, timeout=timeout)
     except Exception as exc:
@@ -50,11 +40,10 @@ def _pod_exec_silent(pod, cmd: str, *, timeout: int = 30, label: str | None = No
             logger.debug("%s: %s", label, exc)
 
 
-# Single source of truth for the per-run remote artifact filenames.
-# ``var_name`` matches the local that consumes it later in ``run_eval_on_pod``;
-# ``basename`` is appended to the run_dir. The resume branch honours
-# ``resume_pod_eval`` overrides per-key so a re-attached run keeps writing to
-# the existing files even if the basenames evolve.
+# Per-run remote artifact filenames. var_name matches the local that
+# consumes it in run_eval_on_pod; basename is appended to run_dir.
+# resume_pod_eval overrides per-key so re-attached runs keep writing
+# to existing files even if basenames evolve.
 _POD_REMOTE_FILES: tuple[tuple[str, str], ...] = (
     ("prompts_remote", "prompts.json"),
     ("remote_eval_script", "pod_eval.py"),
@@ -69,12 +58,8 @@ _POD_REMOTE_FILES: tuple[tuple[str, str], ...] = (
 
 
 def _build_remote_paths(run_dir: str, resume: dict | None = None) -> dict[str, str]:
-    """Return ``{var_name: remote_path}`` for one pod-eval run.
-
-    ``resume`` (when truthy) provides explicit overrides — used by the
-    validator-restart resume path so a re-attached run keeps writing to the
-    same files even if the basename map evolves between releases.
-    """
+    """{var_name: remote_path} for one pod-eval run; resume overrides
+    per-key for re-attached runs."""
     overrides = resume or {}
     return {
         var_name: overrides.get(var_name) or f"{run_dir}/{basename}"
@@ -91,25 +76,12 @@ _LOAD_STAGE_PREFIXES: tuple[str, ...] = (
 
 
 class StageStallWatchdog:
-    """Detect a pod_eval that's been pinned in the same stage too long.
+    """Kill a pod_eval pinned in the same stage past its limit.
 
-    Before this watchdog the only safety net was the 5-hour outer
-    ``eval_timeout``. When a student wedged in ``loading_weights`` (HF
-    download silently stuck, vLLM init deadlock, OOM with no exception),
-    the validator burned the entire 5-hour budget. The May 7 incident
-    sat in ``loading_weights`` for ~4h22m on UID 213 ``const0312/wtbmts09``
-    before the outer loop noticed and replanned. With this watchdog the
-    same condition is detected within ``load_timeout_s`` (default 45 min)
-    and the pod-side worker is killed via the supplied ``kill_action``
-    callback so the outer loop sees ``DISTIL_STATUS:dead`` and replans
-    cleanly.
-
-    The watchdog fingerprints ``(student_idx, student_name, stage,
-    prompts_done, bench_axis_idx, teacher_prompts_done, phase)``. Any
-    change resets the timer. If the fingerprint stays identical past the
-    half-limit, ``warn_action(elapsed)`` fires once. If it stays past the
-    full limit, ``kill_action(elapsed)`` fires once and the watchdog
-    arms itself for the rest of the run (no double-kill).
+    Fingerprint: (student_idx, student_name, stage, prompts_done,
+    bench_axis_idx, teacher_prompts_done, phase). Any change resets the
+    timer. Past half-limit -> warn_action fires once; past full limit
+    -> kill_action fires once and the watchdog arms (no double-kill).
     """
 
     def __init__(
@@ -163,11 +135,7 @@ class StageStallWatchdog:
         self.warned = False
 
     def check(self, pod_progress: dict) -> str:
-        """Return one of ``"ok"``, ``"warn"``, ``"killed"``.
-
-        Idempotent: once ``"killed"`` is returned, subsequent calls also
-        return ``"killed"`` without re-firing the kill action.
-        """
+        """One of "ok" / "warn" / "killed". Idempotent once "killed"."""
         if self.killed:
             return "killed"
         fp = self._fingerprint_from(pod_progress)
@@ -184,9 +152,7 @@ class StageStallWatchdog:
         stage = cur.get("stage")
         limit = self._limit_for(stage)
         elapsed = now - self.since
-        # Past the hard limit always wins, even if we never fired the warn
-        # (e.g. caller skipped a poll cycle so we jumped straight past
-        # half-limit). The kill is the safety net the watchdog exists for.
+        # Hard limit always wins; the kill is the safety net.
         if elapsed >= limit:
             if self.kill_enabled and self._kill_action is not None:
                 try:
@@ -206,29 +172,21 @@ class StageStallWatchdog:
         return "ok"
 
 
-# Validator-side env vars propagated to the pod inner_eval command. Listed
-# in one place so we don't have to dig through 90 lines of inline bash to
-# add a new tunable. The pod-side script (``scripts/pod_eval_vllm.py``)
-# documents each variable's semantics.
+# Env vars propagated from validator to the pod inner_eval command.
+# Pod-side semantics live in scripts/pod_eval_vllm.py.
 _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
-    # ── Bench battery toggles + composite gates ──
+    # Bench battery toggles + composite gates
     "BENCH_BATTERY_ENABLED",
     "BENCH_BATTERY_SHADOW_AXES",
     "BENCH_BATTERY_LITE",
     "POD_PER_MODEL_TIMEOUT",
     "ARENA_V3_AXES_IN_COMPOSITE",
     "REASONING_DENSITY_IN_COMPOSITE",
-    # 2026-04-26 — propagate validator-authoritative composite gates so the
-    # pod-side ``pod_eval_vllm.py`` reports ``in_composite``/log labels that
-    # match what the validator will actually do downstream. Previously the
-    # pod read separate ``*_PROBE_IN_COMPOSITE`` variables that defaulted to
-    # "0" while these axes defaulted to "1" in composite.py, so the eval log
-    # lied about whether axes were in production.
     "JUDGE_AXIS_IN_COMPOSITE",
     "CHAT_TURNS_AXIS_IN_COMPOSITE",
     "PARETO_DOMINANCE_GATE",
     "KING_REGRESSION_GATE",
-    # ── Bench sample counts ──
+    # Bench sample counts
     "BENCH_MATH_PER_ROUND",
     "BENCH_CODE_PER_ROUND",
     "BENCH_REASONING_PER_ROUND",
@@ -247,11 +205,7 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     "BENCH_ROBUSTNESS_PERTURB_K",
     "BENCH_NOISE_PER_ROUND",
     "BENCH_NOISE_PERTURB_K",
-    # ── v31 procedural axes (2026-05-09 promotion + 2026-05-10 variance lift) ──
-    # The pod-side defaults were lifted but we still want to be able to override
-    # them via the policy file (for emergency rollback or one-off ablations) so
-    # they're listed explicitly here. Names follow the pod's short-name
-    # convention (BENCH_V31_<axis>_PER_ROUND / _MAX_TOKENS).
+    # v31 procedural axes (policy-overridable for ablations/rollback)
     "BENCH_V31_GSM_SYMBOLIC_PER_ROUND",
     "BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS",
     "BENCH_V31_MATH_COMPETITION_PER_ROUND",
@@ -274,11 +228,7 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     "BENCH_V31_TRUTHFULNESS_MAX_TOKENS",
     "BENCH_V31_CONSISTENCY_PER_ROUND",
     "BENCH_V31_CONSISTENCY_MAX_TOKENS",
-    # ── Bench max-token budgets ──
-    # Added 2026-04-25 17:00 UTC after live round wall-time observation pegged
-    # the bench battery at ~11 min/student. The default 1024-token AIME budget
-    # alone burns ~120s/student even when the model can't get a single problem
-    # right; tightening it (and the rest) is the single biggest lever.
+    # Bench max-token budgets
     "BENCH_MATH_MAX_TOKENS",
     "BENCH_CODE_MAX_TOKENS",
     "BENCH_REASONING_MAX_TOKENS",
@@ -294,10 +244,8 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     "BENCH_PROCEDURAL_MAX_TOKENS",
     "BENCH_ROBUSTNESS_MAX_TOKENS",
     "BENCH_NOISE_MAX_TOKENS",
-    # ── Thinking-mode toggle (2026-05-05) ──
-    # Defaults ON in the pod (BENCH_ENABLE_THINKING=1). Propagate so an
-    # emergency rollback ("BENCH_ENABLE_THINKING=0") set on the
-    # validator host immediately silences thinking on the next round
+    # Thinking-mode toggle (defaults ON in the pod; override via env
+    # for emergency rollback)
     # without a code push. The pod-side default is also "1" so the
     # absence of this env var has the intended effect (thinking on)
     # without explicit propagation — listing it here is for the
@@ -355,17 +303,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     ordered_uids = []
     if king_uid is not None and king_uid in models_to_eval:
         ordered_uids.append(king_uid)
-    # 2026-05-04 — order challengers by (failure_count asc, commit_block asc).
-    # Previously the only sort key was commit_block; that's reasonable as a
-    # tie-breaker but it puts proven CUDA-poisoners (UID 73 gutenmorgan/guten4
-    # for 3 consecutive rounds) at the FRONT of the queue every round simply
-    # because their commitment is older. When such a model triggers a
-    # device-side assert it poisons the GPU context for every sibling student
-    # — observed cost ~9 deferred students × 30+ min per round. Putting models
-    # with prior failures last means the cascade only torpedoes already-failed
-    # models, while the rest of the round still produces real composite scores.
-    # Honest models with failure_count == 0 are still ordered by commit_block
-    # so the FIFO-by-commit policy still holds for them.
+    # Order challengers by (failure_count asc, commit_block asc): proven
+    # CUDA-poisoners go last so their cascade only torpedoes already-failed
+    # models. Honest models still follow FIFO-by-commit.
     failures_state = getattr(state, "failures", {}) if state is not None else {}
     def _challenger_sort_key(uid):
         fc = int((failures_state or {}).get(str(uid), 0))
@@ -379,18 +319,15 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     now = time.time()
     is_resuming = isinstance(resume_pod_eval, dict) and bool(resume_pod_eval.get("run_dir"))
     if is_resuming:
-        # If the persisted started_at is recent enough, prefer it so the
-        # progress UI keeps showing the original elapsed wall time.
+        # Prefer the persisted started_at so the progress UI keeps the
+        # original elapsed wall time.
         try:
             now = float(resume_pod_eval.get("started_at") or now)
         except (TypeError, ValueError):
             pass
-    # Per-round wall-time estimate (calibrated 2026-05-04 on H200-NVL
-    # with Kimi K2.6 API teacher + bench battery + KL):
-    #   teacher API phase ~370s + probe refs ~145s
-    #   per student: load 140s + probes ~380s + bench ~1700s + KL ~180s
-    #   Healthy student ~45 min, derail-capped ~19 min, ~270 min for a
-    #   10-student round. Underestimating spikes "eval is stuck" pings.
+    # Per-round wall-time estimate (calibrated on H200-NVL + Kimi K2.6
+    # API teacher + bench battery + KL). Underestimating spikes
+    # "eval is stuck" pings; padding is intentional.
     _api_mode = _is_api_teacher_mode()
     if _api_mode:
         try:
@@ -401,18 +338,13 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             teacher_max_new = int(policy_env("TEACHER_MAX_NEW_TOKENS", str(MAX_NEW_TOKENS)) or MAX_NEW_TOKENS)
         except (TypeError, ValueError):
             teacher_max_new = MAX_NEW_TOKENS
-        # API teacher wall time scales with prompt count and provider
-        # concurrency. With reasoning disabled by default, live Kimi-K2.6
-        # rounds are substantially faster than the old reasoning-mode
-        # budget that produced 5h+ dashboard ETAs for 10-student rounds.
+        # API teacher wall time scales with prompt count / provider concurrency.
         per_prompt_s = 20.0 if teacher_max_new <= 768 else 26.0
         est_teacher_s = int((n_prompts * per_prompt_s) / api_concurrency + 300)
     else:
         est_teacher_s = 180
-    # Current post-cap student rounds are dominated by probes + bench
-    # battery and have been landing around 12-16 min/student after the
-    # LFJ derail cap and batched KL path. Keep a modest buffer without
-    # advertising a stale 5h full-round ETA.
+    # Probes + bench battery dominate -- ~12-16 min/student under the
+    # LFJ derail cap with batched KL.
     est_per_student_s = 900
     est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
     eval_order = []
@@ -507,11 +439,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     if not is_resuming:
         try:
             # vLLM v1 renames its EngineCore child via PR_SET_NAME, so a
-            # plain ``pkill -f 'vllm.entrypoints'`` misses it; an unreaped
-            # engine then holds ~130 GB of GPU memory until reboot. We
-            # kill by comm ("VLLM::EngineCor", 15-char kernel cap), by
-            # cmdline (any future rename), and finally fall back to
-            # nvidia-smi if a worker is still on the GPU.
+            # plain pkill -f 'vllm.entrypoints' misses it. Kill by comm
+            # ("VLLM::EngineCor", 15-char cap), cmdline, then nvidia-smi
+            # as a last resort.
             pod.exec(
                 # Preserve chat-king PIDs (sn97-king on :8100 + supervisor)
                 # so chat stays up across the cleanup. Strategy: among any
@@ -632,16 +562,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     revision_list = ",".join(models_to_eval[uid].get("revision", "main") for uid in ordered_uids)
     king_flag = ""
     vllm_flag = " --no-vllm"
-    # API-teacher mode takes precedence over local vLLM. ``--no-vllm``
-    # is pinned here for self-documentation: the API branch in
-    # pod_eval_vllm.py sets teacher_cache_loaded before the local vLLM
-    # branch can race.
+    # API-teacher mode takes precedence over local vLLM.
     _api_mode = _is_api_teacher_mode()
     if use_vllm and not _api_mode:
-        # GPU is co-tenant with chat-king vLLM. Default util 0.65
-        # leaves ~4.6 GiB headroom for chat-king's ~44 GiB occupancy
-        # (legit + leaked workers). Bump VLLM_EVAL_GPU_UTIL to 0.92 if
-        # chat moves to a dedicated pod (provision_chat_pod.py).
+        # GPU is co-tenant with chat-king vLLM; default 0.65 leaves ~4.6 GiB
+        # headroom for the ~44 GiB chat occupancy. Bump to 0.92 once chat
+        # moves to a dedicated pod.
         eval_gpu_util = policy_env("VLLM_EVAL_GPU_UTIL", "0.65")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
@@ -678,14 +604,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"done; "
         f"echo DISTIL_PID:$(cat {shlex.quote(pid_remote)} 2>/dev/null)"
     )
-    # 2026-05-03: zombie-aware status check.
-    # ``kill -0 PID`` returns 0 for zombies (defunct processes whose entry is
-    # still in the process table because no parent has reaped them), so the
-    # previous check reported DISTIL_STATUS:running on a dead worker and the
-    # validator polled forever. Workaround: also inspect ``ps -o stat=`` and
-    # treat 'Z'/'X' (zombie / dying) as DISTIL_STATUS:dead. Falls through to
-    # the cheap ``kill -0`` path when ``ps`` isn't available, which keeps
-    # the legacy behaviour for hosts where /proc isn't mounted.
+    # Zombie-aware status: ``kill -0`` returns 0 for zombies, so use
+    # ``ps -o stat=`` to flag 'Z'/'X' as DISTIL_STATUS:dead. Falls back
+    # to ``kill -0`` when /proc isn't mounted.
     status_inner = (
         f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DISTIL_STATUS:done; "
         f"elif [ ! -f {shlex.quote(pid_remote)} ]; then echo DISTIL_STATUS:starting; "

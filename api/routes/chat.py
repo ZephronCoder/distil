@@ -1,12 +1,4 @@
-"""Chat endpoints: proxy to king model on the chat pod, OpenAI-compatible.
-
-Routes through the ``chat-tunnel.service`` SSH forward
-(localhost:8100 -> chat-pod:8100) using a single async httpx client
-for connection pooling (no per-request SSH spawn, no blocked uvicorn
-workers during long generations). When the tunnel is down,
-``chat-keeper.timer`` re-establishes it every 3 minutes and heals
-vLLM via ``scripts.validator.chat_pod_admin``.
-"""
+"""OpenAI-compatible chat endpoints; proxies to king vLLM via chat-tunnel."""
 
 import ast
 import html
@@ -79,20 +71,14 @@ def _get_king_info():
     return None, None
 
 
-# ── Local httpx client ───────────────────────────────────────────────────────
-# chat_server.py always serves the king under the stable name "sn97-king".
-# vLLM is booted with this fixed served-model name so client-supplied
-# model names are rewritten before forwarding (avoids vLLM 404s after
-# a new king is crowned).
+# chat_server.py serves the king under the fixed name "sn97-king" so
+# we rewrite client-supplied model names below.
 CHAT_POD_SERVED_MODEL = "sn97-king"
 
-# chat-tunnel.service forwards 127.0.0.1:8100 -> chat-pod:8100 via
-# autossh — going through localhost reuses a TCP keep-alive and lets
-# us detect tunnel-down in <2 s.
+# chat-tunnel.service forwards 127.0.0.1:8100 -> chat-pod:8100; using
+# localhost reuses a TCP keep-alive and detects tunnel-down in <2s.
 _LOCAL_CHAT_BASE = f"http://127.0.0.1:{CHAT_POD_PORT}"
 
-# Pooled async client. Short connect (3 s) so a dead tunnel fails fast
-# and we return 503; generous read (90 s) for slow generations.
 _chat_http_client: httpx.AsyncClient | None = None
 _chat_http_lock = threading.Lock()
 
@@ -116,14 +102,8 @@ def _get_http_client() -> httpx.AsyncClient:
 
 
 def _normalize_chat_payload(payload: dict) -> dict:
-    """Rewrite the OpenAI-shaped payload for the chat pod's vLLM.
-
-    Forces the served-model name (vLLM only knows ``sn97-king``);
-    defaults thinking off so small ``max_tokens`` aren't consumed by
-    the reasoning trace; defaults ``max_tokens`` to 1024 if absent;
-    injects a math-formatting system prompt when the client didn't
-    provide one.
-    """
+    """Pin served-model to sn97-king, default thinking off + max_tokens=1024,
+    and inject a math-formatting system prompt if the client didn't."""
     payload = dict(payload)
     payload["model"] = CHAT_POD_SERVED_MODEL
     kwargs = dict(payload.get("chat_template_kwargs") or {})
@@ -652,13 +632,10 @@ def _tool_reasoning(runtime_trace: list[str], model_reasoning: str = "") -> str:
 
 
 class _ThinkStreamSplitter:
-    """Stateful streaming splitter that routes ``<think>`` content to reasoning.
+    """Streaming splitter: routes <think>...</think> content to reasoning channel.
 
-    The splitter buffers just enough trailing text to detect partial
-    ``<think>`` / ``</think>`` tags spanning chunk boundaries. Anything inside
-    the tags becomes a reasoning chunk, anything outside becomes a content
-    chunk. Use ``feed`` for streamed deltas and ``flush`` once the upstream
-    stream ends.
+    Buffers trailing text so partial tags spanning chunk boundaries still split
+    correctly. Use ``feed`` for streamed deltas and ``flush`` at end of stream.
     """
 
     _OPEN = "<think"
@@ -737,15 +714,7 @@ class _ThinkStreamSplitter:
 
 
 def _split_think_blocks(content: str) -> tuple[str, str]:
-    """Move ``<think>...</think>`` segments from content into a reasoning string.
-
-    Many distilled reasoner kings put their chain of thought in raw
-    ``<think>`` blocks because the chat template does not split them into
-    ``reasoning_content``. The UI only knows how to render the reasoning
-    field, so leaving the tags inline shows them as literal text. Split
-    them here so the chat surface displays the model's thinking the way
-    Open WebUI expects.
-    """
+    """Move <think>...</think> segments out of content into a reasoning string."""
     if not content or "<think" not in content.lower():
         return content, ""
     think_chunks = [m.group(1).strip() for m in _THINK_BLOCK_RE.finditer(content)]
@@ -778,15 +747,7 @@ def _looks_empty_or_derailed(content: str) -> bool:
 
 
 def _model_quoted_numeric_answer(direct_answer: str, model_content: str) -> bool:
-    """Decide whether the model faithfully reproduced a numeric tool result.
-
-    For deterministic numeric tool outputs (Fibonacci, big-power arithmetic),
-    miner models often hallucinate digits even when the runtime supplied the
-    exact answer in a system message. To detect that, we extract the longest
-    pure-digit value from ``direct_answer`` and check that the model output
-    contains both its first and last segments. Short values (< 6 digits)
-    are considered easy enough that we trust the model verbatim.
-    """
+    """True if ``model_content`` faithfully reproduces the numeric tool output."""
     if not direct_answer or not model_content:
         return False
     candidates = re.findall(r"[0-9][0-9,_\s]{2,}", direct_answer)
@@ -989,14 +950,7 @@ async def _prepare_orchestrated_chat(
 
 
 async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_model: str | None) -> dict:
-    """Transparent tool runtime around fast vLLM.
-
-    This function may execute tools and add their outputs to the model context,
-    but it must not quality-filter, rewrite, or replace the model's final text.
-    chat.arbos.life is intentionally a window into the current king's behavior;
-    if the king derails after seeing useful tool results, that failure should
-    remain visible.
-    """
+    """Transparent tool runtime around vLLM (do not rewrite the model's text)."""
     vllm_body, tool_context, runtime_trace, direct_answer = await _prepare_orchestrated_chat(
         body, king_uid, king_model, stream=False,
     )
@@ -1110,13 +1064,7 @@ def _delta_reasoning(delta: dict, msg: dict | None = None) -> str:
 
 
 def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_model: str | None):
-    """True SSE streaming for the OpenAI-compatible endpoint.
-
-    Runtime tools execute first and are emitted immediately as visible content;
-    then the raw king answer is streamed from vLLM token-by-token. This keeps
-    chat transparent while avoiding the previous "wait for full completion,
-    then chunk a finished string" behavior.
-    """
+    """True SSE streaming: tool output first, then vLLM tokens as deltas."""
     async def generate():
         response_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
@@ -1399,20 +1347,8 @@ class _ChatPodUnavailable(RuntimeError):
 
 
 async def _local_chat_post(payload: dict, *, timeout: float = 90.0) -> dict:
-    """Async POST to the local tunnel; returns parsed JSON.
-
-    Raises :class:`_ChatPodUnavailable` for connection / DNS / timeout
-    / pool-exhaustion failures so the caller can map to a clean 503.
-    Other exceptions propagate.
-
-    2026-05-09: catch ``httpx.PoolTimeout`` too. When the chat pod is
-    down and dozens of clients pile on, every connect blocks for 3 s,
-    the pool fills up, and the 65th request hits ``PoolTimeout`` after
-    5 s on the wait queue. Pre-fix this leaked as a 500 with a bare
-    ``Internal Server Error`` body instead of the documented 503; the
-    dashboard then flapped between "available" / "errored" states and
-    the journal was burning ~10k suppressed lines per minute.
-    """
+    """Async POST to the chat tunnel; raises _ChatPodUnavailable for
+    transport-level failures so the caller maps cleanly to a 503."""
     client = _get_http_client()
     try:
         resp = await client.post(
@@ -1545,9 +1481,8 @@ def _stream_chat(payload, king_uid, king_model):
     norm = _normalize_chat_payload(payload)
 
     async def generate():
-        # 2026-05-04: streaming via httpx async — no proxy-side
-        # truncation. Forward every SSE delta as-is, accumulate
-        # ``acc`` only for the chat_turns.jsonl audit log at the end.
+        # Streaming via httpx async; forward every SSE delta as-is,
+        # accumulate ``acc`` only for the chat_turns.jsonl audit log.
         acc = ""
         client = _get_http_client()
         try:
@@ -1555,9 +1490,7 @@ def _stream_chat(payload, king_uid, king_model):
                 "POST",
                 "/v1/chat/completions",
                 json=norm,
-                # vLLM streams forever until the model stops; we cap
-                # read at 5 min as a safety belt against runaway
-                # generations from a degraded king.
+                # 5 min read cap against runaway generations.
                 timeout=httpx.Timeout(connect=3.0, read=300.0, write=10.0, pool=5.0),
             ) as resp:
                 if resp.status_code >= 500:
@@ -1609,19 +1542,14 @@ def _stream_chat(payload, king_uid, king_model):
     return _sse_response(generate())
 
 
-# Per-turn audit log (JSONL under STATE_DIR). We log metadata + a
-# 200-char prompt/response preview, NOT full conversations (privacy +
-# disk). When a derail is reported, grep for high non_ascii_frac or
-# non-zero repeated-substring counts.
+# Per-turn audit log (JSONL): metadata + 200-char preview only.
 _CHAT_LOG_PATH = os.path.join(STATE_DIR, "chat_turns.jsonl")
 _chat_log_lock = threading.Lock()
 _CHAT_LOG_MAX_BYTES = 50 * 1024 * 1024  # 50MB rotation
 
 
 def _detect_repeated_substring(text: str, win: int = 50, step: int = 25) -> int:
-    """Cheap repetition heuristic: count how many ``win``-char windows
-    starting at multiples of ``step`` repeat in ``text``.
-    """
+    """Count repeated ``win``-char windows (stride ``step``) in ``text``."""
     seen = set()
     repeats = 0
     if not text or len(text) < win * 2:
@@ -1693,10 +1621,8 @@ def _log_chat_turn(payload, response_text, king_uid, king_model, raw_data=None):
         pass
 
 
-# ── Status caching ───────────────────────────────────────────────────
-# /api/chat/status is polled every 30 s by every dashboard tab. The
-# live vLLM probe is cached for 10 s; quality scores already come
-# from a cheap file read.
+# /api/chat/status is polled every 30s by every dashboard tab; cache
+# the live vLLM probe for 10s.
 _status_cache: dict | None = None
 _status_cache_ts: float = 0.0
 _STATUS_CACHE_TTL = 10.0
@@ -1724,20 +1650,10 @@ def _store_status_cache(snapshot: dict) -> None:
     "/api/chat",
     tags=["Chat"],
     summary="Chat with the king model (dashboard surface)",
-    description=(
-        "Send chat-style messages to the current SN97 king. Used by the "
-        "dashboard chat panel. Honors `stream=true` (SSE deltas) and "
-        "`stream=false` (single JSON). Rate-limited to 10/min per client IP. "
-        "Returns 503 (`chat server unavailable`) when the chat pod is "
-        "rebooting, the eval pipeline is holding the GPU, or the upstream "
-        "vLLM is unhealthy. Use `/api/chat/status` to introspect availability."
-    ),
+    description="Dashboard chat surface; supports stream=true/false. 10/min per IP. 503 when chat pod unavailable.",
 )
 async def chat_with_king(request: Request):
     """Proxy chat to the king model running on the GPU pod."""
-    # client_real_ip returns the cf-connecting-ip / xff / x-real-ip key
-    # so a single client behind Caddy can't fill the bucket for all.
-    # Internal callers (SSR, healthchecks) are exempt to avoid self-DoS.
     client_ip, is_internal = client_real_ip(request)
     if not is_internal and not _chat_rate_limiter.is_allowed(client_ip):
         return JSONResponse(
@@ -1808,10 +1724,8 @@ async def chat_with_king(request: Request):
             status_code=503,
             content={"error": "chat server unavailable", "detail": str(e)[:200]},
         )
-    except Exception as e:  # pragma: no cover — top-level safety net
-        # Mirrors the safety net on /v1/chat/completions: an unexpected
-        # transport variant or tool failure must not surface as a bare
-        # 500 to the public dashboard chat surface.
+    except Exception as e:  # pragma: no cover
+        # Top-level safety net: never 500 the public chat surface.
         return JSONResponse(
             status_code=503,
             content={
@@ -1825,23 +1739,10 @@ async def chat_with_king(request: Request):
     "/api/chat/status",
     tags=["Chat"],
     summary="King chat server availability + quality snapshot",
-    description=(
-        "Reports whether `chat.arbos.life` is currently serving the king. "
-        "Includes the live king UID/model, whether the eval is currently "
-        "holding the GPU, and the latest judge_probe / long_form_judge / "
-        "long_gen_coherence axes from `state/h2h_latest.json` so the "
-        "dashboard chat panel can show a fresh quality summary alongside "
-        "the prompt box. Cached for 10 s."
-    ),
+    description="Live king UID/model + eval-holding-GPU flag + latest judge axes. Cached 10s.",
 )
 async def chat_status():
-    """Check if the king chat server is available.
-
-    2026-05-04: cached for 10 s to keep a 50-tab dashboard from
-    pinging the chat pod 50 times per second. Quality scores are
-    pulled from h2h_latest (cheap file read), the only network cost
-    is a single 2 s GET to the local tunnel per refresh window.
-    """
+    """Check if the king chat server is available (cached 10s)."""
     cached = _cached_status_lookup()
     if cached is not None:
         return cached
@@ -1855,8 +1756,7 @@ async def chat_status():
     if CHAT_POD_HOST:
         served_model = await _local_models_probe(timeout=2.5)
         if served_model:
-            # vLLM serves the king under the stable "sn97-king" name regardless
-            # of which HF repo is loaded; treat any successful probe as healthy.
+            # vLLM always serves under "sn97-king"; any probe success = healthy.
             server_ok = True
 
     quality = {
@@ -1912,14 +1812,7 @@ async def chat_status():
     "/v1/models",
     tags=["Chat"],
     summary="OpenAI-compatible model list",
-    description=(
-        "Returns the OpenAI-shaped `{object: list, data: [...]}` payload "
-        "with the stable served name (`sn97-king`) and the current king's "
-        "HuggingFace repo id so OpenAI-compatible clients (Open WebUI, "
-        "Vercel AI SDK, OpenAI Agents SDK, Flue, …) can attribute the "
-        "completion correctly. Both ids resolve to the same vLLM server "
-        "behind the scenes."
-    ),
+    description="Returns `sn97-king` plus the live king's HF repo id; both resolve to the same vLLM.",
 )
 def openai_models():
     """OpenAI-compatible models list. Returns the current king model."""
@@ -1948,31 +1841,10 @@ def openai_models():
     "/v1/chat/completions",
     tags=["Chat"],
     summary="OpenAI-compatible chat completions",
-    description=(
-        "Drop-in replacement for `https://api.openai.com/v1/chat/completions` "
-        "that targets the current SN97 king model. Honors the standard "
-        "OpenAI request body (`messages`, `stream`, `max_tokens`, "
-        "`temperature`, `top_p`, etc.) plus optional `repetition_penalty`. "
-        "Rate-limited to 240/min per client IP (looser than `/api/chat` "
-        "because agent harnesses loop the king for many tool-calling "
-        "rounds). Returns a structured 503 (`chat server unavailable` / "
-        "`chat orchestration failed`) when the chat pod is rebooting, the "
-        "eval pipeline is holding the GPU, or the connection pool is "
-        "saturated — well-behaved clients should retry."
-    ),
+    description="Drop-in OpenAI completions for the SN97 king. 240/min per IP. 503 when chat pod unavailable.",
 )
 async def openai_chat_completions(request: Request):
-    """OpenAI-compatible chat completions endpoint. Proxies to the king model.
-
-    2026-05-02 (v30.5): this endpoint is the entry point for agent
-    harnesses (Flue, OpenAI Agents SDK, Vercel AI SDK, LangChain, …)
-    that loop the king for many tool-calling rounds. We use a
-    dedicated, more generous rate limiter (``_openai_api_rate_limiter``,
-    240/min) instead of the strict ``_chat_rate_limiter`` (10/min)
-    that throttles direct browser-driven chat.
-    """
-    # 2026-05-09: see chat_with_king above for the per-IP bucket fix.
-    # 240/min/client IP, with internal SSR/healthcheck callers exempt.
+    """OpenAI-compatible chat completions endpoint. Proxies to the king model."""
     client_ip, is_internal = client_real_ip(request)
     if not is_internal and not _openai_api_rate_limiter.is_allowed(client_ip):
         return JSONResponse(
@@ -2043,17 +1915,12 @@ async def openai_chat_completions(request: Request):
                 content={"error": {"message": "chat server unavailable", "detail": str(e)[:200]}},
             )
     except _ChatPodUnavailable as e:
-        # Orchestrated path may bubble up the chat-pod-unavailable
-        # signal if a non-transport caller (e.g. tool execution) can't
-        # complete; map it to the documented 503 instead of a 500.
         return JSONResponse(
             status_code=503,
             content={"error": {"message": "chat server unavailable", "detail": str(e)[:200]}},
         )
-    except Exception as e:  # pragma: no cover — top-level safety net
-        # Anything unexpected (httpx variants, json parse, tool errors)
-        # must not 500 the public OpenAI surface. Log via uvicorn and
-        # return a structured 503 so well-behaved clients retry.
+    except Exception as e:  # pragma: no cover
+        # Top-level safety net: never 500 the public OpenAI surface.
         return JSONResponse(
             status_code=503,
             content={"error": {
@@ -2062,9 +1929,8 @@ async def openai_chat_completions(request: Request):
             }},
         )
     if isinstance(data, dict) and king_model:
-        # Stamp the response with the live king's HF repo id so OpenAI
-        # clients (Open WebUI etc.) display the correct lineage even
-        # though vLLM serves under the stable "sn97-king" name.
+        # Stamp with the live king's HF repo id so OpenAI clients show
+        # the correct lineage despite the vLLM-side "sn97-king" alias.
         data["model"] = king_model
         data["king_uid"] = king_uid
     return JSONResponse(content=data)

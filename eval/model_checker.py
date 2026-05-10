@@ -1,14 +1,5 @@
-"""
-Model architecture checker with MoE-aware param counting and identity verification.
-
-Checks:
-1. Total parameter count ≤ max allowed (prevents huge MoE uploads)
-2. Active parameter count for MoE models (logged for transparency)
-3. Vocab size matches teacher (same tokenizer required)
-4. SHA256 hash of first safetensors shard (copy detection)
-5. Tokenizer file integrity (byte-for-byte comparison with teacher)
-6. Tokenizer encoding verification (spot-check)
-"""
+"""Model architecture/identity checks: MoE-aware param count, vocab/tokenizer
+match against the teacher, safetensors hash for copy detection."""
 import json
 import hashlib
 import logging
@@ -31,20 +22,13 @@ from eval.runtime import (
 logger = logging.getLogger("distillation.model_checker")
 
 
-# huggingface_hub.model_info wrapper that threads HF_TOKEN through and
-# retries transient 429/5xx. Auth keeps prechecks under HF rate limits
-# (~250 calls/round); the bounded retry smooths transient spikes.
+# HF model_info wrapper: thread HF_TOKEN through, retry transient 429/5xx.
 _HF_TOKEN = os.environ.get("HF_TOKEN") or None
-_MODEL_INFO_RETRY_DELAYS = (0.5, 1.5, 4.0)  # ~6s total, caller can still time-box
+_MODEL_INFO_RETRY_DELAYS = (0.5, 1.5, 4.0)  # ~6s total
 
 
 def model_info(model_repo, revision=None, files_metadata=False, token=None, **kwargs):
-    """HF model_info with auth + bounded 429/5xx retries.
-
-    Preserves the original signature so every existing call site keeps
-    working. ``token`` defaults to the validator's ``HF_TOKEN`` so we don't
-    have to touch 5+ existing call sites.
-    """
+    """HF model_info with auth + bounded 429/5xx retries."""
     effective_token = token if token is not None else _HF_TOKEN
     last_exc = None
     for attempt, delay in enumerate((0.0,) + _MODEL_INFO_RETRY_DELAYS):
@@ -77,21 +61,14 @@ STATE_DIR = Path(RUNTIME_STATE_DIR)
 
 
 def compute_moe_params(config: dict) -> dict:
-    """
-    Compute total and active parameters for MoE models.
+    """Compute total/active params for MoE models.
 
-    Returns dict with:
-        - total_params: all parameters including all experts
-        - active_params: parameters active during a single forward pass
-        - is_moe: whether model uses MoE
-        - num_experts: total experts per layer
-        - num_active_experts: experts active per token
+    Returns {total_params, active_params, is_moe, num_experts, num_active_experts}.
+    Supports nested configs (e.g. text_config for multimodal); text_config
+    values are used as fallback.
     """
-    # Support nested configs (e.g. text_config for multimodal models)
-    # Merge text_config into a flat lookup: text_config values are used as fallback
     text_cfg = config.get("text_config", {})
     def _get(key, default=0):
-        """Get from top-level config first, then text_config, then default."""
         v = config.get(key)
         if v is None or v == 0:
             v = text_cfg.get(key)
@@ -215,19 +192,10 @@ def _read_safetensors_header(session, url: str) -> Optional[dict]:
 
 
 def get_embed_weight_shape(model_repo: str, revision: str = None) -> Optional[tuple[int, int, str]]:
-    """Read the actual shape + dtype of ``model.embed_tokens.weight`` from the
-    safetensors headers without downloading any tensor data.
-
-    Used to catch precheck-bypass patterns where a miner ships a config
-    that *claims* the teacher's vocab_size (passes the config-only check)
-    but the actual checkpoint weights are an older/smaller vocab and so
-    the model fails to load on the eval pod (Reinit due to size mismatch
-    → silent DQ at load time, wasting an eval slot).
-
-    Returns ``(vocab_size, hidden_dim, dtype)`` from the embed table, or
-    None if the tensor cannot be located (e.g. non-standard architecture
-    or only pytorch_model.bin shards).
-    """
+    """Read shape + dtype of model.embed_tokens.weight from safetensors headers
+    (no tensor data download). Catches configs that claim teacher vocab while
+    shipping older/smaller checkpoint weights. Returns (vocab, hidden, dtype)
+    or None."""
     try:
         from huggingface_hub import hf_hub_url
         info = model_info(model_repo, revision=revision, files_metadata=True)
@@ -256,20 +224,9 @@ def get_embed_weight_shape(model_repo: str, revision: str = None) -> Optional[tu
 
 
 def detect_safetensors_quantization(model_repo: str, revision: str = None) -> Optional[dict]:
-    """Detect quantized weights via tensor-name signatures in safetensors headers.
-
-    Catches the bypass pattern where a miner strips ``quantization_config``
-    from ``config.json`` (so step 5 of arch precheck sees an unquantized
-    config) while shipping the actual safetensors as bitsandbytes-NF4 /
-    GPTQ / AWQ packed tensors. The eval pod tries to load these as bf16
-    and dies with "ignore_mismatched_sizes=False" or similar — wasting a
-    slot per fraudulent UID.
-
-    Returns ``{"quantized": True, "scheme": <label>, "marker": <name>}``
-    when the first shard contains a known quantization marker tensor, or
-    ``None`` when the model appears unquantized. We only inspect the
-    first shard for speed (quantization is uniform across shards).
-    """
+    """Detect quantized weights by scanning tensor-name signatures (bnb/GPTQ/AWQ)
+    in the first safetensors shard's header. Returns
+    {"quantized": True, "scheme": <label>, "marker": <name>} or None."""
     try:
         from huggingface_hub import hf_hub_url
         info = model_info(model_repo, revision=revision, files_metadata=True)
@@ -306,12 +263,8 @@ def detect_safetensors_quantization(model_repo: str, revision: str = None) -> Op
 
 
 def compute_model_hash(model_repo: str, revision: str = None) -> Optional[str]:
-    """
-    Get a stable identity hash for a model using HuggingFace API metadata.
-    Hashes ALL safetensor shard SHA256s together — catches re-sharded copies
-    that have different individual file hashes but identical total weights.
-    Returns hex digest or None if unavailable.
-    """
+    """Combine SHA256 of every safetensors shard into a single hex digest;
+    catches re-sharded copies with identical total weights."""
     import hashlib
     try:
         info = model_info(model_repo, revision=revision, files_metadata=True)
@@ -342,15 +295,9 @@ def compute_model_hash(model_repo: str, revision: str = None) -> Optional[str]:
 def check_duplicate_hash(
     model_hash: str, miner_uid: int, state_dir: Path = STATE_DIR,
 ) -> Optional[int]:
-    """
-    Check if this model hash was already submitted by a different miner.
-    Returns the UID of the original submitter, or None if unique.
-
-    Stored in weight_hashes.json — kept separate from model_hashes.json
-    (which holds git revision SHAs for integrity) so state.save_model_hashes()
-    can't overwrite the weight hash with an integrity hash and silently
-    break dedup (aizaysi root-caused this via wind77/third ↔ curli12/third).
-    """
+    """Return UID of the original submitter for ``model_hash`` if duplicate,
+    else None. Stored in weight_hashes.json (separate from model_hashes.json
+    so save_model_hashes() can't overwrite and break dedup)."""
     hash_file = state_dir / "weight_hashes.json"
     legacy_file = state_dir / "model_hashes.json"
     for f in (hash_file, legacy_file):
@@ -435,19 +382,9 @@ _CONTENT_HASH_ATTENTION_TARGETS = {
 
 
 def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: int = 4) -> Optional[str]:
-    """
-    Shard-invariant content hash from the raw bytes of a few specific tensors.
-
-    Re-sharding a model (same weights, different file layout) produces
-    different SHA256s at the shard-file level but identical tensor bytes.
-    This hashes the bytes of a fixed set of named tensors, so it catches
-    re-sharded copies that slip past compute_model_hash.
-
-    v2 hashes the old structural sample plus at least one attention tensor.
-    The attention requirement avoids false positives for attention-only LoRA
-    merges where layernorm/MLP/norm stay byte-identical to the base model.
-    Returns hex digest or None if unavailable.
-    """
+    """Shard-invariant content hash from raw bytes of a fixed tensor set.
+    v2 includes at least one attention tensor so attention-only LoRA merges
+    don't false-positive against the base model. Returns hex digest or None."""
     import struct
     try:
         from huggingface_hub import hf_hub_url
@@ -514,12 +451,8 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
 
 
 def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optional[str]:
-    """
-    Compute a shard-invariant hash from safetensors tensor metadata.
-
-    Fetches only the safetensors headers over HTTP range requests instead of
-    downloading whole weight shards into the local Hugging Face cache.
-    """
+    """Shard-invariant hash of safetensors tensor metadata. Header-only fetch
+    via HTTP range requests, no shard download."""
     try:
         from huggingface_hub import hf_hub_url
         import struct
@@ -584,11 +517,10 @@ def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optio
         logger.warning(f"Tensor metadata hash failed for {model_repo}: {e}")
         return None
 
-# Cache positive integrity results so the common "model exists, sha
-# matches" path needs at most one HEAD per _INTEGRITY_CACHE_TTL.
-# Failures aren't cached (miners fix configs and expect fast re-admit).
+# Cache positive integrity results; failures aren't cached so miners
+# get fast re-admit after fixing configs.
 _INTEGRITY_CACHE: dict = {}
-_INTEGRITY_CACHE_TTL = 900  # 15 min; shorter than a typical epoch gap
+_INTEGRITY_CACHE_TTL = 900  # 15 min
 
 
 def verify_model_integrity(
@@ -669,11 +601,7 @@ def _verify_model_integrity_uncached(
             "current_hash": None,
         }
 
-    # 2. Check repo revision hasn't changed (cheap: git SHA comparison)
-    # The HF API returns info.sha = git commit SHA of the resolved revision.
-    # If the miner committed a specific revision, info.sha should match.
-    # If revision is "main", info.sha gives current HEAD — we store it on
-    # first check and compare on subsequent checks.
+    # 2. Compare info.sha (git SHA of resolved revision) to expected.
     current_repo_sha = getattr(info, 'sha', None)
 
     if expected_hash and current_repo_sha:
@@ -737,7 +665,7 @@ def _verify_model_integrity_uncached(
     }
 
 
-# Fixed test strings for tokenizer verification — diverse enough to catch mismatches
+# Fixed test strings for tokenizer verification.
 TOKENIZER_TEST_STRINGS = [
     "The quick brown fox jumps over the lazy dog.",
     "def fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n-1) + fibonacci(n-2)",
@@ -748,21 +676,9 @@ def is_allowed_student_arch(
     model_type: str | None,
     archs: list[str] | None,
 ) -> tuple[bool, str]:
-    """Check a (model_type, architectures) pair against the teacher-specified
-    allowlist in ``subnet-config.json::teacher.studentArchAllowlist``.
-
-    Returns (ok, matched_entry) where matched_entry is a short label for
-    logging. The allowlist is consulted in this order:
-      1. Exact (model_type, architecture) pair match — strongest.
-      2. model_type alone matches a listed entry — accepted with a
-         softer label for observability (covers e.g. text-only students
-         that advertise the same model_type but a different architectures
-         entry, such as a DeepseekV3ForCausalLM student with a custom
-         model_type).
-      3. Architecture alone matches (permissive; catches students that
-         advertise a plain DeepseekV3ForCausalLM and a deepseek_v3
-         model_type).
-    """
+    """Check (model_type, architectures) against subnet-config's allowlist.
+    Returns (ok, label). Order: exact (mt, arch) pair, model_type only,
+    architecture only."""
     archs = list(archs or [])
     mt = model_type or ""
     if not STUDENT_ARCH_ALLOWLIST and not STUDENT_ARCH_NAMES:
@@ -783,15 +699,9 @@ def is_allowed_student_arch(
 
 
 def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
-    """Soft check for whether a student repo is natively vLLM-compatible.
-
-    Returns (vllm_native, reason_label). A student architecture present in
-    ``STUDENT_ARCH_ALLOWLIST`` is considered vLLM-native because the allowlist
-    is curated to only include archs the current vLLM pins support at serving
-    time. The ``preprocessor_config.json`` presence check is preserved for
-    the chat-king wrapper, which may need to stub it for vision-wrapped
-    configs.
-    """
+    """Soft check for native vLLM compatibility (allowlist-based).
+    Returns (vllm_native, label); also reports preprocessor_config.json
+    presence so the chat-king wrapper can stub vision-wrapped configs."""
     model_type = config.get("model_type")
     archs = config.get("architectures") or []
     preproc_present = False
@@ -815,12 +725,8 @@ _teacher_py_hashes_cache: Optional[dict[str, str]] = None
 
 
 def _get_teacher_py_hashes() -> dict[str, str]:
-    """Return a map of {filename: sha256} for every .py file shipped by the
-    current teacher model's HF repo.
-
-    Resolved lazily on first call; missing .py files return an empty dict
-    (strict mode: no student .py is allowed on the teacher that has none).
-    """
+    """Map {filename: sha256} for every .py file shipped by the current
+    teacher repo (lazy; empty dict if none)."""
     global _teacher_py_hashes_cache
     if _teacher_py_hashes_cache is not None:
         return _teacher_py_hashes_cache
@@ -849,19 +755,7 @@ def _filter_teacher_identical_py_files(
     model_repo: str, revision: Optional[str], fnames: list[str],
 ) -> list[str]:
     """Return the subset of ``fnames`` that are NOT byte-identical to the
-    teacher's shipped version of the same filename.
-
-    A student .py file is considered safe if and only if:
-      1. A .py file with the same basename exists in the teacher's repo.
-      2. Its SHA256 matches the teacher's.
-
-    Any student .py file that fails either condition is returned as
-    unsafe (caller fails closed). This is how legitimate Kimi students
-    can bundle ``tokenization_kimi.py`` and ``tool_declaration_ts.py``
-    (copied verbatim from ``moonshotai/Kimi-K2.6``) without tripping
-    the custom-code guard, while a rogue ``tokenizer.py`` that
-    monkey-patches ``json.dump`` would still get rejected.
-    """
+    teacher's shipped version of the same filename (caller fails closed)."""
     teacher_hashes = _get_teacher_py_hashes()
     unsafe: list[str] = []
     for fname in fnames:
@@ -891,14 +785,9 @@ _teacher_chat_template_hash_cache: Optional[str] = None
 
 
 def _teacher_chat_template_hash() -> str:
-    """Return the SHA256 of the teacher's canonical chat template.
-
-    Resolved lazily the first time we need to compare a student's template
-    against the teacher. Checks ``tokenizer_config.json::chat_template`` first
-    (the common location) and falls back to a standalone ``chat_template.jinja``
-    file. If neither is present we return a sentinel that intentionally
-    won't match anything, which fails closed on templates.
-    """
+    """SHA256 of the teacher chat template (lazy).
+    Checks tokenizer_config.json::chat_template, falls back to
+    chat_template.jinja; returns a no-match sentinel if neither exists."""
     global _teacher_chat_template_hash_cache
     if _teacher_chat_template_hash_cache is not None:
         return _teacher_chat_template_hash_cache
@@ -955,11 +844,8 @@ _TOKENIZER_ARTIFACT_NAMES = (
 
 
 def _teacher_tokenizer_artifact_hashes() -> dict[str, str]:
-    """Return SHA256 of every tokenizer-artifact file the teacher actually
-    ships. Only names in ``_TOKENIZER_ARTIFACT_NAMES`` that exist on the
-    teacher repo are included; callers should treat the returned set as
-    the required set for students.
-    """
+    """SHA256 of each tokenizer-artifact file the teacher ships
+    (subset of _TOKENIZER_ARTIFACT_NAMES); the returned set is required."""
     hashes: dict[str, str] = {}
     try:
         from huggingface_hub import list_repo_files as _list
@@ -980,21 +866,11 @@ def _teacher_tokenizer_artifact_hashes() -> dict[str, str]:
 
 
 def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
-    """
-    Byte-for-byte verification of tokenizer files against the teacher model.
-
-    Detects which tokenizer artifacts the teacher actually ships
-    (``tokenizer.json``, ``tiktoken.model``, ``tokenizer.model``, BPE
-    ``vocab.json`` + ``merges.txt``, etc.) and requires each of them to
-    be byte-identical in the student's repo. Kimi K2.6 for example ships
-    ``tiktoken.model`` + ``tokenization_kimi.py`` but NOT ``tokenizer.json``;
-    Qwen ships ``tokenizer.json``. The function adapts automatically.
-
-    Also verifies ``tokenizer_config.json`` (excluding chat_template, which
-    is checked separately) to catch configuration drift.
-
-    Returns dict with ``match: bool`` and ``reason: str`` (if not matching).
-    """
+    """Byte-for-byte tokenizer-file verification against the teacher.
+    Adapts to whichever tokenizer artifacts the teacher ships
+    (tokenizer.json / tiktoken.model / BPE / etc) and also compares
+    tokenizer_config.json (chat_template handled separately).
+    Returns {match: bool, reason: str (if not matching)}."""
     teacher_hashes = _teacher_tokenizer_artifact_hashes()
     if not teacher_hashes:
         return {
@@ -1082,20 +958,10 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
 
 
 def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
-    """
-    Verify that a model's tokenizer produces identical token IDs as the teacher.
-
-    When the teacher ships ``tokenizer.json`` (Qwen-family), we load both via
-    the ``tokenizers`` library and compare encoding IDs on a fixed test set.
-    When the teacher uses a tiktoken-style tokenizer (Kimi K2.6 ships
-    ``tiktoken.model`` + ``tokenization_kimi.py``) there is no standard
-    ``tokenizer.json`` to load — instead we rely on the byte-match check in
-    ``verify_tokenizer_files`` (which has already been called upstream) to
-    guarantee identical behaviour and short-circuit here with ``match: True``.
-
-    Explicit bypass via ``SKIP_TOKENIZER_ENCODING_CHECK=1`` for emergency
-    operators (not recommended).
-    """
+    """Verify the student tokenizer encodes test strings to the same IDs as
+    the teacher. Short-circuits to match=True for tiktoken/sentencepiece
+    teachers (handled byte-wise in verify_tokenizer_files).
+    SKIP_TOKENIZER_ENCODING_CHECK=1 bypasses (not recommended)."""
     if os.environ.get("SKIP_TOKENIZER_ENCODING_CHECK") == "1":
         return {"match": True}
 
@@ -1144,20 +1010,14 @@ def check_model_architecture(
     revision: str = None,
     max_total_params_b: float = 3.5,
 ) -> dict:
-    """
-    Check if a model meets distillation subnet requirements.
-
-    Checks:
-    - Total params ≤ max_total_params_b (prevents huge MoE uploads)
-    - Vocab size matches baseline (same tokenizer)
-    - Reports active params for MoE transparency
-
-    Returns dict with pass, reason, params_b, active_params_b, vocab_size
-    """
+    """Check if a model meets distillation subnet requirements (total params
+    cap, vocab match, MoE active-param reporting).
+    Returns {pass, reason, params_b, active_params_b, vocab_size, ...}."""
     try:
-        # 0. SECURITY: Reject repos with custom Python code files
-        # This blocks exploits like tokenizer.py that monkey-patch json.dump
-        info = None  # may be set below; used later by assess_vllm_compatibility
+        # 0. SECURITY: reject repos with custom .py code (blocks json.dump
+        # monkey-patches etc). Teacher-identical .py files are allowed so
+        # legitimate Kimi students with tokenization_kimi.py still pass.
+        info = None
         try:
             info = model_info(model_repo, revision=revision, files_metadata=True)
             dangerous_files = []
@@ -1166,10 +1026,6 @@ def check_model_architecture(
                 if fname.endswith('.py') and fname != '__init__.py':
                     dangerous_files.append(fname)
             if dangerous_files:
-                # Some teachers (Kimi K2.6) ship custom tokenizer/processor
-                # .py files; students need byte-identical copies to load.
-                # Pass any .py whose SHA256 matches the teacher's; fail-
-                # closed on anything that differs or isn't in the teacher.
                 surviving = _filter_teacher_identical_py_files(
                     model_repo, revision, dangerous_files,
                 )
@@ -1188,10 +1044,10 @@ def check_model_architecture(
         except Exception as e:
             logger.warning(f"Could not check repo files for {model_repo}: {e}")
 
-        # 0b. SECURITY: Comprehensive weight file analysis.
-        # Catches: fake safetensors, hidden pytorch_model.bin weights, size mismatches.
-        MIN_MODEL_BYTES = 500_000_000  # 500MB — even a 0.5B model in bf16 is ~1GB
-        MAX_MODEL_BYTES = max_total_params_b * 2.2e9  # ~2.2 bytes/param in bf16 + overhead
+        # 0b. SECURITY: weight-file analysis (fake safetensors, hidden .bin
+        # weights, size mismatches).
+        MIN_MODEL_BYTES = 500_000_000  # 500MB
+        MAX_MODEL_BYTES = max_total_params_b * 2.2e9  # ~2.2 bytes/param in bf16
 
         try:
             total_st_bytes = 0
@@ -1213,10 +1069,9 @@ def check_model_architecture(
                     total_pt_bytes += fsize
                     pt_files.append((fname, fsize))
 
-            # RULE 1: If safetensors exist, they must be the real weights (not a placeholder alongside .bin)
+            # If both .safetensors and .bin are present, the larger is the
+            # real weight set; tiny .safetensors next to huge .bin = evasion.
             if st_files and pt_files:
-                # Both formats present — the larger one is the real weights.
-                # If safetensors are tiny but .bin files are huge, this is an evasion attempt.
                 if total_st_bytes < MIN_MODEL_BYTES and total_pt_bytes > MIN_MODEL_BYTES:
                     return {
                         "pass": False,
@@ -1225,7 +1080,6 @@ def check_model_architecture(
                         "params_b": 0,
                     }
 
-            # RULE 2: Total model weight files must be within expected range
             total_weight_bytes = max(total_st_bytes, total_pt_bytes)
             if 0 < total_weight_bytes < MIN_MODEL_BYTES:
                 return {
@@ -1242,9 +1096,8 @@ def check_model_architecture(
                     "params_b": total_weight_bytes / 2e9,  # rough estimate
                 }
 
-            # RULE 3: Reject repos with ONLY pytorch_model.bin (no safetensors).
-            # Modern HF models use safetensors. .bin-only is suspicious and bypasses
-            # safetensors metadata param counting.
+            # Reject .bin-only repos (modern HF uses safetensors; .bin-only
+            # bypasses safetensors-metadata param counting).
             if pt_files and not st_files:
                 return {
                     "pass": False,
@@ -1257,25 +1110,18 @@ def check_model_architecture(
         except Exception as e:
             logger.warning(f"Could not check weight file sizes for {model_repo}: {e}")
 
-        # 1. Get safetensors-verified param count
         safetensors_params_b = get_safetensors_param_count(model_repo, revision)
-
-        # 2. Download config.json
         config_path = hf_hub_download(
             repo_id=model_repo, filename="config.json", revision=revision,
         )
         with open(config_path) as f:
             config = json.load(f)
-
-        # 3. MoE-aware param counting from config
         moe_info = compute_moe_params(config)
         config_total_b = moe_info["total_params"] / 1e9
         config_active_b = moe_info["active_params"] / 1e9
 
-        # Soft compatibility signal for future vLLM/sglang-native serving enforcement
         vllm_compatible, vllm_reason = assess_vllm_compatibility(config, info)
-
-        # Use safetensors count if available (most accurate), else config estimate
+        # Prefer safetensors-verified param count (more accurate than config estimate).
         total_params_b = safetensors_params_b if safetensors_params_b > 0 else config_total_b
 
         if total_params_b <= 0:
@@ -1285,7 +1131,7 @@ def check_model_architecture(
                 "params_b": 0,
             }
 
-        # 4. Check TOTAL param count (not active — prevents gaming with huge MoE)
+        # 4. Total params (not active) -- prevents gaming with huge MoE.
         if total_params_b > max_total_params_b:
             return {
                 "pass": False,
@@ -1375,12 +1221,9 @@ def check_model_architecture(
                 "vocab_size": vocab_size,
             }
 
-        # 6b. Cross-check the actual embed_tokens.weight shape+dtype
-        # against the config. Catches (a) wrong vocab, (b) wrong
-        # hidden_size (e.g. 4-bit-packed embed not disclosed), and
-        # (c) quantized integer embed dtype — all three would silently
-        # DQ on the eval pod and cost ~50s each. The safetensors header
-        # is a few KB per shard, so the check is free at precheck time.
+        # 6b. Cross-check embed_tokens.weight shape/dtype against config
+        # (header-only, free at precheck). Catches wrong vocab/hidden_size
+        # or quantized integer embed.
         try:
             embed_info = get_embed_weight_shape(model_repo, revision)
             if embed_info is not None:
@@ -1429,10 +1272,8 @@ def check_model_architecture(
         except Exception as embed_err:
             logger.warning(f"Embed shape precheck error for {model_repo}: {embed_err}")
 
-        # 6c. Detect quantized weights even when quantization_config
-        # is stripped from config.json — the safetensors still carry
-        # bitsandbytes/GPTQ/AWQ marker tensors. Probe the first shard
-        # only (quantization is uniform across shards).
+        # 6c. Detect quantized weights even when quantization_config was
+        # stripped (bnb/GPTQ/AWQ marker tensors in the first shard).
         try:
             quant_info = detect_safetensors_quantization(model_repo, revision)
             if quant_info is not None:
@@ -1450,11 +1291,7 @@ def check_model_architecture(
         except Exception as quant_err:
             logger.warning(f"Quantization precheck error for {model_repo}: {quant_err}")
 
-        # 7a. Tokenizer file hash check REMOVED — different transformers versions
-        # materialize extra_special_tokens into tokenizer.json differently (cosmetic).
-        # The encoding-based check below is sufficient to verify identical behavior.
-
-        # 7b. Verify tokenizer produces identical encodings as teacher
+        # 7. Verify tokenizer encodings match the teacher.
         try:
             tokenizer_match = verify_tokenizer_match(model_repo, revision)
             if not tokenizer_match["match"]:
@@ -1475,13 +1312,8 @@ def check_model_architecture(
                     "vocab_size": vocab_size,
                 }
 
-        # 8. Verify chat_template matches the teacher's template exactly.
-        # Prevents exploits via modified chat templates and blocks derivative
-        # models that copy watermarked templates from other miners. Reference
-        # hash is computed dynamically from the current teacher so a
-        # teacher-swap doesn't require a code change here; students that
-        # shipped the old teacher's template will arch-DQ on the cutover
-        # (which is the intended behaviour).
+        # 8. Verify chat_template matches the teacher's (dynamic hash so a
+        # teacher swap doesn't require code changes).
         REFERENCE_TEMPLATE_HASH = _teacher_chat_template_hash()
         try:
             import hashlib
@@ -1506,8 +1338,7 @@ def check_model_architecture(
                     pass  # No standalone template file
 
             if student_template:
-                # Strip leading/trailing whitespace and any comment-only first lines
-                # (catches watermarks like "{# model distilled by caseus #}")
+                # Strip jinja comment watermarks like "{# model by ... #}"
                 import re
                 cleaned = re.sub(r'^\s*\{#.*?#\}\s*\n?', '', student_template, flags=re.MULTILINE).strip()
                 template_hash = hashlib.sha256(cleaned.encode()).hexdigest()
@@ -1527,13 +1358,9 @@ def check_model_architecture(
                         }
                     # Raw matches but cleaned doesn't — template has injected comments
                     logger.warning(f"Chat template for {model_repo} has injected comments but base template matches")
-            else:
-                # No chat template at all — this is fine, the base tokenizer will be used
-                pass
         except Exception as tmpl_err:
             logger.warning(f"Chat template check failed for {model_repo}: {tmpl_err} (allowing)")
 
-        # Log MoE info for transparency
         if moe_info["is_moe"]:
             logger.info(
                 f"  MoE model: {moe_info['num_experts']} experts, "
@@ -1541,7 +1368,6 @@ def check_model_architecture(
                 f"total={total_params_b:.2f}B, active={config_active_b:.2f}B"
             )
 
-        # Enforce an architecture from the subnet-config allowlist.
         if not vllm_compatible:
             allowed_pairs = ", ".join(
                 f"{e.get('model_type','?')}/{e.get('architecture','?')}"
@@ -1578,8 +1404,7 @@ def check_model_architecture(
 
     except Exception as e:
         err_str = str(e).lower()
-        # Transient errors (rate limits, network issues) should NOT disqualify
-        is_transient = any(k in err_str for k in [
+        is_transient = any(k in err_str for k in [  # do not DQ on transient
             "429", "rate limit", "too many requests",
             "connection", "timeout", "503", "502",
             "temporary", "unavailable",

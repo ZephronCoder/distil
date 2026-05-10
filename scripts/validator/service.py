@@ -85,14 +85,8 @@ def _log_git_revision():
 
 
 def _commitments_from_valid_models(valid_models: dict) -> dict[int, dict]:
-    """Build the UID-keyed commitment view required by king eligibility.
-
-    ``api.state_store.read_commitments()`` is hotkey-keyed for HTTP callers,
-    while ``single_eval._is_kingship_eligible`` expects a UID-keyed mapping.
-    The validator already has the authoritative precheck output in
-    ``valid_models`` at this point, so derive the current commitment view from
-    that instead of depending on API cache shape.
-    """
+    """UID-keyed commitment view (single_eval expects UID->dict, the API
+    cache is hotkey-keyed). Derived from the validator's precheck output."""
     commitments: dict[int, dict] = {}
     for uid, info in (valid_models or {}).items():
         try:
@@ -111,42 +105,27 @@ def _commitments_from_valid_models(valid_models: dict) -> dict[int, dict]:
 
 
 def _resolve_king(valid_models, state):
-    """Resolve the current king.
+    """Resolve (king_uid, king_kl, source).
 
-    Returns (king_uid, king_kl, source) where source is one of:
-      - "h2h_latest":  king was confirmed by the most recent H2H round → trust king_kl
-      - "composite":  single-eval mode — king picked from cross-round composite
-        scores. ``king_kl`` is informational only (round won't re-eval the king).
-      - "scores_fallback": king was picked from stale cached scores → DO NOT trust
-        king_kl for skip-threshold decisions (scores may be from a different teacher,
-        prompt set, or even a different model that was later re-uploaded under the
-        same UID — see cached-score exploit that previously caught UID 237/221)
-      - "none": no king (pure full-eval round)
-    """
+    source: "h2h_latest" (trust king_kl), "composite" (single-eval; KL
+    informational), "scores_fallback" (stale cache; skip-threshold disabled),
+    or "none"."""
     if is_single_eval_mode():
-        # If composite_scores is empty (e.g. validator just upgraded to
-        # single-eval mode), seed it from the most recent canonical H2H so
-        # we don't crown nobody on the first single-eval round.
+        # Cold-start seed: bootstrap composite_scores from h2h_latest so the
+        # first single-eval round has somebody to crown.
         if not state.composite_scores:
             try:
                 bootstrap_composite_from_h2h(state)
             except Exception as exc:
                 logger.warning(f"single-eval bootstrap failed (non-fatal): {exc}")
-        # Trust h2h_latest's king over a fresh network-wide composite
-        # re-rank — re-ranking at epoch start lets a stored composite
-        # from a different sample beat the in-flight round's winner.
-        # Gate on _is_kingship_eligible (not round membership): in
-        # single-eval mode the king is intentionally excluded from the
-        # challenger pool, so a round-membership check would silently
-        # drop the persisted king every epoch.
+        # Trust h2h_latest over a fresh composite re-rank (re-rank at epoch
+        # start lets a stale sample beat the in-flight winner). Gate on
+        # _is_kingship_eligible -- single-eval excludes the king from the
+        # challenger pool, so a round-membership check would drop him.
         if state.h2h_latest:
             persisted_king = state.h2h_latest.get("king_uid")
             if persisted_king is not None:
                 from scripts.validator.single_eval import _is_kingship_eligible
-                # uid_to_hotkey + commitments are already on state via
-                # state.uid_hotkey_map (set in run_validator before this
-                # call) and the most recent commitments cache. Resolve
-                # them defensively.
                 uid_to_hotkey = {}
                 try:
                     for uid_str, hk in (
@@ -192,12 +171,9 @@ def _resolve_king(valid_models, state):
                     return persisted_king, king_kl, "composite"
                 logger.warning(
                     f"single-eval: persisted king UID {persisted_king} "
-                    f"no longer kingship-eligible (deregistered, hotkey "
-                    f"changed, or DQ'd) — falling back to composite "
-                    f"selection."
+                    f"no longer kingship-eligible -- falling back to composite."
                 )
-        # Fallback: bootstrap from composite_scores only when h2h_latest
-        # is empty (cold start, first round after upgrade).
+        # Cold-start fallback (h2h_latest empty): pick from composite_scores.
         composite_king_uid, _ = select_king_by_composite(state, valid_models)
         if composite_king_uid is not None:
             king_kl = state.scores.get(str(composite_king_uid), float("inf"))
@@ -206,8 +182,6 @@ def _resolve_king(valid_models, state):
                 f"UID {composite_king_uid} (stored KL={king_kl})"
             )
             return composite_king_uid, king_kl, "composite"
-        # Fall through to the legacy logic on first boot only — once we have
-        # composite data we'll always end up here.
 
     king_uid, king_kl, source = None, float("inf"), "none"
     if state.h2h_latest:
@@ -233,8 +207,8 @@ def _resolve_king(valid_models, state):
 
 
 def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, state_dir):
-    """Call set_weights and surface SetWeightsError as a log_event so the epoch
-    loop can sleep + retry instead of silently leaving stale weights."""
+    """set_weights wrapper that logs SetWeightsError and returns False so the
+    epoch loop can sleep + retry rather than leaving stale weights."""
     try:
         set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
         return True
@@ -245,13 +219,9 @@ def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, st
 
 
 def _expected_payout_uids(state, king_uid: int | None) -> set[int]:
-    """Return the set of UIDs that should currently hold non-zero on-chain
-    weight, given ``state.recent_kings`` and the live ``king_uid``.
-
-    Mirrors the front-pushing dedupe done in :func:`_build_emission_weights`
-    so the comparison against on-chain weights uses the same source of
-    truth as the writer would.
-    """
+    """Set of UIDs that should hold non-zero on-chain weight given
+    state.recent_kings + the live king_uid (mirrors _build_emission_weights's
+    front-push dedupe)."""
     history: list[int] = []
     if king_uid is not None:
         history.append(int(king_uid))
@@ -269,28 +239,10 @@ def _expected_payout_uids(state, king_uid: int | None) -> set[int]:
 
 
 def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir, state):
-    """2026-05-02 (v30.5 hotfix): the multi-king payout refactor moved the
-    weights-vector builder behind ``_build_emission_weights(state, ...)``
-    but the call-site here was still passing the old (king_uid) signature
-    via the closure-name ``state``, which is undefined in this scope.
-    Result: NameError every epoch BEFORE the round even starts → the
-    validator catches the exception in run_validator's broad except and
-    sleeps the full tempo, so the round NEVER runs. Hot-fix: take state
-    explicitly so the call-site is the one passing it in. This is what
-    miners are seeing as "validator is idle / eval is stuck".
-
-    2026-05-09: previously compared the chain's *first-tied-max* UID to
-    ``king_uid`` directly. Under v30.4 multi-king splits every UID in
-    the payout set shares the same raw weight, so the chain row's
-    "winner" is whichever UID sorts first (lowest UID in the row).
-    That meant the live king was reported "stale" on every epoch even
-    when the on-chain payout was already correct, causing a doomed
-    set_weights call every ~10 minutes (chain rate-limit rejects them
-    with "too soon to commit weights") and a cascade of misleading
-    "stale weights" warnings. Now compare the SET of non-zero UIDs on
-    chain to the SET we would write with ``_build_emission_weights``;
-    only sync when they actually disagree.
-    """
+    """Re-write validator weights only when the on-chain payout set
+    disagrees with _expected_payout_uids(state, king_uid). Comparing
+    SETS (not first-tied-max) avoids spurious sync calls under the
+    multi-king split where many UIDs share the same raw weight."""
     if king_uid is None or validator_uid is None:
         return
     try:
@@ -320,40 +272,25 @@ def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_ui
 
 
 def _build_emission_weights(state, n_uids: int, king_uid: int | None) -> list[float]:
-    """Return the emission-weight vector for the current crown.
-
-    2026-05-01 (v30.4): combines the LIVE king with up to 4 most-recent
-    distinct previous kings tracked in ``state.recent_kings``. Each
-    distinct UID gets ``1.0 / N`` emission where N is the number of
-    distinct kings (up to 5). Falls back to the legacy winner-takes-all
-    behaviour when ``state.recent_kings`` is empty (boot phase) or
-    ``MULTI_KING_PAYOUT_ENABLED=0`` is set in the env.
-
-    The live ``king_uid`` is always pushed to index 0 if present so the
-    current king is in the payout queue regardless of whether it has
-    been persisted yet for this round.
-    """
+    """Emission-weight vector: live king + up to RECENT_KINGS_MAX-1
+    distinct previous kings, each at 1/N. Falls back to winner-takes-all
+    when state.recent_kings is empty or MULTI_KING_PAYOUT_ENABLED=0."""
     import os
     if not bool(int(os.environ.get("MULTI_KING_PAYOUT_ENABLED", "1") or 1)):
         if king_uid is None:
             return [0.0] * n_uids
         return build_winner_take_all_weights(n_uids, king_uid)
     history = list(getattr(state, "recent_kings", []) or [])
-    if king_uid is not None:
-        # Ensure live king is at the front. Keep dedupe in
-        # build_recent_kings_weights so we don't double-pay.
-        if not history or history[0] != king_uid:
-            history = [king_uid] + history
-    if not history and king_uid is None:
+    if king_uid is not None and (not history or history[0] != king_uid):
+        history = [king_uid] + history
+    if not history:
         return [0.0] * n_uids
     return build_recent_kings_weights(n_uids, history, max_kings=RECENT_KINGS_MAX)
 
 
 def _record_king_change(state, new_king_uid: int) -> None:
-    """Push a new king to the front of ``state.recent_kings`` and
-    persist. Dedupes if the same UID re-takes the crown — moves it
-    back to the front rather than duplicating. Caps the queue at
-    RECENT_KINGS_MAX entries (default 5)."""
+    """Push new king to the front of state.recent_kings (dedupe, cap
+    at RECENT_KINGS_MAX) and persist."""
     history = list(getattr(state, "recent_kings", []) or [])
     history = [u for u in history if int(u) != int(new_king_uid)]
     history.insert(0, int(new_king_uid))
@@ -423,14 +360,9 @@ def _append_round_score_history(state, current_block, winner_uid, uid_to_hotkey)
 # ── pipeline steps ──────────────────────────────────────────────────────
 
 def _detect_resumable_round(state, pod):
-    """If a prior validator instance left an in-flight pod eval, return the
-    persisted current_round dict. Otherwise return None.
-
-    Attachment is only attempted when (a) current_round has a pod_eval meta
-    block, (b) the pod-side process is still alive or a done marker is
-    present, AND (c) this round's block has not already been applied to state
-    (otherwise we'd re-process the same results every epoch).
-    """
+    """Return current_round dict if a prior validator left an in-flight pod
+    eval and (a) it has a pod_eval block, (b) the pod process is alive or a
+    done marker exists, AND (c) the block hasn't already been applied."""
     try:
         cur = state.current_round
         if not isinstance(cur, dict):
