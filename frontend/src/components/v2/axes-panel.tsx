@@ -845,7 +845,7 @@ function ScoresView({
         </strong>
         . The amber bar = primary; the grey marker = compare. The
         ranking key is{" "}
-          <code>composite.final = 0.7 × worst_5_mean + 0.3 × weighted</code>{" "}
+          <code>composite.final = 0.85 × worst_5_mean + 0.15 × weighted</code>{" "}
           — see the <strong>v31 · Math/Code/Reasoning/Knowledge/Honesty</strong>{" "}
           sections first (those carry ~50% of composite weight), then{" "}
           <strong>Teacher-Similarity</strong>, then the rest. The{" "}

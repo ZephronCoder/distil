@@ -40,7 +40,7 @@ export const SCORE_EPSILON = subnetConfig.validator.epsilon;
 /**
  * Legacy KL-headline factor — kept for callers that haven't migrated to
  * the composite-first framing. The production ranking key is
- * `composite.final = 0.7·worst_5_mean + 0.3·weighted` (see
+ * `composite.final = 0.85·worst_5_mean + 0.15·weighted` (see
  * `scripts/validator/composite.py`); KL is one of 25+ axes, not the gate.
  *
  * To dethrone the king under v31.2, a challenger must beat

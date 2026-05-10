@@ -16,10 +16,10 @@ A Bittensor subnet for competitive model distillation of **moonshotai/Kimi-K2.6*
 ### Ranking key — `composite.final` (v31.2)
 
 ```
-composite.final = α × worst_5_mean + (1 - α) × weighted
+composite.final = α × worst_K_mean + (1 - α) × weighted
 ```
 
-Default `α = 0.7`. So 70% of your score comes from the **mean of your 5 lowest non-broken axes** (was 3 before v31.1's variance-reduction sweep on 2026-05-10), and 30% from the **weighted mean of every axis**. This smooths single-axis noise while preserving anti-Goodhart pressure (you still can't camp specialists). The API field is still named `worst_3_mean` for back-compat but the math uses K=5. The legacy `composite.worst` (single-axis min) is retained as telemetry — see API + dashboard.
+Live tuning: **α = 0.85, K = 5**. So 85% of your score comes from the **mean of your 5 lowest non-broken axes** (was K=3, α=0.7 before v31.1's variance-reduction sweep on 2026-05-10), and 15% from the **weighted mean of every axis**. This smooths single-axis noise while preserving anti-Goodhart pressure (you still can't camp specialists). The API field is still named `worst_3_mean` for back-compat but the math uses K=5. The legacy `composite.worst` (single-axis min) is retained as telemetry — see API + dashboard.
 
 ### Axis structure (v31.2)
 

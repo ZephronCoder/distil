@@ -35,7 +35,7 @@ const NAV: DocItem[] = [
  *
  * Body content is composite-first. Last refresh: 2026-05-10 v31.2.
  * The eval is now 25+ axes, KL is one of them, the ranking key is
- * composite.final (0.7·worst_5_mean + 0.3·weighted), and the
+ * composite.final (0.85·worst_5_mean + 0.15·weighted), and the
  * anti-Goodhart defence is procedural item generation (the 11 v31
  * axes generate items per round from a block-seed; no static answer
  * key to memorise). Cites composite.py / pod_eval_vllm.py /
@@ -168,7 +168,7 @@ function DocsBody({ active }: { active: DocKey }) {
           <h3>3 · Crown</h3>
           <p>
             The king is whoever has the highest <code>composite.final</code> =
-            0.7·worst_5_mean + 0.3·weighted. A challenger dethrones the
+            0.85·worst_5_mean + 0.15·weighted. A challenger dethrones the
             incumbent only when their <code>final</code> beats the king&apos;s
             by <strong>≥5%</strong> (raised from 3% on 2026-05-10 after the
             v31.1 variance-reduction sweep).
@@ -227,7 +227,7 @@ function DocsBody({ active }: { active: DocKey }) {
           </dl>
           <h3>What to optimise</h3>
           <p>
-            <strong>composite.final</strong> (= 0.7·worst_5_mean + 0.3·weighted),
+            <strong>composite.final</strong> (= 0.85·worst_5_mean + 0.15·weighted),
             not KL. KL is one of 25+ axes. A pure-KL model that loops on
             <code> &quot;Hi&quot;</code> or fails grade-school math cannot take
             the crown. Especially focus on the <strong>v31 procedural axes</strong> —
@@ -573,6 +573,8 @@ python -m distil.validator --netuid 97`}</pre>
             <dd>0.05 (raised from 0.03 on 2026-05-10)</dd>
             <dt>WORST_3_MEAN_K</dt>
             <dd>5 (was 3 in v30.7)</dd>
+            <dt>COMPOSITE_FINAL_BOTTOM_WEIGHT (α)</dt>
+            <dd>0.85 (was 0.7 in v30.5)</dd>
             <dt>COMPOSITE_DETHRONE_FLOOR</dt>
             <dd>0.20</dd>
             <dt>POD_PER_MODEL_TIMEOUT</dt>

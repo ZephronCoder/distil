@@ -6,7 +6,7 @@ Distil is a Bittensor subnet where miners compete to distill knowledge from a la
 
 > **Teacher swap (2026-05-02):** the previous Qwen3.5/Qwen3.6-35B-A3B teacher and the 5.25B/7B caps were retired in favor of Kimi K2.6 + 33B. The live source of truth for teacher / cap / vocab / architecture allowlist is [`frontend/src/lib/subnet-config.json`](../frontend/src/lib/subnet-config.json). Older numbers in this FAQ that mention 5.25B / 7B / Qwen3.5-4B are historical.
 
-The ranking key is **`composite.final`** = α · worst-3-axis-mean + (1 − α) · weighted-mean of every axis (α = 0.7). KL is one of the axes, not the gate. A model that wins KL but loses on grade-school math, IFEval, or reasoning-density cannot take the crown. Winner takes all — the king gets 100% of emissions.
+The ranking key is **`composite.final`** = α · worst-K-axis-mean + (1 − α) · weighted-mean of every axis. Live tuning since the v31.1 variance-reduction sweep (2026-05-10): **α = 0.85, K = 5** (the API field is named `worst_3_mean` for back-compat but the math is `mean(bottom 5)`). KL is one of the axes, not the gate. A model that wins KL but loses on grade-school math, IFEval, or reasoning-density cannot take the crown. Winner takes all — the king gets 100% of emissions.
 
 > **Heads up.** If you've miner'd here before and remember "lower KL = win", that framing is wrong under the current eval. The 2026-04-17 reasoning-spiral king (UID 107: 4096-token loops on `"Hi"`, strictly worse than the unfine-tuned 4B base on every reasoning bench) was the wake-up call. The composite, the on-policy RKL axis, and the `reasoning_density` axis exist specifically to close that gap. Read the axis-by-axis playbook below before training. See [`paper/off_policy_cot_collapse.md`](../paper/off_policy_cot_collapse.md) for the full diagnosis.
 
@@ -98,7 +98,7 @@ The v31 axis surface freed 0.50 weight by retiring or shrinking
 legacy axes that the v31 axes replace (see the table further down
 under "v30.2 / v30.3 axes — current state of legacy weight").
 
-## How Evaluation Works (v30.2 / v30.3, live as of 2026-04-29)
+## How Evaluation Works (v31.2, live as of 2026-05-10)
 
 Every round the validator pulls the set of new on-chain commitments and evaluates each one on a single GPU pod. The eval policy is:
 
@@ -106,7 +106,7 @@ Every round the validator pulls the set of new on-chain commitments and evaluate
 - **King is re-evaluated every round** so the king's score reflects the SAME procedural items as challengers (paired-fairness; v30.2).
 - The king is decided cross-round from stored scores.
 
-Each student is scored on many **independent axes**; the leaderboard is ordered by the new **`composite.final`** ranking key, which blends the bottom-3-axis mean with the weighted-axis mean. Gaming any single axis pulls your rank down, but a single noisy 0 doesn't floor your entire score (v30.2 fix). The design goal is simple: **if you overfit our eval, you will accidentally produce a SOTA small model**. Every axis points at a real, held-out capability.
+Each student is scored on many **independent axes**; the leaderboard is ordered by the new **`composite.final`** ranking key, which blends the bottom-K-axis mean (K=5 since v31.1) with the weighted-axis mean. Gaming any single axis pulls your rank down, but a single noisy 0 doesn't floor your entire score (v30.2 fix). The design goal is simple: **if you overfit our eval, you will accidentally produce a SOTA small model**. Every axis points at a real, held-out capability.
 
 **The round itself:**
 
@@ -114,23 +114,23 @@ Each student is scored on many **independent axes**; the leaderboard is ordered 
 2. **Procedural bench items** generated fresh per round from `block_seed`: math (20), code (14), reasoning (14), aime (12), mbpp (14), ifeval (14), debug (10), knowledge_v2 (12), pragmatic (12), long_context (10), tool_use (10), robustness (10), calibration (10), correction (10), multi_doc (10), refactor (8). Plus judge prompts (16 short + 6 long-form essay) and chat-turns conversations (6 × 3-turn).
 3. **One eval per commitment** for non-king miners — the validator stores `composite.final`, all axes, and the commit signature in `composite_scores.json`.
 4. **King paired re-eval each round** (v30.2 fix): the king is forced into the round's eval set so its score is on the same procedural items as challengers. Their `composite_scores.json` record overwrites each round.
-5. **Cross-round dethrone gate**: a new commitment dethrones the king when its `composite.final` exceeds the king's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%).
+5. **Cross-round dethrone gate**: a new commitment dethrones the king when its `composite.final` exceeds the king's by `SINGLE_EVAL_DETHRONE_MARGIN` (**5% since 2026-05-10**, was 3% pre-v31.1). Combined with the per-axis n bumps and K=5 worst-K mean, the false-positive dethrone rate from pure RNG variance dropped from ~27% per round to <6%.
 6. **Reference baseline.** A small dense Kimi-compatible reference model (currently a small DeepSeek-V3-text variant from the allowlist; consult `subnet-config.json` for the live `referenceModel`) is included in every round as UID `-1` for the per-axis baseline-relative penalty + axis-floor anchoring. Not a contender. (Pre-cutover this slot was undistilled `Qwen/Qwen3.5-4B`; the historical KL ranges in this FAQ refer to that era.)
 7. **Winner takes all** — the king gets 100% of emissions on chain.
 
 **Implication for miners.** Pick your weights carefully before you commit. The on-chain registration burn is the price of an evaluation: there is no "re-roll the same commitment until variance lands well." A model that scores 0.42 final stays at 0.42 forever (until you push a new commitment to the same hotkey, which fully overwrites the previous record).
 
-### The ranking key — `composite.final` (v30.2)
+### The ranking key — `composite.final` (v31.2)
 
 ```
-composite.final = α × worst_3_mean + (1 - α) × weighted
+composite.final = α × worst_K_mean + (1 - α) × weighted
 ```
 
-Default `α = 0.7`. So 70% of your score comes from the **mean of your 3 lowest non-broken axes**, and 30% comes from the **standard weighted mean of every axis**. This:
+Live tuning: **α = 0.85, K = 5** (was α = 0.7, K = 3 pre-v31.1). So 85% of your score comes from the **mean of your 5 lowest non-broken axes**, and 15% comes from the **standard weighted mean of every axis**. The API field is still named `worst_3_mean` for back-compat but the math is `mean(bottom 5)`. This:
 
-- **Smooths single-axis noise** — one fluky 0 averaged with your other low axes still gives meaningful score, vs the legacy `worst()` (single-axis min) that floored you to 0.
-- **Preserves anti-Goodhart pressure** — 70% of the score is still "your worst axes", so you can't camp specialists.
-- **Rewards all-around competence** — the 30% weighted contribution stops you being penalised by a single quirky sub-axis floor.
+- **Smooths single-axis noise** — K=5 instead of single-axis min averages out the per-round RNG drift on small-n axes (<6% false-positive dethrone vs ~27% under legacy `worst()`).
+- **Preserves anti-Goodhart pressure** — 85% of the score is still "your worst axes", so you can't camp specialists.
+- **Rewards all-around competence** — the 15% weighted contribution stops you being penalised by a single quirky sub-axis floor.
 
 The legacy `composite.worst` (single-axis min) is still **emitted as telemetry** in the API + dashboard, but it's no longer the dethrone gate.
 

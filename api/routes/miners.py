@@ -499,7 +499,7 @@ def get_composite_scores():
             "count": len(result),
             "v30_2_count": sum(1 for r in result if r.get("final") is not None),
             "schema_version": "v30.2",
-            "ranking_key": "composite.final = 0.7 * worst_3_mean + 0.3 * weighted",
+            "ranking_key": "composite.final = 0.85 * worst_5_mean + 0.15 * weighted",
         }),
         headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
     )

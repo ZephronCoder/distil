@@ -10,9 +10,26 @@ from scripts.validator.config import DISTIL_ROLE_ID, PAIRED_TEST_ALPHA, EVAL_PRO
 from scripts.validator.composite import (
     ARENA_V3_AXIS_WEIGHTS,
     BENCH_AXIS_WEIGHTS,
+    COMPOSITE_FINAL_BOTTOM_WEIGHT,
     COMPOSITE_SHADOW_VERSION,
+    WORST_3_MEAN_K,
 )
 from scripts.validator.single_eval import SINGLE_EVAL_DETHRONE_MARGIN
+
+
+def _formula_text() -> str:
+    """Return the live ``composite.final`` formula as a Discord-ready string.
+
+    Rendered against the *running* ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` and
+    ``WORST_3_MEAN_K`` so a tuning change (e.g. v31.1's K=3 → K=5,
+    v30.6's α=0.7 → α=0.85) cannot leave the announcement text stale.
+    The previous hard-coded ``0.7 × worst_3_mean`` was off-by-α and
+    off-by-K against the live validator (Discord users `pudding_dev6`
+    and `hklark.1` flagged the mismatch on 2026-05-10).
+    """
+    a = COMPOSITE_FINAL_BOTTOM_WEIGHT
+    k = WORST_3_MEAN_K
+    return f"{a:.2f} × worst_{k}_mean + {1.0 - a:.2f} × weighted"
 
 logger = logging.getLogger("distillation.remote_validator")
 
@@ -60,10 +77,12 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
     """Write a pending announcement to state for async Discord posting.
 
     v30.2 (2026-04-29): the canonical ranking key is ``composite.final``
-    (= 0.7 × worst_3_mean + 0.3 × weighted), not ``composite.worst``
-    (single-axis min). When ``new_composite_final`` is provided, the
-    headline leads with ``Composite final`` and demotes ``worst`` to
-    a "limiting axis" telemetry line. Falls back to the legacy
+    (= α × worst_K_mean + (1 − α) × weighted) where α and K live in
+    ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` and ``WORST_3_MEAN_K`` (current
+    runtime: ``α = 0.85, K = 5`` after the v31.1 variance-reduction
+    sweep). When ``new_composite_final`` is provided, the headline
+    leads with ``Composite final`` and demotes ``worst`` to a
+    "limiting axis" telemetry line. Falls back to the legacy
     ``Composite worst`` headline for callers that haven't migrated yet.
     """
     import os as _os
@@ -149,7 +168,7 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
         prompt_line = f"🧪 Scored on {prompt_count} block-seeded prompts"
         n_axes, axis_list = _active_axis_summary()
         gate_explainer = (
-            f"Dethronement uses `composite.final = 0.7 × worst_3_mean + 0.3 × weighted` "
+            f"Dethronement uses `composite.final = {_formula_text()}` "
             f"across {n_axes} axes ({axis_list}). Challenger must clear the king on "
             f"`final` by >{int(round(SINGLE_EVAL_DETHRONE_MARGIN * 100))}%. "
             f"KL shown above is one of N axes — not the ranking key. "
@@ -167,9 +186,13 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
     p_line = f" (p={p_value:.4f})" if isinstance(p_value, (int, float)) else ""
 
     # Build the headline. v30.2 (2026-04-29) made ``composite.final`` the
-    # ranking key (= 0.7 × worst_3_mean + 0.3 × weighted). When ``final``
-    # is available, lead with it and surface ``worst_3_mean``, ``worst``
+    # ranking key (= α × worst_K_mean + (1 − α) × weighted). When ``final``
+    # is available, lead with it and surface ``worst_K_mean``, ``worst``
     # (as the limiting-axis telemetry line), ``weighted``, and KL.
+    # The ``worst-K`` label is rendered against the live ``WORST_3_MEAN_K``
+    # so v31.1's K=3 → K=5 bump can never leak as ``worst-3 mean: …``
+    # in Discord (which it did during the 2026-05-10 transition window
+    # and which Discord users `pudding_dev6` and `hklark.1` flagged).
     # Falls back to the legacy worst-led headline for legacy callers.
     if new_composite_final is not None:
         final_line = f"📊 **Composite final: {new_composite_final:.3f}** (ranking key)"
@@ -177,7 +200,7 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
             final_line += f" — previous king: {old_composite_final:.3f}"
         breakdown_parts = []
         if new_composite_worst_3_mean is not None:
-            w3 = f"worst-3 mean: {new_composite_worst_3_mean:.3f}"
+            w3 = f"worst-{WORST_3_MEAN_K} mean: {new_composite_worst_3_mean:.3f}"
             if old_composite_worst_3_mean is not None:
                 w3 += f" (was {old_composite_worst_3_mean:.3f})"
             breakdown_parts.append(w3)
