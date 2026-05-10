@@ -11,6 +11,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ SERVICE_UNITS = {
     "dashboard": "distil-dashboard",
     "benchmark_timer": "distil-benchmark-sync.timer",
     "caddy": "caddy",
+    "openclaw": os.environ.get("DISTIL_OPENCLAW_UNIT", "openclaw"),
 }
 if CHAT_POD_HOST:
     SERVICE_UNITS["chat_tunnel"] = "chat-tunnel"
@@ -67,6 +69,17 @@ def maybe_json(text: str) -> Any:
 
 
 def request_url(url: str, timeout: int = 10) -> dict[str, Any]:
+    """Fetch ``url`` with a single try and return a normalized status dict.
+
+    2026-05-09: previously caught only ``URLError`` and ``HTTPError``. When
+    the API listener accepted TCP but never wrote a response (e.g. all
+    workers wedged on a flooded chat surface), urllib raised a bare
+    ``socket.timeout`` / ``TimeoutError`` from inside ``http.client`` —
+    not wrapped in ``URLError`` — and the healthcheck script crashed
+    instead of recording a failure for the affected endpoint. We now
+    fall back to a generic ``Exception`` clause so ANY transport-level
+    failure becomes a structured ``ok=False`` instead of a stack trace.
+    """
     req = Request(url, headers={"User-Agent": "sn97-healthcheck/1.0"})
     try:
         with urlopen(req, timeout=timeout) as resp:
@@ -89,6 +102,24 @@ def request_url(url: str, timeout: int = 10) -> dict[str, Any]:
         }
     except URLError as exc:
         text = str(exc)
+        return {
+            "ok": False,
+            "status": None,
+            "body_excerpt": text[:400],
+            "body_bytes": len(text.encode("utf-8", errors="ignore")),
+            "json": None,
+        }
+    except (TimeoutError, ConnectionError, OSError) as exc:
+        text = f"{type(exc).__name__}: {exc}"
+        return {
+            "ok": False,
+            "status": None,
+            "body_excerpt": text[:400],
+            "body_bytes": len(text.encode("utf-8", errors="ignore")),
+            "json": None,
+        }
+    except Exception as exc:  # pragma: no cover — defensive catch-all
+        text = f"{type(exc).__name__}: {exc}"
         return {
             "ok": False,
             "status": None,
@@ -238,6 +269,19 @@ def chat_pod_probe(expected_model: str | None) -> dict[str, Any]:
 
 
 def chain_weight_sanity(expected_king_uid: int | None) -> dict[str, Any]:
+    """Probe the on-chain weights for our validator and compare against the
+    expected v30.4 multi-king payout set.
+
+    2026-05-09: previously compared a single ``chain_target_uid`` (returned
+    by :func:`eval.chain.get_validator_weight_target`) to the live king,
+    which is wrong under multi-king splits — every UID in the split
+    shares the same raw weight, so the "target" picks the lowest UID in
+    the row and the live king looks stale forever. Now compare the SET
+    of non-zero on-chain UIDs to the SET we would emit
+    (``state.recent_kings`` + the live king, capped at ``RECENT_KINGS_MAX``).
+    The single ``chain_target_uid`` is still surfaced for back-compat
+    consumers (e.g. dashboards that grep for it).
+    """
     if expected_king_uid is None:
         return {"ok": True, "skipped": True, "reason": "no_king"}
     if not os.environ.get("VALIDATOR_UID"):
@@ -246,13 +290,13 @@ def chain_weight_sanity(expected_king_uid: int | None) -> dict[str, Any]:
         "import os,sys,json;"
         "sys.path.insert(0, '/opt/distil/repo');"
         "import bittensor as bt;"
-        "from eval.chain import get_validator_weight_target;"
+        "from eval.chain import get_validator_weight_pairs;"
         "net=os.environ.get('BT_NETWORK','finney');"
         "netuid=int(os.environ.get('BT_NETUID','97'));"
         "vuid=int(os.environ.get('VALIDATOR_UID','-1'));"
         "st=bt.subtensor(network=net);"
-        "t=get_validator_weight_target(st, netuid, vuid) if vuid>=0 else None;"
-        "print(json.dumps({'target': t}))"
+        "pairs=get_validator_weight_pairs(st, netuid, vuid) if vuid>=0 else None;"
+        "print(json.dumps({'pairs': pairs}))"
     )
     venv = "/opt/distil/venv/bin/python"
     py = venv if Path(venv).exists() else "python3"
@@ -260,10 +304,37 @@ def chain_weight_sanity(expected_king_uid: int | None) -> dict[str, Any]:
     if result.returncode != 0:
         return {"ok": False, "reason": (result.stderr.strip() or result.stdout.strip())[:400]}
     data = maybe_json(result.stdout.strip().splitlines()[-1] if result.stdout else "")
-    target = (data or {}).get("target")
+    pairs = (data or {}).get("pairs") or []
+    chain_uids = sorted({int(uid) for uid, w in pairs if int(w) > 0})
+
+    # Read recent_kings + the live king from local validator state. If the
+    # state file is missing (boot or fresh install), fall back to expecting
+    # only the live king (legacy winner-takes-all behaviour).
+    state_dir = os.environ.get("DISTIL_STATE_DIR", "/opt/distil/repo/state")
+    recent_kings_path = Path(state_dir) / "recent_kings.json"
+    expected: list[int] = [int(expected_king_uid)]
+    try:
+        with open(recent_kings_path) as fh:
+            history = json.load(fh) or []
+            for u in history:
+                try:
+                    u_i = int(u)
+                except (TypeError, ValueError):
+                    continue
+                if u_i in expected or u_i < 0:
+                    continue
+                expected.append(u_i)
+                # RECENT_KINGS_MAX is 5 in eval.state; keep this in sync.
+                if len(expected) >= 5:
+                    break
+    except FileNotFoundError:
+        pass
+    expected_set = set(expected)
     return {
-        "ok": target == expected_king_uid,
-        "chain_target_uid": target,
+        "ok": chain_uids == sorted(expected_set),
+        "chain_uids": chain_uids,
+        "expected_uids": sorted(expected_set),
+        "chain_target_uid": chain_uids[0] if chain_uids else None,
         "expected_king_uid": expected_king_uid,
     }
 
@@ -280,6 +351,134 @@ def journal_failures(units: list[str], since: str = "1 hour ago") -> dict[str, i
             continue
         out[unit] = sum(1 for line in result.stdout.splitlines() if "Failed" in line or "failed with result" in line)
     return out
+
+
+def _cleanup_hf_hub(
+    hub_path: str,
+    *,
+    current_student: str | None,
+    min_age_h: int,
+    min_size_gb: float,
+    actions: list[str],
+    tag: str,
+) -> dict[str, Any]:
+    """Delete stale ``models--*`` directories in a HuggingFace hub cache.
+
+    Skips the directory matching the currently-scoring student (if any) and
+    any entry whose newest mtime is below ``min_age_h``. Designed for shared
+    use between the always-safe ``/root/.cache`` scratch and the validator
+    cache at ``/home/distil/.cache``.
+    """
+    import shutil as _shutil
+    now = time.time()
+    reclaimed_bytes = 0
+    removed = 0
+    keep_dir = (
+        f"models--{current_student.replace('/', '--')}"
+        if current_student else None
+    )
+    try:
+        entries = os.listdir(hub_path)
+    except FileNotFoundError:
+        return {"removed": 0, "gb": 0.0}
+
+    for entry in entries:
+        if not entry.startswith("models--"):
+            continue
+        if keep_dir and entry == keep_dir:
+            continue
+        path = os.path.join(hub_path, entry)
+        if not os.path.isdir(path):
+            continue
+        latest = 0
+        size = 0
+        for dirpath, _, filenames in os.walk(path):
+            for fn in filenames:
+                fp = os.path.join(dirpath, fn)
+                try:
+                    st = os.lstat(fp)
+                    if st.st_mtime > latest:
+                        latest = st.st_mtime
+                    # Use the apparent size (st_size) so sparse files in
+                    # tests are counted by their declared length.
+                    size += st.st_size
+                except OSError:
+                    pass
+        if size < int(min_size_gb * (1024 ** 3)):
+            continue
+        if min_age_h > 0:
+            age_h = (now - latest) / 3600 if latest else 0
+            if age_h < min_age_h:
+                continue
+        try:
+            _shutil.rmtree(path, ignore_errors=False)
+            reclaimed_bytes += size
+            removed += 1
+        except Exception as exc:
+            actions.append(f"disk:cleanup_failed:{tag}:{entry}:{exc}")
+    return {"removed": removed, "gb": reclaimed_bytes / (1024 ** 3)}
+
+
+def openclaw_config_probe() -> dict[str, Any]:
+    """Run the OpenClaw config invariant guard without echoing secrets."""
+    guard = REPO_ROOT / "scripts" / "openclaw_config_guard.py"
+    if not guard.exists():
+        return {"ok": False, "status": "missing_guard"}
+    state_file = STATE_DIR / "openclaw_config_health.json"
+    result = run(
+        [
+            sys.executable,
+            str(guard),
+            "--quiet",
+            "--state-file",
+            str(state_file),
+        ],
+        timeout=15,
+    )
+    data = read_json(state_file) if state_file.exists() else None
+    status = data.get("status") if isinstance(data, dict) else None
+    return {
+        "ok": result.returncode == 0 and status == "ok",
+        "status": status or ("error" if result.returncode else "unknown"),
+        "findings": data.get("findings", []) if isinstance(data, dict) else [],
+    }
+
+
+def openclaw_discord_probe(unit: str = "openclaw", since: str = "30 minutes ago") -> dict[str, Any]:
+    """Detect Discord-provider failures that do not stop the OpenClaw service."""
+    result = run(
+        ["journalctl", "-u", unit, "--since", since, "--output=short", "--no-pager"],
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return {"ok": False, "reason": "journal_unavailable"}
+
+    auth_401 = 0
+    app_id_failed = 0
+    provider_exited = 0
+    last_error = None
+    for line in result.stdout.splitlines():
+        if "[discord]" not in line:
+            continue
+        if "channel exited" in line:
+            provider_exited += 1
+            last_error = last_error or "provider_exited"
+        if "401" in line and "Unauthorized" in line:
+            auth_401 += 1
+            last_error = "discord_unauthorized"
+        if "Failed to resolve Discord application id" in line:
+            app_id_failed += 1
+            last_error = "application_id_resolution_failed"
+
+    ok = auth_401 == 0 and app_id_failed == 0 and provider_exited == 0
+    return {
+        "ok": ok,
+        "auth_401": auth_401,
+        "application_id_failures": app_id_failed,
+        "provider_exits": provider_exited,
+        "last_error": last_error,
+        "since": since,
+    }
 
 
 def _load_json_safe(path: Path, default: Any) -> Any:
@@ -332,6 +531,8 @@ def collect() -> dict[str, Any]:
     public_http = {name: request_url(url) for name, url in PUBLIC_ENDPOINTS.items()}
     revision = git_revision(REPO_ROOT)
     open_webui = inspect_open_webui()
+    openclaw_config = openclaw_config_probe()
+    openclaw_discord = openclaw_discord_probe(SERVICE_UNITS["openclaw"])
 
     health_json = local_http["api_local"].get("json") or {}
     h2h_latest = read_json(STATE_DIR / "h2h_latest.json") or {}
@@ -393,6 +594,18 @@ def collect() -> dict[str, Any]:
     if not open_webui["ok"]:
         issues.append(f"container:{OPEN_WEBUI_CONTAINER}:{open_webui['health']}")
 
+    if not openclaw_config.get("ok"):
+        issues.append(f"openclaw:config:{openclaw_config.get('status')}")
+    if not openclaw_discord.get("ok"):
+        if openclaw_discord.get("auth_401"):
+            issues.append("openclaw:discord_auth_failed")
+        elif openclaw_discord.get("application_id_failures"):
+            issues.append("openclaw:discord_application_id_failed")
+        elif openclaw_discord.get("provider_exits"):
+            issues.append("openclaw:discord_provider_exited")
+        else:
+            issues.append(f"openclaw:discord:{openclaw_discord.get('reason') or 'failed'}")
+
     for filename, exists in critical_files.items():
         if not exists:
             issues.append(f"state:{filename}:missing")
@@ -450,6 +663,8 @@ def collect() -> dict[str, Any]:
         "services": service_states,
         "http": {**local_http, **public_http},
         "open_webui": open_webui,
+        "openclaw_config": openclaw_config,
+        "openclaw_discord": openclaw_discord,
         "validator": {
             "health": health_json,
             "eval_progress": eval_summary,
@@ -491,7 +706,7 @@ def repair(report: dict[str, Any]) -> list[str]:
         else:
             actions.append(f"failed_restart:{unit}:{reason}:{result.stderr.strip() or result.stdout.strip()}")
 
-    for name in ("validator", "api", "dashboard", "caddy"):
+    for name in ("validator", "api", "dashboard", "caddy", "openclaw"):
         if not services[name]["ok"]:
             restart(services[name]["unit"], "inactive")
     if "chat_tunnel" in services and not services["chat_tunnel"]["ok"]:
@@ -532,6 +747,29 @@ def repair(report: dict[str, Any]) -> list[str]:
     if any(issue.startswith("chain:weight_mismatch:") for issue in report["issues"]):
         actions.append("notify:chain:weight_mismatch")
 
+    if any(issue == "openclaw:config:regression" for issue in report["issues"]):
+        result = run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "openclaw_config_guard.py"),
+                "--repair",
+                "--quiet",
+                "--state-file",
+                str(STATE_DIR / "openclaw_config_health.json"),
+            ],
+            timeout=15,
+        )
+        if result.returncode == 0:
+            actions.append("repaired:openclaw_config")
+            restart(services["openclaw"]["unit"], "config_repaired")
+        else:
+            actions.append("failed_repair:openclaw_config")
+
+    if any(issue.startswith("openclaw:discord_") for issue in report["issues"]):
+        # Auth/application-id failures need credential/config attention; blind
+        # restarts just burn the budget while the provider keeps receiving 401s.
+        actions.append("notify:openclaw:discord_provider_unhealthy")
+
     # Disk pressure. Two thresholds:
     #   disk:      >= DISK_FAIL_PCT  (default 90)  → notify + attempt cleanup
     #   disk_warn: >= DISK_WARN_PCT  (default 80)  → attempt cleanup only
@@ -543,36 +781,44 @@ def repair(report: dict[str, Any]) -> list[str]:
     # at 82% until a human ran ``rm -rf`` by hand.
     disk_issue_keys = [i for i in report["issues"] if i.startswith("disk:") or i.startswith("disk_warn:")]
     if disk_issue_keys:
-        root_hub = os.path.expanduser("~/.cache/huggingface/hub")
-        reclaimed_bytes = 0
-        removed = 0
-        try:
-            for entry in os.listdir(root_hub):
-                if not entry.startswith("models--"):
-                    continue  # keep dataset caches (tiny, useful)
-                path = os.path.join(root_hub, entry)
-                if not os.path.isdir(path):
-                    continue
-                try:
-                    size = 0
-                    for dirpath, _, filenames in os.walk(path):
-                        for fn in filenames:
-                            try:
-                                size += os.path.getsize(os.path.join(dirpath, fn))
-                            except OSError:
-                                pass
-                    import shutil as _shutil
-                    _shutil.rmtree(path, ignore_errors=True)
-                    reclaimed_bytes += size
-                    removed += 1
-                except Exception as exc:
-                    actions.append(f"disk:cleanup_failed:{entry}:{exc}")
-        except FileNotFoundError:
-            pass
-        if removed:
-            reclaimed_gb = reclaimed_bytes / (1024 ** 3)
+        # 1) /root/.cache scratch (always-safe, kept for backwards compat).
+        root_reclaimed = _cleanup_hf_hub(
+            os.path.expanduser("~/.cache/huggingface/hub"),
+            current_student=None,
+            min_age_h=0,
+            min_size_gb=0.0,
+            actions=actions,
+            tag="root",
+        )
+        # 2) Validator HF cache. Only delete entries that are clearly stale
+        # (>= DISTIL_HF_HUB_MAX_AGE_H, default 7 days), large enough to matter
+        # (>= DISTIL_HF_HUB_MIN_SIZE_GB, default 1 GB), and never the model
+        # currently being scored. The single-eval architecture means a
+        # commitment cache is unreferenced once its score lands; this is the
+        # actual residual that fills the disk after the /root scratch path
+        # turned out to be a near-empty mirror.
+        validator_hub = os.environ.get(
+            "DISTIL_VALIDATOR_HF_HUB", "/home/distil/.cache/huggingface/hub"
+        )
+        eval_progress = report.get("validator", {}).get("eval_progress") or {}
+        current_student = eval_progress.get("current_student") or None
+        validator_reclaimed = _cleanup_hf_hub(
+            validator_hub,
+            current_student=current_student,
+            min_age_h=int(os.environ.get("DISTIL_HF_HUB_MAX_AGE_H", "168")),
+            min_size_gb=float(os.environ.get("DISTIL_HF_HUB_MIN_SIZE_GB", "1.0")),
+            actions=actions,
+            tag="validator",
+        )
+        if root_reclaimed["removed"]:
             actions.append(
-                f"disk:reclaimed_hf_hub:{removed}_caches:{reclaimed_gb:.1f}GB"
+                f"disk:reclaimed_hf_hub:root:{root_reclaimed['removed']}_caches:"
+                f"{root_reclaimed['gb']:.1f}GB"
+            )
+        if validator_reclaimed["removed"]:
+            actions.append(
+                f"disk:reclaimed_hf_hub:validator:{validator_reclaimed['removed']}_caches:"
+                f"{validator_reclaimed['gb']:.1f}GB"
             )
         if any(i.startswith("disk:") for i in disk_issue_keys):
             actions.append("notify:disk:full")
@@ -586,12 +832,20 @@ def repair(report: dict[str, Any]) -> list[str]:
 
 def render_markdown(report: dict[str, Any]) -> str:
     health = report["validator"]["health"] or {}
+    chat_service = report["services"].get("chat_tunnel")
+    chat_status = (
+        f"{chat_service['active']} / {report['http']['chat_public']['status']}"
+        if chat_service
+        else f"external / {report['http']['chat_public']['status']}"
+    )
     checks = [
         ("Code revision", report["revision"].get("git") or report["revision"].get("file") or "unknown"),
         ("Validator", report["services"]["validator"]["active"]),
         ("API", f"{report['services']['api']['active']} / {report['http']['api_local']['status']}"),
         ("Dashboard", f"{report['services']['dashboard']['active']} / {report['http']['dashboard_local']['status']}"),
-        ("Chat", f"{report['services']['chat_tunnel']['active']} / {report['http']['chat_public']['status']}"),
+        ("OpenClaw", report["services"]["openclaw"]["active"]),
+        ("Discord bot", "ok" if report.get("openclaw_discord", {}).get("ok") else report.get("openclaw_discord", {}).get("last_error") or "failed"),
+        ("Chat", chat_status),
         ("King", str(health.get("king_uid")) if health else "unknown"),
         ("Eval active", str(bool(health.get("eval_active"))) if health else "unknown"),
     ]

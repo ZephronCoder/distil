@@ -10,6 +10,7 @@ from eval.chain import (
     build_winner_take_all_weights,
     fetch_metagraph,
     get_validator_weight_target,
+    get_validator_weight_targets,
     parse_commitments,
     set_weights,
 )
@@ -260,6 +261,30 @@ def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, st
         return False
 
 
+def _expected_payout_uids(state, king_uid: int | None) -> set[int]:
+    """Return the set of UIDs that should currently hold non-zero on-chain
+    weight, given ``state.recent_kings`` and the live ``king_uid``.
+
+    Mirrors the front-pushing dedupe done in :func:`_build_emission_weights`
+    so the comparison against on-chain weights uses the same source of
+    truth as the writer would.
+    """
+    history: list[int] = []
+    if king_uid is not None:
+        history.append(int(king_uid))
+    for uid in (getattr(state, "recent_kings", []) or []):
+        try:
+            uid_i = int(uid)
+        except (TypeError, ValueError):
+            continue
+        if uid_i < 0 or uid_i in history:
+            continue
+        history.append(uid_i)
+        if len(history) >= RECENT_KINGS_MAX:
+            break
+    return set(history)
+
+
 def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir, state):
     """2026-05-02 (v30.5 hotfix): the multi-king payout refactor moved the
     weights-vector builder behind ``_build_emission_weights(state, ...)``
@@ -269,21 +294,39 @@ def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_ui
     validator catches the exception in run_validator's broad except and
     sleeps the full tempo, so the round NEVER runs. Hot-fix: take state
     explicitly so the call-site is the one passing it in. This is what
-    miners are seeing as "validator is idle / eval is stuck"."""
+    miners are seeing as "validator is idle / eval is stuck".
+
+    2026-05-09: previously compared the chain's *first-tied-max* UID to
+    ``king_uid`` directly. Under v30.4 multi-king splits every UID in
+    the payout set shares the same raw weight, so the chain row's
+    "winner" is whichever UID sorts first (lowest UID in the row).
+    That meant the live king was reported "stale" on every epoch even
+    when the on-chain payout was already correct, causing a doomed
+    set_weights call every ~10 minutes (chain rate-limit rejects them
+    with "too soon to commit weights") and a cascade of misleading
+    "stale weights" warnings. Now compare the SET of non-zero UIDs on
+    chain to the SET we would write with ``_build_emission_weights``;
+    only sync when they actually disagree.
+    """
     if king_uid is None or validator_uid is None:
         return
     try:
-        current_weight_target = get_validator_weight_target(subtensor, netuid, validator_uid)
+        chain_uids = get_validator_weight_targets(subtensor, netuid, validator_uid)
     except Exception as exc:
-        current_weight_target = None
+        chain_uids = None
         logger.warning(f"Could not read current validator weights: {exc}")
-    if current_weight_target == king_uid:
+    expected_uids = _expected_payout_uids(state, king_uid)
+    if chain_uids is not None and chain_uids == expected_uids:
         return
+    chain_repr = sorted(chain_uids) if chain_uids is not None else None
+    expected_repr = sorted(expected_uids)
     logger.warning(
-        f"Validator weights stale before eval: chain UID {current_weight_target} != king UID {king_uid}; syncing"
+        f"Validator weights stale before eval: chain UIDs {chain_repr} != "
+        f"expected payout UIDs {expected_repr}; syncing"
     )
     log_event(
-        f"Syncing stale weights before eval: chain UID {current_weight_target} -> king UID {king_uid}",
+        f"Syncing stale weights before eval: chain UIDs {chain_repr} -> "
+        f"expected payout UIDs {expected_repr}",
         level="warning", state_dir=state_dir,
     )
     _safe_set_weights(

@@ -147,8 +147,22 @@ def build_recent_kings_weights(
     return weights
 
 
-def get_validator_weight_target(subtensor, netuid: int, validator_uid: int) -> int | None:
-    """Return the validator's current highest-weight target UID, if any."""
+def get_validator_weight_pairs(
+    subtensor, netuid: int, validator_uid: int
+) -> list[tuple[int, int]] | None:
+    """Return the validator's full ``[(uid, raw_weight), ...]`` row from chain.
+
+    Returns ``None`` if the validator hasn't submitted any weights yet
+    (chain returns no row for the UID), or if the on-chain row is empty.
+    Raw weights are u16 ints; callers that want a normalized view should
+    divide by ``sum(weights)``.
+
+    2026-05-09: introduced so callers can reason about multi-king splits.
+    Pre-existing :func:`get_validator_weight_target` only surfaces a
+    single UID, which silently lies under v30.4 multi-king payouts —
+    every UID in the split shares the same raw weight, so ``max`` picks
+    the lowest UID in the row regardless of which one is the live king.
+    """
 
     def _fetch():
         rows = subtensor.weights(netuid)
@@ -157,14 +171,46 @@ def get_validator_weight_target(subtensor, netuid: int, validator_uid: int) -> i
                 continue
             if not pairs:
                 return None
-            best_uid, _ = max(
-                ((int(uid), int(weight)) for uid, weight in pairs),
-                key=lambda item: item[1],
-            )
-            return best_uid
+            return [(int(uid), int(weight)) for uid, weight in pairs]
         return None
 
     return _retry_chain(_fetch, label="fetch_validator_weights")
+
+
+def get_validator_weight_targets(
+    subtensor, netuid: int, validator_uid: int
+) -> set[int] | None:
+    """Return the set of UIDs with non-zero on-chain weight for ``validator_uid``.
+
+    ``None`` means the chain has no row for this validator (boot, or the
+    UID never set weights). An empty set means the row is present but
+    every weight is zero.
+
+    Use this whenever you want to compare on-chain weights against a
+    multi-king payout set. For a single dominant UID, prefer
+    :func:`get_validator_weight_target`.
+    """
+    pairs = get_validator_weight_pairs(subtensor, netuid, validator_uid)
+    if pairs is None:
+        return None
+    return {uid for uid, weight in pairs if weight > 0}
+
+
+def get_validator_weight_target(subtensor, netuid: int, validator_uid: int) -> int | None:
+    """Return one UID with the highest on-chain weight for this validator.
+
+    .. deprecated:: v30.5
+        Useful only for single-king-payout chains. Under v30.4 multi-king
+        splits all targets share the same raw weight so the choice of
+        ``max`` is arbitrary (today: lowest UID first because that's how
+        the chain orders pairs). Prefer :func:`get_validator_weight_targets`
+        (plural) when comparing against ``recent_kings``.
+    """
+    pairs = get_validator_weight_pairs(subtensor, netuid, validator_uid)
+    if not pairs:
+        return None
+    best_uid, _ = max(pairs, key=lambda item: item[1])
+    return best_uid
 
 
 class SetWeightsError(RuntimeError):
