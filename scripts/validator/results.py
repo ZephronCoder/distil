@@ -32,18 +32,14 @@ logger = logging.getLogger("distillation.remote_validator")
 
 MIN_PROMPTS_DETHRONE = 100
 
-# Challenger-side score gate. Mirrors state_manager.MIN_PROMPTS_FOR_LEADERBOARD;
-# below this we treat the round's scores as untrustworthy (a partial
-# round once corrupted "best score ever" from 0.2 → 0.06 and broke
-# select_challengers — 2026-04-24 rollback).
+# Mirrors state_manager.MIN_PROMPTS_FOR_LEADERBOARD: below this we don't
+# overwrite scores from an early-stopped/partial round (avoids breaking
+# select_challengers with a phantom "best ever" KL).
 MIN_PROMPTS_FOR_SCORE_UPDATE = 150
 
-# ── Composite-axis dethronement floor ───────────────────────────────────
-# A challenger that passes the dethrone margin is still blocked if its
-# worst composite axis is below this floor. 0.20 is the
-# "catastrophic-failure" threshold per axis (e.g. on_policy_rkl < 0.20 ⇒
-# > 5x king's RKL; capability < 0.20 ⇒ < 20% of teacher pass rate). The
-# gate fails open if too few axes are populated.
+# Catastrophic-failure per-axis floor. A challenger passing the dethrone
+# margin is still blocked if its worst axis is below this. Fails open
+# when fewer than COMPOSITE_DETHRONE_MIN_AXES axes are populated.
 COMPOSITE_DETHRONE_FLOOR = float(policy_env("COMPOSITE_DETHRONE_FLOOR", "0.20"))
 COMPOSITE_DETHRONE_MIN_AXES = int(policy_env("COMPOSITE_DETHRONE_MIN_AXES", "3"))
 
@@ -53,9 +49,8 @@ def _log_finetune_probe_telemetry(
 ):
     """Append one finetune-probe row to state/finetune_probe_telemetry.jsonl.
 
-    Persists every probe value (pass AND fail, king AND challengers) so
-    we can later replace heuristic thresholds with calibrated ones.
-    """
+    Persists every probe value (king + challengers, pass + fail) so we
+    can recalibrate thresholds from data later."""
     probe = student_result.get("finetune_probe") or {}
     if not probe:
         return
@@ -84,13 +79,8 @@ def _log_finetune_probe_telemetry(
 
 
 def _apply_dp_noise_to_per_prompt(per_prompt, prompt_texts, private_start_idx):
-    """Axis A7: inject DP-Laplace noise into per-prompt KL values for prompts
-    drawn from the private (reusable-holdout) subset. Public prompt scores are
-    untouched.
-
-    per_prompt is a list of floats aligned with prompt_texts. Returns a noised
-    copy without mutating the input.
-    """
+    """Inject DP-Laplace noise into per-prompt KL for private-subset prompts.
+    Public scores untouched; returns a copy without mutating input."""
     if not per_prompt or not prompt_texts or private_start_idx is None:
         return per_prompt
     n = min(len(per_prompt), len(prompt_texts))
@@ -108,12 +98,7 @@ def _apply_dp_noise_to_per_prompt(per_prompt, prompt_texts, private_start_idx):
 
 def _pairwise_two_sided_p(a_per_prompt: list[float], b_per_prompt: list[float]) -> tuple[float, float, int]:
     """Two-sided paired t-test on per-prompt KL between two challengers.
-
-    Returns (mean_delta, p_two_sided, n) where mean_delta = a - b.
-    Used by `_resolve_dethrone_winner` to decide whether two dethroners are
-    statistically distinguishable. We only care about the two-sided p — sign
-    is irrelevant for the equivalence-class check.
-    """
+    Returns (mean_delta=a-b, p_two_sided, n_paired)."""
     n = min(len(a_per_prompt), len(b_per_prompt))
     if n < 2:
         return 0.0, 1.0, n
@@ -128,46 +113,13 @@ def _baseline_floor_dethrone_veto(
     reference_model: str | None,
     students_data: dict,
 ) -> dict | None:
-    """Veto a dethrone if the challenger regresses below the Qwen 4B base.
+    """Veto when the challenger regresses >BASELINE_FLOOR_MARGIN below the
+    same-round Qwen3.5-4B reference on any held-out-transfer bench axis
+    (math/code/reasoning/ifeval/aime/mbpp). Fails open when the reference
+    isn't in the round or too few axes are comparable.
 
-    Goodhart guard (2026-04-28): the held-out evalscope canary showed
-    kings regressing -7.4pp on gsm8k and -10.2pp on BBH versus the
-    Qwen3.5-4B base (state/benchmarks/baseline_qwen35_4b.json gsm8k
-    0.934 vs king 0.86; bbh 0.879 vs king 0.777). The composite gate
-    can't catch this because the validator's procedural items don't
-    reach that absolute level — a challenger gaming math_bench at 0.92
-    can still be -0.10 below where the *base* model would score on the
-    same items, which is direct evidence the model has *regressed* on
-    real capability rather than gained it.
-
-    This gate is paired-evaluation: when the reference (Qwen3.5-4B
-    base, REFERENCE_UID = -1) is included in the same round
-    (INCLUDE_REFERENCE_IN_ROUND=1), challenger and reference see the
-    *same* block-seeded items, so the comparison is sample-paired and
-    free of cross-round prompt drift. If the reference isn't in the
-    round (legacy behavior), this veto silently fails open.
-
-    Threshold: a challenger that scores below the reference by more
-    than ``BASELINE_FLOOR_MARGIN`` on any of the gsm8k-/humaneval-/bbh-
-    transfer axes (math_bench, code_bench, reasoning_bench,
-    ifeval_bench, aime_bench, mbpp_bench) is blocked from dethrone.
-    Default 0.10 = 10pp absolute margin: a small regression is allowed
-    to avoid sample-noise false positives, but a -10pp absolute drop
-    on a held-out-transfer axis vs the SAME 4B base reads as the
-    model is genuinely worse than the un-distilled control.
-
-    Returns None when:
-      * reference not in the round
-      * fewer than ``BASELINE_FLOOR_MIN_AXES_COMPARABLE`` axes are
-        comparable (insufficient sample, fail open)
-      * no axis regresses by more than the margin (challenger is at
-        least non-regressive)
-    Returns ``{"reason": str, "axis": str, "challenger": float,
-    "reference": float, "margin": float}`` to block dethrone.
-
-    Implementation note: this is in addition to the existing
-    composite-floor / Pareto vetoes. A challenger must pass ALL gates
-    to take the crown.
+    Catches kings that score well on procedural items while regressing
+    on real capability relative to the un-distilled control.
     """
     if not challenger_model or not reference_model:
         return None
@@ -233,18 +185,9 @@ def _composite_dethrone_veto(
     king_kl: float | None,
     king_rkl: float | None,
 ) -> dict | None:
-    """Return a veto dict iff the challenger's composite is catastrophic.
-
-    A "veto" means the challenger passed the KL gate (paired t-test + 3%
-    epsilon) but has at least one composite axis below
-    ``COMPOSITE_DETHRONE_FLOOR``. This remains a catastrophic-failure guard;
-    normal SOTA pressure comes from the composite ranking and soft weights.
-
-    Returns:
-      None if the challenger should be allowed through, OR
-      ``{"reason": str, "worst_axis": str, "worst_value": float, "composite": dict}``
-      if the dethronement should be blocked.
-    """
+    """Catastrophic-failure guard: veto when any composite axis falls
+    below COMPOSITE_DETHRONE_FLOOR. Fails open when fewer than
+    COMPOSITE_DETHRONE_MIN_AXES are present."""
     if not challenger_model:
         return None
     data = students_data.get(challenger_model) or {}
@@ -290,21 +233,9 @@ def _pareto_dethrone_veto(
     king_kl: float | None,
     king_rkl: float | None,
 ) -> dict | None:
-    """Return a veto dict iff the challenger fails the Pareto-dominance gate.
-
-    2026-04-24 (Session 3): secondary dethrone consideration inspired by
-    Affine Cortex — a challenger that beats the king on KL but fails to
-    dominate on a majority of axes is flagged. The gate is
-    shadow-active (``PARETO_DOMINANCE_GATE=0`` by default) so this
-    function returns None in production until the 48h public notice
-    completes and the gate flips. Meanwhile the telemetry / dashboard
-    surface the pareto result so we can verify the gate's expected
-    behavior on real rounds.
-
-    When the gate is active and the challenger has insufficient
-    comparable axes, the veto fails OPEN (returns None). We never want
-    a probe outage to freeze the crown.
-    """
+    """Veto when the challenger fails the Pareto-dominance gate (not a
+    majority of axes win). Fails open when PARETO_DOMINANCE_GATE is off
+    or comparable-axis count is insufficient."""
     from scripts.validator.composite import (
         PARETO_DOMINANCE_GATE as _PG,
         compute_axes as _axes,
@@ -407,23 +338,11 @@ def _run_dethrone_vetos(
     path_label: str,
     extra_context: str,
 ) -> bool:
-    """Run composite + baseline + Pareto vetos for one dethroner candidate.
+    """Run composite + baseline + Pareto vetos for one challenger.
 
-    Centralises the veto cascade that used to be inlined twice in
-    ``process_results`` (paired-t-test path and legacy-epsilon path).
-    Each veto is checked in order; the first one that fires logs a
-    structured ``BLOCKED DETHRONE`` line plus a state-event entry and
-    returns ``True``. The composite-floor veto can be silently waived
-    by the king-regression gate (``king_floor_waived``) — the others
-    cannot.
-
-    Returns True iff the dethrone should be blocked (caller should
-    skip the candidate). Returns False iff every veto cleared.
-
-    ``path_label`` is appended to log messages so it's obvious which
-    code path produced the line (``"t-test"`` or ``"legacy epsilon"``).
-    ``extra_context`` carries per-call diagnostics (KL, p-value, etc.)
-    that vary between paths.
+    First fired veto logs a BLOCKED DETHRONE line + state event and
+    returns True (caller skips the candidate). composite-floor can be
+    waived by king_floor_waived; the others cannot.
     """
     suffix = f"[{path_label}]" if path_label else ""
     comp_veto = _composite_dethrone_veto(
@@ -483,27 +402,11 @@ def _run_dethrone_vetos(
 
 
 def _king_regression_floor_waived(state, king_uid) -> bool:
-    """Return True when a persistently at-risk king loses floor protection.
-
-    Two independent at-risk signals trigger a waiver:
-
-      (1) Internal composite at-risk: the king's ``composite.worst`` has
-          been below ``KING_COMPOSITE_FLOOR`` (or below the base model)
-          for ``KING_REGRESSION_MIN_STREAK`` consecutive canonical
-          rounds. Tracked via ``state.king_regression_streak``.
-
-      (2) Held-out canary at-risk (2026-04-28): the king's mean
-          held-out evalscope score across ``KING_CANARY_AXES`` has
-          been > ``KING_CANARY_MARGIN`` pp below the Qwen 4B base for
-          ``KING_CANARY_MIN_STREAK`` consecutive canonical rounds.
-          Tracked via ``state.king_canary_streak``.
-
-    The composite floor is challenger-side: it stops a narrow KL
-    specialist from taking the crown. Once EITHER at-risk signal fires,
-    keeping that same floor asymmetrically protects a weak king. We
-    still require the challenger to pass KL significance and Pareto,
-    but we waive only the composite-floor veto.
-    """
+    """True when a persistently at-risk king loses the composite-floor
+    protection. Triggered by either (a) internal composite streak below
+    KING_COMPOSITE_FLOOR (state.king_regression_streak) or (b) held-out
+    canary streak below the Qwen 4B baseline (state.king_canary_streak).
+    KL significance + Pareto are still required."""
     if king_uid is None:
         return False
     try:
@@ -527,26 +430,17 @@ def _king_regression_floor_waived(state, king_uid) -> bool:
 
 
 def _resolve_dethrone_winner(dethroners: list[dict]) -> int:
-    """Pick the king-of-the-round from a list of dethrone-passing challengers.
+    """Pick the round-winner from dethrone-passing challengers.
 
-    Anti-spam logic (apple_2357 attack vector, 2026-04-19):
-      A miner can spam noise-injected near-copies of a competitor's leading
-      model. Each copy passes the activation fingerprint (different weights
-      ⇒ different activations) and each one passes the t-test vs the king
-      (because the original would, and the copies inherit ~the same KL).
-      Old logic: pick lowest KL among them ⇒ random copy wins on noise.
-      New logic: cluster challengers that aren't significantly different from
-      one another (pairwise paired-t-test, p > PAIRED_TEST_ALPHA two-sided)
-      and within the cluster prefer earliest commit_block; ties broken by
-      lowest KL. A genuinely-better outlier still wins because pairwise it
-      will be significantly better than the rest of the cluster.
+    Anti-spam: copies of a leading model all pass the t-test vs king;
+    picking lowest KL would let a random near-duplicate win. Cluster
+    challengers that aren't significantly distinguishable (pairwise
+    two-sided paired-t-test, p > PAIRED_TEST_ALPHA) and within a cluster
+    prefer earliest commit_block (ties: lowest KL). Genuinely-better
+    outliers still win since pairwise they beat the rest of the cluster.
 
-    Args:
-      dethroners: list of dicts each with keys
-                  uid, kl, per_prompt, commit_block, p_vs_king, n_paired_vs_king
-
-    Returns:
-      uid of the chosen winner.
+    Args: list of {uid, kl, per_prompt, commit_block, p_vs_king, n_paired_vs_king}.
+    Returns: uid of the chosen winner.
     """
     if not dethroners:
         raise ValueError("_resolve_dethrone_winner called with empty list")
@@ -662,16 +556,8 @@ def _composite_for_uid(
 def _resolve_reference_axes_for_ranking(
     students_data, king_kl_ref, king_rkl_ref,
 ):
-    """Resolve same-round reference axis values once for ranking.
-
-    2026-04-28 (v29.1): the dethroner ranking and the late display
-    composite need to apply the same per-axis baseline-relative penalty;
-    without resolving the reference axes once here they would disagree
-    for kings/challengers that regress below Qwen-4B-base on a bench
-    axis. Falls open to (None, None) when the reference is missing or
-    ``compute_axes`` throws — penalty silently disables that round and
-    ranking degrades to the pre-v29.1 behaviour.
-    """
+    """Same-round reference axes for the baseline-relative penalty.
+    Falls open to (None, None) when the reference is missing."""
     try:
         from eval.runtime import REFERENCE_MODEL as _REF_MODEL_RANK
         from eval.runtime import REFERENCE_UID as _REF_UID_RANK
@@ -689,21 +575,12 @@ def _select_h2h_winner(
     h2h_candidates, epsilon_dethroned_by, king_uid, king_kl, state,
     uid_to_model, students_data, king_kl_ref, king_rkl_ref,
 ):
-    """Pick the round's H2H winner and re-sort h2h_candidates by composite.
+    """Sort h2h_candidates by composite.final (then worst_k, worst,
+    weighted, then -KL) and pick the winner.
 
-    Composite final (bottom-K quality blended with weighted mean) is the
-    primary key. Ties break by worst-K, worst axis, weighted score, then KL
-    ascending so behaviour degrades gracefully to KL-only when the composite
-    is missing (e.g. full-vocab KL still computed but probes errored).
-
-    The paired t-test gate (``epsilon_dethroned_by``) is unchanged — it
-    still enforces statistical significance before a crown changes hands
-    — but which challenger is considered the canonical winner, and what
-    we display as #1, is now driven by composite.final.
-
-    Returns ``(winner_uid, winner_kl, epsilon_dethroned_by)`` — the third
-    component may be cleared when the integrity check trips.
-    """
+    The paired-t-test gate still enforces statistical significance for
+    a crown change. Returns (winner_uid, winner_kl, epsilon_dethroned_by);
+    the third may be cleared when the integrity check trips."""
     if not h2h_candidates:
         return None, float("inf"), epsilon_dethroned_by
     ref_uid_for_ranking, ref_axes_for_ranking = _resolve_reference_axes_for_ranking(
@@ -778,25 +655,11 @@ def _select_h2h_winner(
 def _annotate_and_sort_composite(
     h2h_results, *, king_h2h_kl, students_data, results,
 ):
-    """Run composite annotation, backfill veto markers, sort by composite.
-
-    Catches and logs the rare composite-pipeline failure so a downstream
-    issue (probes errored mid-round, schema drift) doesn't take out the
-    entire round; the legacy KL-only ranking still holds in that case.
-    """
+    """Annotate rows with composite, backfill veto markers, sort by
+    composite.final. Failures degrade to KL-only ranking."""
     try:
-        # Teacher sanity gate (2026-04-23): if pod_eval_vllm recorded a
-        # row for the teacher as a pseudo-student (via the
-        # ``TEACHER_SANITY_PROBE`` path), pass it to the composite
-        # annotator so axes where the teacher itself scored below the
-        # sanity floor drop out this round. Falls back to None when the
-        # teacher wasn't probed (older pod_eval builds) and the gate
-        # fails open — same behaviour as before this commit.
         teacher_name = results.get("teacher")
         teacher_row = students_data.get(teacher_name) if teacher_name else None
-        # Import locally to keep composite.py ML-dep free (see its
-        # module docstring). The reference model is the always-in-round
-        # base student used for king_health telemetry (distil-97, 2026-04-24).
         from eval.runtime import REFERENCE_MODEL as _REF_MODEL
         from eval.runtime import REFERENCE_UID as _REF_UID
         annotate_h2h_with_composite(
@@ -805,12 +668,9 @@ def _annotate_and_sort_composite(
             reference_model=_REF_MODEL,
             reference_uid=_REF_UID,
         )
-        # Backfill the vs_king string for entries that would have passed
-        # the KL gate (``... dethroned``) but were blocked by the
-        # composite-floor veto. Without this the dashboard would say
-        # "dethroned" for a challenger that never actually took the
-        # crown, which is exactly the kind of false-positive signal the
-        # Discord has been asking us to surface clearly.
+        # Re-write "dethroned" -> "blocked by <axis>" when the composite
+        # floor would have vetoed the dethrone (so dashboards don't claim
+        # a challenger took the crown that never actually did).
         for row in h2h_results:
             if row.get("is_king") or row.get("disqualified"):
                 continue
@@ -843,10 +703,8 @@ def _annotate_and_sort_composite(
                 "floor": COMPOSITE_DETHRONE_FLOOR,
             }
 
-        # Re-sort h2h_results by composite.final (desc) so the leaderboard
-        # endpoint and h2h_latest display rank order matches the ranking
-        # key used for crown decisions. KL stays as an informational field
-        # on each row.
+        # Re-sort by composite.final (desc) so display order matches the
+        # ranking key. KL stays as an informational field on each row.
         def _sort_key(row):
             comp = row.get("composite") or {}
             final = comp.get("final")
@@ -893,14 +751,9 @@ def _annotate_and_sort_composite(
 def _handle_eval_error_and_record_failure(
     *, uid, model_name, student_result, models_to_eval, state,
 ):
-    """Log eval error, record failure, fast-track CUDA poisoners to stale.
-
-    A device-side assert (or any CUDA error) in a student model isn't a
-    transient failure — it indicates bad weights (NaN/Inf) or invalid
-    embedding indexing. Worse, it poisons the GPU context for ~9 sibling
-    students this round (avg observed 2026-05-04). Fast-track to 3 strikes
-    so the stale-skip kicks in next round instead of after 3 cascades.
-    """
+    """Log eval error + record failure. CUDA asserts mean bad weights and
+    poison the GPU context for sibling students this round, so fast-track
+    them to 3 strikes (next round stale-skips instead of re-cascading)."""
     err_str = str(student_result["error"])
     logger.warning(f"UID {uid} ({model_name}): eval error — {err_str}")
     rev = models_to_eval.get(uid, {}).get("revision", "main")
@@ -925,17 +778,8 @@ def _check_long_form_derail_dq(
     *, uid, model_name, student_result, models_to_eval,
     uid_to_hotkey, state, king_uid,
 ) -> bool:
-    """Return True if the student was DQ'd for long-form incoherence.
-
-    2026-05-01 (v30.4 patch v3): if the long_form_judge probe found that
-    >50% of round responses scored below 0.3 coherence (statistical
-    detector — non-ASCII salad, word-list mode, compound gibberish, no
-    stop words), the model is permanently DQ'd. Soft-weight degradation
-    alone wasn't dethroning broken kings because their bench scores
-    compensated. Word-salad output is not a partial failure; the model
-    can't sustain coherent generation, which is core to assistant
-    deployment. The current king is exempt from this gate.
-    """
+    """Permanently DQ when >LONG_FORM_DERAIL_DQ_RATIO of long-form responses
+    score below LONG_FORM_DERAIL_DQ_THRESHOLD coherence. King exempt."""
     if uid == king_uid or not LONG_FORM_DERAIL_DQ_ENABLED:
         return False
     lf = student_result.get("long_form_judge_probe") or {}
