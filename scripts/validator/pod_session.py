@@ -385,47 +385,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             now = float(resume_pod_eval.get("started_at") or now)
         except (TypeError, ValueError):
             pass
-    # 2026-05-04: Per-round-wall-time recalibration. Old estimates
-    # (teacher=90s, student=5*n_prompts=300s) predicted ~50 min for a
-    # 10-student round; live timing on H200 NVL with the Kimi K2.6 API
-    # teacher path shows ~370s teacher generation + ~15 min probe + KL
-    # per student = ~3 hours. Underestimating drives miner panic in
-    # Discord ("eval is stuck") because the dashboard ETA expires while
-    # the round is barely past student #1.
-    #
-    # Components (median, single 1xH200 NVL pod):
-    #   • teacher_api_phase:  370s (60 prompts × 6s avg via OpenRouter
-    #                              concurrency=4)
-    #   • teacher_probe_refs: 145s (32 think + 36 cap + 4 chat probes
-    #                              via API)
-    #   • per-student load:   140s (33B Kimi-arch download + load)
-    #   • per-student probes: 380s (chat 65s + capability 36s + judge
-    #                              16s + LFJ 720s on derail-prone
-    #                              students... call it 380s for the
-    #                              healthy case, gets revised below if
-    #                              we detect derail in chat probe)
-    #   • per-student KL:     180s (60 prompts × 3s on H200 eager mode)
-    #
-    # If DISTIL_TEACHER_MODE=api we skip local vLLM bootstrap, so the
-    # teacher phase is dominated by API throughput, not GPU load.
-    #
-    # 2026-05-04 follow-up: round 04:15 telemetry showed the ETA was
-    # *still* too low — actual student #1 runtime was ~50 min not the
-    # ~12 min implied by 700s. The 700s figure assumed the LFJ +
-    # bench-battery wall time we're paying with eager-attn Kimi 33B
-    # on the derail-prone student set we currently have. Real cost
-    # for a derail-prone student is:
-    #   load 140s + chat 65s + cap 36s + judge 16s + LFJ 1027s +
-    #   chat-turns 40s + bench 1700s + KL 180s = 3204s = 53 min.
-    # Healthy students still pay the bench (~28 min) but skip the
-    # derailed-LFJ tail, so they land around 45 min.
-    #
-    # The adaptive caps in pod_eval_vllm.py (cd483d0, 2026-05-04)
-    # cut derailed students to ~19 min and DISTIL_STUDENT_BATCH_SIZE=4
-    # shaves ~90s off KL for everyone, so the post-deploy ratio is
-    # roughly 7 derailed × 19 min + 3 healthy × 45 min = ~270 min on
-    # a 10-student round. Bake that into the ETA so miners' "stuck"
-    # complaints stop spiking on every round restart.
+    # Per-round wall-time estimate (calibrated 2026-05-04 on H200-NVL
+    # with Kimi K2.6 API teacher + bench battery + KL):
+    #   teacher API phase ~370s + probe refs ~145s
+    #   per student: load 140s + probes ~380s + bench ~1700s + KL ~180s
+    #   Healthy student ~45 min, derail-capped ~19 min, ~270 min for a
+    #   10-student round. Underestimating spikes "eval is stuck" pings.
     _api_mode = _is_api_teacher_mode()
     if _api_mode:
         try:
@@ -541,58 +506,22 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         logger.info("Resume probe: pod eval is %s — skipping cleanup, attaching to existing process.", pid_status)
     if not is_resuming:
         try:
-            # VLLM v1 spawns a child process that renames itself to "VLLM::EngineCore"
-            # via prctl(PR_SET_NAME). That process holds the GPU allocation but will
-            # NOT match `pkill -f 'vllm.entrypoints'` because its argv is literally
-            # just "VLLM::EngineCore" — same story for "VllmWorker". If the parent
-            # pod_eval dies without reaping the engine (as happens when the validator
-            # is stopped hard), the EngineCore lives on forever holding ~130 GB of
-            # GPU memory until the next reboot, causing OOMs in future rounds.
-            #
-            # To prevent that, we:
-            #   1. pkill by comm (matches "VLLM::EngineCor", 15-char kernel limit)
-            #   2. pkill by cmdline (belt and braces for any future vllm rename)
-            #   3. fall back on nvidia-smi: if anything is still holding the GPU
-            #      and it looks like a vllm/python worker, nuke it.
+            # vLLM v1 renames its EngineCore child via PR_SET_NAME, so a
+            # plain ``pkill -f 'vllm.entrypoints'`` misses it; an unreaped
+            # engine then holds ~130 GB of GPU memory until reboot. We
+            # kill by comm ("VLLM::EngineCor", 15-char kernel cap), by
+            # cmdline (any future rename), and finally fall back to
+            # nvidia-smi if a worker is still on the GPU.
             pod.exec(
-                # Build a deny-list of PIDs we MUST NOT kill: the chat-king
-                # vLLM (chat_server.py + vllm.entrypoints --served-model-name
-                # sn97-king on port 8100) and its descendants. Pre-2026-04-26
-                # this cleanup blanket-killed every vllm.entrypoints process,
-                # which is why chat.arbos.life went dark for ~30 minutes
-                # every round. The chat-king and the eval-teacher coexist on
-                # the same H200; eval-teacher is on port 9100 and uses
-                # served-model-name "teacher", so the deny-list is precise.
+                # Preserve chat-king PIDs (sn97-king on :8100 + supervisor)
+                # so chat stays up across the cleanup. Strategy: among any
+                # ``--served-model-name sn97-king`` vLLM workers, keep the
+                # YOUNGEST (oldest are SO_REUSEPORT-bound zombies from
+                # prior chat-server restarts each squatting ~22 GB VRAM)
+                # plus its descendants and the chat_server.py supervisor.
+                # Fall back to broad preserve only if no chat-king is
+                # alive (chat is starting up or genuinely dark).
                 "preserve=''; "
-                # Only one chat-king vLLM should be alive at any time. We
-                # kept seeing 2-3 EngineCore processes simultaneously
-                # because the previous detection used `ss -tlnp`, which
-                # isn't installed on the eval pod (iproute2 missing) and
-                # silently returned empty — fallback then preserved ALL
-                # matching processes, leaving zombies untouched.
-                #
-                # New strategy (2026-04-28): pick the youngest
-                # `vllm.entrypoints` chat-king API server (newest start
-                # time per /proc/PID/stat field 22 or `ps -o etimes`)
-                # and preserve only that process tree. Older duplicates
-                # are leaks from prior chat-server restarts that
-                # weren't reaped — they bind to port 8100 via
-                # SO_REUSEPORT and squat on ~22 GB of VRAM each.
-                #
-                # Test history: 3 zombies observed on 2026-04-28
-                # (PIDs 681678 [8h], 758224 [4h41m], 842769 [38min] —
-                # all chat-king API servers, all alive, all
-                # SO_REUSEPORT-bound to 8100). Fix kills the two
-                # oldest, keeps the youngest (which is what
-                # chat-tunnel.path most recently rebound to).
-                #
-                # Falls back to the broad include-all behaviour only if
-                # NO chat-king is found at all (chat is genuinely
-                # dark) so we don't kill a starting/restarting one.
-                # Use `ps auxww` (not pgrep) so the pgrep command itself
-                # doesn't appear in the match. pgrep -f matches its own
-                # cmdline because the regex appears in argv. ps + grep -v
-                # grep is the bullet-proof Unix idiom.
                 "all_chat_pids=$(ps auxww 2>/dev/null | grep 'served-model-name sn97-king' | grep -v grep | awk '{print $2}' | sort -u); "
                 "if [ -n \"$all_chat_pids\" ]; then "
                 # Find the youngest by smallest etimes (elapsed seconds).
@@ -703,53 +632,16 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     revision_list = ",".join(models_to_eval[uid].get("revision", "main") for uid in ordered_uids)
     king_flag = ""
     vllm_flag = " --no-vllm"
-    # 2026-05-03: cloud-API teacher path takes precedence over the local
-    # vLLM startup. ``pod_eval_vllm.py``'s API branch runs before the
-    # vLLM branch and sets ``teacher_cache_loaded = True``, so the local
-    # vLLM server never spins up — but pinning ``--no-vllm`` here keeps
-    # the inner_eval command self-documenting and prevents any future
-    # regression where the vLLM startup races with the API generation.
+    # API-teacher mode takes precedence over local vLLM. ``--no-vllm``
+    # is pinned here for self-documentation: the API branch in
+    # pod_eval_vllm.py sets teacher_cache_loaded before the local vLLM
+    # branch can race.
     _api_mode = _is_api_teacher_mode()
     if use_vllm and not _api_mode:
-        # Eval shares the GPU with the chat-king vLLM. Two regimes:
-        #
-        #   1. Co-located chat-king (default today): chat-king *targets*
-        #      0.15 of GPU memory but in practice we've seen leaked
-        #      duplicate workers holding ~46 GB on a single H200
-        #      (2026-04-27 — two engine-core processes from earlier
-        #      chat-king restarts that weren't reaped). When the eval
-        #      teacher then asks for 0.78 of 139.8 GB (109 GB) it fails
-        #      with `Free memory ... is less than desired GPU memory
-        #      utilization`, falls back to HF, and the round takes 80
-        #      minutes of sequential generation instead of 5 minutes.
-        #      0.65 leaves headroom for ~50 GB of chat-king occupancy
-        #      (whether legit or leaked) without falling back.
-        #
-        #   2. Dedicated chat pod (recommended next step): use
-        #      ``scripts/provision_chat_pod.py`` to rent a small GPU
-        #      (RTX 4090 or H100) just for the chat king. Once chat is
-        #      on its own pod the eval pod has the whole GPU; bump
-        #      VLLM_EVAL_GPU_UTIL=0.92 in /home/distil/.secrets/distil.env
-        #      to unlock it. Eval rounds finish in ~30-45 min instead of
-        #      90+ min.
-        #
-        # Tune via VLLM_EVAL_GPU_UTIL.
-        # 2026-05-01 (v30.3.5): lowered default 0.85 → 0.78. The pod is
-        # co-tenant with the chat-king vLLM (~21 GiB at 0.15 util) AND
-        # a dead vLLM EngineCore leaks ~3 GiB for 10-30s on crash. At
-        # 0.85 the restart path hit "Free memory is less than desired
-        # GPU memory utilization (0.85, 118.83 GiB)" and bailed to HF
-        # for the rest of the round (root cause of the 4700s
-        # teacher_generation timings on 5/1 morning). 0.78 leaves ~10
-        # GiB of headroom; KV cache usage is <5% in practice so we
-        # aren't losing throughput.
-        #
-        # 2026-05-03 (v30.3.6): lowered default 0.78 → 0.65. Chat-king
-        # grew to ~44 GiB (was ~21 GiB at 0.15 util — likely KV cache
-        # growth or leaked EngineCore). 0.78 * 139.8 = 109 GiB but only
-        # 95.5 GiB free → teacher crash on init. 0.65 * 139.8 = 90.9 GiB
-        # fits with ~4.6 GiB headroom. Eval throughput is barely affected
-        # since KV cache is <5% in practice.
+        # GPU is co-tenant with chat-king vLLM. Default util 0.65
+        # leaves ~4.6 GiB headroom for chat-king's ~44 GiB occupancy
+        # (legit + leaked workers). Bump VLLM_EVAL_GPU_UTIL to 0.92 if
+        # chat moves to a dedicated pod (provision_chat_pod.py).
         eval_gpu_util = policy_env("VLLM_EVAL_GPU_UTIL", "0.65")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:

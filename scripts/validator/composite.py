@@ -199,126 +199,47 @@ class _PolicyOSProxy:
 os = _PolicyOSProxy(os)
 
 
-# Five-axis composite (T1.3). On-policy RKL is the primary distillation
-# signal under the new framework — it is the axis that miners cannot game
-# by teacher-forced memorization, because the rollouts are the student's
-# own policy. KL (off-policy forward-KL) is retained as a transparency
-# axis but down-weighted; its existing saturation at the top of the board
-# (Δ < 0.0005 nats across the top-5) is exactly what we’re moving away
-# from. Capability and the two structural axes round out the signal so a
-# model must be competitive on reasoning, length discipline, and
-# non-degenerate generation — not just logit-matching.
+# Composite axis weights. on_policy_rkl is the primary distillation
+# signal (rollouts come from the student's own policy, so memorisation
+# can't game it). KL is retained as a transparency axis but heavily
+# down-weighted because of saturation. Capability + structural axes
+# guard against degenerate / over-long generations.
 AXIS_WEIGHTS = {
-    # Tier 1: relative (teacher-referenced) axes. Production since
-    # 2026-04-19. Kept at the same relative weighting; the weights
-    # below are only used by the ``weighted`` aggregation, which is
-    # auxiliary — the production ranking key is ``worst``.
-    # 2026-04-29 (v29.7): all relative weights are now env-overridable
-    # so the v30 audit rebalance (drop saturated kl/capability/length)
-    # can land via distil.env without a code change.
-    # v30.7 (2026-05-09) — on_policy_rkl bumped 0.25 → 0.30 on the back
-    # of the canary-axis revert. RKL is sample-then-KL: the student
-    # samples its own rollouts and the teacher scores them, so gaming
-    # this axis requires actual access to the (private) teacher's
-    # distribution on the student's own outputs. Closest thing the
-    # subnet has to a Goodhart-immune distillation signal.
-    # v31.3 (2026-05-10) — bumped 0.30 → 0.39 to absorb the 0.09 freed
-    # by halving ``top_k_overlap`` (which the post-Kimi-K2.6 correlation
-    # audit at n=5 shows anti-correlated with held-out gsm8k at
-    # r = -0.481). RKL is the central distillation signal in the
-    # GKD-style "On-Policy Distillation" lineage (Thinking Machines,
-    # Nov 2025) — moving weight from a teacher-mimicry signal that
-    # has started to Goodhart toward the on-policy generalisation
-    # signal is the most defensible single change in this commit.
+    # Tier-1 relative (teacher-referenced) axes. Used only by the
+    # ``weighted`` aggregation; the production ranking key is ``worst``.
+    # All weights are env-overridable so the rebalance audits can land
+    # via distil.env without a code change. Latest rebalance v31.3
+    # (2026-05-10) — see reports/2026-05-09-axis-correlation-audit.md.
+    # on_policy_rkl: GKD-style sample-then-KL — student samples,
+    # teacher scores. Closest thing to a Goodhart-immune distillation
+    # signal because gaming requires the (private) teacher's
+    # distribution on the student's own outputs.
     "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.39")),
     "kl":             float(os.environ.get("BENCH_KL_WEIGHT", "0.05")),
-    # 2026-04-29 (v30): top-K overlap axis. Per the 2026 'Rethinking OPD'
-    # paper, this is the most predictive single signal of downstream
-    # OPD success. Conservative initial weight 0.10 — same magnitude
-    # as a single bench axis. Already in [0, 1] from per-prompt
-    # |top_K_t ∩ top_K_s| / K averaged. Add to the weighted
-    # aggregation by default; gated env-overridable while we collect
-    # 48h of telemetry (see TOP_K_OVERLAP_AXIS_IN_COMPOSITE below).
-    # v30.6 (2026-05-09) — bumped on the back of the 2026-05-09 audit:
-    # top_k_overlap shows r=+0.40 with held-out gsm8k, the strongest
-    # positive correlator we have outside the canary itself. Goodhart-
-    # resistant by construction (tracks token-set overlap with the
-    # private teacher, not probabilities).
-    # v30.7 (2026-05-09) — bumped further 0.10 → 0.18 to absorb the
-    # 0.50 weight freed by removing canary axes from the score.
-    # Top-K overlap is among the hardest to game without genuine
-    # teacher-distribution matching: a miner has to predict, per token,
-    # which K alternatives the (private) teacher considered most
-    # likely. There's no shortcut training-set you can scrape for that.
-    # v31.3 (2026-05-10) — halved 0.18 → 0.09 on the back of the
-    # post-Kimi-K2.6 correlation audit. At n=5 paired kings the axis
-    # shows Pearson r = -0.481 with held-out gsm8k — the largest
-    # negative correlation among any non-zero-weight axis. The published
-    # research that motivated 0.18 (Anshumann ACL 2025) demonstrated
-    # the signal at frontier model scale, not 4 B distilled scale where
-    # teacher mimicry is most likely to memorise rather than generalise.
-    # Freed 0.09 reallocated to ``on_policy_rkl`` (above). If at
-    # n >= 12 the correlation stays at or below 0 with a tight CI,
-    # zero this axis entirely; if it recovers above +0.3, restore to
-    # 0.12.
+    # top_k_overlap: tracks |top_K_t ∩ top_K_s| / K averaged. Halved at
+    # v31.3 after n=5 audit showed r=-0.481 vs held-out gsm8k. Restore
+    # if correlation recovers above +0.3 at n>=12; zero if it stays at
+    # or below 0 with a tight CI.
     "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.09")),
-    # 2026-04-29 (v30) — entropy-aware adaptive KL axis. Per the EOPD
-    # paper (arXiv 2510.27485), per-token RKL/FKL weighting based on
-    # teacher entropy is +1.37 to +5.05 Pass@8 on small-model math
-    # benchmarks. Defaults to 0 (SHADOW) — we collect 48h of correlation
-    # telemetry against the held-out canary before promoting to ranking.
-    # Operators can flip in via ``ENTROPY_AWARE_KL_WEIGHT=0.05`` once
-    # the shadow window concludes.
+    # Research-paper shadow axes (default 0; promoted on correlation):
+    #   entropy_aware_kl  — EOPD entropy-weighted RKL/FKL.
+    #   kl_is             — Anshumann importance-sampled KL.
+    #   forking_rkl       — Wang fork-token RKL at high-entropy spots.
+    #   teacher_trace_plausibility — NLL on teacher-emitted tokens.
+    #   tail_decoupled_kl — head/tail-decoupled KL.
+    # All cheap (computed from the existing top-128 sparse cache).
     "entropy_aware_kl": float(os.environ.get("ENTROPY_AWARE_KL_WEIGHT", "0.0")),
-    # 2026-04-29 (v30) — three additional research-paper shadow axes,
-    # all default weight 0 until 48h of correlation telemetry against
-    # the held-out canary validates them. Computed from the existing
-    # top-128 sparse cache so wall-time impact is negligible.
-    #
-    #   * kl_is — Anshumann ACL 2025 importance-sampled KL. Unbiased
-    #     full-vocab KL contribution from top-K support, replacing the
-    #     biased renormalised KL on shared support. See
-    #     ``compute_kl_is_from_sparse``.
-    #   * forking_rkl — Wang et al. 2025 forking-token RKL. Average
-    #     reverse-KL at positions in the top quartile of teacher
-    #     entropy ("decision points" with most informative teacher
-    #     feedback).
-    #   * teacher_trace_plausibility — average NLL the student
-    #     assigns to the teacher's actually-emitted tokens. Distinct
-    #     from FKL (full-distribution match) and RKL (student-policy
-    #     match); catches LIMO/s1 SFT-only "place mass everywhere
-    #     except where the teacher goes" failure modes.
     "kl_is":          float(os.environ.get("KL_IS_AXIS_WEIGHT", "0.0")),
     "forking_rkl":    float(os.environ.get("FORKING_RKL_AXIS_WEIGHT", "0.0")),
     "teacher_trace_plausibility": float(
         os.environ.get("TEACHER_TRACE_PLAUSIBILITY_WEIGHT", "0.0")
     ),
-    # 2026-04-29 (v30.3) — tail-decoupled KL shadow axis. Detects
-    # "match teacher head but flatten tail" over-confidence pathology
-    # documented in the Tail-Aware Distillation paper. Default 0
-    # (SHADOW); promote once a 48h round-correlation pass against the
-    # canary confirms the signal.
     "tail_decoupled_kl": float(
         os.environ.get("TAIL_DECOUPLED_KL_WEIGHT", "0.0")
     ),
-    # v30.6 (2026-05-09) — over-weighted axes trimmed. ``degeneracy`` and
-    # ``length`` measure structural hygiene (does the model terminate?
-    # is it short enough?) — important but not capability. The 28%
-    # degeneracy + 15% length anchor was crowding out actual benches.
-    # v30.7 (2026-05-09) — capability nudged 0.05 → 0.10 to absorb a
-    # slice of the freed canary weight. The procedural ``capability``
-    # axis CAN be over-fit if the procedural pool is small (which is
-    # why it was at 0.15 → 0.05 last round) so the bump is modest;
-    # the real anti-Goodhart weight goes to the teacher-anchored axes
-    # (on_policy_rkl, top_k_overlap, judge_probe, long_form_judge,
-    # long_gen_coherence) that are hard to game without the teacher.
-    # v31 (2026-05-09) — capability trimmed 0.10 → 0.05 (the v31
-    # procedural axes also generalize the "verifiable correctness"
-    # signal that capability tracks; we don't want to double-count
-    # the same procedural skill).
-    # length / degeneracy trimmed 0.08 → 0.05 and 0.10 → 0.05 for
-    # the same reason: the v31 axes already penalize incoherent
-    # generations through the per-task graders.
+    # Structural hygiene + capability axes. Trimmed at v31 because the
+    # procedural axes already penalise incoherent / mis-terminating
+    # generations; we don't want to double-count.
     "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.05")),
     "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.05")),
     "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.05")),
@@ -330,39 +251,20 @@ TOP_K_OVERLAP_AXIS_IN_COMPOSITE = (
     os.environ.get("TOP_K_OVERLAP_AXIS_IN_COMPOSITE", "1") != "0"
 )
 
-# 2026-04-23 — judge axis weight. When promoted, the other axes retain
-# their relative weighting and the judge weight is added on top before
-# normalization; callers see a per-axis breakdown and the aggregated
-# worst/weighted, so the absolute number changes slightly but the
-# ordering intent is preserved.
-# v30.7 (2026-05-09) — judge_probe bumped 0.10 → 0.20 on the back of
-# the canary revert. The judge is the (private) teacher LLM rating
-# student greedy responses on a 1-5 rubric. Hard to game without
-# either: (a) actually producing high-quality answers, or (b) reverse-
-# engineering the rubric. Path (b) is bounded — the rubric checks
-# helpfulness/correctness/clarity, which are exactly what we want.
-# Path (a) is the genuine improvement we're trying to incentivize.
-# This axis is a strong fit for the anti-Goodhart half of the score.
+# judge_probe: the (private) teacher LLM rating student greedy
+# responses on a 1-5 rubric. Hard to game without either (a) genuinely
+# producing high-quality answers (the goal) or (b) reverse-engineering
+# the rubric (bounded — checks helpfulness/correctness/clarity).
+# Promoted 2026-04-24; flip JUDGE_AXIS_IN_COMPOSITE=0 for rollback.
 JUDGE_AXIS_WEIGHT = float(os.environ.get("JUDGE_AXIS_WEIGHT", "0.20"))
-
-# Shadow/promote gate. 2026-04-24: PROMOTED to production after the
-# original 48h telemetry window. Override with ``JUDGE_AXIS_IN_COMPOSITE=0``
-# if a teacher-rubric outage requires a temporary rollback.
 JUDGE_AXIS_IN_COMPOSITE = os.environ.get("JUDGE_AXIS_IN_COMPOSITE", "1") != "0"
 
-# ── 2026-04-24 — Arena v3 Session 2 (PRODUCTION) ──────────────────────
-# Five absolute-correctness axes drawn from public held-out benchmarks
-# (GSM8K+MATH-500 / HumanEval / BBH / MMLU-Pro / IFEval). Each
-# normalized to [0, 1] by raw ``pass_frac``. Promoted to composite
-# ranking 2026-04-24 after the planned 48h shadow window (see the
-# 2026-04-24-pareto-holistic-eval-v2.md report section 5 + the
-# Discord 48h announcement).
-# Legacy bench + skill-group + super_teacher axes — RETIRED 2026-05-10 (v31.2).
-# All weights default to 0.0; sub-axes still RUN for telemetry/per_src
-# but no longer drive the composite or the dethrone gate. Weight on
-# each axis is re-enabled by setting its env override to a non-zero
-# float (useful for ablations only — the v31 axes are the production
-# surface). Rationale + audit: reports/2026-05-10-axis-correlation-audit.md.
+# ── Legacy Arena-v3 axes (RETIRED) ───────────────────────────────────
+# Bench / skill-group / super_teacher axes RETIRED 2026-05-10 (v31.2).
+# Sub-axes still RUN for telemetry / per_src but contribute zero to
+# the composite or dethrone gate. Re-enable per-axis via env override
+# for ablation studies only — the v31 axes are the production surface.
+# Audit: reports/2026-05-10-axis-correlation-audit.md.
 BENCH_AXIS_WEIGHTS = {
     "math_bench":      float(os.environ.get("BENCH_MATH_WEIGHT", "0.0")),
     "code_bench":      float(os.environ.get("BENCH_CODE_WEIGHT", "0.0")),
@@ -381,17 +283,13 @@ BENCH_GROUP_AXIS_WEIGHTS = {
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"
 
 
-# ── Held-out canary axes ──────────────────────────────────────────────
-# Plumbing: ``annotate_h2h_with_composite`` reads
-# ``state/benchmarks/uid_<uid>.json`` per UID and threads it into
-# ``compute_composite(canary_scores=...)``; ``compute_axes`` invokes
-# ``_axis_canary_*`` per axis. Missing canary file → all canary axes
-# return None → axis drops out of ranking (fail-open).
-#
-# All weights DEFAULT-OUT (0.0) since v30.7: any public-benchmark axis
-# becomes a Goodhart target within ~2 weeks of public weight, so the
-# canary set is computed for diagnostics + the king_canary_streak gate
-# only. Override via env if you explicitly want anchoring back.
+# ── Held-out canary axes ─────────────────────────────────────────────
+# Computed for diagnostics + the king_canary_streak gate. Weights
+# DEFAULT-OUT (0.0) since v30.7 because any public-benchmark axis
+# Goodharts within ~2 weeks of being weighted. Plumbing:
+# ``annotate_h2h_with_composite`` reads state/benchmarks/uid_<uid>.json
+# and threads into ``compute_composite(canary_scores=...)``.
+# Missing canary -> axis drops out (fail-open).
 CANARY_AXIS_WEIGHTS = {
     "canary_gsm8k":     float(os.environ.get("CANARY_GSM8K_WEIGHT", "0.0")),
     "canary_humaneval": float(os.environ.get("CANARY_HUMANEVAL_WEIGHT", "0.0")),
@@ -427,54 +325,20 @@ CANARY_AXIS_MIN_VALID = {
 }
 
 
-# ── 2026-05-09 (v31) — Procedural axes (PRODUCTION) ──────────────────
-# v31 axis surface, promoted out of SHADOW. See
-# reports/2026-05-09-v31-procedural-redesign.md for the design and
-# reports/2026-05-09-v31-axis-promotion.md for the promotion rationale.
-#
-# These eleven axes replace the ad-hoc legacy bench surface (math_bench,
-# code_bench, reasoning_bench, knowledge_bench, ifeval_bench,
-# aime_bench, mbpp_bench, robustness_bench, calibration_bench,
-# truthful_bench, long_context_bench, multi_doc_synthesis_bench) -
-# the legacy axes still RUN but their composite weight has been
-# transferred to the procedural v31 axes. The legacy axes remain
-# weighted in skill-group form for partial overlap with v31, but
-# at reduced weights (see §weight-redistribution in the design doc).
-#
-# Each v31 axis is procedural by construction:
-#   * v31_math_gsm_symbolic    -- Apple's GSM-Symbolic templates +
-#                                  P0/P1/P2 + GSM-NoOp distractors.
-#   * v31_math_competition     -- AMPS-Hard / LiveBench-math style
-#                                  competition templates (algebra,
-#                                  number theory, combinatorics,
-#                                  geometry, probability).
-#   * v31_math_robustness      -- GSM-Plus 4-perturbation suite
-#                                  applied to v31_math_gsm_symbolic
-#                                  base templates.
-#   * v31_code_humaneval_plus  -- EvalPlus-style 30-60 augmented test
-#                                  cases per problem; templated
-#                                  function names per round.
-#   * v31_reasoning_logic_grid -- LiveBench Zebra puzzles with
-#                                  uniqueness-checked clue sets and
-#                                  forgiving graders.
-#   * v31_reasoning_dyval_arith- DyVal arithmetic DAG generator with
-#                                  controllable depth.
-#   * v31_long_context_ruler   -- 4 of the 13 RULER tasks
-#                                  (NIAH-single, NIAH-multikey,
-#                                  multihop-var, aggregation-count).
-#   * v31_knowledge_multi_hop_kg- Synthetic-entity multi-hop KG;
-#                                  fully procedural (no real-world
-#                                  facts, so unmemorizable).
-#   * v31_ifeval_verifiable    -- Google IFEval 21-verifier surface
-#                                  with procedural kwargs.
-#   * v31_truthfulness_calibration- SimpleQA 3-way (correct /
-#                                  incorrect / not_attempted)
-#                                  calibration scoring.
-#   * v31_consistency_paraphrase- Paraphrase-pair consistency over
-#                                  M1 templates (3-way score).
-#
-# Weight allocation (sums to 0.50, freed from a 0.50 reduction in
-# the legacy bench surface in the same commit):
+# ── v31 procedural axes (PRODUCTION) ─────────────────────────────────
+# Eleven procedural axes that replace the legacy bench surface as the
+# primary skill signal (legacy axes still run with reduced weights).
+# See reports/2026-05-09-v31-procedural-redesign.md for the design and
+# reports/2026-05-09-v31-axis-promotion.md for the promotion. Axes:
+#   gsm_symbolic / math_competition / math_robustness (math)
+#   code_humaneval_plus (code)
+#   reasoning_logic_grid / reasoning_dyval_arith (reasoning)
+#   long_context_ruler (RULER subset)
+#   knowledge_multi_hop_kg (synthetic KG, no real-world facts)
+#   ifeval_verifiable (Google IFEval 21-verifier)
+#   truthfulness_calibration (SimpleQA 3-way)
+#   consistency_paraphrase (paraphrase-pair 3-way)
+# Weights sum to 0.50 (offset by a 0.50 reduction in legacy bench).
 V31_AXIS_WEIGHTS = {
     "v31_math_gsm_symbolic":     float(os.environ.get("V31_MATH_GSM_SYMBOLIC_WEIGHT", "0.06")),
     "v31_math_competition":      float(os.environ.get("V31_MATH_COMPETITION_WEIGHT", "0.05")),
@@ -697,29 +561,11 @@ CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "2"))
 # was always None in production.
 JUDGE_PROBE_MIN_VALID = int(os.environ.get("JUDGE_PROBE_MIN_VALID", "4"))
 
-# v30.2 (2026-04-29) — composite.final ranking key.
-#
-# Replaces the legacy ``worst`` (single-axis min) as the canonical
-# dethrone gate with a blend:
-#
-#     final = α · worst_3_mean + (1 − α) · weighted
-#
-# where ``worst_3_mean`` is the mean of the 3 lowest non-broken axis
-# values (with weight > 0) and ``weighted`` is the existing weighted
-# convex combination.
-#
-# Why blend? The audit at reports/2026-04-29-v30-strategic-audit.md
-# §5 showed that ``min(axes)`` is dominated by NOISE on the
-# lowest-data axis (35/160 UIDs sat at exactly worst=0 — a 22%
-# saturated-floor cluster that worst() can't discriminate). Mean of
-# the bottom-3 smooths variance while preserving the anti-Goodhart
-# pressure (a model that tanks one axis still gets ~33% pull from the
-# tanked axis). Blending with weighted retains all-axis information
-# so models that excel broadly are not penalised by a single quirky
-# subaxis floor.
-#
-# Default alpha = 0.75 (heavy emphasis on the bottom 3, in line with the
-# audit's "high (~75%)" recommendation). Tunable via env.
+# composite.final = alpha * worst_3_mean + (1 - alpha) * weighted is
+# the canonical dethrone gate. Replaces the legacy ``worst`` because
+# min(axes) was dominated by noise on the lowest-data axis. Mean of
+# the bottom-3 smooths variance while keeping anti-Goodhart pressure;
+# blending with ``weighted`` keeps all-axis information.
 COMPOSITE_FINAL_BOTTOM_WEIGHT = float(
     os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.85")
 )
@@ -730,27 +576,10 @@ WORST_3_MEAN_K = int(os.environ.get("WORST_3_MEAN_K", "3"))
 # floor convention. Operators bumping ``LONG_FORM_JUDGE_PER_ROUND`` on
 # the eval side can raise this floor accordingly.
 LONG_FORM_JUDGE_MIN_VALID = int(os.environ.get("LONG_FORM_JUDGE_MIN_VALID", "2"))
-# 2026-05-01 (v30.4 patch v3): long-form weights raised to make
-# long-generation coherence dominant. The chat.arbos.life screenshots
-# show kings still producing pure multilingual word salad past 800
-# tokens; the only way that's compatible with composite ≥0.55 is if
-# long-form axes are too small a slice of the composite. Bumping
-# both the rubric-graded ``long_form_judge`` AND the pure-statistical
-# ``long_gen_coherence`` so:
-#   • combined long-form weight = 0.25 (was 0.09)
-#   • a derailed king (coh ~0.05) loses ~0.20 on weighted
-#   • coh = 0.05 lands as a worst-3 axis pulling worst_3_mean toward 0
-#   • on composite.final = 0.7·worst_3_mean + 0.3·weighted, that's
-#     ~0.15 hit on final — ample to flip the dethrone gate
-# The pure-statistical axis can't be cheated by rubric leniency.
-# v30.7 (2026-05-09) — long-form axes bumped to absorb canary weight.
-# These two cover the same anti-Goodhart property as judge_probe but
-# at long-context (~800 tokens). Gaming requires either coherent long
-# generation (the goal) or fooling a judge that explicitly checks for
-# loops/topic-drift/refusal. The pure-statistical coherence axis
-# (loops, perplexity, vocabulary collapse) can't be cheated by rubric-
-# tuning. Combined weight 0.45 — half of the long-form composite is
-# now the long-form coherence cluster.
+# Long-form axes (combined weight 0.45). long_form_judge is rubric-
+# graded; long_gen_coherence is pure-statistical (loops / perplexity /
+# vocabulary collapse) and can't be cheated by rubric leniency. Gaming
+# either requires coherent long generation, which is the goal.
 LONG_FORM_JUDGE_AXIS_WEIGHT = float(
     os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.20")
 )
@@ -763,15 +592,13 @@ LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE = bool(
 LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = (
     os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
 )
-# 2026-05-01 (v30.4 patch v3): hard-DQ floor on long-form coherence.
-# When >LONG_FORM_DERAIL_DQ_RATIO of the round's responses score below
+# Hard-DQ floor on long-form coherence. When more than
+# LONG_FORM_DERAIL_DQ_RATIO of a round's responses score below
 # LONG_FORM_DERAIL_DQ_THRESHOLD coherence, the model is permanently
-# DQ'd at this commit-block. Soft-weight degradation alone wasn't
-# enough — we kept seeing kings retain at composite ≥0.5 because
-# their bench scores compensated for the coherence hit. Hard DQ is
-# justified because long-form word salad is not a partial failure;
-# the model cannot sustain coherent generation, which is a core
-# deployment capability. Re-eval requires a fresh hotkey.
+# DQ'd at the commit-block. Soft-weight degradation alone wasn't
+# enough — bench scores compensated; long-form word salad means the
+# model cannot sustain coherent generation (a core deployment
+# capability). Re-eval requires a fresh hotkey.
 LONG_FORM_DERAIL_DQ_RATIO = float(
     os.environ.get("LONG_FORM_DERAIL_DQ_RATIO", "0.5")
 )
@@ -845,29 +672,12 @@ BENCH_MIN_VALID = {
     "v31_consistency_paraphrase": 6,  # 2 generations per item
 }
 
-# Schema version of the composite ranker. Bumped any time the composite
-# computation, axis weights, or per-axis grading semantics change in a
-# way that would let an old record keep an inflated floor under the new
-# grading. The king-selection filter (``_KING_SELECTION_MIN_VERSION``)
-# quarantines records below this version so the dethrone gate never
-# compares stale-grading records to honest current-grading records.
-#
-# Detailed per-version changelog (Session 3.10 → 3.21, v17 → v30.2):
-# see ``reports/2026-04-*-*.md``. The high-level timeline:
-#   * v17  — rotate on_policy_rkl rollout seed per block.
-#   * v18  — MBPP/HumanEval prose-stripping via ast.parse.
-#   * v19  — capability_probe procedural rebalance.
-#   * v20  — per-round MC option shuffle (arc/knowledge/truthful).
-#   * v21–22 — math/aime/tool_use/self_consistency paraphrase.
-#   * v23–24 — code/MBPP and BBH paraphrase + option shuffle.
-#   * v25–26 — judge/chat_turns/on_policy_rkl chat paraphrase.
-#   * v27   — full procedural switch for every benchmark axis.
-#   * v28   — quality > quantity rebalance (mute 6 weak axes).
-#   * v30.2 — composite.final = α·worst_3_mean + (1−α)·weighted is the
-#             canonical ranking key; skill-group axes (code/math/
-#             reasoning/knowledge) added; super_teacher axis added;
-#             king re-eval per round; legacy ``worst`` retained as
-#             telemetry but no longer the dethrone gate.
+# Schema version of the composite ranker. Bump whenever composite
+# computation, axis weights or per-axis grading change in a way that
+# would let an old record keep an inflated floor under new grading.
+# ``_KING_SELECTION_MIN_VERSION`` quarantines older records so the
+# dethrone gate never compares stale to honest grading. Per-version
+# changelog: reports/2026-*-*.md.
 COMPOSITE_SHADOW_VERSION = 32
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
@@ -1361,27 +1171,13 @@ for _bench_name in _BENCH_AXIS_NAMES:
 del _bench_name
 
 
-# v30.2 (2026-04-29) — Skill-group axes.
-#
-# Why this exists. The audit at reports/2026-04-29-v30-strategic-audit.md
-# §3 found heavy axis sprawl: 5 axes measure code (code_bench,
-# mbpp_bench, debug_bench, correction_bench, refactor_bench), 3 measure
-# math (math_bench, aime_bench, robustness_bench), and several axes
-# overlap on retrieval (long_context_bench, multi_doc_synthesis_bench)
-# and knowledge (knowledge_bench v2, pragmatic_bench). Every axis still
-# runs (no information loss) but only the GROUP score gates ranking —
-# this reduces worst-3 noise without dropping any measurement.
-#
-# A skill-group axis is the equal-weighted MEAN of its sub-axes (only
-# the sub-axes that returned a non-None pass_frac are averaged). When
-# all sub-axes drop, the group axis drops too. Sub-axes remain in
-# ``axes`` for dashboard / per_src telemetry / saturation audit.
-#
-# The composite weights below put the WEIGHT on the group axis and
-# leave the sub-axes at 0 (they're computed but not in
-# ``effective_weights``). To opt out of the grouping for a specific
-# axis (e.g., re-promote ``code_bench`` to its own slot during a
-# debug session), set its env weight > 0 explicitly.
+# ── Skill-group axes ─────────────────────────────────────────────────
+# Group sub-axes by domain (code / math / reasoning / knowledge) so
+# the composite gates on the group, not on each subaxis. Sub-axes
+# still run for telemetry but receive 0 composite weight; the group's
+# weight is shared (mean / bottom-half-mean / min, see
+# SKILL_GROUP_AGGREGATION). Re-promote a single subaxis by setting
+# its env weight > 0.
 
 CODE_SKILL_GROUP_SUB_AXES = (
     "code_bench",
@@ -1413,23 +1209,14 @@ SKILL_GROUP_AGGREGATION = os.environ.get("SKILL_GROUP_AGGREGATION", "bottom_half
 
 
 def _aggregate_skill_group_values(vals: list[float]) -> float:
-    """v30.6 (2026-05-09) — skill-group aggregator with saturation guard.
+    """Skill-group aggregator with saturation guard.
 
-    The default ``bottom_half_mean`` averages only the lower half of
-    sub-axis values (rounded up so n=5 -> bottom 3, n=3 -> bottom 2,
-    n=2 -> bottom 1). Saturated 1.0 sub-axes can no longer inflate the
-    group score: a code group at [0.78, 1.0, 1.0, 1.0, 1.0] now scores
-    mean(0.78, 1.0, 1.0)=0.93 (was mean(...)=0.96), and as more sub-
-    axes saturate the group converges to the LEAST-saturated sub-axis
-    rather than to 1.0.
-
-    Override via SKILL_GROUP_AGGREGATION:
-      * ``mean`` -- legacy v30.2 equal-weight mean (every sub-axis
-        contributes regardless of saturation).
-      * ``min`` -- the worst sub-axis dominates entirely. Aggressive
-        anti-saturation but unforgiving of probe noise on a single
-        sub-axis.
-      * ``bottom_half_mean`` (default) -- balance between the two.
+    Modes (SKILL_GROUP_AGGREGATION):
+      * ``bottom_half_mean`` (default) — mean of the lower half (rounded
+        up; n=5 -> bottom 3). Saturated 1.0 sub-axes can't inflate the
+        group; converges to the least-saturated subaxis as more saturate.
+      * ``mean`` — equal-weight mean over every subaxis.
+      * ``min`` — worst subaxis dominates (aggressive but noise-prone).
     """
     if not vals:
         return 0.0
@@ -1520,29 +1307,13 @@ _axis_reasoning_skill_group = _make_skill_group_axis(REASONING_SKILL_GROUP_SUB_A
 _axis_knowledge_skill_group = _make_skill_group_axis(KNOWLEDGE_SKILL_GROUP_SUB_AXES)
 
 
-# v30.2 — Super-teacher axis: rewards exceeding the teacher on
-# verifiable benches.
-#
-# Why this exists. Pure distillation cannot exceed teacher capability —
-# a student that perfectly matches Qwen3.6-35B on every bench axis
-# tops out at the teacher's pass rate. To produce SOTA-class small
-# models we need miners to mix in (b) RL on verifiable rewards and
-# (c) post-distillation SFT on harder data than the teacher saw. The
-# super-teacher axis explicitly rewards beating the teacher on any
-# verifiable axis, so a student that runs Stage-4 GRPO + curated-data
-# SFT (per the Mining Guide v2) earns above-teacher pass rates and
-# captures the bonus. See strategic audit §1 #4.
-#
-# Computation: for each verifiable bench axis the student and teacher
-# both reported, the per-axis "lift" is max(0, student_frac −
-# teacher_frac). The axis value is the mean of per-axis lifts mapped
-# to [0, 1] via a soft tanh: small lifts (~0.05) score ~0.5, lifts
-# ~0.20 score ~0.95.
-#
-# The teacher's pass_frac per axis is exposed via the teacher row in
-# ``students_data`` (the same row resolve_teacher_broken_axes uses);
-# the caller threads ``teacher_axes`` through compute_axes /
-# compute_composite so this axis can read it.
+# ── Super-teacher axis ───────────────────────────────────────────────
+# Rewards exceeding the teacher on verifiable benches so miners are
+# incentivised to push past distillation (Stage-4 GRPO + curated SFT).
+# Per-axis lift = max(0, student_frac - teacher_frac); axis value is
+# the mean lift mapped through a soft tanh ([0, 1]; lift ~0.05 -> 0.5,
+# lift ~0.20 -> 0.95). Teacher pass_frac threaded via ``teacher_axes``
+# from ``students_data``.
 
 SUPER_TEACHER_AXES = (
     # Verifiable benches where the teacher's pass_frac is meaningful.
