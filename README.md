@@ -7,33 +7,38 @@ A Bittensor subnet for competitive model distillation of **moonshotai/Kimi-K2.6*
 **Chat with the King**: [chat.arbos.life](https://chat.arbos.life) — try the current best distilled model  
 **Subnet**: Finney netuid 97
 
-## How It Works (v30.4+, post-Kimi cutover)
+## How It Works (v31.2, post-Kimi cutover)
 
 **Miners** distill the teacher into a smaller model (**≤33B total params**, Kimi-family architecture, vocab 163,840), upload to HuggingFace, and commit the repo link on-chain. **One commitment per hotkey — commitments are permanent and cannot be changed.** However, if disqualified, miners can register a new hotkey and submit a different model.
 
-**Validators** score every committed model on a **multi-axis composite** ([`scripts/validator/composite.py`](scripts/validator/composite.py)) covering teacher-similarity, capability against ground truth (procedural — no static answer key), conversational quality, generation discipline, and "exceeds the teacher" capability. See [`docs/MINER_FAQ.md`](docs/MINER_FAQ.md) for the full axis-by-axis playbook.
+**Validators** score every committed model on a **25+ axis composite** ([`scripts/validator/composite.py`](scripts/validator/composite.py)) anchored on **11 procedurally-generated v31 axes** (math, code, reasoning, long-context, knowledge, honesty, consistency) plus distillation, judge, and discipline tiers. See [`docs/MINER_FAQ.md`](docs/MINER_FAQ.md) for the full axis-by-axis playbook and [`reports/2026-05-09-v31-axis-promotion.md`](reports/2026-05-09-v31-axis-promotion.md) for the design rationale.
 
-### Ranking key — `composite.final` (v30.2)
+### Ranking key — `composite.final` (v31.2)
 
 ```
-composite.final = α × worst_3_mean + (1 - α) × weighted
+composite.final = α × worst_5_mean + (1 - α) × weighted
 ```
 
-Default `α = 0.7`. So 70% of your score comes from the **mean of your 3 lowest non-broken axes**, and 30% from the **weighted mean of every axis**. This smooths single-axis noise (the legacy `worst()` floored 22% of the leaderboard at 0) while preserving anti-Goodhart pressure (you still can't camp specialists). The legacy `composite.worst` (single-axis min) is retained as telemetry — see API + dashboard.
+Default `α = 0.7`. So 70% of your score comes from the **mean of your 5 lowest non-broken axes** (was 3 before v31.1's variance-reduction sweep on 2026-05-10), and 30% from the **weighted mean of every axis**. This smooths single-axis noise while preserving anti-Goodhart pressure (you still can't camp specialists). The API field is still named `worst_3_mean` for back-compat but the math uses K=5. The legacy `composite.worst` (single-axis min) is retained as telemetry — see API + dashboard.
 
-### Axis structure (v30.2 collapsed without losing depth)
+### Axis structure (v31.2)
 
-- **Skill groups** (the new ranking drivers): `code_skill_group` (0.20) = mean of {code, mbpp, debug, correction, refactor}; `math_skill_group` (0.18) = mean of {math, aime, robustness}; `reasoning_skill_group` (0.12) = mean of {reasoning, multi_doc, long_context}; `knowledge_skill_group` (0.07) = mean of {knowledge_v2, pragmatic}.
-- **Beyond-teacher** (v30.2 — incentivises exceeding teacher): `super_teacher` (0.10) = `tanh(mean(max(0, student - teacher)) / 0.10)` over 16 verifiable benches. Pure distillation can't exceed teacher; this rewards Stage-4 GRPO + post-distillation SFT.
-- **Teacher-similarity**: `on_policy_rkl` (0.35), `kl` (0.05), `top_k_overlap` (0.10), `capability` (0.10).
-- **Shadow distillation axes** (research-validated, low weight 0-0.05): `kl_is`, `forking_rkl`, `teacher_trace_plausibility`, `entropy_aware_kl`, `tail_decoupled_kl`.
-- **Quality**: `judge_probe` (0.15), `long_form_judge` (0.05), `chat_turns_probe` (0.08).
-- **Stand-alone capability**: `tool_use_bench` (0.06), `ifeval_bench` (0.07), `calibration_bench` (0.06).
-- **Discipline**: `length` (0.05), `degeneracy` (0.15), `reasoning_density` (0.05).
+- **v31 procedural axes** (~50% of composite, 11 axes — promoted 2026-05-09):
+  - **Math:** `v31_math_gsm_symbolic` (0.06) · `v31_math_competition` (0.05) · `v31_math_robustness` (0.03, with GSM-NoOp topical-distractor injection).
+  - **Code:** `v31_code_humaneval_plus` (0.08, EvalPlus-augmented test cases, sandbox-graded) · `v31_ifeval_verifiable` (0.04, constraint-driven IFEval).
+  - **Reasoning:** `v31_reasoning_logic_grid` (0.05, zebra-puzzle constraint-sat) · `v31_reasoning_dyval_arith` (0.04, arithmetic on dynamic DAGs) · `v31_long_context_ruler` (0.05, NIAH at variable context).
+  - **Knowledge:** `v31_knowledge_multi_hop_kg` (0.04, procedural 2-3 hop KG).
+  - **Honesty:** `v31_truthfulness_calibration` (0.03, Brier-scored calibration) · `v31_consistency_paraphrase` (0.03, IPT name-rotation consistency).
+- **Distillation tier** (~30%): `on_policy_rkl` (0.30) · `top_k_overlap` (0.18) · `kl` (0.05) · `capability` (0.05) · `length` (0.05) · `degeneracy` (0.05).
+- **Quality**: `judge_probe` (0.20) · `long_form_judge` (0.20) · `long_gen_coherence` (0.25) · `chat_turns_probe` (0.10).
+- **Discipline + standalone**: `reasoning_density` (0.05) · `calibration_bench` (0.05).
+- **Telemetry tier** (composite weight 0): all legacy `*_bench` axes (math_bench, code_bench, tool_use_bench, etc.) and skill groups (code_skill_group, math_skill_group, …). They still RUN every round so you can monitor them on the dashboard, but they no longer touch ranking.
 
 The king is whoever has the **highest `composite.final`**. **Winner-take-all** — best miner gets 100% of emissions on chain.
 
 > **Why not just KL?** Pure forward-KL on teacher continuations rewards token-level surface match. A 4B student that mimics the teacher's "wait, let me reconsider" filler can win KL while never producing a final answer. We caught this on 2026-04-17 (UID 107: 4096-token loops on `"Hi"`, strictly worse than the unfine-tuned 4B base on every reasoning bench). The composite, the on-policy RKL axis, and the reasoning-density axis exist specifically to close that gap.
+
+> **Why procedurally-generated axes?** Earlier versions of distil used static benches (math_bench, code_bench, etc.) where the same items appeared every round. Miners overfit to the items, posted high composite scores, and their held-out benchmarks (GSM8K, HumanEval, MMLU-Pro) stayed flat. That's Goodhart's law. The 11 v31 procedural axes generate every item from the on-chain block-seed — so no two evaluations share items and there's no static answer key to memorise. Canonical wordings are blocked further by **Isomorphic Perturbation Testing** (IPT, name rotation in `v31_consistency_paraphrase`) and **GSM-NoOp topical-distractor injection** (in `v31_math_robustness`).
 
 ### King-of-the-Hill Evaluation
 
@@ -52,11 +57,11 @@ The validator uses a **king-of-the-hill** architecture for efficient, high-confi
 
 4. **Per-UID eval on the pod** — Each student is loaded sequentially on the pod (vLLM teacher → student forward pass → bench battery). The reference baseline runs in every round so the asymmetric reference-broken-axes filter (see `composite.py::resolve_reference_broken_axes`) can drop axes the base model itself can't pass under the eval setup (token cap, etc.).
 
-5. **Multi-axis composite, normalized per axis** — Every student gets a vector covering skill-group axes, beyond-teacher, teacher-similarity, shadow distillation, quality, capability, and discipline. Axis weights live in `composite.py:AXIS_WEIGHTS` (relative tier), `BENCH_AXIS_WEIGHTS` (legacy sub-axes — most weight 0 in v30.2), `BENCH_GROUP_AXIS_WEIGHTS` (the v30.2 skill groups + super_teacher), and `ARENA_V3_AXIS_WEIGHTS` (kept-separate capability axes). Each axis is in [0, 1]. The composite stores `final = 0.7·worst_3_mean + 0.3·weighted` (the ranking key), `worst_3_mean = mean(bottom 3 non-broken axes)`, `worst = min(axes)` (legacy telemetry), and `weighted = Σ wᵢ · axisᵢ / Σ wᵢ`.
+5. **Multi-axis composite, normalized per axis** — Every student gets a vector covering 11 v31 procedural axes, distillation, judge, and discipline. Axis weights live in `composite.py:AXIS_WEIGHTS` (relative tier), `BENCH_AXIS_WEIGHTS` (legacy sub-axes — all weight 0 in v31.2), `BENCH_GROUP_AXIS_WEIGHTS` (legacy skill groups + super_teacher — `code_skill_group` and `tool_use_bench` retired to telemetry on 2026-05-10), and `ARENA_V3_AXIS_WEIGHTS` (kept-separate capability axes). Each axis is in [0, 1]. The composite stores `final = 0.7·worst_5_mean + 0.3·weighted` (the ranking key, K=5 since v31.1's variance reduction), `worst_5_mean = mean(bottom 5 non-broken axes)` (still surfaced as `worst_3_mean` in the API for back-compat), `worst = min(axes)` (legacy telemetry only), and `weighted = Σ wᵢ · axisᵢ / Σ wᵢ`.
 
 6. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. Teacher logits are precomputed and cached on GPU. Multi-GPU pod scaffolding (`DISTIL_TP_SIZE`, `DISTIL_STUDENT_PARALLELISM`) supports 4× / 8× H100 migration for Kimi K2.6 / batched student forward (v30.4).
 
-7. **Cross-round dethronement gate (v30.2)** — King selection runs over `state/composite_scores.json`. The king is whoever has the highest `composite.final`. A challenger dethrones the incumbent only when `challenger.final > incumbent.final × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (default 3% margin). When both are at the saturated floor, the same 3% margin applies to `composite.weighted` as a tiebreaker. Legacy v28 records (lacking `final`) fall back to the v28 `worst`-based rule.
+7. **Cross-round dethronement gate (v31.2)** — King selection runs over `state/composite_scores.json`. The king is whoever has the highest `composite.final`. A challenger dethrones the incumbent only when `challenger.final > incumbent.final × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (**5% margin** since 2026-05-10 — raised from 3% in the v31.1 variance-reduction sweep). Combined with the per-axis n bumps and the wider K=5 worst-K mean, the false-positive dethrone rate from pure RNG variance dropped from ~27% per round to **<6%**. When both are at the saturated floor, the same margin applies to `composite.weighted` as a tiebreaker. Legacy records (lacking `final`) fall back to the v28 `worst`-based rule.
 
 8. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
 
@@ -92,7 +97,10 @@ Disqualification reasons are shown on the dashboard and available via the API.
 - **MoE-aware param counting**: Total params from safetensors metadata (not config estimates)
 - **Quantization rejected**: GPTQ/AWQ/FP8 all blocked — architecture distillation only
 - **Block-hash seeded prompts**: Deterministic from on-chain block hash, unpredictable before block finalization
-- **Top-128 sparse KL**: Teacher returns top-128 logprobs per position (`--max-logprobs 128` on vLLM). Student softmaxes over the full 248,320-token vocab, then gathers + renormalizes to the same 128 positions for a proper KL on the shared support. Full-vocab dense path exists in `compute_kl_from_precomputed` for reference; disabled in prod for bandwidth (~150GB/round at full vocab).
+- **Procedural v31 axes (11)**: Every item generated per round from the block-seed (no static answer key) — see [`scripts/v31/`](scripts/v31/) for the per-axis generators (math/code/reasoning/long-context/knowledge/ifeval/truthfulness/consistency)
+- **Isomorphic Perturbation Testing (IPT)**: `v31_consistency_paraphrase` rotates first names within gender between paired isomorphic problems; a model that memorised the canonical wording fails the rotated one
+- **GSM-NoOp topical distractor**: `v31_math_robustness` injects mathematically irrelevant clauses; a memorised distribution that triggers on surface keywords fails
+- **Top-20 sparse KL**: Teacher (Kimi K2.6, served via OpenRouter) returns top-20 logprobs per position. Student softmaxes over the full 163,840-token Kimi vocab, then gathers + renormalizes to the same 20 positions for a proper KL on the shared support.
 
 ## Mining Guide
 
@@ -264,7 +272,7 @@ pip install "bittensor>=8.0.0" "bittensor-wallet>=2.0.0" "click>=8.0.0" \
 1. Loads the teacher model (Kimi K2.6) via vLLM with `tensor-parallel-size=8` for fast generation across 8× H200/H100 (each GPU holds ~140GB of teacher / activation working set)
 2. Draws 120 prompts from ClimbMix-400B (`karpathy/climbmix-400b-shuffle`, 6542 shards), seeded by on-chain block hash
 3. Polls for new challengers every epoch (~10 min)
-4. Per-UID block-seeded eval (single-eval policy): each commitment is scored once on its own 300-prompt set, including the reference baseline (UID -1) every round. The king is selected cross-round on `composite.worst` from `state/composite_scores.json`.
+4. Per-UID block-seeded eval (single-eval policy): each commitment is scored once on its own 300-prompt set, including the reference baseline (UID -1) every round. The king is re-evaluated EVERY round (paired-fairness fix). The king is selected cross-round on `composite.final` from `state/composite_scores.json`, with a 5% margin over the incumbent required for dethronement.
 5. Teacher logits are precomputed and cached on GPU for fast scoring
 6. Sets weights on-chain: king = 1.0, everyone else = 0.0
 
@@ -316,10 +324,10 @@ SDK, Vercel AI SDK, LangChain, LlamaIndex, and friends.
 ├── test_miner.py             # Pre-submission validator (runs all 15 checks locally)
 ├── check_model.py            # Pre-submission checker (13 pre-GPU + 4 GPU checks)
 ├── eval/
-│   ├── kl_divergence.py      # Sparse top-128 KL on GPU (dense path available for offline replays)
+│   ├── kl_divergence.py      # Sparse top-20 KL on GPU (Kimi K2.6 teacher; dense path available for offline replays)
 │   ├── model_checker.py      # Param counting, integrity, hash, duplicate detection
-│   ├── dataset.py            # ClimbMix-400B dataset loader (120 prompts, block-hash seeded shard selection)
-│   └── scoring.py            # Winner-take-all + cross-round composite-worst dethronement (single-eval mode)
+│   ├── dataset.py            # ClimbMix-400B dataset loader (300 prompts/UID, block-hash seeded shard selection)
+│   └── scoring.py            # Winner-take-all + cross-round composite.final dethronement (5% margin, single-eval mode)
 ├── api/
 │   └── server.py             # FastAPI dashboard backend (runs on separate API server behind Cloudflare)
 ├── scripts/
