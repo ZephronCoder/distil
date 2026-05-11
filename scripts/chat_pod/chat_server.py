@@ -1,28 +1,11 @@
 #!/usr/bin/env python3
-"""
-King chat server bootstrapper — runs on the chat-bench pod.
+"""King chat server bootstrapper for the chat-bench pod.
 
-Starts an OpenAI-compatible vLLM server for the current king model so
-chat.arbos.life can talk to it via the SSH tunnel on port 8100.
+Starts an OpenAI-compatible vLLM server for the current king model on
+port 8100. Auto-detects student family (Qwen3.5/3.6 legacy or Kimi K2.6)
+from config.json.
 
-Two supported student families, selected automatically from config.json:
-
-  (A) Qwen3.5 / Qwen3.6 family (``Qwen3_5ForCausalLM`` or
-      ``Qwen3_5ForConditionalGeneration``). Legacy path — was the only
-      supported family before the Kimi K2.6 teacher swap. Requires the
-      Qwen3_5ForConditionalGeneration VL wrapper and graft-in of base
-      Qwen3.5-4B visual weights so vLLM's weight loader sees a complete
-      checkpoint. Kept for backward compatibility so the current Qwen
-      king keeps serving while miners migrate to Kimi-family arch.
-
-  (B) Kimi K2.6 family — text-only ``DeepseekV3ForCausalLM`` (inner text
-      model of the Kimi K2.6 wrapper) or the full
-      ``KimiK25ForConditionalGeneration`` wrapper. vLLM 0.19+ supports
-      both natively with ``--trust-remote-code``; no config rewrite or
-      weight grafting needed. We just download-and-serve.
-
-Usage:
-    python3 chat_server.py <hf_repo>[:revision] [port]
+Usage: python3 chat_server.py <hf_repo>[:revision] [port]
 """
 import json
 import os
@@ -40,18 +23,13 @@ else:
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8100
 
 MODEL_DIR = Path("/root/king-model")
-# Legacy Qwen wrapper base — only used if the downloaded model is a
-# Qwen3.5/3.6 family student that needs visual-weight grafting.
+# Legacy Qwen wrapper base; only used for visual-weight grafting.
 BASE_MODEL = "Qwen/Qwen3.5-4B"
 SERVED_NAME = "sn97-king"
 
 
 def _detect_arch_family() -> str:
-    """Inspect the downloaded config.json and return the arch family.
-
-    Returns one of ``"qwen35"``, ``"kimi_k2"`` (text-only), ``"kimi_k25"``
-    (vision wrapper), or ``"unknown"``.
-    """
+    """Return arch family: 'qwen35', 'kimi_k2', 'kimi_k25', or 'unknown'."""
     config_path = MODEL_DIR / "config.json"
     if not config_path.exists():
         return "unknown"
@@ -103,13 +81,7 @@ def _read_marker() -> dict:
 
 
 def _write_marker(model: str, revision: str | None):
-    """Persist a marker file describing what's currently in MODEL_DIR.
-
-    Lets the next chat_server startup skip the 30 GB re-download when the
-    king hasn't changed. We persist BOTH the HF repo id and the revision
-    so a same-repo king upgrade (e.g. UID promoting a new commit) still
-    triggers a fresh pull.
-    """
+    """Persist marker so next startup can skip re-download if unchanged."""
     try:
         with open(_KING_MARKER, "w") as f:
             json.dump(
@@ -120,14 +92,7 @@ def _write_marker(model: str, revision: str | None):
 
 
 def _is_complete_download() -> bool:
-    """Best-effort check that MODEL_DIR contains a usable model.
-
-    Heuristic: ``config.json`` + ``model.safetensors.index.json`` present,
-    AND every shard listed in the index actually exists on disk. We pick
-    these two files because every transformers checkpoint we serve has
-    them, and the index lets us verify the shards weren't truncated by
-    a previous crashed download.
-    """
+    """Verify MODEL_DIR has config.json + every shard in the index."""
     config_path = MODEL_DIR / "config.json"
     if not config_path.exists():
         return False
@@ -143,38 +108,15 @@ def _is_complete_download() -> bool:
             return True
         except (OSError, ValueError):
             return False
-    # Single-file model — good enough if there's any *.safetensors.
+    # Single-file model: any *.safetensors is good enough.
     return any(MODEL_DIR.glob("*.safetensors"))
 
 
 def download_model():
-    """Download the king model — but skip the 30 GB pull if we already have it.
+    """Skip re-download if marker matches and shards are intact.
 
-    Pre-2026-05-04 this function unconditionally ``shutil.rmtree``'d
-    ``/root/king-model`` and re-downloaded. That's fine when chat_server
-    only runs once per king crowning, but the API's
-    ``_ensure_chat_server`` watchdog re-spawns the bootstrapper every
-    time vLLM dies (eval-pod GPU contention, OOMs, restarts after
-    network blips, etc.). On the chat-bench pod this means a fresh 30 GB
-    DeepSeek-V3 / Kimi-K2 pull every restart even when the on-disk
-    weights are already perfect — chat stays dark for 5-10 min instead
-    of the ~60 s it takes vLLM to load + warm up. Worse, two concurrent
-    downloads race-delete each other's tmp incomplete files (``shutil.move``
-    blowups in ``hf_hub_download._chmod_and_move``), poisoning the
-    download for both processes.
-
-    The marker file (``/root/king-model/.king_marker.json``) records what
-    HF repo + revision is in the dir. If the marker matches what we were
-    asked to serve AND the shard files are still on disk, we skip the
-    download entirely. Mismatch (new king, revision bump, partial
-    download) → wipe + re-download fresh.
-
-    Sebastian's report 2026-05-04 ("chat doesn't work with current king")
-    was caused by exactly this race: the API spawned 2-3 chat_server.py
-    processes during a single eval-end window, each tried to wipe + re-
-    download, and the racing rmtree+download crashed all of them with
-    ``FileNotFoundError`` on the same incomplete path.
-    """
+    Watchdogs re-spawn this script on every vLLM crash, so avoiding a
+    fresh 30 GB pull (and racing rmtree+download) is critical."""
     marker = _read_marker()
     if (
         marker.get("model") == MODEL_NAME
@@ -199,10 +141,8 @@ def download_model():
 
 
 def patch_config_and_tokenizer():
-    """Normalize config.json to a Qwen3_5ForConditionalGeneration wrapper with
-    text_config + vision_config + image/video token ids, so vLLM can resolve
-    the architecture and so the visual weights we graft in line up.
-    """
+    """Wrap Qwen3.5/3.6 config as a VL wrapper so vLLM resolves the
+    architecture and the grafted visual weights line up."""
     from huggingface_hub import hf_hub_download
 
     config_path = MODEL_DIR / "config.json"
@@ -296,9 +236,8 @@ def patch_config_and_tokenizer():
 
 
 def inject_visual_weights():
-    """Graft base visual weights into the miner's shard set as visual.safetensors,
-    and rebuild model.safetensors.index.json so vLLM finds every key.
-    """
+    """Graft base visual weights into the shard set and rebuild the
+    safetensors index so vLLM finds every key."""
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -357,30 +296,10 @@ def write_health(status: str = "starting"):
 
 
 def _install_custom_reasoning_parser():
-    """Copy ``distil_kimi_reasoning_parser.py`` into vLLM's parser dir
-    AND patch vLLM's ``vllm/reasoning/__init__.py`` to import it.
+    """Copy distil_kimi reasoning parser into vLLM and patch the package
+    __init__ so its registration decorator runs at startup.
 
-    The parser self-registers via the
-    ``@ReasoningParserManager.register_module("distil_kimi")`` decorator,
-    but dropping the file alone isn't enough: vLLM's ``__init__.py``
-    only auto-imports parsers listed in ``_REASONING_PARSERS_TO_REGISTER``
-    (lazy registration); the file just sits there until something imports
-    it. So we also append a single ``from . import …`` line to
-    ``__init__.py`` (guarded by a sentinel so re-runs are no-ops),
-    which forces the decorator to run at vLLM startup.
-
-    We do BOTH actions from chat_server (NOT from a separate deployment
-    step) so the chat-king pod self-heals when the underlying vLLM
-    image is wiped or upgraded — every fresh bootstrap re-installs the
-    parser before launching vLLM.
-
-    Idempotent: re-copies the parser file on every boot so an in-place
-    edit ships, but the ``__init__.py`` patch is sentinel-guarded so it
-    only adds the import line once. No-op (logs a warning) if the
-    source file is missing or the destination dir doesn't exist (e.g. a
-    future vLLM re-org); chat falls back to the stock parsers and
-    ``--reasoning-parser distil_kimi`` will fail loudly at startup.
-    """
+    Idempotent and self-healing on every fresh chat_server bootstrap."""
     src = Path(__file__).parent / "distil_kimi_reasoning_parser.py"
     if not src.is_file():
         log(f"warning: custom reasoning parser src missing: {src}")
@@ -431,12 +350,7 @@ def _install_custom_reasoning_parser():
 def exec_vllm():
     write_health()
     _install_custom_reasoning_parser()
-    # Chat-king coexists with the validator's eval workload on the same GPU
-    # most of the time. ``pod_eval.py`` claims ~0.90 of the H200 during
-    # rounds, so a 0.90 chat slice would OOM the second vLLM to come up
-    # (whichever loses the race). Default to a slim slice that comfortably
-    # fits a 4B-class model + KV cache and tune via env if a future king is
-    # bigger or the eval pod gets a smaller card.
+    # Slim GPU slice; eval claims ~0.90 of the H200 during rounds.
     gpu_util = os.environ.get("CHAT_VLLM_GPU_UTIL", "0.30")
     max_model_len = os.environ.get("CHAT_VLLM_MAX_MODEL_LEN", "32768")
     family = _detect_arch_family()
@@ -452,29 +366,10 @@ def exec_vllm():
         "--gpu-memory-utilization", str(gpu_util),
         "--enforce-eager",
     ]
-    # 2026-05-05 follow-up to Sebastian's 2026-05-04 "chat doesn't work with
-    # current king" report. Earlier fix made the ``kimi_k2`` / ``kimi_k25``
-    # branches omit ``--enable-auto-tool-choice`` entirely because we
-    # believed vLLM didn't ship a Kimi tool parser. That kept vLLM from
-    # crashing at boot, but it broke the chat differently: Open-WebUI
-    # sends ``tools[]`` with implicit ``tool_choice: "auto"`` (the
-    # ``sn97-king`` model row has ``params.function_calling = "native"``
-    # plus the SN97 status toolkit attached by default), and vLLM rejects
-    # those requests with HTTP 400:
-    #
-    #   "auto" tool choice requires --enable-auto-tool-choice and
-    #   --tool-call-parser to be set
-    #
-    # Effect: every chat.arbos.life turn returned an opaque "tool calls"
-    # error and the king never responded. vLLM 0.19.1 actually does ship
-    # both ``kimi_k2`` and ``deepseek_v3`` tool parsers (registered via
-    # ``vllm/tool_parsers/__init__.py``'s ``_TOOL_PARSERS_TO_REGISTER`` map)
-    # plus matching reasoning parsers, so we can wire them up properly
-    # for both Kimi families now.
+    # vLLM 0.19+ ships kimi_k2 + deepseek_v3 tool parsers; wire them so
+    # Open-WebUI's tool_choice="auto" requests don't 400.
     if family == "qwen35":
-        # Qwen 3.5 / 3.6 emit ``<tool_call><function=name><parameter=k>v
-        # </parameter></function></tool_call>`` XML — the ``qwen3_xml``
-        # parser ships with vLLM 0.19+ and matches the family natively.
+        # Qwen 3.5/3.6 tool-call XML; matched by qwen3_xml parser.
         cmd += [
             "--enable-auto-tool-choice",
             "--tool-call-parser", "qwen3_xml",
@@ -483,23 +378,8 @@ def exec_vllm():
             "--skip-mm-profiling",
         ]
     elif family == "kimi_k25":
-        # Kimi K2.5/K2.6 vision wrapper — disable vision path for text
-        # chat, wire the Kimi tool parser so Open-WebUI's
-        # ``function_calling=native`` requests succeed end-to-end, and
-        # use the custom ``distil_kimi`` reasoning parser
-        # (scripts/chat_pod/distil_kimi_reasoning_parser.py, installed
-        # by ``_install_custom_reasoning_parser`` below) so the
-        # Thinking pane lights up cleanly:
-        #   * model emits ``thoughts</think>answer`` → split (thinking
-        #     pane shows ``thoughts``, answer shows ``answer``)
-        #   * model emits ``answer`` (no </think>) → all content (NO
-        #     thinking pane that turn — accurate, the model didn't
-        #     think — but the answer is visible, not buried in
-        #     reasoning like the stock kimi_k2 parser does)
-        # Stock vLLM ``kimi_k2`` reasoning parser was tried earlier and
-        # rejected because it returned ``content=None`` for every turn
-        # the king didn't close ``</think>`` — verified empty on
-        # ``bodenmaurice/distil-new-v16``.
+        # Disable VL path; use kimi_k2 tool parser + custom distil_kimi
+        # reasoning parser (stock kimi_k2 emits content=None unclosed).
         cmd += [
             "--enable-auto-tool-choice",
             "--tool-call-parser", "kimi_k2",
@@ -508,45 +388,22 @@ def exec_vllm():
             "--skip-mm-profiling",
         ]
     elif family == "kimi_k2":
-        # Text-only DeepSeek V3 inner of Kimi K2 — same tool-call +
-        # reasoning template as the vision wrapper. See ``kimi_k25``
-        # for the rationale on the custom ``distil_kimi`` parser.
+        # Text-only DeepSeek V3 inner; same tool/reasoning parsers as kimi_k25.
         cmd += [
             "--enable-auto-tool-choice",
             "--tool-call-parser", "kimi_k2",
             "--reasoning-parser", "distil_kimi",
         ]
     else:
-        # Unknown architecture — pass no family-specific flags. We also
-        # leave auto-tool-choice off because we can't guess the right
-        # parser. vLLM may succeed on simple architectures (Llama-family)
-        # without them.
+        # Unknown arch: minimal vLLM args; auto-tool-choice off.
         log(f"warning: unknown architecture family, falling back to minimal vLLM args")
     log(f"exec vLLM (family={family}, gpu_util={gpu_util}, max_model_len={max_model_len})")
     os.execvp(cmd[0], cmd)
 
 
 def _acquire_startup_lock():
-    """Serialise concurrent ``chat_server.py`` startups via ``flock``.
-
-    The API watchdog (``api/routes/chat.py:_ensure_chat_server``) and the
-    validator's ``ensure_chat_server_running`` BOTH spawn this script
-    when chat is dark, and they don't coordinate with each other. We've
-    seen up to 3 simultaneous chat_server processes during a single
-    eval-end window, all racing on the same model dir and port. The
-    second/third invocations crash on:
-
-      * ``FileNotFoundError`` mid-download (rmtree races)
-      * ``Address already in use`` when two vLLMs fight for port 8100
-      * dueling weight loaders if both somehow get past download
-
-    A non-blocking ``fcntl.flock(LOCK_EX | LOCK_NB)`` on a pid-stamped
-    lock file at ``/tmp/chat_server.lock`` lets the first invocation win
-    cleanly: subsequent invocations log + exit 0 (so the watchdog
-    doesn't see a crash and re-spawn yet again). The OS releases the
-    lock automatically when this process exits — no manual cleanup
-    needed even on hard kill.
-    """
+    """Serialise concurrent startups via flock so racing watchdogs
+    can't fight over the model dir, port 8100, or weight loader."""
     import fcntl
     lock_path = "/tmp/chat_server.lock"
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
@@ -577,12 +434,10 @@ if __name__ == "__main__":
     family = _detect_arch_family()
     log(f"detected arch family: {family}")
     if family == "qwen35":
-        # Legacy Qwen students: run the VL-wrapper dance so vLLM sees the
-        # full config + visual weights.
+        # Legacy Qwen: VL-wrapper dance for full config + visual weights.
         patch_config_and_tokenizer()
         inject_visual_weights()
     else:
-        # Kimi-family and unknown: download-and-serve. vLLM loads the
-        # model's own config.json / tokenizer directly.
+        # Kimi-family / unknown: download-and-serve as-is.
         log(f"skipping Qwen-specific patch + visual-weight grafting for family={family}")
     exec_vllm()

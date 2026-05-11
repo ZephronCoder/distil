@@ -1,63 +1,16 @@
 """Cloud-API teacher generation path for SN97 evaluation.
 
-Why this exists
-===============
-Loading the 1T-param Kimi K2.6 teacher onto a Lium pod has two real costs:
+Replaces local vLLM teacher inference with OpenAI-compatible API calls
+(default: OpenRouter -> moonshotai/kimi-k2.6). Returns top-K logprobs for
+KL scoring; student scoring still runs locally.
 
-* **VRAM** — even FP8/INT8, the model needs ≥600 GB across 8×H200, which means
-  the eval pod has to be a "tensor-parallel monster" before it can even start.
-* **Cold-start latency** — vLLM startup on Kimi K2.6 takes ~6 minutes per
-  attempt, plus Lium provisioning if we don't already have a hot pod. Every
-  vLLM crash burns more wall clock.
+Public API:
+* :func:`generate_via_api` - drop-in for ``generate_via_vllm``
+* :func:`prepare_teacher_probe_refs_api` - greedy text-only probe refs
+* :func:`api_health_check` - sanity test
 
-For our subnet's purposes we don't need to *run* the teacher; we only need
-its logprob distribution at every generated token so we can compute KL
-divergence against student outputs. Cloud inference providers (OpenRouter,
-Moonshot direct, Cloudflare Workers AI, Together AI) expose that exact
-information via OpenAI-compatible ``logprobs`` + ``top_logprobs`` (≤20).
-So we can replace the local teacher with an API call and free the pod's GPU
-budget for student scoring (which we *cannot* outsource — students are
-unique per-miner and do need local FP forward passes).
-
-Key trade-off: cloud APIs cap ``top_logprobs`` at 20 vs vLLM's 128. For our
-KL signal that's fine — top-20 captures >99% of the teacher's distribution
-mass on confident tokens, and ranking signal between miners is preserved
-because the same approximation applies to every student.
-
-Public API
-==========
-* :func:`generate_via_api` — drop-in replacement for ``generate_via_vllm``
-  in :mod:`scripts.pod_eval_vllm`. Returns the same
-  ``[{"full_ids", "prompt_len", "gen_len", "sparse_logprobs"}, ...]``
-  shape, so downstream Phase-2 student scoring is unchanged.
-* :func:`prepare_teacher_probe_refs_api` — drop-in replacement for
-  ``prepare_teacher_probe_refs_vllm``. Greedy text-only (no logprobs),
-  used for calibration probes (think samples / capability answers /
-  chat-probe gen lens).
-* :func:`api_health_check` — quick sanity test before the eval round
-  commits to the API path.
-
-Provider notes
-==============
-The default provider is OpenRouter (it confirmed K2.6 availability and
-``top_logprobs`` support) but any OpenAI-compatible endpoint works:
-
-  ============= ============================== ===================== =====
-  Provider       Base URL                       Model ID              Logp
-  ============= ============================== ===================== =====
-  OpenRouter     https://openrouter.ai/api      moonshotai/kimi-k2.6  ≤20
-  Moonshot       https://api.moonshot.ai        kimi-k2.6             ≤20
-  Cloudflare     https://api.cloudflare.com/... @cf/moonshotai/...    ≤20
-  ============= ============================== ===================== =====
-
-Configure via environment variables:
-
-* ``DISTIL_TEACHER_API_BASE`` — defaults to ``https://openrouter.ai/api``
-* ``DISTIL_TEACHER_API_KEY``  — required
-* ``DISTIL_TEACHER_API_MODEL`` — defaults to ``moonshotai/kimi-k2.6``
-* ``DISTIL_TEACHER_API_ENDPOINT`` — ``chat`` (default) or ``completions``
-* ``DISTIL_TEACHER_API_CONCURRENCY`` — parallel requests (default 8)
-* ``DISTIL_TEACHER_API_TOP_LOGPROBS`` — top-K per position (default 20)
+Env: ``DISTIL_TEACHER_API_BASE``, ``_KEY``, ``_MODEL``, ``_ENDPOINT``
+({chat,completions}), ``_CONCURRENCY``, ``_TOP_LOGPROBS``, ``_PROVIDERS``.
 """
 
 from __future__ import annotations
@@ -80,11 +33,8 @@ DEFAULT_ENDPOINT = "chat"
 DEFAULT_CONCURRENCY = 12
 DEFAULT_TOP_LOGPROBS = 20
 DEFAULT_TIMEOUT_S = 120
-# OpenRouter routes through 14 providers for kimi-k2.6 — but only ONE
-# (Inceptron, int4) actually exposes ``logprobs``. The rest silently
-# return ``logprobs: null``, which would zero our KL signal. Pin the
-# provider on OpenRouter unless DISTIL_TEACHER_API_PROVIDERS overrides.
-# See ``GET /api/v1/models/{id}/endpoints`` for the live list.
+# Only Inceptron (int4) exposes logprobs for kimi-k2.6 on OpenRouter;
+# others return ``logprobs: null`` and would zero our KL signal.
 DEFAULT_OPENROUTER_PROVIDERS = ("Inceptron",)
 
 
@@ -101,25 +51,16 @@ class APIConfig:
     top_logprobs: int
     concurrency: int
     timeout_s: int
-    # Provider-routing hint — only meaningful for OpenRouter. Empty list
-    # = let OpenRouter pick freely. Names must match
-    # ``provider_name`` in the OpenRouter endpoints API.
+    # Provider routing for OpenRouter; empty = let OpenRouter pick.
     providers: Tuple[str, ...] = ()
-    # Disable Kimi's "thinking" reasoning loop. K2.6 defaults to
-    # thinking-on, which (a) burns ``reasoning_tokens`` against
-    # ``max_tokens`` before any actual content is emitted, and (b)
-    # produces ``content: null`` if the budget runs out mid-thought.
-    # For SN97's KL-based eval we want pure instant-mode raw next-token
-    # distributions, not chain-of-thought.
+    # Disable K2.6 "thinking" reasoning loop for raw next-token logprobs.
     disable_reasoning: bool = True
 
     @classmethod
     def from_env(cls, **overrides) -> "APIConfig":
         env = os.environ.get
         base_url = overrides.get("base_url") or env("DISTIL_TEACHER_API_BASE", DEFAULT_BASE_URL)
-        # ``DISTIL_TEACHER_API_KEY`` is the canonical name. We also accept
-        # ``OPENROUTER_API_KEY`` for OpenRouter-default deployments since
-        # that is the env var name OpenRouter's own examples use.
+        # Accept the canonical name plus OPENROUTER_API_KEY fallback.
         api_key = (
             overrides.get("api_key")
             or env("DISTIL_TEACHER_API_KEY")
@@ -131,8 +72,7 @@ class APIConfig:
         conc = overrides.get("concurrency") or int(env("DISTIL_TEACHER_API_CONCURRENCY", DEFAULT_CONCURRENCY) or DEFAULT_CONCURRENCY)
         timeout = overrides.get("timeout_s") or int(env("DISTIL_TEACHER_API_TIMEOUT_S", DEFAULT_TIMEOUT_S) or DEFAULT_TIMEOUT_S)
 
-        # Provider list: comma-separated env var, e.g. "Inceptron" or
-        # "Inceptron,DeepInfra". Empty string disables pinning.
+        # Comma-separated provider list; empty disables pinning.
         providers_env = env("DISTIL_TEACHER_API_PROVIDERS")
         if "providers" in overrides:
             providers = tuple(overrides["providers"]) if overrides["providers"] else ()
@@ -143,10 +83,7 @@ class APIConfig:
         else:
             providers = ()
 
-        # Reasoning toggle. Default OFF for the API-teacher KL path. The
-        # provider often omits visible content/logprobs when it spends the
-        # budget in hidden reasoning, which wastes calls and shrinks the KL
-        # prompt set. Chat/probe quality is tested separately in pod_eval.py.
+        # Default OFF for KL path; hidden reasoning omits visible logprobs.
         dr_env = env("DISTIL_TEACHER_API_DISABLE_REASONING", "1")
         disable_reasoning = overrides.get("disable_reasoning",
                                           dr_env not in ("0", "false", "False", "no", ""))
@@ -155,9 +92,7 @@ class APIConfig:
             raise ValueError(f"DISTIL_TEACHER_API_ENDPOINT must be 'chat' or 'completions' (got {endpoint!r})")
         if not api_key:
             raise ValueError(
-                "DISTIL_TEACHER_API_KEY (or OPENROUTER_API_KEY) is not set. "
-                "Configure your inference provider's API key (OpenRouter / "
-                "Moonshot / etc.) in the validator's environment file."
+                "DISTIL_TEACHER_API_KEY (or OPENROUTER_API_KEY) is not set."
             )
         return cls(
             base_url=base_url.rstrip("/"),
@@ -176,8 +111,7 @@ class APIConfig:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        # OpenRouter recommends adding referer/title headers for analytics &
-        # rate-limit tier; harmless to other providers (they ignore unknowns).
+        # OpenRouter analytics/rate-limit-tier hints (ignored elsewhere).
         if "openrouter" in self.base_url:
             h["HTTP-Referer"] = os.environ.get("DISTIL_OPENROUTER_REFERER", "https://chat.arbos.life")
             h["X-Title"] = os.environ.get("DISTIL_OPENROUTER_TITLE", "Bittensor SN97 distil validator")
@@ -189,8 +123,6 @@ class APIConfig:
         if self.providers and "openrouter" in self.base_url:
             body["provider"] = {"only": list(self.providers)}
         if self.disable_reasoning and "openrouter" in self.base_url:
-            # OpenRouter's normalized field; underlying providers ignore
-            # if they don't support reasoning.
             body["reasoning"] = {"enabled": False}
         return body
 
@@ -200,27 +132,14 @@ class APIConfig:
 # ---------------------------------------------------------------------------
 
 def _chat_logprobs_to_dict_list(content_lp: List[Dict[str, Any]]) -> List[Dict[str, float]]:
-    """Convert chat-completions logprobs format to vLLM-compatible list-of-dicts.
-
-    Chat completions API returns:
-        logprobs.content = [
-            {"token": "Hello", "logprob": -0.123,
-             "top_logprobs": [{"token": "Hello", "logprob": -0.12}, ...]},
-            ...
-        ]
-
-    We want the same shape vLLM/text-completions returns:
-        [{"Hello": -0.12, "Hi": -2.5, ...}, ...]
-    """
+    """Convert chat-completions logprobs to vLLM-shape list-of-dicts."""
     out = []
     for tok_entry in content_lp or []:
         d: Dict[str, float] = {}
-        # The chosen token's own logprob
         chosen = tok_entry.get("token", "")
         chosen_lp = tok_entry.get("logprob")
         if chosen_lp is not None and chosen != "":
             d[chosen] = float(chosen_lp)
-        # All siblings in top_logprobs
         for sib in tok_entry.get("top_logprobs", []) or []:
             t = sib.get("token", "")
             lp = sib.get("logprob")
@@ -267,10 +186,7 @@ def _call_api_chat(
         raise RuntimeError(f"API error: {data['error']}")
     choice = data["choices"][0]
     msg = choice.get("message") or {}
-    # K2.6 emits ``content: null`` if the request landed in
-    # reasoning-mode and ``max_tokens`` was eaten by the chain-of-
-    # thought before any visible content. With ``disable_reasoning``
-    # this should be rare, but guard anyway and surface as empty.
+    # K2.6 emits ``content: null`` if reasoning ate the token budget.
     text = msg.get("content") or ""
     lp_field = choice.get("logprobs") or {}
     content_lp = lp_field.get("content") or []
@@ -330,23 +246,12 @@ def _generate_single_prompt_api(
     sparse_converter: Callable,
     align_prompt_boundary: Callable,
 ) -> Tuple[int, Dict[str, Any]]:
-    """Worker: one API call → one sequence_data dict.
-
-    Args:
-        sparse_converter: function (top_lp_list, token_to_id, tokenizer, k) ->
-            sparse-tensor dict {indices, values}. We pass it in to avoid a
-            circular import with pod_eval_vllm.
-        align_prompt_boundary: function (full_text, prompt_text, full_ids,
-            tokenizer) -> int. Same reason.
-    """
+    """Worker: one API call -> one sequence_data dict. ``sparse_converter``
+    and ``align_prompt_boundary`` are passed in to avoid a circular import."""
     import requests
 
     last_err: Optional[Exception] = None
-    # 6 attempts with exp backoff covers the worst Inceptron-side rate-limit
-    # bursts we've observed (60 prompts × concurrency=4 occasionally hits a
-    # cluster of 4-8 consecutive 429s when a coincident user spikes the
-    # provider's queue). 1+2+4+8+16+30 = ~61 s of budget per prompt before
-    # we give up; far cheaper than a 5 min vLLM cold-start.
+    # 6 attempts with exp backoff handles Inceptron rate-limit bursts.
     for attempt in range(6):
         try:
             if cfg.endpoint == "chat":
@@ -392,10 +297,8 @@ def _generate_single_prompt_api(
                     backoff_s = float(retry_after_hdr) if retry_after_hdr else (2.0 ** attempt)
                 except Exception:
                     backoff_s = 2.0 ** attempt
-                backoff_s = min(backoff_s, 30.0)
-                # Provider-assigned Retry-After can be 0; force at least 1 s
-                # so we don't immediately retry into the same closed window.
-                backoff_s = max(backoff_s, 1.0)
+                # Provider Retry-After can be 0; force >= 1s.
+                backoff_s = max(min(backoff_s, 30.0), 1.0)
                 time.sleep(backoff_s)
                 continue
             if attempt < 5:
@@ -429,27 +332,12 @@ def generate_via_api(
     align_prompt_boundary: Optional[Callable] = None,
     config: Optional[APIConfig] = None,
 ) -> List[Dict[str, Any]]:
-    """Generate teacher continuations + top-K logprobs via cloud inference API.
+    """Generate teacher continuations + top-K logprobs via cloud API.
 
-    Drop-in replacement for ``generate_via_vllm``. Same return shape:
-    list of dicts with keys ``full_ids``, ``prompt_len``, ``gen_len``, and
-    optionally ``sparse_logprobs`` ({"indices": tensor, "values": tensor}).
-
-    Args:
-        prompts: pre-rendered prompt strings (already chat-templated).
-        tokenizer: HF tokenizer matching the teacher (Kimi BPE).
-        max_new_tokens: max output tokens.
-        block_seed: deterministic-block seed; None = greedy.
-        logprobs_k: requested top-K. Will be capped at the API max (20).
-            If 0, no logprobs requested.
-        token_to_id: pre-built {token_str: token_id} (from
-            ``_build_token_to_id_map`` in pod_eval_vllm).
-        progress_cb: callback(done, total) for live progress reporting.
-        concurrency: parallel API requests; defaults to env / 8.
-        sparse_converter: pod_eval_vllm.vllm_logprobs_to_sparse, passed in
-            to avoid a circular import.
-        align_prompt_boundary: pod_eval_vllm._align_prompt_boundary.
-        config: optional pre-built APIConfig.
+    Drop-in for ``generate_via_vllm``. Returns dicts with ``full_ids``,
+    ``prompt_len``, ``gen_len``, and optionally ``sparse_logprobs``.
+    ``sparse_converter`` and ``align_prompt_boundary`` are passed in to
+    avoid a circular import with pod_eval_vllm.
     """
     if sparse_converter is None or align_prompt_boundary is None:
         raise ValueError(
@@ -546,7 +434,6 @@ def generate_via_api(
                 raise RuntimeError(f"API generation failed for prompt {idx} after retry: {e2}") from e2
 
     if any(r is None for r in result_slots):
-        # Should not happen — every prompt either succeeded or raised above.
         raise RuntimeError("generate_via_api: some prompts have no result (internal bug)")
     return result_slots  # type: ignore[return-value]
 
@@ -556,16 +443,8 @@ def generate_via_api(
 # ---------------------------------------------------------------------------
 
 def _greedy_text_one(prompt_text: str, cfg: APIConfig, max_new_tokens: int, idx: int) -> str:
-    """Single greedy generation, text only (no logprobs). Used for probe refs.
-
-    Uses the same exp-backoff retry strategy as the logprob-fetching worker
-    (:func:`_generate_single_prompt_api`). Probe refs are fired in waves
-    (think-probe ≈ 30, capability ≈ 36, chat-probe ≈ 4) right after the
-    main 60-prompt logprob batch finishes, so the Inceptron rate-limit
-    bucket is still cold and the first dozen+ requests routinely 429.
-    Without retries that would cascade into 'API teacher capability
-    failed' for every probe and the round would lose all benchmark axes.
-    """
+    """Single greedy generation, text only. Used for probe refs.
+    Uses exp-backoff retries to absorb Inceptron rate-limit bursts."""
     import requests
 
     if cfg.endpoint == "chat":
@@ -626,11 +505,7 @@ def greedy_batch_api(
     config: Optional[APIConfig] = None,
     concurrency: Optional[int] = None,
 ) -> List[str]:
-    """Greedy text-only generation for a batch of prompts via API.
-
-    Used by :func:`prepare_teacher_probe_refs_api` (and any caller that
-    wants probe-style refs without logprob overhead).
-    """
+    """Greedy text-only batch generation; used for probe refs."""
     cfg = config or APIConfig.from_env(
         **({"concurrency": concurrency} if concurrency else {})
     )
@@ -658,17 +533,8 @@ def greedy_batch_api(
 
 def api_health_check(config: Optional[APIConfig] = None, prompt: str = "Say OK and nothing else.",
                      max_attempts: int = 6) -> Dict[str, Any]:
-    """Quick connectivity + logprobs sanity test. Raises on failure.
-
-    Returns ``{"ok": True, "text": "...", "n_logprobs": N, "model": "...", "elapsed_s": ...}``.
-    Run this once before committing the eval round to the API path.
-
-    Retries on 429 (rate limit) and 5xx with exponential backoff. The OpenRouter
-    Inceptron route has been observed to bounce 429 in clusters when several
-    workers compete for the same backend; the per-prompt worker uses the same
-    retry logic, so the health check needs to be at least as patient — failing
-    fast here means the round aborts immediately on a transient burst.
-    """
+    """Connectivity + logprobs sanity test. Retries 429/5xx with backoff.
+    Run once before committing an eval round to the API path."""
     import requests
 
     cfg = config or APIConfig.from_env()
@@ -699,8 +565,7 @@ def api_health_check(config: Optional[APIConfig] = None, prompt: str = "Say OK a
         try:
             resp = requests.post(url, headers=cfg.headers(), data=json.dumps(payload), timeout=cfg.timeout_s)
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
-                # Honour Retry-After if the provider sets it; otherwise
-                # exponential backoff with full jitter, capped at 30s.
+                # Honour Retry-After if set; else exp backoff capped at 30s.
                 retry_after_hdr = resp.headers.get("Retry-After")
                 try:
                     backoff_s = float(retry_after_hdr) if retry_after_hdr else (2.0 ** attempt)

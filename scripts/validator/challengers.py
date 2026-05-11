@@ -53,43 +53,19 @@ def _write_eval_backlog(state: ValidatorState, *, cap: int, pending: dict, kept:
         logger.debug("single-eval: failed to persist eval backlog: %s", exc)
 
 
-# 2026-04-24 (distil-97): once the subnet enters steady-state (all ~65
-# valid models in ``state.scores``), ``select_challengers`` yields zero
-# P1/P3 candidates because every UID is considered "already evaluated".
-# ``add_top5_contenders`` then fills with the 4 H2H leaderboard slots
-# and the round settles at 5-6 models — fine for tracking the king vs
-# top-4 but blind to any dormant miner whose global KL (measured vs an
-# earlier king on a different prompt set) is actually better than the
-# current king's H2H KL. Without re-rotation, the subnet ranking
-# silently goes stale and dormant miners with legitimately better
-# models cannot regain the crown without re-uploading.
-#
-# ``DORMANT_ROTATION_N`` adds that many dormant miners per round,
-# filtered to those whose ``state.scores[uid]`` beats the current
-# king's h2h_kl (so we only spend compute on candidates who could
-# plausibly win). Default 2 = ~16 extra minutes per round with
-# shadow axes off, fits inside the 60-75min target.
+# Rotate N dormant miners per round whose global KL beats the king's,
+# so dormant high-scorers can re-challenge without re-uploading.
 DORMANT_ROTATION_N = int(policy_env("DORMANT_ROTATION_N", "2"))
 
-# Maintenance rounds should keep the crown under pressure without turning every
-# block into a multi-hour full sweep. The first few H2H contenders are sticky;
-# lower leaderboard slots still enter the candidate pool, but new submissions
-# and high-scoring dormant models can beat them for capped slots.
+# Maintenance rounds cap challenger count; top H2H contenders stay sticky.
 MAINTENANCE_CHALLENGER_CAP = int(policy_env("MAINTENANCE_CHALLENGER_CAP", "12"))
 PROTECTED_H2H_CONTENDERS = int(
     policy_env("PROTECTED_H2H_CONTENDERS", str(min(4, max(1, TOP_N_ALWAYS_INCLUDE - 1))))
 )
 
 
-# 2026-04-24 (distil-97): evict H2H leaderboard contenders that fail precheck
-# repeatedly. Scenario we keep hitting: a miner submits a public model, wins
-# into the top-4 leaderboard, then privates the repo (restricted/gated on HF).
-# Validator can never re-verify it, the entry sits there as a ghost blocking
-# a real slot and spamming the TOP-CONTENDER REGRESSION CHECK warning every
-# round. UID 64 (sampleratez/3406940) has been stuck like this for 4+ rounds.
-# After this many consecutive precheck failures we drop the entry from the
-# persisted leaderboard. The counter resets the moment precheck passes again,
-# so transient HF blips (see 60317bb) don't evict anyone unfairly.
+# Evict H2H leaderboard contenders after N consecutive precheck failures
+# (e.g. miner privates a public repo). Counter resets on first pass.
 LB_PRECHECK_EVICTION_STREAK = int(policy_env("LB_PRECHECK_EVICTION_STREAK", "3"))
 
 
@@ -97,39 +73,17 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                        epoch_count: int, trust_king_kl: bool = True):
     """Pick challengers for the round.
 
-    ``trust_king_kl`` = False disables the ``best_ever > king_kl*2`` prune.
-    Set this when the king was picked from a stale cached score (the old H2H
-    leaderboard expired and `_resolve_king` fell back to `state.scores`) —
-    in that case ``king_kl`` can be artificially low (scores were measured
-    against a different king, prompt set, or even a different model later
-    re-uploaded under the same UID) and tightens the skip threshold so
-    aggressively that genuinely competitive UIDs never get re-evaluated.
+    ``trust_king_kl`` = False disables the ``best_ever > king_kl*2`` prune
+    when ``king_kl`` came from a stale cached score.
 
-    When ``SINGLE_EVAL_MODE=1`` the planner runs a stripped-down version
-    that only returns commitments not yet scored (or whose on-chain commit
-    has changed since the last eval). The legacy king-pairing prune and
-    the full-eval P1B branch are skipped entirely — re-evaluation is
-    explicitly disallowed.
+    ``SINGLE_EVAL_MODE=1`` returns only commitments not yet scored (or
+    with a changed on-chain commit); re-evaluation is disallowed.
     """
     if is_single_eval_mode():
         evict_stale_evaluated_uids(state, valid_models)
         challengers = {}
-        # Force-eligible UIDs:
-        #
-        #   - The current king ALWAYS gets force-eligible (2026-04-27).
-        #     Even with procedural per-round bench items the king's
-        #     stored composite came from a different prompt sample than
-        #     this round's challengers, so worst-axis comparison is
-        #     cross-sample. SE on bench axes with n=8-12 binomial items
-        #     is ~0.14, which is bigger than the dethrone margin.
-        #     Re-evaluating the king on the same prompts as challengers
-        #     restores paired evaluation. (Discord 2026-04-27, coffieex
-        #     +crypsick: "the variance is extreme across shards".)
-        #
-        #   - Historically: also re-eval'd on schema bumps. Now
-        #     redundant because we re-eval every round, but the
-        #     code path still works as a safety net if king-in-round
-        #     ever gets disabled.
+        # Force-eligible: current king (paired re-eval on shared prompts,
+        # fixes cross-sample variance) + schema-bump fallback.
         force_eligible: set[str] = set()
         if king_uid is not None:
             king_record = (state.composite_scores or {}).get(str(king_uid))
@@ -161,25 +115,13 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                 continue
             if uid_str in state.composite_scores and uid_str not in force_eligible:
                 continue
-            # Strict no-re-eval: a UID in evaluated_uids has been through a
-            # full round once already. Even if its score row got dropped
-            # later (DQ revert, partial-state reset, etc.), per single-eval
-            # policy it should not run again unless its commitment changed
-            # — and ``evict_stale_evaluated_uids`` already pulled out the
-            # commitment-changed entries above. The previous filter required
-            # both ``evaluated_uids`` AND ``scores`` to be set, which let
-            # historical UIDs sneak back into the queue when state was
-            # partially rebuilt.
+            # Strict no-re-eval: any UID already in evaluated_uids has had
+            # its one shot (commitment-changed entries are evicted above).
             if uid_str in state.evaluated_uids and uid_str not in force_eligible:
                 continue
             challengers[uid] = info
-        # FIFO cap: oldest commitment first. Without this the planner
-        # queues every pending new commit at once and rounds bloat to 8h
-        # of pod compute. The cap forces rotation across rounds so each
-        # individual round stays in the 60–75 min target. We read the
-        # live cap from the single_eval module each call so unit tests
-        # (and operators editing the env at runtime) can override it
-        # without restarting the planner.
+        # FIFO cap (oldest commit first) keeps each round inside the
+        # 60-75 min target. Read live from single_eval for runtime overrides.
         cap = int(single_eval_mod.SINGLE_EVAL_MAX_PER_ROUND)
         pending_before_cap = dict(challengers)
         deferred: list[int] = []
@@ -211,7 +153,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             n_others = len(challengers) - n_king
             logger.info(
                 f"single-eval: {n_others} new commitment(s) to evaluate"
-                + (" + king (paired re-eval, 2026-04-27 fairness fix)" if n_king else "")
+                + (" + king (paired re-eval)" if n_king else "")
                 + " (no top-N rotation, no dormant rotation)"
             )
         else:
@@ -279,21 +221,12 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
 
 
 def add_top5_contenders(challengers, valid_models, state: ValidatorState, king_uid):
-    """Always include top contenders in every eval round.
+    """Always include top H2H contenders in every eval round.
 
-    Uses the latest round's H2H leaderboard (``top4_leaderboard.contenders``)
-    first — these were ranked on the same prompt set as the current king and
-    are the only fair cross-round comparison. Falls back to ``state.scores``
-    only when no H2H leaderboard exists yet (e.g. fresh state after migration).
+    Prefers ``top4_leaderboard.contenders`` (same-prompt-set ranking);
+    falls back to ``state.scores`` only when no H2H leaderboard exists.
 
-    The previous behaviour ranked purely by ``state.scores`` which mixes KL
-    from different prompt sets and silently bumped genuine top-4 contenders
-    off the round when newer challengers happened to have better-looking
-    cross-round raw KL. Reported by Topaz (2026-04-17).
-
-    No-op when ``SINGLE_EVAL_MODE=1``: the new policy is one-eval-per-
-    commitment, so re-pinning H2H contenders into the round is exactly the
-    behavior the flag exists to disable.
+    No-op in single-eval mode (one-eval-per-commitment).
     """
     if is_single_eval_mode():
         return
@@ -338,27 +271,11 @@ def add_top5_contenders(challengers, valid_models, state: ValidatorState, king_u
 
 def add_dormant_rotation(challengers, valid_models, state: ValidatorState,
                          king_uid, king_kl):
-    """Rotate in ``DORMANT_ROTATION_N`` dormant miners whose global KL beats
-    the current king.
+    """Rotate in ``DORMANT_ROTATION_N`` dormant miners with KL < king's.
 
-    Rationale: once the subnet is steady-state, no new P1/P3 fires and the
-    round shrinks to king+top-4. Miners who scored very well against an
-    earlier king sit in ``state.scores`` forever without re-entering the
-    ranking. This function picks the N best dormant scorers whose KL is
-    below the current king's h2h_kl, so they can either:
-      (a) confirm they're genuinely strong and climb back into the top-N,
-      (b) show their old score was noise from an easier prompt set and
-          settle back out of the running next round.
-
-    Defensive filters:
-      * skip king, skip current challengers, skip permanently_bad_models
-      * require ``state.scores[uid] < king_kl`` (no point re-testing
-        already-worse models)
-      * require uid in ``valid_models`` (passed precheck this round)
-
-    Opt-out: set ``DORMANT_ROTATION_N=0`` in the validator env to disable.
-    Also a no-op when ``SINGLE_EVAL_MODE=1`` — dormant rotation is itself a
-    re-eval mechanism and is incompatible with one-eval-per-commitment.
+    Picks the N best dormant scorers below ``king_kl`` so they can re-test.
+    Skips king, current challengers, and permanently_bad_models.
+    No-op when ``DORMANT_ROTATION_N=0`` or in single-eval mode.
     """
     if is_single_eval_mode():
         return
@@ -393,11 +310,7 @@ def add_dormant_rotation(challengers, valid_models, state: ValidatorState,
 
 
 def cap_challengers(challengers, state: ValidatorState, king_uid):
-    # Single-eval mode: every commitment in the round is a never-evaluated
-    # new submission, so the cap doesn't apply (there's nothing to truncate
-    # — the natural ceiling is "however many new commits arrived"). The
-    # registration burn cost is the spam control instead of an artificial
-    # per-round limit.
+    # Single-eval mode: registration burn is the spam control, no cap needed.
     if is_single_eval_mode():
         return
     phase = state.top4_leaderboard.get("phase", "maintenance")
@@ -406,10 +319,7 @@ def cap_challengers(challengers, state: ValidatorState, king_uid):
         return
     logger.warning(f"{len(challengers)} challengers exceeds cap of {max_cap} (phase={phase}). Truncating.")
     king_entry = challengers.pop(king_uid, None)
-    # Preserve only the strongest H2H contenders. Previously every stored H2H
-    # contender was pinned, so a six-slot leaderboard plus dormant rotation
-    # could crowd out newer commits and make maintenance rounds too slow. The
-    # remaining H2H entries still compete below, but do not override P1/new.
+    # Pin only the strongest H2H contenders; the rest still compete below.
     lb_entries = [
         entry for entry in (state.top4_leaderboard.get("contenders") or [])
         if entry.get("uid") is not None and entry.get("uid") != king_uid
@@ -428,11 +338,7 @@ def cap_challengers(challengers, state: ValidatorState, king_uid):
         is_new = score is None and uid_str not in state.evaluated_uids
         is_lb = uid in lb_rank
         commit_block = int((info or {}).get("commit_block") or 0)
-        # Lower tuple sorts first:
-        #   0: never-evaluated/new submissions, newest first
-        #   1: scored dormant candidates by best known KL
-        #   2: unprotected H2H contenders by H2H rank
-        #   3: everything else
+        # Sort order: new/unevaluated -> scored dormant -> H2H rank -> rest.
         if is_new:
             return (0, -commit_block, uid)
         if score is not None and 0 < score < float("inf"):
@@ -456,15 +362,10 @@ def cap_challengers(challengers, state: ValidatorState, king_uid):
 
 
 def assert_top_contenders_present(challengers, valid_models, state: ValidatorState, king_uid):
-    """Regression guard: loud WARNING if any H2H leaderboard contender is absent from the
-    eval round despite being a valid known model. Topaz's top-4 bug silently dropped
-    genuine contenders for several rounds before being noticed — never again.
+    """Regression guard: WARN if any H2H contender is absent from the round.
 
-    Also handles auto-eviction of ghost contenders that persistently fail precheck
-    (``LB_PRECHECK_EVICTION_STREAK``) — see module docstring for rationale.
-
-    No-op when ``SINGLE_EVAL_MODE=1``: there's no notion of "top contenders that
-    must reappear every round" — each commitment is evaluated exactly once.
+    Also auto-evicts ghost contenders after ``LB_PRECHECK_EVICTION_STREAK``
+    precheck failures. No-op in single-eval mode.
     """
     if is_single_eval_mode():
         return
@@ -488,9 +389,7 @@ def assert_top_contenders_present(challengers, valid_models, state: ValidatorSta
             if uid in challengers:
                 kept.append(entry)
                 continue
-            # If a valid H2H leaderboard contender was lost during cap/planning,
-            # force it back into the round instead of merely warning. These are
-            # the exact UIDs whose absence makes the crown under-tested.
+            # Force a lost-but-valid H2H contender back instead of warning.
             if in_valid:
                 challengers[uid] = valid_models[uid]
                 forced.append({"uid": uid, "model": model, "h2h_kl": entry.get("h2h_kl") or entry.get("kl")})

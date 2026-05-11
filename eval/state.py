@@ -1,10 +1,7 @@
-"""
-Centralized state management for the SN97 validator.
+"""Centralized state management for the SN97 validator.
 
-All JSON state files are managed through the ValidatorState class,
-which provides atomic writes, consistency validation, and a single
-source of truth for file paths.
-"""
+ValidatorState wraps every JSON state file with atomic writes,
+consistency validation, and a single source of truth for paths."""
 import json
 import math
 import os
@@ -27,12 +24,7 @@ def _sanitize_for_json(obj):
 
 
 def atomic_json_write(path, data, indent=None):
-    """Write JSON atomically: write to .tmp then os.replace (atomic on Linux).
-
-    Parents are created if they don't exist. Sanitised first so inf/nan
-    floats don't blow up serialisation. Used by every helper in the
-    ``eval`` package and by the validator service for state files.
-    """
+    """Atomic JSON write (tmp -> os.replace). Sanitises inf/nan."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path = str(path)
@@ -65,11 +57,7 @@ SCORES_FILE = "scores.json"
 FAILURES_FILE = "failures.json"
 DISQUALIFIED_FILE = "disqualified.json"
 EVALUATED_UIDS_FILE = "evaluated_uids.json"
-# 2026-04-25 (distil-97): per-UID canonical composite record. Each entry is
-# the absolute composite from the single eval that UID's current commitment
-# received. Used by SINGLE_EVAL_MODE to rank kings cross-round without
-# re-evaluating models, and by the API/dashboard to surface stable per-UID
-# scores. Format: {uid_str: {worst, weighted, axes, model, revision, block, ts}}.
+# Per-UID absolute composite (single-eval ranking); see results.py.
 COMPOSITE_SCORES_FILE = "composite_scores.json"
 H2H_LATEST_FILE = "h2h_latest.json"
 H2H_HISTORY_FILE = "h2h_history.json"
@@ -80,34 +68,14 @@ EVAL_PROGRESS_FILE = "eval_progress.json"
 CURRENT_ROUND_FILE = "current_round.json"
 TOP4_LEADERBOARD_FILE = "top4_leaderboard.json"
 H2H_TESTED_KING_FILE = "h2h_tested_against_king.json"
-# 2026-04-24 (distil-97, leeroyjkin): per-king consecutive-at-risk round
-# counter. Tracks how many recent rounds the current king's composite
-# ``worst`` axis has been below the floor or below the base model. Read
-# by API/dashboard (``king_health`` badge) and, once
-# ``KING_REGRESSION_GATE=1`` flips, used by results.py to force
-# dethronement. Shadow until we've observed ≥1 week of data.
+# Per-king consecutive-at-risk round counter (composite below floor/base).
 KING_REGRESSION_FILE = "king_regression_streak.json"
-# 2026-04-28: held-out canary regression streak. Sibling of
-# KING_REGRESSION_FILE — the latter tracks composite-internal at-risk
-# rounds, this one tracks held-out evalscope regression vs Qwen 4B base.
-# See ``composite._compute_king_canary_regression``.
+# Held-out canary regression streak (evalscope vs base model).
 KING_CANARY_FILE = "king_canary_streak.json"
-# 2026-05-01 (v30.4): top-N recent-kings payout history. Stored as a
-# list of UIDs with the MOST RECENT king at index 0. Each round's
-# weight-set call distributes 1.0 / min(5, N) emission to each
-# distinct UID. A UID that takes the crown but is later dethroned
-# stays in this list for up to 5 subsequent crown-changes — enough
-# that even one round of being king earns meaningful incentive.
+# Top-N recent kings (newest first); weights split 1/N across the list.
 RECENT_KINGS_FILE = "recent_kings.json"
 RECENT_KINGS_MAX = 5
-# 2026-05-01 (v30.4): one-eval-per-registration enforcement. Maps
-# hotkey_str → {model, revision, evaluated_at_block, evaluated_at_ts,
-# composite_final}. Once a hotkey has its eval recorded here, ALL
-# subsequent commits from that hotkey to a different (model, revision)
-# pair are rejected at precheck time. Prevents the recommit-spam vector
-# where one registration produces unlimited evaluations by re-uploading
-# slightly-mutated weights to the same hotkey. Re-registration with a
-# brand new hotkey resets eligibility (the new hotkey isn't in the map).
+# One-eval-per-registration tracker (hotkey -> evaluation record).
 EVALUATED_HOTKEYS_FILE = "evaluated_hotkeys.json"
 ANNOUNCEMENT_FILE = "announcement.json"
 MODEL_HASHES_FILE = "model_hashes.json"
@@ -118,11 +86,8 @@ VALIDATOR_LOG_MAX_ENTRIES = 100
 
 
 def log_event(msg: str, level: str = "info", state_dir: str = "state"):
-    """Append a structured log entry to validator_log.json.
-
-    Keeps the last VALIDATOR_LOG_MAX_ENTRIES entries. Thread-safe via
-    atomic write. Each entry: {ts, level, msg}.
-    """
+    """Append a structured log entry to validator_log.json
+    (capped at VALIDATOR_LOG_MAX_ENTRIES)."""
     log_path = os.path.join(state_dir, VALIDATOR_LOG_FILE)
     entries = []
     if os.path.exists(log_path):
@@ -148,17 +113,7 @@ def log_event(msg: str, level: str = "info", state_dir: str = "state"):
 
 
 class ValidatorState:
-    """Manages all JSON state files for the validator.
-
-    Provides a unified interface for loading, saving, and validating
-    state data. All paths are relative to a configurable state_dir.
-
-    Usage:
-        state = ValidatorState("state")
-        state.load()
-        state.scores["42"] = 0.05
-        state.save()
-    """
+    """Unified manager for the validator's JSON state files."""
 
     def __init__(self, state_dir: str = "state"):
         """Initialize with the state directory path."""
@@ -171,30 +126,18 @@ class ValidatorState:
         self.failure_models: dict[str, str] = {}  # UID -> model_name at time of failure
         self.dq_reasons: dict[str, str] = {}
         self.evaluated_uids: set[str] = set()
-        # 2026-05-01 (v30.4): one-eval-per-registration tracker.
-        # Keyed by hotkey string (unique per registration on Bittensor —
-        # if a slot is deregistered and re-registered, the new owner
-        # picks a fresh hotkey, so a brand-new hotkey signals a fresh
-        # registration cycle eligible for an eval). Each entry records
-        # the (model, revision, block, ts, composite_final) of the one
-        # eval this registration is allowed.
+        # One-eval-per-registration tracker (hotkey -> eval record).
         self.evaluated_hotkeys: dict[str, dict] = {}
         # Canonical absolute composite per UID (one-eval-per-commitment).
-        # uid_str -> {"worst", "weighted", "axes", "model", "revision",
-        #             "block", "ts", "n_axes"}.
         self.composite_scores: dict[str, dict] = {}
-        # 2026-05-01 (v30.4): rolling list of last 5 distinct king UIDs
-        # for the multi-king payout split. Most-recent at index 0.
+        # Last 5 distinct king UIDs (newest first) for payout split.
         self.recent_kings: list[int] = []
 
         # Head-to-head state
         self.h2h_latest: dict = {}
         self.h2h_history: list[dict] = []
         self.h2h_tested_against_king: dict = {}
-        # King regression streak (2026-04-24): maps stringified king_uid →
-        # consecutive round counter of "at risk" composite (below floor
-        # OR worse than base model). Shadow telemetry for the
-        # leeroyjkin/distil-97 design discussion.
+        # King regression streak: king_uid -> consecutive at-risk rounds.
         self.king_regression_streak: dict = {}
 
         # Model tracking
@@ -297,20 +240,9 @@ class ValidatorState:
     def save_progress(self, data: dict = None):
         """Write eval progress for dashboard live display.
 
-        When ``data`` is a full dict (``active`` is present and a bool),
-        replace both disk and ``self.eval_progress`` atomically —
-        full-round overwrites are the normal path.
-
-        When ``data`` is a partial update (e.g. ``{"failed": True}``),
-        merge it into ``self.eval_progress`` first and write the merged
-        result. This prevents the 220m phantom-age false-kill where a
-        round-end partial update truncated ``started_at`` out of the
-        on-disk progress, while the stale in-memory dict still said
-        ``active=True`` with a started_at from the validator's original
-        bootstrap — ``ensure_clean_state``'s ``age_min`` check then
-        computed ~3.5h and nuked a fresh, healthy round at ~1m age.
-        2026-04-24, distil-97.
-        """
+        Full dicts (with ``active`` bool + extra fields) replace atomically;
+        partial updates merge into ``self.eval_progress`` first so
+        ``started_at`` isn't truncated by round-end partials."""
         if data is None:
             payload = dict(self.eval_progress)
         else:
@@ -328,17 +260,7 @@ class ValidatorState:
         atomic_json_write(self._path(CURRENT_ROUND_FILE), data or self.current_round)
 
     def clear_round(self):
-        """Clear round state after successful completion.
-
-        IMPORTANT: also resets the in-memory ``self.current_round`` dict.
-        Without that step the next epoch's ``_detect_resumable_round`` reads
-        the stale in-memory copy (still pointing at a dead pod ``run_dir``),
-        wrongly enters resume mode, and then aborts with
-        ``Resume: king UID … is no longer valid`` — which on 2026-04-25
-        repeatedly discarded fully-completed single-eval rounds. The on-disk
-        unlink without the in-memory reset was the actual root cause behind
-        commit 0b82081's residual recurrence.
-        """
+        """Clear round state on disk AND reset in-memory ``self.current_round``."""
         path = self._path(CURRENT_ROUND_FILE)
         if path.exists():
             path.unlink()
@@ -349,21 +271,11 @@ class ValidatorState:
         atomic_json_write(self._path(TOP4_LEADERBOARD_FILE), self.top4_leaderboard, indent=2)
 
     def save_composite_scores(self):
-        """Persist canonical per-UID composite scores immediately.
-
-        Used by single-eval bootstrap and merge so the validator can crash
-        or restart at any point without losing the ranking table. Cheaper
-        than ``save()`` (one file vs ~13).
-        """
+        """Persist per-UID composite scores immediately (one file vs ~13)."""
         atomic_json_write(self._path(COMPOSITE_SCORES_FILE), self.composite_scores, indent=2)
 
     def save_announcement(self, data: dict):
-        """Write a pending announcement for async Discord posting.
-        
-        Skips write if an existing announcement for the same king change
-        is already present (whether posted or not), to prevent duplicates.
-        In the single-host distil layout this only needs a local write.
-        """
+        """Persist a pending Discord announcement (deduped by king change)."""
         existing = _load_json(self._path(ANNOUNCEMENT_FILE), {})
         if existing.get("type") == data.get("type"):
             existing_data = existing.get("data", {})

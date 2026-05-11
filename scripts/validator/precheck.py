@@ -57,25 +57,12 @@ def _hf_upload_griefing_swap(
 ):
     """Tiebreak duplicate-detection by HuggingFace upload time.
 
-    The chain ``commit_block`` is not authoritative for "who came
-    first": a miner can recycle a UID slot, commit the bare model
-    name on chain at block X, then upload stolen weights to that
-    repo days later. Their on-chain block X then makes them appear
-    earlier than the legitimate miner.
-
-    HF, by contrast, records when the safetensors actually became
-    available — which is the timeline copy detection cares about.
-    Returns the *true* (copy_uid, copy_repo, copy_block, copy_hotkey,
-    original_uid, original_repo, original_block, original_hotkey)
-    using HF order when both lookups succeed.
-
-    If HF says the would-be "original" was uploaded *later* than the
-    would-be "copy", we swap the labels and emit a HF_UPLOAD_GRIEFING
-    warning. Otherwise we leave the caller's chain-based decision
-    alone.
-
-    Returns ``None`` when no swap is needed (HF agrees with chain or
-    HF is unreachable).
+    chain commit_block is not authoritative -- a miner can pre-commit a
+    UID then upload stolen weights to the repo days later. HF records
+    when safetensors actually became available, which is what copy
+    detection should compare against.
+    Returns the swap payload or None if HF agrees with chain / HF is
+    unreachable.
     """
     try:
         this_ts = get_first_upload_epoch(this_repo, this_revision, state_dir=state_dir)
@@ -114,38 +101,15 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
                                  evaluated_uids=None, composite_scores=None,
                                  revision: str = "main",
                                  uid_to_revision: dict = None):
-    """Compare the incoming model's activation fingerprint against stored ones.
+    """Compare an incoming fingerprint to stored ones.
 
-    Returns: (is_copy, copy_uid, copy_model, original_uid, original_model, sim)
-        - is_copy: True iff a near-duplicate (sim >= ACTIVATION_COPY_THRESHOLD) was found.
-        - copy_uid / copy_model: the LATER-committed of the two (the one to DQ).
-        - original_uid / original_model: the EARLIER-committed (the one to keep).
-        - sim: the similarity score for the matched pair.
+    Returns (is_copy, copy_uid, copy_model, original_uid, original_model, sim).
 
-    If commit_block / uid_to_commit_block aren't provided, falls back to the legacy
-    behaviour (DQ the incoming UID, treat any existing stored entry as the original).
-    The fingerprint is only persisted under `uid` if it is NOT determined to be a copy
-    of an earlier-committed model — avoids polluting the store with later copies and
-    makes future griefing attempts much harder (the king's fingerprint is the canonical one).
-
-    Same-coldkey carve-out (2026-04-20, sebastian_020521 request): if the matched
-    UID shares a coldkey with `uid`, this is a miner iterating on their own model
-    across hotkeys (e.g. best26/* family). We still report the match in logs so
-    scoring can use it as a tiebreaker, but we do NOT DQ either side — a miner
-    griefing themselves is not the attack we're protecting against, and losing a
-    legitimate hotkey slot is worse than letting a self-copy sit un-crowned.
-
-    Anti-griefing guard (2026-04-28, crypsick discord report): if the
-    "later-committed" side has been EVALUATED (in evaluated_uids and has a
-    composite_scores entry) but the "earlier-committed" side has NEVER been
-    evaluated, the earlier UID is the griefing copy — the attacker reserved
-    a slot on-chain ahead of time, then uploaded the king's weights to their
-    HF repo after the king was crowned. In that case we REVERSE the DQ
-    direction: the unevaluated, earlier-committed UID is the copy to DQ.
-    Pass ``evaluated_uids`` (set of stringified UIDs) and ``composite_scores``
-    (dict keyed by stringified UID) to enable the guard. Without them we fall
-    back to the commit_block-only logic, which was vulnerable to the
-    pre-commit-then-copy attack.
+    Same-coldkey matches are reported but NOT DQ'd (miner iterating on their
+    own model). Anti-griefing guard (requires ``evaluated_uids`` +
+    ``composite_scores``): if the "later" side is evaluated and the "earlier"
+    side never was, reverse the DQ direction -- the unevaluated, earlier UID
+    is the pre-commit-then-copy attacker.
     """
     from pathlib import Path
 
@@ -207,13 +171,8 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
             is_copy = False
 
     if is_copy:
-        # Resolve commit_block for both sides with layered fallback:
-        #   self:  explicit arg > uid_to_commit_block > None
-        #   other: uid_to_commit_block > stored fingerprint's commit_block > None
-        # Using stored commit_block fixes the case where the matched UID is not in
-        # the current round (uid_to_commit_block would miss it) and avoids the
-        # flip-flop bug where the earlier committer kept getting flagged as the
-        # "later" one because its block resolved to None→inf.
+        # Resolve commit_block on both sides with layered fallback so we
+        # don't flip-flop when the matched UID isn't in the current round.
         my_block = commit_block
         if my_block is None and uid_to_commit_block is not None:
             my_block = uid_to_commit_block.get(uid)
@@ -230,9 +189,8 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
             other_b = float(other_block) if other_block is not None else None
         except (TypeError, ValueError):
             other_b = None
-        # Safety: if we can't determine commit order for sure, DO NOT DQ.
-        # Flipping a coin here is exactly the bug that took down UID 174.
-        # The copy will still be caught on the next round once we can resolve blocks.
+        # Safety: if commit order is unknown, do not DQ (the copy will be
+        # caught next round once blocks are resolvable).
         if my_b is None or other_b is None:
             logger.warning(
                 f"UID {uid} ({model_name}) activation-matched UID {max_sim_uid} "
@@ -253,11 +211,8 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
                 original_uid = uid
                 original_model = model_name
 
-        # ── Anti-griefing guard (2026-04-28) ─────────────────────────────
-        # Reverse the DQ if commit_block-based logic would DQ an evaluated
-        # model in favour of an unevaluated one. See docstring; this is
-        # the activation-fingerprint mirror of the SHA256/content-hash
-        # guard added in beafc1f.
+        # Anti-griefing: reverse the DQ when a stale-but-evaluated UID
+        # would lose to a never-evaluated pre-commit-then-copy attacker.
         if is_copy and evaluated_uids is not None and copy_uid is not None and original_uid is not None:
             def _is_real_eval(u):
                 if u is None:
@@ -278,15 +233,8 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
                 copy_uid, original_uid = original_uid, copy_uid
                 copy_model, original_model = original_model, copy_model
 
-        # ── HF-upload-time anti-griefing guard (2026-04-28) ───────────────
-        # Even when both UIDs have been evaluated, the on-chain
-        # commit_block can be tricked: a miner reserves a slot on
-        # chain pointing to ``namespace/repo`` *before* ``namespace/repo``
-        # actually exists, then uploads stolen weights to that repo days
-        # later. HF, by contrast, records when the safetensors became
-        # available — which is the timeline copy-detection cares about.
-        # If HF says the would-be original was uploaded *after* the
-        # would-be copy, we reverse the DQ direction.
+        # HF-upload-time guard: chain commit_block can be pre-reserved;
+        # HF records when safetensors actually became available.
         if is_copy and copy_uid is not None and original_uid is not None and copy_model and original_model:
             def _resolve_revision(u):
                 if uid_to_revision and u in uid_to_revision:
@@ -331,11 +279,7 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
 
 
 def _one_eval_per_registration_enabled() -> bool:
-    """Feature flag for the v30.4 one-eval-per-registration policy.
-
-    Default ON. Set ``ONE_EVAL_PER_REGISTRATION=0`` in distil.env to
-    disable for emergency rollback.
-    """
+    """ONE_EVAL_PER_REGISTRATION policy flag (default on)."""
     import os
     return bool(int(os.environ.get("ONE_EVAL_PER_REGISTRATION", "1") or 1))
 
@@ -345,37 +289,20 @@ def _check_registration_already_used(
     state: ValidatorState,
     commit_block: int | None = None,
 ) -> tuple[bool, str | None]:
-    """Has this hotkey already used its one-eval-per-registration slot?
+    """Has this hotkey already spent its one-eval slot?
 
-    Returns ``(already_used, reason)``. ``already_used=True`` means the
-    incoming commit must be rejected. ``already_used=False`` means it's
-    safe to evaluate (either fresh hotkey or same-model replay).
-
-    Per-hotkey enforcement only:
-      • Hotkey not in tracker → fresh registration → eligible.
-      • Hotkey in tracker, same (model, revision) → replay of the
-        already-evaluated commit. Eligible (no-op; downstream will
-        skip eval since it's in ``evaluated_uids``).
-      • Hotkey in tracker, different (model, revision) → recommit
-        spam. Reject.
-
-    Coldkey is persisted into ``evaluated_hotkeys[hotkey].coldkey``
-    by ``merge_composite_scores`` (see ``single_eval.py``) so the
-    dashboard can surface coldkey clustering, but cross-hotkey
-    enforcement is NOT applied — multiple hotkeys under one coldkey
-    are allowed.
-
-    Re-registration of a deregistered slot installs a brand new
-    hotkey on Bittensor, so a fresh hotkey naturally bypasses this
-    check.
+    Returns (already_used, reason). Per-hotkey only: fresh hotkey eligible,
+    same (model, revision) replay eligible, different (model, revision)
+    rejected as recommit spam. Cross-hotkey enforcement is intentionally
+    NOT applied -- coldkey clustering is dashboard-only.
     """
     if not hotkey or not _one_eval_per_registration_enabled():
         return False, None
     rec = (state.evaluated_hotkeys or {}).get(hotkey)
     if not rec:
         return False, None
-    # Guard: skip backfilled entries that predate this commit's block
-    # (recycled UID carried over a stale record from previous occupant).
+    # Skip backfilled entries that predate this commit's block (recycled
+    # UID with a stale record from the previous occupant).
     if rec.get("backfilled") and commit_block:
         eval_block = rec.get("evaluated_at_block", 0)
         if eval_block and eval_block < commit_block:
@@ -410,25 +337,10 @@ def _clear_uid_hash_and_stale_dqs(
     new_block,
     reset_failures_fn=None,
 ) -> None:
-    """Drop a UID's stored model hash + stale DQ entries.
-
-    Called when a UID's commitment changes (different block, different
-    hotkey, or a legacy hash with no stored block) so the next round
-    re-runs the full integrity check against the new revision.
-
-    DQ keys are cleared under two shapes — ``{hotkey}:{block}``
-    (block-scoped) and ``{hotkey}`` (legacy unscoped) — for both
-    the current hotkey and the previously stored one (if different),
-    so a UID-recycle that DQ'd the old occupant doesn't poison the
-    new one. Also discards ``evaluated_uids`` membership and any
-    cached score so the new commitment is treated as fresh.
-
-    ``reset_failures_fn(uid, state.failures)`` is called when supplied
-    (the full-check path always resets failures so a transient
-    network blip from the previous occupant doesn't gate the new
-    submission; the quick-path skips it because the caller falls
-    through to a full check that will reset failures itself).
-    """
+    """Drop a UID's stored hash + stale DQ entries so the next round runs a
+    fresh integrity check. Clears both ``{hk}:{block}`` and legacy ``{hk}``
+    DQ keys, discards ``evaluated_uids`` membership, and (optionally) resets
+    failures."""
     logger.info(
         f"UID {uid}: {log_reason} at block {new_block} "
         f"(was {stored_commit_block}), resetting hash"
@@ -470,19 +382,14 @@ def _resolve_weight_duplicate(
     weight_phrase: str,
     weight_suffix: str = "",
 ) -> bool:
-    """Resolve a weight duplicate detection (SHA hash or content hash).
+    """Resolve a weight-duplicate detection (SHA or shard-invariant content hash).
 
-    Both ``check_duplicate_hash`` (SHA256 of weight tensors) and
-    ``check_duplicate_content_hash`` (shard-invariant content hash)
-    converge on the same downstream pipeline:
-
-      1. Try the HF-upload-time tiebreak via :func:`_hf_upload_griefing_swap`.
-         If the would-be "original" was actually uploaded later than the
-         would-be "copy", swap the DQ direction.
-      2. Otherwise compare chain commit blocks: the later commit is the
-         copy unless the GRIEFING guard fires (later UID is already
-         evaluated, earlier UID never was — the earlier UID is the
-         copy that pre-reserved a slot then uploaded king weights).
+    Pipeline:
+      1. HF-upload-time tiebreak: swap DQ direction if the chain "original"
+         was uploaded later than the "copy".
+      2. Otherwise the later chain commit is the copy, unless the griefing
+         guard fires (later UID evaluated, earlier UID never was -- earlier
+         pre-reserved + uploaded king weights).
       3. Register the canonical hash under the keeper so future detections
          match against the right UID.
 
@@ -602,12 +509,8 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
             disqualified.add(uid)
             continue
-        # 2026-05-01 (v30.4): one-eval-per-registration policy. Reject
-        # any commit from a hotkey that has already used its eval slot
-        # on a different (model, revision). The commitment is permanent
-        # but the hotkey only gets one shot — to try again miners must
-        # register a new hotkey. Coldkey is passed for telemetry only;
-        # cross-hotkey-under-same-coldkey commits are NOT rejected.
+        # One-eval-per-registration: reject any commit from a hotkey
+        # that already used its slot on a different (model, revision).
         coldkey = uid_to_coldkey.get(uid) if uid_to_coldkey else None
         already_used, reason = _check_registration_already_used(
             hotkey, model_repo, revision, state,
@@ -757,8 +660,8 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                     continue
             else:
                 register_model_hash(model_hash, uid, state.state_dir)
-        # Shard-invariant content hash — catches re-sharded copies that slip
-        # past compute_model_hash (aizaysi's wind77/third ↔ pure-iron-6291 case).
+        # Shard-invariant content hash catches re-sharded copies that slip
+        # past compute_model_hash.
         content_hash = compute_content_hash(model_repo, revision)
         if content_hash:
             dup_uid = check_duplicate_content_hash(content_hash, uid, state.state_dir)
