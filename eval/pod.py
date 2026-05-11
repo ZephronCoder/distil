@@ -1,9 +1,5 @@
-"""
-Pod lifecycle management for the SN97 validator.
-
-Handles: connection, dependency installation, disk cleanup,
-file upload/download, and command execution with retries.
-"""
+"""Pod lifecycle management: connect, install deps, transfer files,
+exec commands, and clean up disk on a Lium GPU pod."""
 import json
 import os
 import re
@@ -41,7 +37,7 @@ def sanitize_gpu_log(raw: str) -> str:
 
 
 def _retry(fn, max_attempts: int = 3, delay: float = 5.0, label: str = "operation"):
-    """Generic retry wrapper. Returns the result of fn() or raises on final failure."""
+    """Retry ``fn`` up to ``max_attempts`` times with linear backoff."""
     for attempt in range(max_attempts):
         try:
             return fn()
@@ -54,32 +50,17 @@ def _retry(fn, max_attempts: int = 3, delay: float = 5.0, label: str = "operatio
 
 
 class PodManager:
-    """Manages a Lium GPU pod for remote evaluation.
-
-    Handles pod discovery, dependency installation, file transfers,
-    command execution, and disk cleanup.
-
-    Usage:
-        pm = PodManager(lium, pod_name="distil-validator")
-        pm.connect()
-        pm.upload("scripts/pod_eval_vllm.py", "/home/pod_eval.py")
-        result = pm.exec("python3 /home/pod_eval.py ...")
-        pm.download("/home/eval_results.json", "state/last_eval.json")
-    """
+    """Lium GPU pod handle: discovery, deps, file IO, exec, cleanup."""
 
     def __init__(self, lium, pod_name: str = "distil-validator"):
-        """Initialize with a Lium client and pod name to search for."""
         self.lium = lium
         self.pod_name = pod_name
         self.pod = None
-        # Serialize SFTP/SSH — concurrent sessions to the same pod can drop the long eval channel.
+        # Serialise SFTP/SSH; concurrent sessions can drop long eval channels.
         self._io_lock = threading.Lock()
 
     def connect(self):
-        """Find and connect to the named Lium pod.
-
-        Raises RuntimeError if the pod is not found.
-        """
+        """Find and attach to the named Lium pod (raises if missing)."""
         pods = self.lium.ps()
         for p in pods:
             if self.pod_name in p.name:
@@ -111,13 +92,8 @@ class PodManager:
         _retry(_do, max_attempts=max_attempts, delay=5, label=f"Download {remote}")
 
     def _prep_command(self, command: str, env: dict | None = None) -> str:
-        """Prepare a shell script with exported environment variables.
-
-        This string is fed to ``bash -s`` over SSH stdin when ``env`` is
-        provided. Keeping env exports out of the SSH command line prevents API
-        keys from showing up in remote ``ps`` output while preserving the same
-        shell semantics for callers.
-        """
+        """Prefix ``command`` with env exports; fed via stdin so secrets
+        don't appear in remote ``ps`` output."""
         if not env:
             return command
         exports = " && ".join(
@@ -127,20 +103,14 @@ class PodManager:
         return f"{exports} && {command}"
 
     def exec(self, command: str, env: dict = None, timeout: int = None):
-        """Execute a command on the pod. Returns the result dict.
-
-        If timeout is specified, raises TimeoutError if the command
-        doesn't complete within that many seconds.
-        """
+        """Run a command on the pod; returns result dict, raises on timeout."""
         full_command = self._prep_command(command, env)
         ssh_command = "bash -s" if env else full_command
         started = time.time()
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 
-        # The upstream SDK waits for exit status before draining stdout/stderr.
-        # For long-running verbose eval jobs that can stall or break the session,
-        # so we drain both streams incrementally while the command runs.
+        # Drain stdout/stderr incrementally so long jobs don't stall the session.
         with self._io_lock:
             with self.lium.ssh_connection(self.pod, timeout=30) as client:
                 transport = client.get_transport()
@@ -194,30 +164,11 @@ class PodManager:
             return False
 
     def ensure_dependencies(self, teacher_model: str = "moonshotai/Kimi-K2.6"):
-        """Install required packages on the pod and apply B200 + Kimi patches.
-
-        Installs vllm, accelerate, transformers, and patches:
-        - grouped_mm for B200 (sm_100) GPUs where torch._grouped_mm crashes;
-        - Kimi K2.6 modeling_deepseek.py for the transformers >=5.0 removal of
-          ``is_torch_fx_available`` (HF fallback path);
-        - vLLM ``kimi_k25.py`` for the missing ``media_tokens_calculator``
-          attribute on transformers 5.x ``Qwen2VLImageProcessor`` (vLLM
-          startup path). Both Kimi patches are pure idempotent text-substitutions
-          guarded by sentinel strings so re-running on the same pod is a no-op.
-        """
+        """Install pod deps and apply B200 grouped_mm + Kimi K2.6 patches
+        (idempotent, guarded by sentinels)."""
         try:
             logger.info("Ensuring pod dependencies...")
-            # 2026-05-04: ``datasets`` was previously omitted, which made
-            # ``pod_eval_vllm._bench_load_pools`` log "datasets import
-            # failed: No module named 'datasets'" on every fresh pod. The
-            # round itself doesn't depend on it (v27+ generates bench
-            # items procedurally from block_seed) but several adjacent
-            # tools do — ``scripts/verify_round.py``,
-            # ``eval/dataset.py``, ``examples/distil_kl_train.py``, and
-            # the ``auto_benchmark.sh`` post-hoc evalscope verifier — so
-            # installing it removes a permanent log smell and unbreaks
-            # those paths if they're ever invoked from the pod. Pinning
-            # ``>=2.20`` matches what the rest of the repo expects.
+            # ``datasets`` is needed by verify_round / dataset.py / evalscope.
             dep_result = self.exec(
                 "pip install --break-system-packages 'vllm>=0.19' accelerate -q 2>&1 | tail -1 && "
                 "pip install --break-system-packages 'transformers>=5.0' -q 2>&1 | tail -1 && "
@@ -228,7 +179,7 @@ class PodManager:
             )
             logger.info(f"Pod deps: {dep_result.get('stdout', '').strip()}")
 
-            # Patch grouped_mm for B200 sm_100
+            # B200 sm_100 grouped_mm fallback patch.
             self.exec(
                 'python3 -c "import torch; cap=torch.cuda.get_device_capability(0); '
                 'print(f\\"GPU compute capability: {cap}\\")" && '
@@ -243,9 +194,7 @@ class PodManager:
             )
             logger.info("Applied grouped_mm B200 patch")
 
-            # Kimi K2.6 transformers-5.x compatibility patches.
-            # Apply regardless of teacher_model so a future swap back to Qwen
-            # is a no-op (Kimi files won't be on disk → cd fails → noop).
+            # Kimi K2.6 transformers-5.x compat patches (no-op if absent).
             kimi_patch = r"""
 set -e
 
@@ -353,11 +302,7 @@ echo KIMI_PATCHES_OK
             logger.warning(f"Pod dep check failed (non-fatal): {e}")
 
     def disk_cleanup(self, teacher_name: str, threshold: int = 85):
-        """Clean non-teacher model caches and stale files from the pod.
-
-        Keeps the teacher model cached. Cleans student caches,
-        stale /tmp files, and old eval artifacts.
-        """
+        """Drop student caches + stale /tmp; keep the teacher cached."""
         try:
             disk_check = self.exec("df --output=pcent / | tail -1 | tr -d ' %'")
             disk_pct_str = disk_check.get('stdout', disk_check) if isinstance(disk_check, dict) else disk_check

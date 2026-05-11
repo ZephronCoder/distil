@@ -1,31 +1,8 @@
 """Chat-pod state administration.
 
-Single source of truth for the king-serving Lium pod coordinates lives in
-``state/chat_pod.json``. This module exposes:
-
-* ``read_chat_pod_state()`` — programmatic access used by the validator's
-  side-effects loop and the API.
-* ``write_chat_pod_state()`` — atomic write used whenever ``side_effects``
-  re-deploys the king to a new pod.
-* A CLI (``python -m scripts.validator.chat_pod_admin``) for manual ops.
-
-Why a dedicated module:
-    Pre-2026-04-26, the chat pod host was wired through ``CHAT_POD_HOST`` env,
-    set by hand in the systemd unit. Lium reprovisioning wiped the host
-    every few days and ``chat.arbos.life`` went dark until ops noticed.
-    The state file + this admin layer make the rotation a one-line
-    operation that also nudges the systemd ``chat-tunnel.path`` watcher to
-    rebind the SSH tunnel without a service restart.
-
-CLI usage::
-
-    python -m scripts.validator.chat_pod_admin get
-    python -m scripts.validator.chat_pod_admin set \
-        --host 213.13.7.110 --ssh-port 6039 --app-port 8100 \
-        --ssh-key /root/.ssh/eval_pod_key --model ivangrapher/distilman3
-    python -m scripts.validator.chat_pod_admin clear
-    python -m scripts.validator.chat_pod_admin heal           # re-launch chat_server.py
-    python -m scripts.validator.chat_pod_admin probe          # ssh-curl /v1/models
+``state/chat_pod.json`` is the single source of truth for the king-serving
+Lium pod. This module exposes read/write/clear helpers plus a CLI
+(``python -m scripts.validator.chat_pod_admin {get,set,clear,heal,probe}``).
 """
 from __future__ import annotations
 
@@ -43,8 +20,7 @@ from eval.state import atomic_json_write
 
 logger = logging.getLogger("distillation.chat_pod_admin")
 
-# Resolved fresh on every import / call so the CLI works even when STATE_DIR
-# is overridden from the shell (tests, multi-validator hosts).
+# Resolved fresh on every call so DISTIL_STATE_DIR overrides take effect.
 def _state_dir() -> Path:
     return Path(
         os.environ.get("DISTIL_STATE_DIR")
@@ -67,12 +43,7 @@ def read_chat_pod_state() -> dict[str, Any]:
 
 
 def write_chat_pod_state(updates: dict[str, Any], *, source: str = "validator") -> dict[str, Any]:
-    """Merge ``updates`` into the persisted chat-pod state.
-
-    Atomic via tmp-file + rename so the systemd path watcher only fires once
-    per change. Touch is OK if no fields changed (callers can detect via
-    ``updated_at`` skew if they need to throttle).
-    """
+    """Atomic merge of ``updates`` into the persisted chat-pod state."""
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     state = read_chat_pod_state()
@@ -84,21 +55,11 @@ def write_chat_pod_state(updates: dict[str, Any], *, source: str = "validator") 
 
 
 def clear_chat_pod_state(*, source: str = "validator") -> None:
-    """Mark the chat pod as undefined.
-
-    The wrapper script + systemd unit treat an empty ``host`` as 'no chat
-    pod available' and exit cleanly; healthchecks then report the chat
-    surface as unavailable instead of pounding a dead host.
-    """
+    """Mark the chat pod as undefined (empty host == 'no chat pod')."""
     write_chat_pod_state({"host": "", "ssh_port": 0, "model": ""}, source=source)
 
 
-# Tolerate host-key rotation. Lium pods sometimes get reprovisioned with the
-# same IP+port but a fresh host key; without ``UserKnownHostsFile=/dev/null``
-# the keeper hits ``REMOTE HOST IDENTIFICATION HAS CHANGED`` and refuses to
-# connect even with ``StrictHostKeyChecking=no``. The chat-tunnel already
-# ignored known_hosts; this brings probe/heal in line so chat.arbos.life
-# survives a rebuild without manual ``ssh-keygen -R``.
+# Tolerate host-key rotation across Lium pod reprovisions.
 _BASE_SSH_OPTS = [
     "-o", "ConnectTimeout=10",
     "-o", "StrictHostKeyChecking=no",
@@ -141,11 +102,7 @@ def _scp_args(state: dict[str, Any], src: str, dst: str) -> list[str]:
 
 
 def probe(state: dict[str, Any] | None = None, timeout: int = 12) -> dict[str, Any]:
-    """Probe the chat pod for vLLM health + the served model name.
-
-    Returns ``{"ok": bool, "model": str|None, "raw": str|None, "error": str|None}``.
-    Used by the validator self-heal loop and the admin CLI.
-    """
+    """SSH-curl /v1/models; returns ok/model/raw/error dict."""
     state = state or read_chat_pod_state()
     if not state.get("host") or not state.get("ssh_port"):
         return {"ok": False, "model": None, "raw": None, "error": "no chat pod configured"}
@@ -178,20 +135,7 @@ _ENV_KEY_RE = __import__("re").compile(r"^[A-Z_][A-Z0-9_]*$")
 
 def _format_env_exports(env: dict[str, Any] | None) -> str:
     """Return ``KEY=VALUE`` exports prefix for a remote bash command.
-
-    2026-05-09: when chat moved off the eval pod onto a dedicated GPU
-    (``provision_chat_pod.py`` flow), the chat_server.py defaults — tuned
-    for co-location at ``CHAT_VLLM_GPU_UTIL=0.30`` — left ~70% of the
-    chat-pod GPU idle and capped the king's KV cache short. We now allow
-    chat_pod.json to declare an ``env`` dict (e.g. ``{"CHAT_VLLM_GPU_UTIL":
-    "0.85", "CHAT_VLLM_MAX_MODEL_LEN": "32768"}``) which is exported into
-    the heal-launch shell. Keys are validated against
-    ``[A-Z_][A-Z0-9_]*`` so a fat-fingered chat_pod.json can't smuggle
-    ``LD_PRELOAD`` or ``rm -rf /`` past the export. Values are
-    single-quoted and any literal single-quote is escaped via the bash
-    ``'"'"'`` idiom — the only way to embed ``'`` inside a single-quoted
-    bash string.
-    """
+    Keys must match ``[A-Z_][A-Z0-9_]*``; values are single-quoted."""
     if not env:
         return ""
     parts: list[str] = []
@@ -208,23 +152,8 @@ def _format_env_exports(env: dict[str, Any] | None) -> str:
 
 
 def _is_download_in_progress(state: dict[str, Any], grace_sec: int = 90) -> tuple[bool, str]:
-    """Return ``(in_progress, reason)`` for an existing chat_server.py on the pod.
-
-    A chat_server.py process is "downloading" if:
-
-    1. ``pgrep -fa chat_server.py`` finds a python interpreter, AND
-    2. ``/root/chat_server.log`` was modified within ``grace_sec`` seconds, AND
-    3. The log's tail does NOT contain a fatal traceback (so we can
-       distinguish an active download from a recently-crashed one).
-
-    2026-05-09 motivation: chat-keeper.timer ticks every 3 min. Before
-    this guard, a 5-10 min HF model download would be killed every 3
-    min by a fresh ``heal`` invocation, restarting from 0 % and never
-    finishing. Result: chat stayed dark for the entire model swap. The
-    validator's ``sync_king_runtime`` exhibits the same bug whenever
-    a king's model isn't in MODEL_DIR yet. We now noop when the
-    bootstrapper is making progress on its own.
-    """
+    """Return (in_progress, reason). True if chat_server.py is running,
+    log is fresh (<= grace_sec), and tail has no traceback."""
     if not state.get("host") or not state.get("ssh_port"):
         return False, "pod not configured"
     probe_cmd = (
@@ -270,25 +199,11 @@ def _is_download_in_progress(state: dict[str, Any], grace_sec: int = 90) -> tupl
 
 
 def heal(model_name: str | None = None, *, source: str = "cli", force: bool = False) -> dict[str, Any]:
-    """Sync ``chat_server.py`` + relaunch vLLM on the configured chat pod.
+    """Sync chat_server.py + relaunch vLLM on the configured chat pod.
 
-    If ``model_name`` is omitted, falls back to the last persisted model. We
-    don't pick up the live king from h2h_latest.json here on purpose: the
-    validator's side-effects loop is the authority for who's reigning, and
-    the CLI should be a manual override that doesn't second-guess it.
-
-    If ``chat_pod.json`` contains an ``env`` dict, those ``KEY=VALUE``
-    pairs are exported into the heal launch shell so per-pod tuning
-    (e.g. ``CHAT_VLLM_GPU_UTIL`` for a dedicated chat pod) propagates
-    without forking the script.
-
-    If a chat_server.py is already running with a recently-touched log
-    and no traceback (i.e. it's making download/load progress), this
-    function noop's so chat-keeper's 3-min ticks can't kill an
-    in-flight 5-10 min model pull. Pass ``force=True`` to override
-    (used by the king-rotation path which DOES need to interrupt
-    a stale download to switch model).
-    """
+    Falls back to the last persisted model if ``model_name`` is None.
+    Noop's if a chat_server.py is making progress (unless ``force=True``).
+    Exports any ``env`` dict from chat_pod.json into the launch shell."""
     state = read_chat_pod_state()
     if not state.get("host"):
         raise RuntimeError("chat pod is not configured; run `set --host ... --ssh-port ...` first")
@@ -317,15 +232,7 @@ def heal(model_name: str | None = None, *, source: str = "cli", force: bool = Fa
         _scp_args(state, str(chat_src), "/root/chat_server.py"),
         check=True, capture_output=True, text=True, timeout=30,
     )
-    # 2026-05-09: chat_server.py invokes vLLM with
-    # ``--reasoning-parser distil_kimi``. That parser is registered by
-    # ``_install_custom_reasoning_parser`` in chat_server.py — but
-    # ONLY if the parser source file exists at
-    # ``/root/distil_kimi_reasoning_parser.py`` when chat_server boots.
-    # On a freshly-provisioned pod the file isn't there, vLLM then dies
-    # with ``KeyError: Reasoning parser 'distil_kimi' not found.`` Sync
-    # it alongside chat_server.py so heal is self-contained on a fresh
-    # pod.
+    # Sync distil_kimi parser so a fresh pod has it before vLLM boots.
     parser_src = repo_root / "scripts" / "chat_pod" / "distil_kimi_reasoning_parser.py"
     if parser_src.exists():
         try:
@@ -342,17 +249,8 @@ def heal(model_name: str | None = None, *, source: str = "cli", force: bool = Fa
         logger.warning(f"distil_kimi_reasoning_parser.py not found at {parser_src}; skipping sync")
     app_port = int(state.get("app_port") or 8100)
     env_prefix = _format_env_exports(state.get("env") if isinstance(state.get("env"), dict) else None)
-    # Single SSH does the kill / launch / probe so we don't get caught by
-    # split-brain (kill-but-no-launch) if the second SSH fails. The kill is
-    # broad because vLLM v1 spawns a child that renames itself to
-    # ``VLLM::EngineCore`` and holds the GPU; only killing chat_server.py
-    # leaves the engine running and the next launch starves on memory.
-    # ``pkill -f`` matches against the *entire* command line, including its own
-    # ``bash -c`` invocation. A bare pattern like ``chat_server.py`` would
-    # match the SSH shell that's running this kill (because the pattern itself
-    # appears in argv), self-terminate, and SSH returns rc=255 with empty
-    # stderr — the chat king then never gets relaunched. Anchoring on
-    # ``^python`` filters to the actual python interpreter holding the model.
+    # Single SSH kills the VLLM::EngineCore worker + chat_server.py,
+    # then relaunches. ``^python`` anchor avoids the kill matching itself.
     cmd = (
         "set -e; "
         + env_prefix
