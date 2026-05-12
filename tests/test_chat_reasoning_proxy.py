@@ -1,3 +1,11 @@
+"""Tests for the thin transport layer in ``api/routes/chat.py``.
+
+The orchestration / tool-calling / Python-execution stack now lives in
+``api.agent_runner`` and is exercised by ``tests/test_agent_runner.py``.
+This file only verifies the bits ``chat.py`` is still responsible for:
+the per-turn audit-log helper, the chat-pod transport error mapping,
+and the request-payload normalizer. Anything more is a misplaced test."""
+
 import asyncio
 import os
 import sys
@@ -13,310 +21,7 @@ for path in (ROUTES, API, ROOT):
 import chat as chat_route  # noqa: E402
 
 
-def test_clean_client_messages_strips_displayed_thinking():
-    cleaned = chat_route._clean_client_messages(
-        [
-            {"role": "user", "content": "first"},
-            {
-                "role": "assistant",
-                "content": (
-                    "<think>Runtime trace, not hidden model reasoning: inspected "
-                    "the latest user request.</think>\nActual answer."
-                ),
-            },
-        ],
-        system="system prompt",
-    )
-
-    assert cleaned[-1] == {"role": "assistant", "content": "Actual answer."}
-
-
-def test_orchestrated_chat_returns_only_model_reasoning(monkeypatch):
-    async def fake_local_chat_post(_payload, *, timeout):
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": "final answer",
-                        "reasoning_content": "model-supplied thinking",
-                    }
-                }
-            ],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
-        }
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", fake_local_chat_post)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {"messages": [{"role": "user", "content": "hello"}]},
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert msg["content"] == "final answer"
-    assert msg["reasoning"] == "model-supplied thinking"
-    assert "Runtime trace" not in msg["reasoning"]
-
-
-def test_orchestrated_chat_omits_fake_reasoning_when_model_has_none(monkeypatch):
-    async def fake_local_chat_post(_payload, *, timeout):
-        return {"choices": [{"message": {"content": "final answer"}}]}
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", fake_local_chat_post)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {"messages": [{"role": "user", "content": "hello"}]},
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert msg["content"] == "final answer"
-    assert "reasoning" not in msg
-    assert "reasoning_content" not in msg
-
-
-def test_orchestrated_chat_passes_tool_results_to_model(monkeypatch):
-    captured = {}
-
-    async def fake_local_chat_post(payload, *, timeout):
-        captured["payload"] = payload
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": "The 32nd Fibonacci number is 2178309.",
-                    }
-                }
-            ]
-        }
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", fake_local_chat_post)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {"messages": [{"role": "user", "content": "what is the 2**5th fibonacci number"}]},
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert "2178309" in msg["content"]
-    assert msg["content"] == "The 32nd Fibonacci number is 2178309."
-    payload_msgs = captured["payload"]["messages"]
-    sys_msgs = [m for m in payload_msgs if m["role"] == "system"]
-    assert any("PYTHON_EXECUTION_RESULT" in m["content"] for m in sys_msgs), (
-        "tool results must be supplied to the model as authoritative context"
-    )
-    assert any("web search" in m["content"].lower() for m in sys_msgs), (
-        "system prompt must advertise the runtime tool capabilities"
-    )
-    assert any("internet access" in m["content"].lower() for m in sys_msgs)
-    assert "Tool trace:" in msg["reasoning"]
-
-
-def test_orchestrated_chat_falls_back_to_direct_answer_when_model_empty(monkeypatch):
-    async def empty_model(_payload, *, timeout):
-        return {"choices": [{"message": {"content": "   "}}]}
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", empty_model)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {"messages": [{"role": "user", "content": "run python: print(4**8)"}]},
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert "65536" in msg["content"]
-    assert "Tool trace:" in msg["reasoning"]
-    assert "deterministic" in msg["reasoning"]
-
-
-def test_orchestrated_chat_falls_back_when_model_says_no_internet(monkeypatch):
-    async def derailed_model(_payload, *, timeout):
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": "I'm sorry, I cannot do that.",
-                    }
-                }
-            ]
-        }
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", derailed_model)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {"messages": [{"role": "user", "content": "run python: print(4**8)"}]},
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert "65536" in msg["content"]
-    assert "deterministic" in msg["reasoning"]
-
-
-def test_orchestrated_chat_falls_back_when_model_hallucinates_fibonacci(monkeypatch):
-    async def hallucinating_model(_payload, *, timeout):
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": (
-                            "The 4^8th Fibonacci number is 1,024,000,000,000,000,000,000."
-                        )
-                    }
-                }
-            ]
-        }
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", hallucinating_model)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {"messages": [{"role": "user", "content": "what is the 2**5th fibonacci number"}]},
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert "2178309" in msg["content"]
-    assert "did not quote" in msg["reasoning"]
-
-
-def test_orchestrated_chat_executes_contextual_fibonacci_followup(monkeypatch):
-    captured = {}
-
-    async def hallucinating_model(payload, *, timeout):
-        captured["payload"] = payload
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": "[boxed{832}]",
-                    }
-                }
-            ]
-        }
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", hallucinating_model)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {
-                "messages": [
-                    {"role": "user", "content": "no 4^6th number"},
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "I'll interpret that as the (4^6)th number in the "
-                            "Fibonacci sequence. 4^6 = 4096."
-                        ),
-                    },
-                    {"role": "user", "content": "yes the 4096th number"},
-                ]
-            },
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert "index 4096" in msg["content"]
-    assert "It has 856 digits" in msg["content"]
-    assert "[boxed{832}]" not in msg["content"]
-    assert "did not quote" in msg["reasoning"]
-    sys_msgs = [m for m in captured["payload"]["messages"] if m["role"] == "system"]
-    assert any("PYTHON_EXECUTION_RESULT" in m["content"] for m in sys_msgs)
-
-
-def test_orchestrated_chat_executes_plain_arithmetic_without_keyword(monkeypatch):
-    async def empty_model(_payload, *, timeout):
-        return {"choices": [{"message": {"content": ""}}]}
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", empty_model)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {"messages": [{"role": "user", "content": "what is 4^6?"}]},
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert "4096" in msg["content"]
-    assert "Executed a arithmetic expression" in msg["reasoning"]
-
-
-def test_model_quoted_numeric_answer_helper():
-    assert chat_route._model_quoted_numeric_answer("F_32 is 2178309.", "Result: 2178309")
-    assert chat_route._model_quoted_numeric_answer(
-        "Result: 2178309",
-        "The Fibonacci index 32 result is 2,178,309.",
-    )
-    assert not chat_route._model_quoted_numeric_answer(
-        "Python stdout:\n285",
-        "The sum is 385. The runtime printed 285.",
-    )
-    assert not chat_route._model_quoted_numeric_answer(
-        "Result: 2178309",
-        "The number is 1,024,000,000,000.",
-    )
-    big_value = "26" + "0" * 13700 + "57"
-    assert chat_route._model_quoted_numeric_answer(
-        f"Result: {big_value}",
-        f"Approximately {big_value[:8]}…{big_value[-8:]}",
-    )
-    assert not chat_route._model_quoted_numeric_answer(
-        f"Result: {big_value}",
-        "Approximately 102400000000000000000.",
-    )
-
-
-def test_orchestrated_chat_promotes_inline_think_blocks(monkeypatch):
-    async def think_model(_payload, *, timeout):
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": (
-                            "<think>Let me compute step-by-step. 4 ** 8 = 65536.</think>"
-                            "The answer is 65536."
-                        )
-                    }
-                }
-            ]
-        }
-
-    monkeypatch.setattr(chat_route, "_local_chat_post", think_model)
-
-    data = asyncio.run(
-        chat_route._orchestrated_chat_completion(
-            {"messages": [{"role": "user", "content": "what is 4**8?"}]},
-            king_uid=1,
-            king_model="king/model",
-        )
-    )
-
-    msg = data["choices"][0]["message"]
-    assert msg["content"] == "The answer is 65536."
-    assert "Let me compute step-by-step" in msg["reasoning"]
-    assert "<think>" not in msg["content"]
-
+# ── Transport-error mapping ──────────────────────────────────────────────────
 
 def test_local_chat_post_maps_pool_timeout_to_unavailable(monkeypatch):
     """Regression for the 2026-05-09 Internal Server Error bug.
@@ -351,7 +56,9 @@ def test_local_chat_post_maps_pool_timeout_to_unavailable(monkeypatch):
         except chat_route._ChatPodUnavailable as e:
             assert exc.__class__.__name__ in str(e)
         else:
-            raise AssertionError(f"_local_chat_post did not convert {exc!r} to _ChatPodUnavailable")
+            raise AssertionError(
+                f"_local_chat_post did not convert {exc!r} to _ChatPodUnavailable"
+            )
 
 
 def test_local_chat_post_maps_5xx_response_to_unavailable(monkeypatch):
@@ -360,6 +67,7 @@ def test_local_chat_post_maps_5xx_response_to_unavailable(monkeypatch):
     is down on the next tick and triggers a recovery."""
     class _Resp:
         status_code = 503
+
         def json(self):  # pragma: no cover — should not be called
             return {}
 
@@ -373,73 +81,88 @@ def test_local_chat_post_maps_5xx_response_to_unavailable(monkeypatch):
     except chat_route._ChatPodUnavailable as e:
         assert "503" in str(e)
     else:
-        raise AssertionError("_local_chat_post did not surface 503 as _ChatPodUnavailable")
+        raise AssertionError(
+            "_local_chat_post did not surface 503 as _ChatPodUnavailable"
+        )
 
 
-def test_web_search_regex_triggers_on_time_sensitive_questions():
-    cases = [
-        "what's the bitcoin price right now?",
-        "current bitcoin price please",
-        "today's headlines on AI",
-        "latest news about openai",
-        "current weather in tokyo",
-        "btc price",
-        "what's happening today in the markets",
-        "what are today's top tech headlines?",
-        "find me a list of recent space launches",
-        "what's the price of ethereum right now?",
-    ]
-    for case in cases:
-        assert chat_route._WEB_SEARCH_RE.search(case), case
+# ── Payload normalizer ───────────────────────────────────────────────────────
+
+def test_normalize_chat_payload_pins_served_model_and_enables_thinking():
+    """Thinking must default ON so the chat reflects the king's actual
+    reasoning capability (matches the held-out benchmark and bench
+    axes). ``max_tokens`` defaults to 16 384 (16 K) — the v32.1
+    reasoning-uncap default — so the king's <think>...</think> chain
+    has full room to reason without truncation. The chat pod's vLLM
+    runs with max_model_len=32 768, so 16 K leaves ample headroom for
+    the prompt + thinking + answer. The served-model is pinned and a
+    formatting system prompt is injected if the client didn't supply
+    one."""
+    payload = {
+        "model": "client-supplied-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    out = chat_route._normalize_chat_payload(payload)
+    assert out["model"] == chat_route.CHAT_POD_SERVED_MODEL
+    assert out["chat_template_kwargs"]["enable_thinking"] is True
+    assert out["max_tokens"] == 16384
+    sys_msgs = [m for m in out["messages"] if m["role"] == "system"]
+    assert sys_msgs, "missing system formatting prompt was not injected"
 
 
-def test_web_search_regex_skips_general_questions():
-    not_search = [
-        "tell me about bittensor subnet 97",
-        "explain transformers in simple terms",
-        "write me a haiku about clouds",
-    ]
-    for case in not_search:
-        assert not chat_route._WEB_SEARCH_RE.search(case), case
+def test_normalize_chat_payload_honours_explicit_thinking_off():
+    """A client that explicitly opts out of thinking (low-latency
+    use cases) must still get the no-think rendering."""
+    payload = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    out = chat_route._normalize_chat_payload(payload)
+    assert out["chat_template_kwargs"]["enable_thinking"] is False
 
 
-def test_parse_duckduckgo_html_extracts_titles_and_snippets():
-    body = """
-    <div class="result"><h2 class="result__title">
-      <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.example%2Fbtc">
-        Bitcoin price today
-      </a>
-    </h2>
-      <a class="result__snippet" href="...">Bitcoin is currently $81,491.41 USD.</a>
-    </div>
-    <div class="result"><h2 class="result__title">
-      <a class="result__a" href="https://b.example/news">Tech news</a>
-    </h2>
-    <div class="result__snippet">Top tech stories today.</div>
-    </div>
-    """
-    rendered = chat_route._parse_duckduckgo_html(body, query="btc", limit=5)
-    assert "Bitcoin price today" in rendered
-    assert "https://a.example/btc" in rendered
-    assert "$81,491.41" in rendered
-    assert "Tech news" in rendered
-    assert "Top tech stories today" in rendered
+def test_normalize_chat_payload_preserves_existing_system_prompt():
+    """If the client supplies a system prompt we must not stomp on it."""
+    payload = {
+        "messages": [
+            {"role": "system", "content": "BE TERSE."},
+            {"role": "user", "content": "hi"},
+        ],
+        "max_tokens": 256,
+    }
+    out = chat_route._normalize_chat_payload(payload)
+    sys_msgs = [m for m in out["messages"] if m["role"] == "system"]
+    assert len(sys_msgs) == 1
+    assert sys_msgs[0]["content"] == "BE TERSE."
+    assert out["max_tokens"] == 256
 
 
-def test_think_stream_splitter_handles_split_chunks():
-    splitter = chat_route._ThinkStreamSplitter()
-    visibles, reasonings = [], []
-    for chunk in ["Hello <thi", "nk>step one ", "step two</think>final ", "answer"]:
-        v, r = splitter.feed(chunk)
-        visibles.append(v)
-        reasonings.append(r)
-    v_tail, r_tail = splitter.flush()
-    visible_total = "".join(visibles) + v_tail
-    reasoning_total = "".join(reasonings) + r_tail
-    assert visible_total.strip() == "Hello final answer"
-    assert "step one" in reasoning_total
-    assert "step two" in reasoning_total
-    # The splitter must not leak the literal tags into either stream.
-    assert "<think" not in visible_total
-    assert "</think>" not in reasoning_total
-    assert "<think" not in reasoning_total
+# ── Audit log: repeated-substring detector ───────────────────────────────────
+
+def test_detect_repeated_substring_finds_duplicates():
+    repeats = chat_route._detect_repeated_substring("abc" * 200)
+    assert repeats > 0
+
+
+def test_detect_repeated_substring_handles_short_input():
+    assert chat_route._detect_repeated_substring("") == 0
+    assert chat_route._detect_repeated_substring("short") == 0
+
+
+def test_extract_message_content_promotes_thinking_when_content_empty():
+    """Some vLLM builds emit an empty `content` and stuff the answer
+    into `reasoning` instead. The transport helper must surface that
+    as the visible content so the user is not left with nothing."""
+    content, thinking = chat_route._extract_message_content(
+        {"content": "", "reasoning": "the answer is 42"}
+    )
+    assert content == "the answer is 42"
+    assert thinking is None
+
+
+def test_extract_message_content_keeps_thinking_when_content_present():
+    content, thinking = chat_route._extract_message_content(
+        {"content": "the answer is 42", "reasoning": "step-by-step trace"}
+    )
+    assert content == "the answer is 42"
+    assert thinking == "step-by-step trace"
