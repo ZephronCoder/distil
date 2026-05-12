@@ -97,6 +97,87 @@ _chat_http_client: httpx.AsyncClient | None = None
 _chat_http_lock = threading.Lock()
 
 
+_CHAT_MODEL_MAX_LEN = int(os.environ.get("DISTIL_CHAT_MODEL_MAX_LEN", "32768"))
+_CHAT_AGENT_OVERHEAD_TOKENS = int(
+    os.environ.get("DISTIL_CHAT_AGENT_OVERHEAD_TOKENS", "2048")
+)
+_CHAT_MIN_OUTPUT_TOKENS = int(
+    os.environ.get("DISTIL_CHAT_MIN_OUTPUT_TOKENS", "256")
+)
+
+
+def _estimate_input_tokens(messages):
+    """Cheap upper-bound token estimate for the chat-king context budget.
+
+    Assumes ~3 chars/token (correct order of magnitude for English; a
+    hair pessimistic for code-heavy text where BPE splits punctuation
+    aggressively) and adds 8 tokens of per-message chat-template
+    overhead. We deliberately avoid shipping a tokenizer in the API
+    process -- the clamp's job is to keep us under the hard 32 K vLLM
+    limit, not to be exact.
+    """
+    total = 0
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += max(1, len(content) // 3)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text", "") or ""
+                    if isinstance(text, str):
+                        total += max(1, len(text) // 3)
+        total += 8
+    return total
+
+
+def _clamp_for_context_budget(
+    messages,
+    max_tokens,
+    *,
+    model_max_len=_CHAT_MODEL_MAX_LEN,
+    overhead=_CHAT_AGENT_OVERHEAD_TOKENS,
+    floor=_CHAT_MIN_OUTPUT_TOKENS,
+):
+    """Trim oldest non-system messages and lower ``max_tokens`` so
+    ``input + output + overhead`` stays under ``model_max_len``.
+
+    The chat pod runs vLLM with ``max_model_len=32768`` and the agent
+    harness layers ~1.5 K tokens of system-prompt + tool-definition
+    overhead on top of the raw messages. Without this clamp, a
+    multi-turn dashboard session that grew past ~30 K input tokens
+    would 400 with ``maximum context length is 32768 tokens``. We
+    preserve every system message and the most recent non-system turn
+    (user's current question) and only drop history in between.
+
+    Returns ``(trimmed_messages, clamped_max_tokens)``.
+    """
+    msgs = list(messages or [])
+    available = max(floor + 1, model_max_len - overhead)
+    estimated = _estimate_input_tokens(msgs)
+    while estimated + floor > available and len(msgs) > 1:
+        idx = next(
+            (
+                i
+                for i, m in enumerate(msgs)
+                if isinstance(m, dict) and m.get("role") != "system"
+            ),
+            None,
+        )
+        if idx is None or idx == len(msgs) - 1:
+            break
+        msgs.pop(idx)
+        estimated = _estimate_input_tokens(msgs)
+    budget = max(floor, available - estimated)
+    try:
+        requested = int(max_tokens)
+    except (TypeError, ValueError):
+        requested = budget
+    return msgs, max(floor, min(requested, budget))
+
+
 def _get_http_client() -> httpx.AsyncClient:
     """Return the module-level pooled httpx client, creating it on first use."""
     global _chat_http_client
@@ -543,10 +624,6 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    # 2026-05-11 (uncap reasoning): default 16 K, ceiling 30 K. The chat
-    # pod runs vLLM with ``max_model_len=32768``; the ceiling leaves a
-    # 2 K floor for the prompt so vLLM never 400's. Reasoning model =
-    # we want the chain-of-thought to use as much budget as it needs.
     max_tokens = body.get("max_tokens", 16384)
     try:
         max_tokens = min(int(max_tokens), 30720)
@@ -570,6 +647,7 @@ async def chat_with_king(request: Request):
             )
     if not isinstance(max_tokens, (int, float)) or max_tokens < 1:
         max_tokens = 16384
+    messages, max_tokens = _clamp_for_context_budget(messages, max_tokens)
     temperature = body.get("temperature", 0.7)
     if not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2:
         temperature = 0.7
@@ -744,6 +822,12 @@ async def openai_chat_completions(request: Request):
     king_uid, king_model = _get_king_info()
     if king_uid is None:
         return JSONResponse(status_code=503, content={"error": {"message": "no king model available"}})
+
+    requested_max = body.get("max_tokens", 16384)
+    trimmed_msgs, clamped_max = _clamp_for_context_budget(messages, requested_max)
+    body["messages"] = trimmed_msgs
+    body["max_tokens"] = clamped_max
+    messages = trimmed_msgs
 
     stream = body.get("stream", False)
     try:

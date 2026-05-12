@@ -166,3 +166,72 @@ def test_extract_message_content_keeps_thinking_when_content_present():
     )
     assert content == "the answer is 42"
     assert thinking == "step-by-step trace"
+
+
+def test_estimate_input_tokens_string_content():
+    msgs = [{"role": "user", "content": "abcabcabc"}]
+    assert chat_route._estimate_input_tokens(msgs) == (9 // 3) + 8
+
+
+def test_estimate_input_tokens_handles_multimodal_parts():
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "abcabc"},
+            {"type": "text", "text": "xyzxyz"},
+        ]},
+    ]
+    assert chat_route._estimate_input_tokens(msgs) == (6 // 3) + (6 // 3) + 8
+
+
+def test_clamp_passes_small_payload_through():
+    msgs = [
+        {"role": "system", "content": "be concise"},
+        {"role": "user", "content": "hi"},
+    ]
+    trimmed, clamped = chat_route._clamp_for_context_budget(msgs, 1024)
+    assert trimmed == msgs
+    assert clamped == 1024
+
+
+def test_clamp_lowers_max_tokens_for_long_input():
+    big_user = "x" * (28000 * 3)
+    msgs = [{"role": "user", "content": big_user}]
+    trimmed, clamped = chat_route._clamp_for_context_budget(msgs, 16384)
+    assert trimmed == msgs, "single-turn message must never be dropped"
+    estimated = chat_route._estimate_input_tokens(msgs)
+    overhead = chat_route._CHAT_AGENT_OVERHEAD_TOKENS
+    assert estimated + clamped + overhead <= chat_route._CHAT_MODEL_MAX_LEN
+    assert clamped >= chat_route._CHAT_MIN_OUTPUT_TOKENS
+
+
+def test_clamp_trims_oldest_history_when_needed():
+    sys_msg = {"role": "system", "content": "system rules"}
+    big = "x" * (8000 * 3)
+    msgs = [
+        sys_msg,
+        {"role": "user", "content": big},
+        {"role": "assistant", "content": big},
+        {"role": "user", "content": big},
+        {"role": "assistant", "content": big},
+        {"role": "user", "content": "what did I just ask?"},
+    ]
+    trimmed, _ = chat_route._clamp_for_context_budget(msgs, 4096)
+    assert trimmed[0] is sys_msg, "system prompt must always survive"
+    assert trimmed[-1] == msgs[-1], "latest user turn must always survive"
+    assert len(trimmed) < len(msgs), "stale history must be dropped"
+
+
+def test_clamp_never_drops_only_user_message():
+    huge = "x" * (60000 * 3)
+    msgs = [{"role": "user", "content": huge}]
+    trimmed, clamped = chat_route._clamp_for_context_budget(msgs, 16384)
+    assert trimmed == msgs
+    assert clamped == chat_route._CHAT_MIN_OUTPUT_TOKENS
+
+
+def test_clamp_handles_invalid_max_tokens():
+    msgs = [{"role": "user", "content": "hi"}]
+    _, c1 = chat_route._clamp_for_context_budget(msgs, None)
+    _, c2 = chat_route._clamp_for_context_budget(msgs, "abc")
+    assert c1 == c2
+    assert c1 >= chat_route._CHAT_MIN_OUTPUT_TOKENS
