@@ -129,6 +129,29 @@ def test_resolve_falls_back_to_network_when_cache_miss():
     assert len(seen) == 2
     assert seen[0][2].get("local_files_only") is True
     assert "local_files_only" not in seen[1][2]
+    patterns = seen[1][2].get("allow_patterns")
+    assert patterns is not None
+    assert "tokenizer*" in patterns and "*.json" in patterns
+    for forbidden in ("*.safetensors", "*.bin", "*.pt"):
+        assert forbidden not in patterns
+
+
+def test_resolve_full_snapshot_when_tokenizer_only_disabled():
+    mod = _load_pod_eval_vllm()
+    seen = []
+    def _fake(name, **kwargs):
+        seen.append(("call", name, dict(kwargs)))
+        if kwargs.get("local_files_only"):
+            raise FileNotFoundError("not in cache")
+        return "/cache/snap/full"
+    fake_pkg = types.ModuleType("huggingface_hub")
+    fake_pkg.snapshot_download = _fake
+    with mock.patch.dict(sys.modules, {"huggingface_hub": fake_pkg}):
+        out = mod.resolve_local_snapshot_path(
+            "moonshotai/Kimi-K2.6", tokenizer_only=False
+        )
+    assert out == "/cache/snap/full"
+    assert "allow_patterns" not in seen[1][2]
 
 
 def test_resolve_returns_original_when_both_paths_fail(capsys):

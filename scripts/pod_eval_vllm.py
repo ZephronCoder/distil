@@ -629,28 +629,38 @@ def prefetch_model(name, revision=None, max_retries=3):
                 return
 
 
-def resolve_local_snapshot_path(name, revision=None):
-    """Return the local snapshot directory for ``name`` if it's an HF repo,
-    or ``name`` itself if it's already a local path.
+_TOKENIZER_ONLY_PATTERNS = [
+    "tokenizer*",
+    "tokenization_*.py",
+    "*.json",
+    "*.txt",
+    "*.model",
+    "tiktoken*",
+    "vocab*",
+    "merges*",
+    "special_tokens*",
+    "added_tokens*",
+    "chat_template*",
+]
 
-    Why we need this: the Kimi K2.6 ``tokenization_kimi_fast.py``
-    (snapshot 81bcaaa, May 11) requires ``model_root`` to be a local
-    directory containing ``tokenizer.json`` + ``tiktoken.model`` —
-    passing the bare HF repo name (``moonshotai/Kimi-K2.6``) makes its
-    ``__init__`` raise ``ValueError: Missing tokenizer files under:
-    moonshotai/Kimi-K2.6`` because it does ``os.path.join(model_root,
-    "tokenizer.json")`` and the result is not a real file.
 
-    This helper resolves the repo to its cached snapshot path so the
-    custom tokenizer's local-file check passes. We use
-    ``local_files_only=True`` first (fast path; the eval pod prefetches
-    everything in the bootstrap step), then fall back to a network
-    download. If anything fails we return the original name so
-    ``from_pretrained`` follows its normal HF path.
+def resolve_local_snapshot_path(name, revision=None, tokenizer_only=True):
+    """Return the local snapshot directory for an HF repo (or pass through
+    a local path).
+
+    Default ``tokenizer_only=True`` restricts the network fallback to
+    tokenizer + config files. This avoids accidentally pulling 595 GB of
+    Kimi K2.6 weights onto an 80 GB pod volume when the caller only
+    needs ``AutoTokenizer.from_pretrained`` to succeed (i.e. the entire
+    API-teacher path). Pass ``tokenizer_only=False`` only when the
+    caller actually needs the full snapshot, e.g. local-vLLM teacher
+    mode where ``start_vllm_server`` will load the weights itself.
+
+    The local-cache hit (``local_files_only=True``) is unrestricted so
+    that an existing complete snapshot is reused as-is.
     """
     if not name:
         return name
-    # Already a local path? Skip resolution.
     if os.path.isdir(name):
         return name
     try:
@@ -660,12 +670,15 @@ def resolve_local_snapshot_path(name, revision=None):
     rev_kwargs = {}
     if revision and revision != "main":
         rev_kwargs["revision"] = revision
+    dl_kwargs = dict(rev_kwargs)
+    if tokenizer_only:
+        dl_kwargs["allow_patterns"] = _TOKENIZER_ONLY_PATTERNS
     try:
         return snapshot_download(name, local_files_only=True, **rev_kwargs)
     except Exception:
         pass
     try:
-        return snapshot_download(name, **rev_kwargs)
+        return snapshot_download(name, **dl_kwargs)
     except Exception as exc:
         print(
             f"  [resolve_snapshot] {name}: snapshot_download failed "
