@@ -40,12 +40,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-# Pod-side helpers. ``pod_session.upload_aux_modules`` uploads every
-# ``scripts/eval_*.py`` alongside this script, so the validator path
-# (``scripts.eval_*``) and the pod path (flat ``eval_*``) are both real.
-# We don't keep inline fallback copies: if both arms fail, dozens of
-# other imports also fail and a loud ImportError is more useful than a
-# silent stale duplicate.
+# Pod-side helpers. ``upload_aux_modules`` uploads every ``scripts/eval_*.py``
+# alongside this script so both ``scripts.eval_*`` and flat ``eval_*`` resolve.
 try:
     from scripts.eval_benchmarks import (
         NOISE_PERTURBATION_TEMPLATES,
@@ -81,16 +77,8 @@ try:
 except ImportError:
     from eval_policy import policy_metadata  # type: ignore
 
-# 2026-05-04: Suppress the spammy ``GenerationMixin`` warning that
-# transformers emits on EVERY ``model.generate()`` call when both
-# ``max_new_tokens`` and ``max_length`` are present in the merged
-# ``GenerationConfig``. We always pass ``max_new_tokens`` explicitly
-# (which takes precedence) and don't care about the ``max_length``
-# inherited from ``config.json``. Without this filter every probe
-# floods the eval log with ~50 identical lines per student, drowning
-# out the actual progress markers that the dashboard parses. The
-# filter is scoped tightly so any *new* generation warning still
-# surfaces.
+# Suppress the spammy ``max_new_tokens`` + ``max_length`` warning so
+# dashboard progress parsing isn't drowned out. Scoped tightly.
 import logging
 import warnings
 warnings.filterwarnings(
@@ -123,31 +111,19 @@ HF_CHUNK_SIZE = 4096        # Chunk size for KV-cached forward on long sequences
 MIN_COMPLETION_TOKENS = 10  # Skip prompts producing fewer continuation tokens
 
 # -- KL computation --
-# Uses F.kl_div(log_target=True) which is mathematically identical to
-# sum(P * (log P - log Q)) but lets PyTorch fuse the kernel internally.
-# Chunked over positions to reduce peak memory (~4x less for 512-pos sequences).
-# Credit: caseus (github.com/winglian) for the optimization.
+# F.kl_div(log_target=True) fused, chunked over positions for ~4x lower peak.
 KL_CHUNK_SIZE = 128
 
 # -- Activation fingerprinting (functional copy detection) --
-# 2026-04-29: vocab size is teacher-tokenizer-specific (Qwen=248320,
-# Kimi/GLM/etc would differ on swap). Read from env so the planned
-# teacher swap doesn't require a code change here. Default still
-# matches Qwen3.5 for backward compatibility.
+# Vocab size is teacher-tokenizer-specific; override via env on teacher swap.
 ACTIVATION_FP_SEED = 42
 ACTIVATION_FP_N_INPUTS = 5
 ACTIVATION_FP_SEQ_LEN = 64
 
-# Module-level teacher name. Populated once by main() after parsing
-# --teacher so helpers like load_model() can decide whether to enable
-# trust_remote_code without re-parsing args every call. Empty string
-# means "not yet set"; downstream code falls back to env / heuristic.
+# Set by main() after --teacher parsing; empty string => not yet set.
 TEACHER_NAME = ""
 def _default_fp_vocab() -> int:
-    """Return the teacher's ``configVocabSize`` as the activation-fingerprint
-    vocab default. Falls back to Qwen3.5's 248320 if the subnet-config can't
-    be imported (e.g. this script running outside the validator venv).
-    """
+    """Teacher's configVocabSize for activation-fingerprint; falls back to 248320."""
     try:
         from eval.runtime import TEACHER_CONFIG_VOCAB_SIZE as _v
         return int(_v)
@@ -155,7 +131,7 @@ def _default_fp_vocab() -> int:
         return 248320
 ACTIVATION_FP_VOCAB_SIZE = int(
     os.environ.get("ACTIVATION_FP_VOCAB_SIZE") or _default_fp_vocab()
-)  # derives from subnet-config.json; override via env for testing
+)
 
 # -- vLLM server --
 VLLM_PORT = 9100
@@ -302,18 +278,10 @@ def _pod_detect_safetensors_quantization(model_repo, revision=None):
 
 
 def free_gpu():
-    """Free GPU memory: garbage collect, empty cache, synchronize.
+    """gc.collect + empty_cache + ipc_collect + synchronize.
 
-    All CUDA calls are wrapped in try/except so that a previously-raised
-    device-side assertion (which poisons the CUDA context for the rest
-    of the process) cannot propagate out of cleanup and kill main(). A
-    poisoned context will fail every subsequent CUDA op anyway; surfacing
-    that as an unrecoverable exception here loses the eval results for
-    every still-pending student. We swallow the errors and let the
-    higher-level loop quarantine remaining students cleanly. See
-    distil-97 incident 2026-05-04: one student's vocab-OOB embed crash
-    killed the whole pod_eval process via free_gpu.empty_cache.
-    """
+    Each CUDA call is try/except'd because a poisoned context from an earlier
+    device-side assertion would otherwise propagate through cleanup."""
     try:
         gc.collect()
     except Exception:
@@ -659,6 +627,53 @@ def prefetch_model(name, revision=None, max_retries=3):
             else:
                 print(f"  [prefetch] {name} failed: {e}", flush=True)
                 return
+
+
+def resolve_local_snapshot_path(name, revision=None):
+    """Return the local snapshot directory for ``name`` if it's an HF repo,
+    or ``name`` itself if it's already a local path.
+
+    Why we need this: the Kimi K2.6 ``tokenization_kimi_fast.py``
+    (snapshot 81bcaaa, May 11) requires ``model_root`` to be a local
+    directory containing ``tokenizer.json`` + ``tiktoken.model`` —
+    passing the bare HF repo name (``moonshotai/Kimi-K2.6``) makes its
+    ``__init__`` raise ``ValueError: Missing tokenizer files under:
+    moonshotai/Kimi-K2.6`` because it does ``os.path.join(model_root,
+    "tokenizer.json")`` and the result is not a real file.
+
+    This helper resolves the repo to its cached snapshot path so the
+    custom tokenizer's local-file check passes. We use
+    ``local_files_only=True`` first (fast path; the eval pod prefetches
+    everything in the bootstrap step), then fall back to a network
+    download. If anything fails we return the original name so
+    ``from_pretrained`` follows its normal HF path.
+    """
+    if not name:
+        return name
+    # Already a local path? Skip resolution.
+    if os.path.isdir(name):
+        return name
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        return name
+    rev_kwargs = {}
+    if revision and revision != "main":
+        rev_kwargs["revision"] = revision
+    try:
+        return snapshot_download(name, local_files_only=True, **rev_kwargs)
+    except Exception:
+        pass
+    try:
+        return snapshot_download(name, **rev_kwargs)
+    except Exception as exc:
+        print(
+            f"  [resolve_snapshot] {name}: snapshot_download failed "
+            f"({type(exc).__name__}: {str(exc)[:120]}); falling back "
+            f"to bare repo name (custom tokenizer may still fail)",
+            flush=True,
+        )
+        return name
 
 
 def clean_model_cache(name, teacher_name=None):
@@ -3696,33 +3711,12 @@ def _build_legacy_word_pool(n: int = 64) -> tuple[str, ...]:
 _PROC_CAPABILITY_WORD_POOL: tuple[str, ...] = _build_legacy_word_pool()
 
 
-# ── 2026-04-29 (v29.6) — Procedural CHAT-PROMPT synthesiser ────────────
-#
-# Replaces the legacy ``ON_POLICY_RKL_POOL`` / ``JUDGE_PROBE_POOL`` /
-# ``CHAT_TURNS_PROBE_POOL`` static pools (88 + ~65 + ~25 entries
-# respectively) that miners could pre-train against. Each per-round
-# probe now synthesises fresh chat-style prompts from procedural
-# templates whose slots are filled by combinations of:
-#
-#   * procedural topic noun-phrases (procedural adj + noun + suffix)
-#   * procedural opener sentences (subject + verb + object + clause)
-#   * procedural character names + actions
-#   * a small REAL-WORD lexicon for slots that need semantic anchoring:
-#     audiences, aspects, languages, styles, tasks (the model needs
-#     these to interpret the prompt meaningfully — pseudo-words would
-#     break grading)
-#
-# Combinatorial space: ~12 template families × per-template slot
-# multiplicity × procedural slots ⇒ effectively unbounded surface
-# rotation. The teacher's rubric grading still applies because the
-# templates are coherent, grammatical, and call for a clear response;
-# the teacher grades on RESPONSE QUALITY (rubric-1-5) rather than
-# specific factual knowledge of the procedural topic.
-
-# Real-word lexicons. Kept fixed because the model needs these as
-# semantic anchors to interpret the prompt. Combinatorial composition
-# with procedural slots makes the prompt-LEVEL surface form effectively
-# uncacheable.
+# Procedural chat-prompt synthesiser (v29.6) replaces legacy static
+# prompt pools (memorisable). Templates combine procedural topics/openers
+# /characters with a small real-word lexicon for semantic anchoring.
+# Teacher grades on response quality (rubric 1-5), not topic facts.
+# Real-word lexicons below are fixed (model needs them to interpret); the
+# combinatorial composition keeps the prompt surface form uncacheable.
 _CHAT_AUDIENCES = (
     "a curious child", "a beginner", "an experienced engineer",
     "a careful student", "a busy professional", "a high-school class",
@@ -4678,87 +4672,48 @@ BENCH_SELF_CONSISTENCY_TOPP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TOPP"
 # Muted axes (env-addressable for emergency rollback).
 BENCH_ARC_PER_ROUND = int(os.environ.get("BENCH_ARC_PER_ROUND", "0"))
 BENCH_TRUTHFUL_PER_ROUND = int(os.environ.get("BENCH_TRUTHFUL_PER_ROUND", "0"))
-# Long-context needle-in-haystack (~1400 input tokens per item).
+# Long-context needle-in-haystack (~1400 input tokens, 60 distractors).
+# Confusers force entity-matched retrieval over regex; capped at
+# len(_LC_NEEDLE_TEMPLATES)-1 at runtime so one template stays real.
+# 40% multi-needle items require retrieve-2-and-combine.
 BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "4"))
-# 60 distractor facts (~30 tokens each) + needle + question.
 BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "60"))
-# 6 confuser needles force genuine entity-matched retrieval rather than
-# regex-matching any all-caps code in the doc. Capped at
-# len(_LC_NEEDLE_TEMPLATES)-1 at runtime to leave one template real.
 BENCH_LC_N_CONFUSERS = int(os.environ.get("BENCH_LC_N_CONFUSERS", "6"))
-# 2026-04-29 (v29.2): fraction of items that are MULTI-NEEDLE — model
-# must retrieve 2-3 distinct needles and combine (sum / compare /
-# concatenate). Default 0.4 means 40 % multi-needle items per round; the
-# remaining 60 % are single-needle (legacy, kept as a difficulty floor).
 BENCH_LC_MULTI_FRACTION = float(os.environ.get("BENCH_LC_MULTI_FRACTION", "0.4"))
-# Session 3.6 (added 2026-04-25): block-seeded procedural tasks mixing
-# arithmetic reasoning, instruction following, and invented-fact retrieval.
-# This is intentionally synthetic: there is no public pool to memorize, but
-# solving it requires the same skills miners should train for.
-# Muted in v28 — duplicates capability + math_bench after the v27
-# procedural rewrite. Kept env-addressable for emergency rollback.
+# Muted: subsumed by capability + math_bench / robustness_bench.
 BENCH_PROCEDURAL_PER_ROUND = int(os.environ.get("BENCH_PROCEDURAL_PER_ROUND", "0"))
-# Session 3.7 (added 2026-04-25): robustness_bench. Same items as
-# ``math_bench`` (independent stream so we usually pick *different* items
-# than the canonical math probe), but each item is asked under K
-# block-rotated paraphrase wrappers. A model that overfits the canonical
-# wording of public math items will pass math_bench and fail this — the
-# axis directly punishes prompt-pattern memorization without re-evaling
-# anyone. Pure string transforms, no LLM call required.
-# 2026-04-26 (v28) — robustness now absorbs the noise_resistance signal
-# under one umbrella. Per-round count bumped 4 → 6 to keep statistical
-# power across both perturbation families (paraphrase + surface noise),
-# weight 0.04 → 0.07.
+# robustness_bench: math items under K paraphrase OR surface-noise
+# wrappers per round; punishes prompt-pattern memorisation without
+# re-evaling anyone. Absorbs the old noise_resistance signal (muted).
 BENCH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_ROBUSTNESS_PER_ROUND", "6"))
 BENCH_ROBUSTNESS_PERTURB_K = int(os.environ.get("BENCH_ROBUSTNESS_PERTURB_K", "2"))
-# Session 3.7 (added 2026-04-25): noise_resistance_bench. Sibling of
-# ``robustness_bench``; same pool (alias of math) but the perturbations
-# are *adversarial input noise* — typos, case jitter, extra whitespace,
-# distractor chatter, common misspellings — rather than semantic
-# paraphrase. Designed so a model overfit to clean canonical wordings
-# of public math items breaks under realistic chat-noise distribution
-# shift. Pure string transforms (no LLM call), block-seeded rotation,
-# answer-extraction-safe (we never touch digits/operators).
-# Muted in v28. The noise resistance signal is now sampled inside
-# robustness_bench's expanded perturbation menu (paraphrase OR surface
-# noise per item, block-rotated) so we don't pay for the same items
-# twice. Kept env-addressable for emergency rollback.
 BENCH_NOISE_PER_ROUND = int(os.environ.get("BENCH_NOISE_PER_ROUND", "0"))
 BENCH_NOISE_PERTURB_K = int(os.environ.get("BENCH_NOISE_PERTURB_K", "2"))
-# v29.2 (2026-04-29) — debug_bench. Procedural buggy-code items, model
-# must emit a corrected function. Tests real-world coding skill
-# (debugging) which code_bench (write-from-scratch) does not measure.
-# Start at 6 items per round; ratchet based on saturation telemetry.
+# Procedural buggy-code -> corrected function (read/fix skill complements
+# code_bench's write-from-scratch).
 BENCH_DEBUG_PER_ROUND = int(os.environ.get("BENCH_DEBUG_PER_ROUND", "6"))
-BENCH_DEBUG_MAX_TOKENS = int(os.environ.get("BENCH_DEBUG_MAX_TOKENS", "512"))
-# v29.4 (2026-04-29) — correction_bench. Procedural buggy-code +
-# explicit error trace; model emits the corrected function. Tests the
-# read→run→see-error→fix workflow specifically. Same item shape as
-# debug_bench so humaneval_sandbox runs unchanged. 6 items per round,
-# weight 0.05.
+BENCH_DEBUG_MAX_TOKENS = int(os.environ.get("BENCH_DEBUG_MAX_TOKENS", "16384"))
+# Same shape as debug_bench but with an explicit error trace (tests the
+# read->run->see-error->fix workflow).
 BENCH_CORRECTION_PER_ROUND = int(os.environ.get("BENCH_CORRECTION_PER_ROUND", "6"))
-BENCH_CORRECTION_MAX_TOKENS = int(os.environ.get("BENCH_CORRECTION_MAX_TOKENS", "512"))
-# v29.4 — multi_doc_synthesis_bench. Procedural fact cards + cross-card
-# question. Tests info integration across discrete sources.
+BENCH_CORRECTION_MAX_TOKENS = int(os.environ.get("BENCH_CORRECTION_MAX_TOKENS", "16384"))
+# Procedural fact cards + cross-card question (info synthesis).
 BENCH_MULTI_DOC_PER_ROUND = int(os.environ.get("BENCH_MULTI_DOC_PER_ROUND", "6"))
 BENCH_MULTI_DOC_N_CARDS = int(os.environ.get("BENCH_MULTI_DOC_N_CARDS", "4"))
-BENCH_MULTI_DOC_MAX_TOKENS = int(os.environ.get("BENCH_MULTI_DOC_MAX_TOKENS", "64"))
-# v29.4 — calibration_bench. Mix solvable + intentionally unsolvable
-# items; reward correct answers AND correct refusals. Discourages
-# confabulation.
+BENCH_MULTI_DOC_MAX_TOKENS = int(os.environ.get("BENCH_MULTI_DOC_MAX_TOKENS", "16384"))
+# Mix solvable + unsolvable items; reward correct answers AND refusals.
 BENCH_CALIBRATION_PER_ROUND = int(os.environ.get("BENCH_CALIBRATION_PER_ROUND", "12"))
 BENCH_CALIBRATION_UNSOLVABLE_FRACTION = float(
     os.environ.get("BENCH_CALIBRATION_UNSOLVABLE_FRACTION", "0.5"),
 )
-BENCH_CALIBRATION_MAX_TOKENS = int(os.environ.get("BENCH_CALIBRATION_MAX_TOKENS", "96"))
-# v29.4 — refactor_bench. Working code + style constraint, AST-graded.
-# Tests refactoring skill (preserve behavior + improve form).
+BENCH_CALIBRATION_MAX_TOKENS = int(os.environ.get("BENCH_CALIBRATION_MAX_TOKENS", "16384"))
+# Working code + style constraint, AST-graded (refactor: preserve behavior).
 BENCH_REFACTOR_PER_ROUND = int(os.environ.get("BENCH_REFACTOR_PER_ROUND", "4"))
-BENCH_REFACTOR_MAX_TOKENS = int(os.environ.get("BENCH_REFACTOR_MAX_TOKENS", "512"))
+BENCH_REFACTOR_MAX_TOKENS = int(os.environ.get("BENCH_REFACTOR_MAX_TOKENS", "16384"))
 # v30 — pragmatic_bench (theory-of-mind / scalar implicature / indirect
 # request). Procedural items, open-ended generation with regex match.
 BENCH_PRAGMATIC_PER_ROUND = int(os.environ.get("BENCH_PRAGMATIC_PER_ROUND", "8"))
-BENCH_PRAGMATIC_MAX_TOKENS = int(os.environ.get("BENCH_PRAGMATIC_MAX_TOKENS", "64"))
+BENCH_PRAGMATIC_MAX_TOKENS = int(os.environ.get("BENCH_PRAGMATIC_MAX_TOKENS", "16384"))
 
 # ── v31 procedural axes ────────────────────────────────────────────────
 # Each v31 axis defaults to PER_ROUND=0 (axis disabled) so the change is
@@ -4781,51 +4736,84 @@ BENCH_PRAGMATIC_MAX_TOKENS = int(os.environ.get("BENCH_PRAGMATIC_MAX_TOKENS", "6
 # eval, more confidence", and the variance audit (see
 # reports/2026-05-10-variance-reduction.md) confirmed n=8 axes were the
 # top variance contributors.
+# 2026-05-11 (v32.1 reasoning uncap): user asked "why are we capping
+# reasoning at all? why not make it uncapped so the model can be the
+# best that it can be." So every capability axis is bumped to 16 384
+# tokens — the chat pod's effective budget — so the king's
+# ``<think>...</think>`` chain never truncates mid-reason on any
+# capability axis. The eval pod's vLLM ``--max-model-len`` was bumped
+# to 32 K (matches chat pod) so prompt + 16 K output always fits even
+# for the long-context axes (RULER, KG, multi_doc — those have
+# 4-8 K prompts). Long-context axes that already had short prompts
+# stay at the higher cap because the headroom is free.
+#
+# Why 16 K and not "infinite": vLLM still enforces ``max_model_len``,
+# so the request 400's if prompt+output exceed the context window.
+# 16 K leaves >= 16 K for the prompt on all axes (worst case is
+# 8 K-prompt RULER + 16 K output = 24 K, well under the 32 K budget).
+#
+# Cost: each axis can now use ~10× more tokens than the v32 baseline.
+# Empirically the model uses 2-4 K of reasoning when it has room, so
+# the realised cost is more like 2× — well within the round timeout
+# (POD_PER_MODEL_TIMEOUT, set in the validator) and a fair price for
+# accurate scores. See paper/off_policy_cot_collapse.md for the
+# Goodhart argument: capping reasoning artificially compresses the
+# capability gap and rewards no-think collapse.
+#
+# What stays small: CHAT_PROBE / THINK_PROBE / CAPABILITY_PROBE
+# explicitly test for chat / thinking / capability collapse and need
+# their tight 48–768 caps to detect the pathology — see those
+# constants below for the rationale (this block intentionally does
+# NOT touch them).
 BENCH_V31_GSM_SYMBOLIC_PER_ROUND = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_PER_ROUND", "24"))
-BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS", "384"))
+BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS", "16384"))
 BENCH_V31_MATH_COMPETITION_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_COMPETITION_PER_ROUND", "18"))
-BENCH_V31_MATH_COMPETITION_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_COMPETITION_MAX_TOKENS", "512"))
+BENCH_V31_MATH_COMPETITION_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_COMPETITION_MAX_TOKENS", "16384"))
 BENCH_V31_MATH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_PER_ROUND", "18"))
-BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS", "384"))
+BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS", "16384"))
 BENCH_V31_CODE_PLUS_PER_ROUND = int(os.environ.get("BENCH_V31_CODE_PLUS_PER_ROUND", "12"))
-BENCH_V31_CODE_PLUS_MAX_TOKENS = int(os.environ.get("BENCH_V31_CODE_PLUS_MAX_TOKENS", "512"))
+BENCH_V31_CODE_PLUS_MAX_TOKENS = int(os.environ.get("BENCH_V31_CODE_PLUS_MAX_TOKENS", "16384"))
 BENCH_V31_LOGIC_GRID_PER_ROUND = int(os.environ.get("BENCH_V31_LOGIC_GRID_PER_ROUND", "18"))
-BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "256"))
+BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "16384"))
 BENCH_V31_DYVAL_PER_ROUND = int(os.environ.get("BENCH_V31_DYVAL_PER_ROUND", "18"))
-BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "256"))
+BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "16384"))
 BENCH_V31_RULER_PER_ROUND = int(os.environ.get("BENCH_V31_RULER_PER_ROUND", "16"))
-BENCH_V31_RULER_MAX_TOKENS = int(os.environ.get("BENCH_V31_RULER_MAX_TOKENS", "96"))
+# RULER prompts are 4-8 K; cap kept at 8 K so prompt+output stays
+# safely under the 32 K context window.
+BENCH_V31_RULER_MAX_TOKENS = int(os.environ.get("BENCH_V31_RULER_MAX_TOKENS", "8192"))
 BENCH_V31_KG_PER_ROUND = int(os.environ.get("BENCH_V31_KG_PER_ROUND", "18"))
-BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "128"))
+# KG prompts ~2-4 K; 16 K output gives ample reasoning headroom.
+BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "16384"))
 BENCH_V31_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_V31_IFEVAL_PER_ROUND", "16"))
-BENCH_V31_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_IFEVAL_MAX_TOKENS", "512"))
+BENCH_V31_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_IFEVAL_MAX_TOKENS", "16384"))
 BENCH_V31_TRUTHFULNESS_PER_ROUND = int(os.environ.get("BENCH_V31_TRUTHFULNESS_PER_ROUND", "18"))
-BENCH_V31_TRUTHFULNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_TRUTHFULNESS_MAX_TOKENS", "192"))
+BENCH_V31_TRUTHFULNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_TRUTHFULNESS_MAX_TOKENS", "16384"))
 BENCH_V31_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_V31_CONSISTENCY_PER_ROUND", "14"))
-BENCH_V31_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_V31_CONSISTENCY_MAX_TOKENS", "384"))
+BENCH_V31_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_V31_CONSISTENCY_MAX_TOKENS", "16384"))
 
 # Token budgets.
-BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
-BENCH_CODE_MAX_TOKENS = int(os.environ.get("BENCH_CODE_MAX_TOKENS", "512"))
-BENCH_REASONING_MAX_TOKENS = int(os.environ.get("BENCH_REASONING_MAX_TOKENS", "128"))
-BENCH_KNOWLEDGE_MAX_TOKENS = int(os.environ.get("BENCH_KNOWLEDGE_MAX_TOKENS", "48"))
-BENCH_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_IFEVAL_MAX_TOKENS", "512"))
-BENCH_AIME_MAX_TOKENS = int(os.environ.get("BENCH_AIME_MAX_TOKENS", "1024"))
-BENCH_MBPP_MAX_TOKENS = int(os.environ.get("BENCH_MBPP_MAX_TOKENS", "512"))
-BENCH_TOOL_USE_MAX_TOKENS = int(os.environ.get("BENCH_TOOL_USE_MAX_TOKENS", "320"))
-BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_MAX_TOKENS", "512"))
+BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "16384"))
+BENCH_CODE_MAX_TOKENS = int(os.environ.get("BENCH_CODE_MAX_TOKENS", "16384"))
+BENCH_REASONING_MAX_TOKENS = int(os.environ.get("BENCH_REASONING_MAX_TOKENS", "16384"))
+BENCH_KNOWLEDGE_MAX_TOKENS = int(os.environ.get("BENCH_KNOWLEDGE_MAX_TOKENS", "16384"))
+BENCH_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_IFEVAL_MAX_TOKENS", "16384"))
+BENCH_AIME_MAX_TOKENS = int(os.environ.get("BENCH_AIME_MAX_TOKENS", "16384"))
+BENCH_MBPP_MAX_TOKENS = int(os.environ.get("BENCH_MBPP_MAX_TOKENS", "16384"))
+BENCH_TOOL_USE_MAX_TOKENS = int(os.environ.get("BENCH_TOOL_USE_MAX_TOKENS", "16384"))
+BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_MAX_TOKENS", "16384"))
 BENCH_TOOL_USE_SANDBOX_TIMEOUT_S = float(os.environ.get("BENCH_TOOL_USE_SANDBOX_TIMEOUT_S", "4.0"))
-BENCH_ARC_MAX_TOKENS = int(os.environ.get("BENCH_ARC_MAX_TOKENS", "48"))
-BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "48"))
+BENCH_ARC_MAX_TOKENS = int(os.environ.get("BENCH_ARC_MAX_TOKENS", "16384"))
+BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "16384"))
 # 2026-04-29 (v29.2): bumped 32 → 96 so multi-needle items have room to
-# emit "the sum is N" or "the codes are X, Y" (the new combined-answer
-# format requires more tokens than a bare 7-char code). Single-needle
-# items still pass at 32 tokens, so the budget bump is harmless for
-# legacy items; multi-needle items previously truncated.
-BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "96"))
-BENCH_PROCEDURAL_MAX_TOKENS = int(os.environ.get("BENCH_PROCEDURAL_MAX_TOKENS", "64"))
-BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "384"))
-BENCH_NOISE_MAX_TOKENS = int(os.environ.get("BENCH_NOISE_MAX_TOKENS", "384"))
+# emit "the sum is N" or "the codes are X, Y". 2026-05-11 (v32): bumped
+# 96 → 1024 so the model can think before locating the needle (RULER
+# items often need 200+ thinking tokens to align the needle position).
+# 2026-05-11 (v32.1 uncap): bumped 1024 → 8192. LC prompts run to ~3 K
+# (60 distractors) so 8 K output keeps prompt+output well under 32 K.
+BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "8192"))
+BENCH_PROCEDURAL_MAX_TOKENS = int(os.environ.get("BENCH_PROCEDURAL_MAX_TOKENS", "16384"))
+BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "16384"))
+BENCH_NOISE_MAX_TOKENS = int(os.environ.get("BENCH_NOISE_MAX_TOKENS", "16384"))
 
 # Per-bench RNG stream offsets so the axes draw from independent
 # substreams even when given the same block_seed. Hex constants are
@@ -4901,65 +4889,15 @@ def _coerce_block_seed(block_seed) -> int | None:
 def _paraphrase_math_problem(question: str, block_seed) -> str:
     """Per-round paraphrase wrapper for math word problems.
 
-    Originally added in round 21 (``_paraphrase_aime_problem``) for the
-    AIME pool; promoted in round 22 to cover ``math_bench`` (GSM8K +
-    MATH-500) too, since the same memorisation attack applies and
-    ``math_bench`` carries 3× the composite weight (0.12 vs 0.04).
-
-    Goodhart hardening: every public math benchmark we evaluate
-    (``aime_bench``, ``math_bench``, ``robustness_bench``,
-    ``noise_resistance_bench``) draws from a static set of canonical
-    items. AIME has ~90 public problems; GSM8K has 1 319 + MATH-500
-    adds 500. A miner who pre-trains on those datasets can build a
-    ``{problem_text → answer}`` lookup keyed on the canonical wording
-    and saturate the axis from cache without doing any math. Round 21
-    audit confirmed the attack vector (``ty4321/cc`` + several others
-    showing capability=1.0 / aime=0 / math_bench≈0.5 — the textbook
-    wording-memorisation signature). Round 22 extends the same defence
-    to the larger math axis where the weight payoff is bigger.
-
-    Defence: reuse the math-domain-safe paraphrase machinery already
-    used by ``robustness_bench`` (``_apply_instruction_synonyms`` +
-    ``_imperative_to_question``) keyed on
-    ``(block_seed, sha(question))``. The synonym table only swaps
-    instruction-domain words (find / calculate / determine / what is)
-    and the imperative→question rewrite only touches the closing
-    sentence, so:
-
-    * Numeric constants, LaTeX (``$...$``, ``\\boxed{...}``), GSM8K
-      "####" answer markers, and the ``\\n\\n`` format suffix are all
-      untouched — the math reasoning and answer-extraction remain
-      identical.
-    * Exact-text and naive-substring lookups break because the wording
-      rotates per round.
-    * A model that genuinely understands the problem still solves it
-      because the underlying math is unchanged.
-
-    Layered with ``robustness_bench`` (heavier paraphrase wrappers on a
-    disjoint sample of the same pool) and ``noise_resistance_bench``
-    (typo / case / whitespace noise) this gives a tiered defence: a
-    pure memoriser fails all three; a model that handles light
-    paraphrase but not heavier wrappers fails robustness + noise; a
-    truly capable model passes all three.
-
-    Forward reference note: ``_apply_instruction_synonyms`` and
-    ``_imperative_to_question`` are defined later in this module
-    (with the rest of the robustness-bench infrastructure). That's
-    fine because this function is only called at round-start from
-    ``set_bench_block_seed``, by which point all module-level defs
-    exist. Returns ``question`` unchanged when ``block_seed`` is
-    None (dev/replay mode).
-
-    Order of operations: the imperative→question rewrite is applied
-    PROBABILISTICALLY (50% per question per round) rather than
-    unconditionally. Without this, every "Find / Calculate / Compute
-    / Determine X." imperative collapses to the same "What is X?"
-    string and the synonym-swap variants on ``find/calculate/compute``
-    are lost — defeating the per-round rotation. With the coin flip,
-    half the rounds keep the imperative form and rotate via the
-    synonym table; the other half rewrite to the question form and
-    then rotate via "what is" → "compute the value of". Combined
-    surface count typically ≥ 4 per imperative problem.
+    Defeats ``{problem_text -> answer}`` lookup attacks against the
+    public AIME/GSM8K/MATH-500 pools by rotating instruction-domain
+    wording per (block_seed, sha(question)). Only swaps instruction
+    words and optionally rewrites the closing imperative to a
+    question; numerics, LaTeX, GSM8K ``####`` markers and the format
+    suffix are preserved so a competent solver still gets the right
+    answer. The imperative->question rewrite is applied with prob 0.5
+    so the synonym-swap variants on ``find/calculate/...`` are not
+    lost via universal collapse to ``What is X?``.
     """
     seed = _coerce_block_seed(block_seed)
     if seed is None:
@@ -4973,10 +4911,7 @@ def _paraphrase_math_problem(question: str, block_seed) -> str:
     return out
 
 
-# ── Backwards-compatible alias (round 21 name) ────────────────────────
-# The function was originally added as ``_paraphrase_aime_problem`` in
-# round 21 and external tests reference that name. Keeping the alias so
-# existing imports keep working after the round-22 generalisation.
+# Back-compat alias; external tests reference the original round-21 name.
 _paraphrase_aime_problem = _paraphrase_math_problem
 
 
@@ -5387,32 +5322,12 @@ def _shuffle_mc_options_for_round(item: dict, block_seed) -> dict:
     return out
 
 
-# ── Round 24: BBH (reasoning_bench) inline-MC option shuffle ────────
-# BBH stores options inline in the ``input`` text rather than as a
-# separate ``options`` field, so the round-20 ``_shuffle_mc_options_for_round``
-# helper (which operates on ``labels`` / ``texts`` / ``options`` fields)
-# can't be reused directly. A miner who pre-trained on the public
-# ``lukaemon/bbh`` dataset can still build a ``{question_text → letter}``
-# lookup for the ~12 multi-choice subtasks (logical_deduction_*,
-# tracking_shuffled_objects_*, disambiguation_qa, geometric_shapes,
-# hyperbaton, movie_recommendation, penguins_in_a_table, ruin_names,
-# snarks, temporal_sequences) and saturate those subtasks without
-# reading the option text. Evidence: schema-version=0 records (pre any
-# Goodhart hardening) hit reasoning_bench=0.88 paired with capability=
-# 0.99 / arc_bench=0 / code_bench=0 — the textbook "saturated on the
-# memorisable axis, zero everywhere else" Goodhart signature.
-#
-# Round 24 closes this gap by parsing the inline ``Options:\n(A) ...
-# \n(B) ...`` block, shuffling the option contents per
-# ``(block_seed XOR sha256(question))``, and remapping the gold letter
-# to point to where the original correct content lands. Boolean and
-# numeric BBH subtasks (boolean_expressions, web_of_lies, navigate,
-# object_counting, etc.) have no inline-options block and pass through
-# unchanged. The option-block detection is anchored on the literal
-# header ``Options:`` plus a leading ``(letter) `` pattern, matching
-# the canonical BBH format used by every MC subtask in the dataset
-# (verified against ``logical_deduction_three_objects``,
-# ``tracking_shuffled_objects_three_objects``, ``hyperbaton``).
+# BBH stores MC options inline in the input text rather than in a
+# separate field, so we parse the ``Options:\n(A) ...`` block, shuffle
+# contents per (block_seed XOR sha256(question)), and remap the gold
+# letter. Defeats {question -> letter} memorisation seen in v28 logs
+# (reasoning_bench=0.88 with everything else ~0). Boolean / numeric
+# subtasks have no inline block and pass through unchanged.
 
 _BBH_OPTION_BLOCK_RE = re.compile(
     r"(?P<header>(?:^|\n)Options:\s*\n)"
@@ -5696,30 +5611,11 @@ def _eos_pad_ids(tokenizer) -> tuple[list[int] | None, int]:
     return eos_set, pad_id
 
 
-# 2026-05-05 (axes/evals/benchmarks thinking rollout):
-# Single global toggle for thinking-mode on the bench battery (math,
-# code, reasoning, knowledge, ifeval, aime, mbpp, tool-use, multi-doc,
-# calibration, pragmatic, knowledge, ifeval, ARC, robustness, noise,
-# procedural, truthful, long-context). Defaults ON so SN97's published
-# benchmark scores reward kings that actually think before answering —
-# the existing ``_strip_thinking_probe`` cleanup already removes
-# ``<think>...</think>`` blocks from bench output before scoring, so
-# enabling thinking is "free correctness" for any model trained to use
-# it (and a no-op for kings that ignore the flag — the chat template
-# just renders an extra ``<think>`` token that never closes, which is
-# stripped by `_strip_thinking_probe` before grading).
-#
-# We deliberately make ``_bench_generate`` IGNORE the per-call
-# ``enable_thinking`` argument and always honor the global. The
-# argument is kept for back-compat with old call sites (~17 callers
-# pass ``enable_thinking=False`` explicitly; rather than churn each
-# one we just override here). To run the legacy "no thinking" battery,
-# set ``BENCH_ENABLE_THINKING=0`` on the eval pod.
-#
-# Chat-shaped probes (chat_response_probe, capability_probe, chat_turns_probe,
-# judge_response_probe) also honor this global so the eval matches deployed
-# usage. Teacher-side graders keep thinking disabled when they need a compact
-# deterministic score-only response.
+# Global toggle for thinking-mode on benches + chat-shaped probes. ON by
+# default so kings that actually think get full credit (_strip_thinking_probe
+# already removes <think>...</think> before grading). Override per
+# validator with BENCH_ENABLE_THINKING=0. ``_bench_generate`` ignores
+# its per-call ``enable_thinking`` arg in favor of this global.
 BENCH_ENABLE_THINKING = os.environ.get("BENCH_ENABLE_THINKING", "1") != "0"
 
 
@@ -8196,30 +8092,11 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
     kinds = nar_pool[:n_narrative] + leg_pool[:n_legacy]
     rng.shuffle(kinds)
     out: list[dict] = []
-    # ── v29 narrative templates (gsm8k-distribution-similar) ─────────
-    # These mimic the gsm8k narrative format: a multi-step word problem
-    # with named entities, real-world context, no formula in the prompt,
-    # and at least one numeric distractor. The model has to read the
-    # full scenario, identify the relevant numbers, and chain 3-5
-    # operations to the final integer answer. This is the SAME skill
-    # gsm8k tests, so optimising procedural math_bench transfers to
-    # gsm8k held-out scoring (the v27 direct-compute items did not).
-    # 2026-04-29 (v29.5): replace static name/shop/item lists with
-    # procedural synthesisers so the surface form rotates per item.
-    # Each per-item RNG below draws fresh names; shops and items use
-    # procedural nouns synthesised from the lex inventory plus a
-    # plural-marker suffix. The math is invariant to the surface
-    # tokens (a buying scenario is still recognisable as a buying
-    # scenario regardless of whether the shop is called "bakery" or
-    # "Drenshire") so the procedural form is grading-equivalent to
-    # the legacy lists.
-    # 2026-05-01 (v30.4 patch v4): real-vocabulary shop/item pools.
-    # Anti-memorisation is preserved by the procedural numeric params
-    # (start_money, prices, counts) which fully determine the gold
-    # answer; the surface names of shops and items are decorative
-    # and do not change what the model is asked to compute. Real
-    # vocabulary makes the prompts read like gsm8k items, which is
-    # the whole point of the v29 narrative rebalance.
+    # Narrative templates mimic the gsm8k format (multi-step word
+    # problem, named entities, distractors) so optimising procedural
+    # math_bench transfers to held-out gsm8k. Real-vocabulary shop/item
+    # pools below are decorative; the procedural numeric params fully
+    # determine the gold answer, so memorisation is still defeated.
     _MATH_SHOPS = (
         "bakery", "grocery store", "corner shop", "deli", "farmers' market",
         "supermarket", "general store", "produce stand", "hardware store",
@@ -16933,7 +16810,14 @@ def main():
                         help="top_logprobs per position (default 20 = OpenAI-spec max).")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                         help="vLLM GPU memory utilization (default 0.90)")
-    parser.add_argument("--vllm-max-model-len", type=int, default=8192)
+    # 2026-05-11 (reasoning uncap): bumped 8192 → 32768 so the king's
+    # ``<think>...</think>`` chain has room across every capability axis
+    # without truncation. Eval pod has 8×H200 (139 GB free per shard);
+    # 32 K context costs <2 GB of KV cache for the bench batch sizes
+    # we use, so the GPU memory budget is fine. The validator-side
+    # ``--vllm-max-model-len`` flag stays overridable via the round
+    # config in case a future model regresses on long-context.
+    parser.add_argument("--vllm-max-model-len", type=int, default=32768)
     parser.add_argument("--logprobs-k", type=int, default=128,
                         help="Top-k logprobs to store (128=sparse, 0=full vocab). Default 128.")
     parser.add_argument("--hf-batch-size", type=int, default=2,
@@ -17052,7 +16936,18 @@ def main():
     print(f"[eval] VRAM: {gpu_mem_str()}", flush=True)
 
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
+    # Resolve the teacher to its local HF snapshot path before loading.
+    # The Kimi K2.6 custom tokenizer (tokenization_kimi_fast.py, snapshot
+    # 81bcaaa, May 11 2026) does an ``os.path.isfile(model_root/
+    # tokenizer.json)`` check which fails for the bare repo string and
+    # raises ``ValueError: Missing tokenizer files under: moonshotai/
+    # Kimi-K2.6`` — that crash aborted every eval round for ~12 hours
+    # (May 11 09:42-21:43 UTC) until this was caught. Resolving to the
+    # snapshot dir makes the local-file check pass.
+    teacher_path = resolve_local_snapshot_path(args.teacher)
+    if teacher_path != args.teacher:
+        print(f"[eval] Teacher resolved to local snapshot: {teacher_path}", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(teacher_path, trust_remote_code=True)
     input_ids_list = []
     for p in prompts:
         ids = tokenizer(p, return_tensors="pt", truncation=False).input_ids.to(device)
@@ -19339,32 +19234,10 @@ def main():
                     flush=True,
                 )
 
-            # Length penalty axis (production, 2026-04-22). Ratio of
-            # student mean generation length to teacher mean. Ratio > 1
-            # means student rambles; 1.0 means matched; small ratios mean
-            # student hard-stops. Two data sources, ordered by quality:
-            #
-            #   1. think_probe (enable_thinking=True, 32 prompts) — the
-            #      ideal signal because it catches the exact pathology of
-            #      "model rambles on simple reasoning questions". Only
-            #      available when THINK_COLLAPSE_PROBE=1. Anchored on the
-            #      teacher's own think-probe length (_TEACHER_PROBE_SAMPLES).
-            #
-            #   2. chat_probe (enable_thinking=False, 4 trivial prompts) —
-            #      always-on fallback. Anchored on the teacher's chat
-            #      probe length (_TEACHER_CHAT_PROBE_GEN_LENS, new in this
-            #      commit). Weaker signal because enable_thinking=False
-            #      suppresses the visible ramble, but still catches
-            #      degraded students that emit 400+ tokens of "Thinking
-            #      Process:..." on "hi".
-            #
-            # Before this commit only the think_probe path existed, so
-            # with the probe disabled the length axis was always None and
-            # dropped out of the composite — leaving KL as the only
-            # defense against the length pathology the user explicitly
-            # flagged. Falling back to chat_probe keeps the axis live and
-            # the composite honest while the think probe remains
-            # opt-in.
+            # Length penalty: student/teacher mean-gen-length ratio.
+            # Primary source: think_probe (best signal, opt-in via
+            # THINK_COLLAPSE_PROBE=1). Fallback: chat_probe (always-on,
+            # 4 trivial prompts) so the axis stays live in the composite.
             length_source = None
             stud_mean_gen = 0.0
             teach_mean_gen = 0.0

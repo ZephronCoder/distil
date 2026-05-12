@@ -44,17 +44,36 @@ BENCH_DATASET_ARGS = {
     "winogrande": {"dataset_id": "allenai/winogrande", "subset_list": ["winogrande_xl"]},
 }
 
+# 2026-05-11 (v32.1 reasoning uncap, follow-up to user's "why are we
+# capping reasoning at all?"): every held-out benchmark gets 16 K of
+# output budget so the king's ``<think>...</think>`` chain has room
+# even on the hardest items. The chat pod's vLLM ``--max-model-len``
+# is 32 K; ARC/MMLU prompts are <2 K so 16 K output leaves >= 14 K
+# headroom and the request never 400's. Adapter strips the trace
+# before grading (see ``patch_evalscope_think`` later in this file)
+# so a larger budget can only ADD signal, never inflate the score.
+# Old budgets (v32 think-budget bump, 2026-05-11): gsm8k 4096,
+# ifeval 4096, humaneval 6144, bbh 4096, arc 2048, mmlu_pro 2048,
+# mmlu 2048, hellaswag 1024, winogrande 1024. Pre-v32 (no think):
+# gsm8k 2048, ifeval 2048, humaneval 4096, bbh 2048, arc/mmlu/mmlu_pro
+# 1024, hellaswag 512, winogrande 256.
 MAX_TOKENS = {
-    "gsm8k": 2048,
-    "ifeval": 2048,
-    "humaneval": 4096,
-    "bbh": 2048,
-    "arc": 1024,
-    "mmlu_pro": 1024,
-    "mmlu": 1024,
-    "hellaswag": 512,
-    "winogrande": 256,
+    "gsm8k": 16384,
+    "ifeval": 16384,
+    "humaneval": 16384,
+    "bbh": 16384,
+    "arc": 16384,
+    "mmlu_pro": 16384,
+    "mmlu": 16384,
+    "hellaswag": 16384,
+    "winogrande": 16384,
 }
+
+# Single env switch so an operator can roll back the held-out benchmark
+# to the historical no-think behaviour without editing source. Default
+# True so the public leaderboard reports the king's *real* capability,
+# not the artificially-suppressed no-think floor.
+ENABLE_THINKING = os.environ.get("KING_BENCH_ENABLE_THINKING", "1") != "0"
 
 _THINK_TAG = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _THINK_TRAILING = re.compile(r"^.*?</think>\s*", re.DOTALL)
@@ -151,8 +170,19 @@ def run_one(cfg_cls, run_fn, bench, extra_dataset_args):
             # 4/27 humaneval/ifeval/mmlu_pro 0/0 outage). Keep
             # max_tokens well below the model's max_model_len so
             # there's always room for the prompt.
-            "max_tokens": MAX_TOKENS.get(bench, 2048),
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            "max_tokens": MAX_TOKENS.get(bench, 16384),
+            # 2026-05-11: thinking ON by default. The king is a
+            # reasoning model — disabling thinking on the held-out
+            # bench was the same Goodhart trap we just retired on the
+            # composite axes (paper/off_policy_cot_collapse.md and
+            # the v32 think-budget audit). ``patch_evalscope_think``
+            # above strips ``<think>...</think>`` blocks before the
+            # adapter grades, so enabling thinking here only adds
+            # signal — it never inflates the score by leaking trace
+            # text into the answer.
+            "extra_body": {
+                "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING}
+            },
         },
         eval_batch_size=BATCH_SIZE,
         ignore_errors=True,
