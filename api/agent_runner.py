@@ -13,16 +13,23 @@ blocks. ``_SN97ChatCompletionsModel`` converts those fences into synthetic
 sandbox and feeds the real stdout back to the model in the next turn.
 
 Streaming model:
-- We always run the agent loop via ``Runner.run`` (non-streaming under
-  the hood) so the python-fence-to-tool-call rewrite is unconditionally in
-  the path.
-- Tool start/end events stream to the client live as ``thinking`` / SSE
-  reasoning deltas via a per-request ``StreamingHooks`` queue.
-- Once the agent finishes, the final assistant text is chunked into
-  SSE content deltas. This loses true token-by-token streaming for the
-  text body, but the chat is still progressive (the user sees tool
-  progress while the model generates) and is correct for both the
-  prompt-fence and the future native-tool-call king.
+- The non-streaming ``run_agent_chat`` (used by ``/api/chat`` non-stream
+  + the legacy dashboard sync path) drives the agent via ``Runner.run``.
+- The streaming bridges (``stream_agent_chat_openai`` for Open-WebUI on
+  ``/v1/chat/completions``; ``stream_agent_chat_legacy`` for the v2
+  dashboard's SSE) drive ``Runner.run_streamed`` for true token-by-
+  token deltas.
+- Tool start events surface as native OpenAI ``tool_calls`` deltas on
+  the OpenAI bridge so Open-WebUI renders them as code blocks + tool-
+  output pills; on the legacy bridge they go through a separate
+  ``thinking`` channel for the dashboard's collapsible side panel.
+- Only true model ``<think>...</think>`` deltas reach Open-WebUI's
+  ``reasoning_content`` field. Pre-flight + tool-trace metadata stays
+  off that channel because Open-WebUI inlines accumulated reasoning
+  into a ``<details type="reasoning">`` block at stream end with HTML-
+  entity-escaped content, and any ``>`` / ``"`` / ``'`` characters in
+  trace lines would render as literal ``&gt;`` / ``&quot;`` / ``&#x27;``
+  noise.
 """
 from __future__ import annotations
 
@@ -1323,19 +1330,51 @@ def stream_agent_chat_openai(
             yield "data: [DONE]\n\n"
             return
         yield _openai_sse_delta(base, {"role": "assistant"})
+        tool_call_idx = 0
+        last_content_text = ""
         async for ev in _run_agent_streaming(body, king_uid, king_model, max_tokens, inputs):
             if ev.kind == "thinking":
-                yield _openai_sse_delta(base, {"reasoning": ev.text + "\n", "reasoning_content": ev.text + "\n"})
-            elif ev.kind == "content":
+                phase = ev.extra.get("phase") if isinstance(ev.extra, dict) else None
+                if phase == "reasoning":
+                    yield _openai_sse_delta(base, {"reasoning": ev.text, "reasoning_content": ev.text})
+                    continue
+                if phase == "start":
+                    name, args_preview = _parse_tool_call_event(ev.text)
+                    if not name:
+                        continue
+                    call_id = f"call_{uuid.uuid4().hex[:12]}"
+                    yield _openai_sse_delta(base, {"tool_calls": [{"index": tool_call_idx, "id": call_id, "type": "function", "function": {"name": name, "arguments": args_preview or ""}}]})
+                    tool_call_idx += 1
+                continue
+            if ev.kind == "content":
+                last_content_text = ev.text
                 yield _openai_sse_delta(base, {"content": ev.text})
             elif ev.kind == "error":
                 yield "data: " + json.dumps({**base, "error": {"message": ev.text}}) + "\n\n"
             elif ev.kind == "done":
+                if last_content_text and not last_content_text.endswith("\n\n"):
+                    pad = "\n\n" if not last_content_text.endswith("\n") else "\n"
+                    yield _openai_sse_delta(base, {"content": pad})
                 yield _openai_sse_delta(base, {}, finish_reason="stop")
                 break
         yield "data: [DONE]\n\n"
 
     return generate
+
+
+_TOOL_CALL_PREVIEW_RE = re.compile(r"^calling\s+([A-Za-z0-9_]+)(?:\((.*)\))?$")
+
+
+def _parse_tool_call_event(text: str) -> tuple[str | None, str | None]:
+    """Parse a thinking-channel ``calling <name>(<preview>)`` line into
+    ``(name, args_preview)`` for a native OpenAI ``tool_calls`` delta.
+    Returns ``(None, None)`` on malformed input."""
+    if not text:
+        return None, None
+    m = _TOOL_CALL_PREVIEW_RE.match(text.strip())
+    if not m:
+        return None, None
+    return m.group(1), (m.group(2) or "")
 
 
 def stream_agent_chat_legacy(

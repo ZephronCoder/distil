@@ -886,12 +886,18 @@ def test_stream_agent_chat_openai_emits_role_then_content_then_done(monkeypatch)
     assert '"content": "world"' in body
 
 
-def test_stream_agent_chat_openai_emits_thinking_deltas(monkeypatch):
-    """Pre-flight + tool start/end ``thinking`` events become OpenAI
-    ``reasoning_content`` deltas so the dashboard can render them."""
+def test_stream_agent_chat_openai_only_forwards_true_reasoning(monkeypatch):
+    """Open-WebUI inlines accumulated reasoning_content deltas into a
+    <details type="reasoning"> block at stream end and HTML-escapes the
+    inner text. So pre-flight / tool-start / tool-end traces would leak
+    as &gt; / &quot; / &#x27; noise inside that block. Only true model
+    <think> deltas (phase=reasoning) reach reasoning_content; tool
+    starts become native OpenAI tool_calls deltas."""
     _patch_streaming(monkeypatch, [
-        agent_runner._StreamEvent(kind="thinking", text="preflight: web_search (5 hits)"),
-        agent_runner._StreamEvent(kind="thinking", text="calling python_exec(...)"),
+        agent_runner._StreamEvent(kind="thinking", text="preflight: web_search (5 hits)", extra={"phase": "preflight"}),
+        agent_runner._StreamEvent(kind="thinking", text="calling python_exec(...)", extra={"phase": "start"}),
+        agent_runner._StreamEvent(kind="thinking", text="python_exec stdout: 42", extra={"phase": "end"}),
+        agent_runner._StreamEvent(kind="thinking", text="Let me think about this carefully.", extra={"phase": "reasoning"}),
         agent_runner._StreamEvent(kind="content", text="The answer is 42."),
         agent_runner._StreamEvent(kind="done"),
     ])
@@ -907,10 +913,54 @@ def test_stream_agent_chat_openai_emits_thinking_deltas(monkeypatch):
         return out
 
     body = "".join(asyncio.run(collect()))
-    assert "preflight: web_search" in body
-    assert "calling python_exec" in body
+    assert "Let me think about this carefully" in body
+    assert '"reasoning_content": "Let me think about this carefully' in body
+    assert '"reasoning_content": "preflight' not in body
+    assert '"reasoning_content": "python_exec stdout' not in body
+    assert '"reasoning_content": "calling python_exec' not in body
+    assert '"tool_calls"' in body
+    assert '"name": "python_exec"' in body
     assert "The answer is 42." in body
     assert "[DONE]" in body
+
+
+def test_stream_agent_chat_openai_pads_content_with_blank_line(monkeypatch):
+    """Content stream must end with \\n\\n so any HTML block Open-WebUI
+    inlines (reasoning collapsible, etc.) sits on its own markdown line
+    and parses as block-level HTML, not as inline text inside the last
+    paragraph (which would render the raw <details ...> tag literally)."""
+    _patch_streaming(monkeypatch, [
+        agent_runner._StreamEvent(kind="content", text="answer with no trailing newline"),
+        agent_runner._StreamEvent(kind="done"),
+    ])
+    gen = agent_runner.stream_agent_chat_openai(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        king_uid=1, king_model="m",
+    )
+
+    async def collect():
+        out: list[str] = []
+        async for c in gen():
+            out.append(c)
+        return out
+
+    body = "".join(asyncio.run(collect()))
+    pad_idx = body.find('"content": "\\n\\n"')
+    finish_idx = body.find('"finish_reason": "stop"')
+    assert pad_idx >= 0, body
+    assert pad_idx < finish_idx
+
+
+def test_parse_tool_call_event_extracts_name_and_args():
+    name, args = agent_runner._parse_tool_call_event('calling python_exec({"code": "print(42)"})')
+    assert name == "python_exec"
+    assert args == '{"code": "print(42)"}'
+    name, args = agent_runner._parse_tool_call_event("calling web_search")
+    assert name == "web_search"
+    assert args == ""
+    assert agent_runner._parse_tool_call_event("") == (None, None)
+    assert agent_runner._parse_tool_call_event("not a tool call") == (None, None)
+    assert agent_runner._parse_tool_call_event("preflight: ...") == (None, None)
 
 
 def test_stream_agent_chat_legacy_emits_response_chunks(monkeypatch):
