@@ -629,18 +629,21 @@ def prefetch_model(name, revision=None, max_retries=3):
                 return
 
 
-_TOKENIZER_ONLY_PATTERNS = [
-    "tokenizer*",
-    "tokenization_*.py",
-    "*.json",
-    "*.txt",
-    "*.model",
-    "tiktoken*",
-    "vocab*",
-    "merges*",
-    "special_tokens*",
-    "added_tokens*",
-    "chat_template*",
+_WEIGHT_SHARD_PATTERNS = [
+    "*.safetensors",
+    "*.bin",
+    "*.pt",
+    "*.pth",
+    "*.h5",
+    "*.msgpack",
+    "*.ot",
+    "*.gguf",
+    "*.ggml",
+    "*.onnx",
+    "consolidated.*",
+    "pytorch_model*",
+    "model-*-of-*",
+    "model.safetensors.index.json",
 ]
 
 
@@ -648,13 +651,18 @@ def resolve_local_snapshot_path(name, revision=None, tokenizer_only=True):
     """Return the local snapshot directory for an HF repo (or pass through
     a local path).
 
-    Default ``tokenizer_only=True`` restricts the network fallback to
-    tokenizer + config files. This avoids accidentally pulling 595 GB of
+    Default ``tokenizer_only=True`` excludes model weight shards from
+    the network fallback. This avoids accidentally pulling 595 GB of
     Kimi K2.6 weights onto an 80 GB pod volume when the caller only
     needs ``AutoTokenizer.from_pretrained`` to succeed (i.e. the entire
     API-teacher path). Pass ``tokenizer_only=False`` only when the
     caller actually needs the full snapshot, e.g. local-vLLM teacher
     mode where ``start_vllm_server`` will load the weights itself.
+
+    Implemented as an ``ignore_patterns`` denylist (rather than an
+    allowlist) so future repos that ship custom tokenizer helpers,
+    chat-template includes, generation configs, etc. continue to
+    work without us having to enumerate every supporting file.
 
     The local-cache hit (``local_files_only=True``) is unrestricted so
     that an existing complete snapshot is reused as-is.
@@ -672,7 +680,7 @@ def resolve_local_snapshot_path(name, revision=None, tokenizer_only=True):
         rev_kwargs["revision"] = revision
     dl_kwargs = dict(rev_kwargs)
     if tokenizer_only:
-        dl_kwargs["allow_patterns"] = _TOKENIZER_ONLY_PATTERNS
+        dl_kwargs["ignore_patterns"] = _WEIGHT_SHARD_PATTERNS
     try:
         return snapshot_download(name, local_files_only=True, **rev_kwargs)
     except Exception:

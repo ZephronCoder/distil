@@ -129,11 +129,14 @@ def test_resolve_falls_back_to_network_when_cache_miss():
     assert len(seen) == 2
     assert seen[0][2].get("local_files_only") is True
     assert "local_files_only" not in seen[1][2]
-    patterns = seen[1][2].get("allow_patterns")
-    assert patterns is not None
-    assert "tokenizer*" in patterns and "*.json" in patterns
-    for forbidden in ("*.safetensors", "*.bin", "*.pt"):
-        assert forbidden not in patterns
+    ignore = seen[1][2].get("ignore_patterns")
+    assert ignore is not None, (
+        "network fallback must denylist weight shards by default to avoid "
+        "downloading 595 GB of Kimi K2.6 weights onto an 80 GB pod volume"
+    )
+    for required in ("*.safetensors", "*.bin", "*.pt", "*.gguf"):
+        assert required in ignore, f"weight shard pattern {required!r} missing"
+    assert "allow_patterns" not in seen[1][2]
 
 
 def test_resolve_full_snapshot_when_tokenizer_only_disabled():
@@ -151,6 +154,7 @@ def test_resolve_full_snapshot_when_tokenizer_only_disabled():
             "moonshotai/Kimi-K2.6", tokenizer_only=False
         )
     assert out == "/cache/snap/full"
+    assert "ignore_patterns" not in seen[1][2]
     assert "allow_patterns" not in seen[1][2]
 
 
