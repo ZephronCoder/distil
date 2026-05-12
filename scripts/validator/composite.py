@@ -53,19 +53,9 @@ class _PolicyOSProxy:
 os = _PolicyOSProxy(os)
 
 
-# Tier-1 relative axes (teacher-referenced). Used only by the
-# ``weighted`` aggregation; ranking goes through ``final``. All weights
-# are env-overridable. Latest rebalance v31.3 (reports/2026-05-09-axis-
-# correlation-audit.md).
-#
-# on_policy_rkl is the primary distillation signal: student samples,
-# teacher scores -- gaming requires the (private) teacher's distribution
-# on the student's own outputs. KL is kept as a transparency axis but
-# down-weighted (saturated). Capability + structural axes guard against
-# degenerate / over-long generations.
-#
-# Shadow axes default 0; promoted on correlation. All cheap (computed
-# from the existing top-128 sparse cache).
+# Tier-1 relative axes (teacher-referenced). Used by ``weighted`` only;
+# ranking goes through ``final``. Shadow axes default 0; promoted on
+# correlation. Latest: v31.3 (reports/2026-05-09-axis-correlation-audit.md).
 AXIS_WEIGHTS = {
     "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.39")),
     "kl":             float(os.environ.get("BENCH_KL_WEIGHT", "0.05")),
@@ -82,18 +72,12 @@ AXIS_WEIGHTS = {
 
 TOP_K_OVERLAP_AXIS_IN_COMPOSITE = os.environ.get("TOP_K_OVERLAP_AXIS_IN_COMPOSITE", "1") != "0"
 
-# judge_probe: teacher LLM rates student greedy responses on a 1-5 rubric.
-# Gaming requires either genuinely good answers (the goal) or
-# reverse-engineering a rubric that itself checks helpfulness/correctness.
+# judge_probe: teacher LLM rates student responses on a 1-5 rubric.
 JUDGE_AXIS_WEIGHT = float(os.environ.get("JUDGE_AXIS_WEIGHT", "0.20"))
 JUDGE_AXIS_IN_COMPOSITE = os.environ.get("JUDGE_AXIS_IN_COMPOSITE", "1") != "0"
 
-# ── Legacy Arena-v3 axes (RETIRED) ───────────────────────────────────
-# Bench / skill-group / super_teacher axes RETIRED 2026-05-10 (v31.2).
-# Sub-axes still RUN for telemetry / per_src but contribute zero to
-# the composite or dethrone gate. Re-enable per-axis via env override
-# for ablation studies only — the v31 axes are the production surface.
-# Audit: reports/2026-05-10-axis-correlation-audit.md.
+# ── Legacy Arena-v3 axes (RETIRED v31.2; telemetry only) ──────────────
+# Audit: reports/2026-05-10-axis-correlation-audit.md
 BENCH_AXIS_WEIGHTS = {
     "math_bench":      float(os.environ.get("BENCH_MATH_WEIGHT", "0.0")),
     "code_bench":      float(os.environ.get("BENCH_CODE_WEIGHT", "0.0")),
@@ -106,15 +90,12 @@ BENCH_GROUP_AXIS_WEIGHTS = {
     "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.0")),
     "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.0")),
     "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.0")),
-    # ``_axis_super_teacher`` stays as a private helper for legacy records.
     "super_teacher":         float(os.environ.get("SUPER_TEACHER_WEIGHT", "0.0")),
 }
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"
 
 
-# Held-out canary axes. Weight 0 by default (any weighted public-bench
-# axis Goodharts within ~2 weeks); used for diagnostics + king_canary_streak.
-# Missing canary -> axis drops (fail-open).
+# Held-out canary axes (weight 0 by default; used for king_canary_streak).
 CANARY_AXIS_WEIGHTS = {
     "canary_gsm8k":     float(os.environ.get("CANARY_GSM8K_WEIGHT", "0.0")),
     "canary_humaneval": float(os.environ.get("CANARY_HUMANEVAL_WEIGHT", "0.0")),
@@ -143,9 +124,8 @@ CANARY_AXIS_MIN_VALID = {
 }
 
 
-# v31 procedural axes (PRODUCTION) -- procedurally generated skill probes
-# that replace the legacy bench surface as the primary skill signal.
-# Design: reports/2026-05-09-v31-procedural-redesign.md. Weights sum to ~0.50.
+# v31 procedural axes (production skill probes; sum ~0.50).
+# Design: reports/2026-05-09-v31-procedural-redesign.md
 V31_AXIS_WEIGHTS = {
     "v31_math_gsm_symbolic":     float(os.environ.get("V31_MATH_GSM_SYMBOLIC_WEIGHT", "0.06")),
     "v31_math_competition":      float(os.environ.get("V31_MATH_COMPETITION_WEIGHT", "0.05")),
@@ -236,9 +216,7 @@ def _axis_canary(canary_scores: dict[str, Any] | None, axis_name: str) -> float 
     return max(0.0, min(1.0, v))
 
 
-# Arena v3 sub-bench axes. Default 0 (telemetry only); skill weight
-# is carried by V31_AXIS_WEIGHTS. calibration_bench keeps a small
-# weight since no v31 axis covers honest refusal under unsolvable items.
+# Arena v3 sub-bench axes (telemetry; skill weight is in V31_AXIS_WEIGHTS).
 ARENA_V3_AXIS_WEIGHTS = {
     "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.0")),  # in math_skill_group
     "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.0")),  # in code_skill_group
@@ -260,10 +238,7 @@ ARENA_V3_AXIS_WEIGHTS = {
 
 ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "1") != "0"
 
-# reasoning_density: bench-level efficiency = pass_frac * length_bonus.
-# length_bonus = 1.0 at <=target tokens, ~0.5 at 2x, ~0.25 at 4x.
-# Penalises both over-thinking simple questions and answer-only memorisation.
-# Targets are empirical (calibrated to teacher's typical bench lengths).
+# reasoning_density: pass_frac * length_bonus (1.0 at <=target, ~0.5 at 2x).
 REASONING_DENSITY_TARGET_TOKENS = {
     "math_bench":            float(os.environ.get("RD_MATH_TARGET", "400")),
     "code_bench":            float(os.environ.get("RD_CODE_TARGET", "300")),
@@ -305,39 +280,29 @@ REASONING_DENSITY_IN_COMPOSITE = (
     os.environ.get("REASONING_DENSITY_IN_COMPOSITE", "1") != "0"
 )
 
-# chat_turns_probe: teacher grades a 3-turn transcript on a 1-5 rubric
-# (coherence + consistency + helpfulness). Catches single-turn KL specialists
-# that can't hold context across a short dialogue.
+# chat_turns_probe: teacher grades a 3-turn transcript on a 1-5 rubric.
 CHAT_TURNS_AXIS_WEIGHT = float(os.environ.get("CHAT_TURNS_AXIS_WEIGHT", "0.14"))
 CHAT_TURNS_AXIS_IN_COMPOSITE = os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "1") != "0"
 CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "2"))
 JUDGE_PROBE_MIN_VALID = int(os.environ.get("JUDGE_PROBE_MIN_VALID", "4"))
 
-# Canonical dethrone gate: composite.final = alpha * worst_3_mean + (1-alpha) * weighted.
-# Bottom-K mean keeps anti-Goodhart pressure; blending with weighted retains all-axis info.
+# Dethrone gate: final = alpha * worst_3_mean + (1-alpha) * weighted.
 COMPOSITE_FINAL_BOTTOM_WEIGHT = float(os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.85"))
 WORST_3_MEAN_K = int(os.environ.get("WORST_3_MEAN_K", "3"))
 
-# Long-form axes (combined weight ~0.45). long_form_judge is rubric-graded;
-# long_gen_coherence is pure-statistical (loops / perplexity / vocab collapse)
-# and can't be cheated by rubric leniency. Gaming either requires coherent
-# long generation, which is the goal.
+# Long-form axes: long_form_judge (rubric) + long_gen_coherence (statistical).
 LONG_FORM_JUDGE_MIN_VALID = int(os.environ.get("LONG_FORM_JUDGE_MIN_VALID", "2"))
 LONG_FORM_JUDGE_AXIS_WEIGHT = float(os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.20"))
 LONG_GEN_COHERENCE_AXIS_WEIGHT = float(os.environ.get("LONG_GEN_COHERENCE_WEIGHT", "0.25"))
 LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE = bool(int(os.environ.get("LONG_GEN_COHERENCE_IN_COMPOSITE", "1") or 1))
 LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
 
-# Hard-DQ floor: when >LONG_FORM_DERAIL_DQ_RATIO of a round scores below
-# LONG_FORM_DERAIL_DQ_THRESHOLD coherence, the model is permanently DQ'd at
-# commit_block. Soft-weight wasn't enough -- bench scores compensated for
-# long-form word salad. Re-eval requires a fresh hotkey.
+# Hard-DQ floor: >RATIO of a round scoring <THRESHOLD coherence -> DQ.
 LONG_FORM_DERAIL_DQ_RATIO = float(os.environ.get("LONG_FORM_DERAIL_DQ_RATIO", "0.5"))
 LONG_FORM_DERAIL_DQ_THRESHOLD = float(os.environ.get("LONG_FORM_DERAIL_DQ_THRESHOLD", "0.30"))
 LONG_FORM_DERAIL_DQ_ENABLED = bool(int(os.environ.get("LONG_FORM_DERAIL_DQ_ENABLED", "1") or 1))
 
-# Min valid-item count per axis (below this the axis drops as
-# "insufficient sample"). Tighter floors for small per-round pools.
+# Min valid-item count per axis; below the floor the axis drops.
 BENCH_MIN_VALID = {
     "math_bench": 4,
     "code_bench": 2,
@@ -373,45 +338,33 @@ BENCH_MIN_VALID = {
     "v31_consistency_paraphrase": 6,
 }
 
-# Schema version. Bump whenever axis weights or grading change in a
-# way that would let an old record keep an inflated floor under new
-# grading. _KING_SELECTION_MIN_VERSION quarantines older records.
+# Schema version; bump on grading changes so stale records get quarantined.
 COMPOSITE_SHADOW_VERSION = 32
 
-# Pareto-majority dethrone gate: a challenger must beat the king on a
-# majority of scorable axes by at least PARETO_DOMINANCE_MARGIN, not
-# just the single worst axis.
+# Pareto-majority dethrone gate: challenger must beat king on a majority
+# of scorable axes by at least PARETO_DOMINANCE_MARGIN.
 PARETO_DOMINANCE_MARGIN = float(os.environ.get("PARETO_DOMINANCE_MARGIN", "0.02"))
 PARETO_DOMINANCE_MIN_COMPARABLE = int(os.environ.get("PARETO_DOMINANCE_MIN_COMPARABLE", "5"))
 PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "1") != "0"
 
-# King regression health: stamps below_floor/worse_than_base on the
-# king's row; streak >= MIN_STREAK with the gate on force-dethrones to
-# the best gate-passing challenger.
+# King regression health: streak >= MIN_STREAK force-dethrones if gate on.
 KING_COMPOSITE_FLOOR = float(os.environ.get("KING_COMPOSITE_FLOOR", "0.20"))
 KING_REGRESSION_MIN_STREAK = int(os.environ.get("KING_REGRESSION_MIN_STREAK", "3"))
 KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 
-# Canary-regression auto-dethrone: held-out version of KING_REGRESSION_GATE.
-# When the king's canary mean drops >MARGIN below the Qwen-4B baseline on
-# >=4 of 5 canary axes for MIN_STREAK rounds, the composite-floor veto is
-# waived so a challenger can dethrone. Safety net for kings climbing the
-# procedural axes while regressing on held-out skill.
+# Canary-regression auto-dethrone: waives composite-floor veto when the
+# king regresses below the Qwen-4B baseline on enough canary axes.
 KING_CANARY_MARGIN = float(os.environ.get("KING_CANARY_MARGIN", "0.04"))
 KING_CANARY_MIN_STREAK = int(os.environ.get("KING_CANARY_MIN_STREAK", "1"))
 KING_CANARY_GATE = os.environ.get("KING_CANARY_GATE", "1") != "0"
 KING_CANARY_AXES = ("gsm8k", "humaneval", "bbh", "ifeval")
 KING_CANARY_BASELINE_FILE = os.environ.get("KING_CANARY_BASELINE_FILE", "baseline_qwen35_4b.json")
 
-# Per-axis baseline-relative penalty: bench axis is docked by
-# ALPHA * (ref - student) clipped to [0, axis] when the student
-# regresses below same-round Qwen3.5-4B. Worst-axis aggregation then
-# favors balanced-and-above-base over below-base specialists.
+# Per-axis baseline-relative penalty: docks an axis by ALPHA*(ref-student)
+# when the student regresses below same-round Qwen3.5-4B.
 BASELINE_RELATIVE_PENALTY_ENABLED = os.environ.get("BASELINE_RELATIVE_PENALTY_ENABLED", "1") != "0"
 BASELINE_RELATIVE_PENALTY_ALPHA = float(os.environ.get("BASELINE_RELATIVE_PENALTY_ALPHA", "1.5"))
-# Bench axes where regression below same-round reference docks the axis.
-# Absolute pass_frac bench axes only — relative axes (kl, rkl, length,
-# capability, degeneracy) are excluded since they'd double-penalise.
+# Absolute pass_frac bench axes only (relative axes would double-penalise).
 BASELINE_RELATIVE_PENALTY_AXES = frozenset({
     "math_bench", "code_bench", "reasoning_bench", "ifeval_bench",
     "aime_bench", "mbpp_bench", "tool_use_bench",
@@ -420,42 +373,12 @@ BASELINE_RELATIVE_PENALTY_AXES = frozenset({
     "calibration_bench", "refactor_bench", "pragmatic_bench",
 })
 
-# ── Teacher sanity gate (2026-04-23) ──────────────────────────────────────
-# For each ranking axis we can optionally compute the axis value for the
-# teacher itself (scored as if it were a student). If the teacher's axis
-# value falls below this floor, the axis is miscalibrated for the round
-# (probe miscoded, prompt pool corrupted, etc.) and must be dropped before
-# it can corrupt rankings. This is the structural defense against the
-# 2026-04-19 outage class (Wilson-anchor think-probe DQ'd the teacher
-# itself, so every student failed). See
-# ``reports/2026-04-23-goodhart-immune-eval.md`` section on invariants.
-#
-# Threshold reasoning: a well-calibrated axis should show the teacher at
-# >= 0.85 comfortably (the teacher IS what we distill to, any axis where
-# the teacher scores poorly is definitionally measuring the wrong thing).
-# We pick 0.70 as the "drop the axis" floor to give some slack for
-# stochasticity in the teacher's own generations (temperature=0 helps but
-# vLLM sampling can still jitter), while still catching outright bugs.
+# Teacher sanity gate: drop any axis where the teacher itself scores
+# below this floor (the axis is measuring the wrong thing for that round).
 TEACHER_SANITY_FLOOR = 0.70
 
-# Reference-broken-axes filter (2026-04-26). The reference model is the
-# baseline undistilled Qwen base; every round it runs through the same
-# bench probes the students do. If the reference scores ``pass_frac == 0``
-# on a bench axis, that axis is *not* measuring student skill — it is
-# measuring an eval-setup bug (token truncation, malformed prompt,
-# unsolvable item set, etc.). Audit 2026-04-26 of last_eval.json showed
-# the reference scoring 0 on aime_bench (token truncation), code_bench,
-# tool_use_bench, and noise_resistance_bench — locking ``worst() == 0``
-# for all 36 current-schema records and making the dethrone gate
-# degenerate. By dropping such axes from ``worst()`` we restore signal
-# without giving miners a free pass: the axes still appear in the
-# ``axes`` dict and contribute to ``weighted`` aggregation.
-#
-# We're more conservative than ``TEACHER_SANITY_FLOOR`` (0.70) here
-# because the reference model is a *small* base model (Qwen3.5-4B) — it
-# legitimately fails some hard items. Only the ``pass_frac == 0`` exact
-# floor is treated as eval-broken; partial scores 0.25-0.50 are kept so
-# students who outperform the reference are properly rewarded.
+# Reference-broken-axes filter: drop a bench axis from ``worst()`` when
+# the reference model scores pass_frac == 0 (eval-setup bug).
 REFERENCE_BROKEN_BENCH_FLOOR = 0.0
 
 
@@ -464,21 +387,7 @@ def _king_ratio_axis(
     student_field: str,
     king_ref: float | None,
 ) -> float | None:
-    """Generic ``king_ref / student_value`` ratio axis, clamped to [0, 1].
-
-    Used by every lower-is-better divergence axis (``kl``, ``kl_is``,
-    ``forking_rkl``, ``tail_decoupled_kl``, ``teacher_trace_plausibility``,
-    ``entropy_aware_kl``): a student matching the king scores 1.0;
-    2× the king's value scores ~0.5; 10× scores ~0.1. Anchoring on the
-    king keeps every axis scaled to real, achievable values rather than
-    a hard-coded absolute floor.
-
-    Returns ``None`` when:
-      * student lacks the field (legacy record / dense-path eval / the
-        teacher-as-student row, which has no KL vs itself);
-      * king reference is None or non-positive;
-      * the student value can't be coerced to a positive finite float.
-    """
+    """``king_ref / student_value`` clamped to [0, 1]; ``None`` if missing."""
     val = student.get(student_field)
     if val is None or king_ref is None or king_ref <= 0:
         return None
