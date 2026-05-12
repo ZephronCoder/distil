@@ -4795,16 +4795,30 @@ BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_ROBUST
 BENCH_V31_CODE_PLUS_PER_ROUND = int(os.environ.get("BENCH_V31_CODE_PLUS_PER_ROUND", "12"))
 BENCH_V31_CODE_PLUS_MAX_TOKENS = int(os.environ.get("BENCH_V31_CODE_PLUS_MAX_TOKENS", "16384"))
 BENCH_V31_LOGIC_GRID_PER_ROUND = int(os.environ.get("BENCH_V31_LOGIC_GRID_PER_ROUND", "18"))
-BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "16384"))
+# 2026-05-12 (v32.2): logic_grid lowered 16 K -> 6144. The 2026-05-12
+# 16:49 UTC round stalled in this bench for 1515s with prompts_done=0
+# because logic_grid puzzles trigger unterminating reasoning loops on
+# 4-7B distilled students -- the model thinks the answer is "almost
+# there" and keeps revisiting the constraints until it hits the cap.
+# At 16 K * 50 ms/token = 800 s/prompt, 18 prompts can run for hours.
+# 6 K still gives generous reasoning room (3 K of <think> + 3 K answer
+# is more than the average non-stuck chain) but bounds the worst case
+# to 18 * 6 K * 50 ms = ~90 min, which the watchdog can survive.
+BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "6144"))
 BENCH_V31_DYVAL_PER_ROUND = int(os.environ.get("BENCH_V31_DYVAL_PER_ROUND", "18"))
-BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "16384"))
+# 2026-05-12 (v32.2): dyval lowered 16 K -> 6144. Same unterminating
+# reasoning-loop pathology as logic_grid (procedural arithmetic
+# puzzles where the model second-guesses each step).
+BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "6144"))
 BENCH_V31_RULER_PER_ROUND = int(os.environ.get("BENCH_V31_RULER_PER_ROUND", "16"))
 # RULER prompts are 4-8 K; cap kept at 8 K so prompt+output stays
 # safely under the 32 K context window.
 BENCH_V31_RULER_MAX_TOKENS = int(os.environ.get("BENCH_V31_RULER_MAX_TOKENS", "8192"))
 BENCH_V31_KG_PER_ROUND = int(os.environ.get("BENCH_V31_KG_PER_ROUND", "18"))
-# KG prompts ~2-4 K; 16 K output gives ample reasoning headroom.
-BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "16384"))
+# 2026-05-12 (v32.2): KG (multi-hop knowledge graph) lowered 16 K -> 6144.
+# Same unterminating-chain pathology -- the model "almost has" the path
+# and keeps proposing alternative hops until the cap fires.
+BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "6144"))
 BENCH_V31_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_V31_IFEVAL_PER_ROUND", "16"))
 BENCH_V31_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_IFEVAL_MAX_TOKENS", "16384"))
 BENCH_V31_TRUTHFULNESS_PER_ROUND = int(os.environ.get("BENCH_V31_TRUTHFULNESS_PER_ROUND", "18"))
