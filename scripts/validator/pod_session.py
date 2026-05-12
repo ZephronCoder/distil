@@ -652,9 +652,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     except (TypeError, ValueError):
         _STAGE_STALL_LOAD_S = 2700
     try:
-        _STAGE_STALL_DEFAULT_S = int(policy_env("DISTIL_STAGE_STALL_DEFAULT_S", "2400") or "2400")
+        _STAGE_STALL_DEFAULT_S = int(policy_env("DISTIL_STAGE_STALL_DEFAULT_S", "3000") or "3000")
     except (TypeError, ValueError):
-        _STAGE_STALL_DEFAULT_S = 2400
+        _STAGE_STALL_DEFAULT_S = 3000
     _STAGE_STALL_KILL = (policy_env("DISTIL_STAGE_STALL_KILL", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
     def _stall_warn(*, elapsed, limit, stage, current, **_):
