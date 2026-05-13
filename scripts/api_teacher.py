@@ -416,22 +416,58 @@ def generate_via_api(
                 failed.append((orig_idx, str(e)))
                 print(f"  [api] Prompt {orig_idx} failed: {e}", flush=True)
 
-    # Retry failures sequentially
+    # Retry failures sequentially. Sustained 429 storms from OpenRouter (Inceptron)
+    # can outlast the per-call exp backoff, so we do up to 5 sequential passes with
+    # an additional inter-pass cool-down. Each pass calls `_generate_single_prompt_api`
+    # which already retries the single prompt 5 times with exp backoff, so each pass
+    # holds the prompt for up to ~30 s. Passes back off 60 s -> 90 s -> 120 s -> 180 s
+    # -> 300 s between attempts (total max ~12 min stall budget per failed prompt).
     if failed:
-        print(f"  [api] Retrying {len(failed)} failed prompts sequentially...", flush=True)
-        for idx, _err in failed:
-            try:
-                _, result = _generate_single_prompt_api(
-                    idx, prompts[idx], max_new_tokens, block_seed, cfg,
-                    tokenizer, token_to_id, sparse_converter, align_prompt_boundary,
+        max_passes = 5
+        inter_pass_backoff = (60, 90, 120, 180, 300)
+        for pass_idx in range(max_passes):
+            if not failed:
+                break
+            print(
+                f"  [api] Sequential retry pass {pass_idx + 1}/{max_passes} "
+                f"on {len(failed)} failed prompt(s)...",
+                flush=True,
+            )
+            still_failed: List[Tuple[int, str]] = []
+            for idx, _err in failed:
+                try:
+                    _, result = _generate_single_prompt_api(
+                        idx, prompts[idx], max_new_tokens, block_seed, cfg,
+                        tokenizer, token_to_id, sparse_converter, align_prompt_boundary,
+                    )
+                    result_slots[idx] = result
+                    completed += 1
+                    print(f"  [api] Retry prompt {idx}: OK", flush=True)
+                    if progress_cb:
+                        progress_cb(completed, n)
+                except Exception as e2:
+                    still_failed.append((idx, str(e2)))
+                    print(
+                        f"  [api] Retry pass {pass_idx + 1} prompt {idx} failed: {e2}",
+                        flush=True,
+                    )
+            failed = still_failed
+            if failed and pass_idx < max_passes - 1:
+                cool_s = inter_pass_backoff[pass_idx]
+                print(
+                    f"  [api] {len(failed)} prompt(s) still failing -- cooling "
+                    f"{cool_s}s before next pass (likely sustained 429 storm)",
+                    flush=True,
                 )
-                result_slots[idx] = result
-                completed += 1
-                print(f"  [api] Retry prompt {idx}: OK", flush=True)
-                if progress_cb:
-                    progress_cb(completed, n)
-            except Exception as e2:
-                raise RuntimeError(f"API generation failed for prompt {idx} after retry: {e2}") from e2
+                time.sleep(cool_s)
+        if failed:
+            # Honest fail-fast after the full retry budget is exhausted.
+            first_idx, first_err = failed[0]
+            raise RuntimeError(
+                f"API generation failed for {len(failed)} prompt(s) after "
+                f"{max_passes} sequential retry passes "
+                f"(first failure: prompt {first_idx}: {first_err})"
+            )
 
     if any(r is None for r in result_slots):
         raise RuntimeError("generate_via_api: some prompts have no result (internal bug)")
