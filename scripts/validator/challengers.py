@@ -122,25 +122,35 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             challengers[uid] = info
         # FIFO cap (oldest commit first) keeps each round inside the
         # 60-75 min target. Read live from single_eval for runtime overrides.
+        # The king is force_eligible (paired re-eval for variance reduction)
+        # and MUST NOT consume a cap slot — otherwise cap=1 evaluates only
+        # the king and never any new challengers, producing no new ranking.
         cap = int(single_eval_mod.SINGLE_EVAL_MAX_PER_ROUND)
         pending_before_cap = dict(challengers)
         deferred: list[int] = []
-        if challengers and cap > 0 and len(challengers) > cap:
+        king_str = str(king_uid) if king_uid is not None else None
+        non_king_items = [
+            (uid, info) for uid, info in challengers.items() if str(uid) != king_str
+        ]
+        king_entry = challengers.get(king_uid) if king_uid is not None and king_uid in challengers else None
+        if non_king_items and cap > 0 and len(non_king_items) > cap:
             ordered = sorted(
-                challengers.items(),
+                non_king_items,
                 key=lambda kv: (
                     int((kv[1] or {}).get("commit_block") or 0),
                     kv[0],
                 ),
             )
-            kept = dict(ordered[:cap])
+            kept_non_king = dict(ordered[:cap])
             deferred = [uid for uid, _ in ordered[cap:]]
             logger.info(
-                f"single-eval: capping round at {cap} of {len(challengers)} "
+                f"single-eval: capping round at {cap} of {len(non_king_items)} "
                 f"pending new commitments (FIFO by commit_block); deferred "
                 f"to next round: {deferred}"
             )
-            challengers = kept
+            challengers = kept_non_king
+            if king_entry is not None:
+                challengers[king_uid] = king_entry
         _write_eval_backlog(
             state,
             cap=cap,
