@@ -685,7 +685,21 @@ def ensure_clean_state(state, state_dir):
     )
     if state.eval_progress.get("active"):
         age_min = (time.time() - state.eval_progress.get("started_at", 0)) / 60
-        stale_limit = 180 if has_pod_eval else 30
+        if has_pod_eval:
+            # Stale-round limit MUST exceed the per-round pod eval timeout
+            # (DISTIL_POD_EVAL_TIMEOUT_S, default 8 h for v32.6 multi-
+            # challenger rounds) plus a buffer for shutdown. Otherwise this
+            # check kills a healthy long round mid-flight, exactly when
+            # we're babysitting the slow path. Derived = pod_eval_timeout
+            # + 30 min buffer; floor at 180 min for legacy single-eval
+            # config so smaller rounds still get caught.
+            try:
+                pod_timeout_s = int(os.environ.get("DISTIL_POD_EVAL_TIMEOUT_S", "28800") or "28800")
+            except (TypeError, ValueError):
+                pod_timeout_s = 28800
+            stale_limit = max(180, (pod_timeout_s // 60) + 30)
+        else:
+            stale_limit = 30
         if age_min > stale_limit:
             logger.warning(
                 f"STALE ROUND: active for {age_min:.0f}m (limit={stale_limit}m, "
