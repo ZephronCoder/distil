@@ -784,15 +784,35 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
     # bench axes), so the dethrone gate now uses the king's fresh
     # composite from THIS round, falling back to the stored composite
     # only if the king couldn't be evaluated (DQ / integrity / OOM).
+    # 2026-05-13 (v32.5): seat the king ONLY when the policy flag
+    # SINGLE_EVAL_KING_REEVAL=1 (default) — set 0 to fit a tighter
+    # round budget at the cost of cross-round comparison variance.
     # The reference baseline (Qwen3.5-4B, UID -1) is no longer seated
     # — held-out canary refreshes go through scripts/run_teacher_benchmark.sh.
+    from scripts.eval_policy import policy_env as _policy_env  # avoid circular import at module load
+    king_reeval_enabled = (
+        (_policy_env("SINGLE_EVAL_KING_REEVAL", "1") or "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
     seat_king = (
         not is_full_eval
         and king_uid is not None
         and king_uid in valid_models
+        and king_reeval_enabled
     )
     if seat_king:
         models_to_eval[king_uid] = valid_models[king_uid]
+    elif (
+        king_uid is not None
+        and king_uid in valid_models
+        and not king_reeval_enabled
+        and not is_full_eval
+    ):
+        logger.info(
+            "Round seating: king UID %s NOT seated this round "
+            "(SINGLE_EVAL_KING_REEVAL=0); challenger eval'd alone, "
+            "dethrone gate uses king's stored composite.", king_uid,
+        )
     for uid, info in challengers.items():
         models_to_eval[uid] = info
     # Reference baseline runs in scripts/run_teacher_benchmark.sh now;
