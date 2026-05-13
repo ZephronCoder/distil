@@ -4795,14 +4795,14 @@ BENCH_V31_MATH_COMPETITION_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_COMPET
 # 4 K of <think> + 4 K of derivation (more than enough for a
 # competition-math chain that doesn't get derailed) but bounds
 # worst-case per-prompt to ~7 min on H100 PCIe in eager mode.
-BENCH_V31_MATH_COMPETITION_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_COMPETITION_MAX_TOKENS", "8192"))
+BENCH_V31_MATH_COMPETITION_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_COMPETITION_MAX_TOKENS", "3072"))
 BENCH_V31_MATH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_PER_ROUND", "18"))
 # 2026-05-12 (v32.3): math_robustness lowered 16 K -> 8192. Took
 # 647s on student 1 in the 18:45 UTC round (slowest non-procedural
 # bench). The IPT (irrelevant-premise) defence in this axis tends
 # to make the model second-guess every step, so a tighter cap is
 # more reliable than waiting for natural termination.
-BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS", "8192"))
+BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS", "3072"))
 BENCH_V31_CODE_PLUS_PER_ROUND = int(os.environ.get("BENCH_V31_CODE_PLUS_PER_ROUND", "12"))
 BENCH_V31_CODE_PLUS_MAX_TOKENS = int(os.environ.get("BENCH_V31_CODE_PLUS_MAX_TOKENS", "16384"))
 BENCH_V31_LOGIC_GRID_PER_ROUND = int(os.environ.get("BENCH_V31_LOGIC_GRID_PER_ROUND", "18"))
@@ -4815,12 +4815,12 @@ BENCH_V31_LOGIC_GRID_PER_ROUND = int(os.environ.get("BENCH_V31_LOGIC_GRID_PER_RO
 # 6 K still gives generous reasoning room (3 K of <think> + 3 K answer
 # is more than the average non-stuck chain) but bounds the worst case
 # to 18 * 6 K * 50 ms = ~90 min, which the watchdog can survive.
-BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "6144"))
+BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "1536"))
 BENCH_V31_DYVAL_PER_ROUND = int(os.environ.get("BENCH_V31_DYVAL_PER_ROUND", "18"))
 # 2026-05-12 (v32.2): dyval lowered 16 K -> 6144. Same unterminating
 # reasoning-loop pathology as logic_grid (procedural arithmetic
 # puzzles where the model second-guesses each step).
-BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "6144"))
+BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "2048"))
 BENCH_V31_RULER_PER_ROUND = int(os.environ.get("BENCH_V31_RULER_PER_ROUND", "16"))
 # RULER prompts are 4-8 K; cap kept at 8 K so prompt+output stays
 # safely under the 32 K context window.
@@ -4829,7 +4829,7 @@ BENCH_V31_KG_PER_ROUND = int(os.environ.get("BENCH_V31_KG_PER_ROUND", "18"))
 # 2026-05-12 (v32.2): KG (multi-hop knowledge graph) lowered 16 K -> 6144.
 # Same unterminating-chain pathology -- the model "almost has" the path
 # and keeps proposing alternative hops until the cap fires.
-BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "6144"))
+BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "2048"))
 BENCH_V31_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_V31_IFEVAL_PER_ROUND", "16"))
 BENCH_V31_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_IFEVAL_MAX_TOKENS", "16384"))
 BENCH_V31_TRUTHFULNESS_PER_ROUND = int(os.environ.get("BENCH_V31_TRUTHFULNESS_PER_ROUND", "18"))
@@ -4840,7 +4840,7 @@ BENCH_V31_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_V31_CONSISTENCY_PER_
 # 5x with paraphrases, multiplying any stuck generation by 5x.
 # In the 2026-05-12 18:45 UTC round student 1 spent 1255s on this
 # bench (87 s/sample average across 70 generations).
-BENCH_V31_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_V31_CONSISTENCY_MAX_TOKENS", "6144"))
+BENCH_V31_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_V31_CONSISTENCY_MAX_TOKENS", "2048"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "16384"))
@@ -4848,7 +4848,7 @@ BENCH_CODE_MAX_TOKENS = int(os.environ.get("BENCH_CODE_MAX_TOKENS", "16384"))
 BENCH_REASONING_MAX_TOKENS = int(os.environ.get("BENCH_REASONING_MAX_TOKENS", "16384"))
 BENCH_KNOWLEDGE_MAX_TOKENS = int(os.environ.get("BENCH_KNOWLEDGE_MAX_TOKENS", "16384"))
 BENCH_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_IFEVAL_MAX_TOKENS", "16384"))
-BENCH_AIME_MAX_TOKENS = int(os.environ.get("BENCH_AIME_MAX_TOKENS", "8192"))
+BENCH_AIME_MAX_TOKENS = int(os.environ.get("BENCH_AIME_MAX_TOKENS", "4096"))
 BENCH_MBPP_MAX_TOKENS = int(os.environ.get("BENCH_MBPP_MAX_TOKENS", "16384"))
 BENCH_TOOL_USE_MAX_TOKENS = int(os.environ.get("BENCH_TOOL_USE_MAX_TOKENS", "16384"))
 BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_MAX_TOKENS", "16384"))
@@ -4863,7 +4863,7 @@ BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "163
 # (60 distractors) so 8 K output keeps prompt+output well under 32 K.
 BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "8192"))
 BENCH_PROCEDURAL_MAX_TOKENS = int(os.environ.get("BENCH_PROCEDURAL_MAX_TOKENS", "16384"))
-BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "8192"))
+BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "3072"))
 BENCH_NOISE_MAX_TOKENS = int(os.environ.get("BENCH_NOISE_MAX_TOKENS", "16384"))
 
 # Per-bench RNG stream offsets so the axes draw from independent

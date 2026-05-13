@@ -564,7 +564,7 @@ python -m distil.validator --netuid 97`}</pre>
             <dt>eval prompts (single-eval)</dt>
             <dd>300</dd>
             <dt>policy version</dt>
-            <dd>2026-05-13-v32.4-b200-uncapped-prompts</dd>
+            <dd>2026-05-13-v32.5-72min-cap</dd>
             <dt>weighted axes (live)</dt>
             <dd>25+ (11 v31 procedural + distillation + judge + discipline)</dd>
             <dt>v31 axes share of composite</dt>

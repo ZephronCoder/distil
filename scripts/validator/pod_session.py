@@ -652,9 +652,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     except (TypeError, ValueError):
         _STAGE_STALL_LOAD_S = 2700
     try:
-        _STAGE_STALL_DEFAULT_S = int(policy_env("DISTIL_STAGE_STALL_DEFAULT_S", "3000") or "3000")
+        _STAGE_STALL_DEFAULT_S = int(policy_env("DISTIL_STAGE_STALL_DEFAULT_S", "600") or "600")
     except (TypeError, ValueError):
-        _STAGE_STALL_DEFAULT_S = 3000
+        _STAGE_STALL_DEFAULT_S = 600
     _STAGE_STALL_KILL = (policy_env("DISTIL_STAGE_STALL_KILL", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
     def _stall_warn(*, elapsed, limit, stage, current, **_):
@@ -796,9 +796,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     poll_thread.start()
     n_eval_models = len(models_to_eval)
     try:
-        eval_timeout = int(policy_env("DISTIL_POD_EVAL_TIMEOUT_S", str(8 * 60 * 60)) or str(8 * 60 * 60))
+        eval_timeout = int(policy_env("DISTIL_POD_EVAL_TIMEOUT_S", str(72 * 60)) or str(72 * 60))
     except (TypeError, ValueError):
-        eval_timeout = 8 * 60 * 60
+        eval_timeout = 72 * 60
     logger.info(f"Running eval ({n_eval_models} models, {n_prompts} prompts, timeout={eval_timeout // 60}m)")
     log_event(f"Running eval on pod: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
     eval_env = {
