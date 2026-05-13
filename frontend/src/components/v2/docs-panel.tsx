@@ -565,7 +565,7 @@ python -m distil.validator --netuid 97`}</pre>
             <dt>eval prompts (single-eval)</dt>
             <dd>300</dd>
             <dt>policy version</dt>
-            <dd>2026-05-13-v32.5.2-slow-student-margin</dd>
+            <dd>2026-05-13-v32.6-restore-king-reeval-multi-challenger</dd>
             <dt>weighted axes (live)</dt>
             <dd>25+ (11 v31 procedural + distillation + judge + discipline)</dd>
             <dt>v31 axes share of composite</dt>
