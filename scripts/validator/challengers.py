@@ -82,18 +82,25 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
     if is_single_eval_mode():
         evict_stale_evaluated_uids(state, valid_models)
         challengers = {}
-        # Force-eligible: current king (paired re-eval on shared prompts,
-        # fixes cross-sample variance) + schema-bump fallback.
         force_eligible: set[str] = set()
+        king_reeval_enabled = (
+            (policy_env("SINGLE_EVAL_KING_REEVAL", "1") or "1").strip().lower()
+            not in ("0", "false", "no", "off")
+        )
         if king_uid is not None:
             king_record = (state.composite_scores or {}).get(str(king_uid))
-            force_eligible.add(str(king_uid))
-            if isinstance(king_record, dict):
-                try:
-                    king_version = int(king_record.get("version") or 0)
-                except (TypeError, ValueError):
-                    king_version = 0
-                if king_version < int(COMPOSITE_SHADOW_VERSION):
+            try:
+                king_version = (
+                    int((king_record or {}).get("version") or 0)
+                    if isinstance(king_record, dict)
+                    else 0
+                )
+            except (TypeError, ValueError):
+                king_version = 0
+            schema_bump = king_version < int(COMPOSITE_SHADOW_VERSION)
+            if king_reeval_enabled or schema_bump:
+                force_eligible.add(str(king_uid))
+                if schema_bump:
                     logger.info(
                         f"single-eval: forcing king UID {king_uid} re-eval "
                         f"(stored composite version {king_version} < "
@@ -105,6 +112,12 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                         f"single-eval: king UID {king_uid} included in "
                         f"this round (paired re-eval on shared prompts)."
                     )
+            else:
+                logger.info(
+                    f"single-eval: king UID {king_uid} re-eval SKIPPED "
+                    f"(SINGLE_EVAL_KING_REEVAL=0; using stored composite "
+                    f"v{king_version} for dethrone comparison)."
+                )
         for uid, info in valid_models.items():
             uid_str = str(uid)
             model_name = info["model"]
