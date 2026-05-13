@@ -55,8 +55,8 @@ Miners submit distilled models and a validator scores each commitment on a **mul
 - **Discipline**: `reasoning_density` (0.05), `calibration_bench` (0.05)
 - **Telemetry tier (composite weight 0)**: legacy `*_bench` and `*_skill_group` axes still RUN every round but no longer touch ranking — they exist for dashboard visibility and `axis_correlation.json`.
 
-**Ranking key** (v31.2): `composite.final = 0.85 × worst_5_mean + 0.15 × weighted` where:
-- `worst_5_mean` = equal-weighted mean of the 5 lowest non-broken axes (the API field is named `worst_3_mean` for back-compat but the math is K=5 since the v31.1 variance-reduction sweep on 2026-05-10)
+**Ranking key** (v32.5, 2026-05-13): `composite.final = 0.75 × worst_3_mean + 0.25 × weighted` where:
+- `worst_3_mean` = equal-weighted mean of the 3 lowest non-broken axes (K reverted from 5 to 3 in v32.5 — the API field name now matches the math again)
 - `weighted` = standard weighted convex combination of all active axes
 
 The king is whoever has the highest `composite.final`. A challenger dethrones only when its final beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 5% since 2026-05-10, was 3%). The legacy `composite.worst` (single-axis min) is retained as telemetry but is no longer the dethrone gate.

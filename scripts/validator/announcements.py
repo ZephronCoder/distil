@@ -22,10 +22,11 @@ def _formula_text() -> str:
 
     Rendered against the *running* ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` and
     ``WORST_3_MEAN_K`` so a tuning change (e.g. v31.1's K=3 → K=5,
-    v30.6's α=0.7 → α=0.85) cannot leave the announcement text stale.
-    The previous hard-coded ``0.7 × worst_3_mean`` was off-by-α and
-    off-by-K against the live validator (Discord users `pudding_dev6`
-    and `hklark.1` flagged the mismatch on 2026-05-10).
+    v30.6's α=0.7 → α=0.85, v32.5 reverted to α=0.75/K=3) cannot leave
+    the announcement text stale. The previous hard-coded
+    ``0.7 × worst_3_mean`` was off-by-α and off-by-K against the live
+    validator (Discord users `pudding_dev6` and `hklark.1` flagged the
+    mismatch on 2026-05-10).
     """
     a = COMPOSITE_FINAL_BOTTOM_WEIGHT
     k = WORST_3_MEAN_K
@@ -79,11 +80,11 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
     v30.2 (2026-04-29): the canonical ranking key is ``composite.final``
     (= α × worst_K_mean + (1 − α) × weighted) where α and K live in
     ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` and ``WORST_3_MEAN_K`` (current
-    runtime: ``α = 0.85, K = 5`` after the v31.1 variance-reduction
-    sweep). When ``new_composite_final`` is provided, the headline
-    leads with ``Composite final`` and demotes ``worst`` to a
-    "limiting axis" telemetry line. Falls back to the legacy
-    ``Composite worst`` headline for callers that haven't migrated yet.
+    runtime: ``α = 0.75, K = 3`` since v32.5 — see distil.env). When
+    ``new_composite_final`` is provided, the headline leads with
+    ``Composite final`` and demotes ``worst`` to a "limiting axis"
+    telemetry line. Falls back to the legacy ``Composite worst``
+    headline for callers that haven't migrated yet.
     """
     import os as _os
     single_eval_active = bool(int(_os.environ.get("SINGLE_EVAL_MODE", "0") or 0))

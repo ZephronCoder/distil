@@ -33,9 +33,9 @@ const NAV: DocItem[] = [
 /**
  * In-dashboard docs. Sidebar nav + body. Idiom from the v2 reference.
  *
- * Body content is composite-first. Last refresh: 2026-05-10 v31.2.
+ * Body content is composite-first. Last refresh: 2026-05-13 v32.5.2.
  * The eval is now 25+ axes, KL is one of them, the ranking key is
- * composite.final (0.85·worst_5_mean + 0.15·weighted), and the
+ * composite.final (0.75·worst_3_mean + 0.25·weighted), and the
  * anti-Goodhart defence is procedural item generation (the 11 v31
  * axes generate items per round from a block-seed; no static answer
  * key to memorise). Cites composite.py / pod_eval_vllm.py /
@@ -168,10 +168,11 @@ function DocsBody({ active }: { active: DocKey }) {
           <h3>3 · Crown</h3>
           <p>
             The king is whoever has the highest <code>composite.final</code> =
-            0.85·worst_5_mean + 0.15·weighted. A challenger dethrones the
+            0.75·worst_3_mean + 0.25·weighted. A challenger dethrones the
             incumbent only when their <code>final</code> beats the king&apos;s
             by <strong>≥5%</strong> (raised from 3% on 2026-05-10 after the
-            v31.1 variance-reduction sweep).
+            v31.1 variance-reduction sweep; α reverted to 0.75 / K=3 in v32.5
+            on 2026-05-13).
           </p>
         </Article>
       );
@@ -227,7 +228,7 @@ function DocsBody({ active }: { active: DocKey }) {
           </dl>
           <h3>What to optimise</h3>
           <p>
-            <strong>composite.final</strong> (= 0.85·worst_5_mean + 0.15·weighted),
+            <strong>composite.final</strong> (= 0.75·worst_3_mean + 0.25·weighted),
             not KL. KL is one of 25+ axes. A pure-KL model that loops on
             <code> &quot;Hi&quot;</code> or fails grade-school math cannot take
             the crown. Especially focus on the <strong>v31 procedural axes</strong> —

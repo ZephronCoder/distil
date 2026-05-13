@@ -37,7 +37,7 @@ from state_store import (
 router = APIRouter()
 
 @router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
-         description="Top-4 leaderboard. Under SINGLE_EVAL_MODE the king is selected cross-round by highest `composite.final` (= 0.85*worst_3_mean + 0.15*weighted); a challenger dethrones only when its final beats the king's by SINGLE_EVAL_DETHRONE_MARGIN (default 5%).")
+         description="Top-4 leaderboard. Under SINGLE_EVAL_MODE the king is selected cross-round by highest `composite.final` (= 0.75*worst_3_mean + 0.25*weighted); a challenger dethrones only when its final beats the king's by SINGLE_EVAL_DETHRONE_MARGIN (default 5%).")
 def get_leaderboard():
     top4 = top4_leaderboard() or {}
     scores_data = scores()

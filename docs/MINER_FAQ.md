@@ -6,7 +6,7 @@ Distil is a Bittensor subnet where miners compete to distill knowledge from a la
 
 > **Teacher swap (2026-05-02):** the previous Qwen3.5/Qwen3.6-35B-A3B teacher and the 5.25B/7B caps were retired in favor of Kimi K2.6 + 33B. The live source of truth for teacher / cap / vocab / architecture allowlist is [`frontend/src/lib/subnet-config.json`](../frontend/src/lib/subnet-config.json). Older numbers in this FAQ that mention 5.25B / 7B / Qwen3.5-4B are historical.
 
-The ranking key is **`composite.final`** = α · worst-K-axis-mean + (1 − α) · weighted-mean of every axis. Live tuning since the v31.1 variance-reduction sweep (2026-05-10): **α = 0.85, K = 5** (the API field is named `worst_3_mean` for back-compat but the math is `mean(bottom 5)`). KL is one of the axes, not the gate. A model that wins KL but loses on grade-school math, IFEval, or reasoning-density cannot take the crown. Winner takes all — the king gets 100% of emissions.
+The ranking key is **`composite.final`** = α · worst-K-axis-mean + (1 − α) · weighted-mean of every axis. Live tuning since v32.5 (2026-05-13): **α = 0.75, K = 3** (reverted from the v31.1 α = 0.85, K = 5 sweep — see distil.env). The API field is named `worst_3_mean` and now actually contains `mean(bottom 3)`. KL is one of the axes, not the gate. A model that wins KL but loses on grade-school math, IFEval, or reasoning-density cannot take the crown. Winner takes all — the king gets 100% of emissions.
 
 > **Heads up.** If you've miner'd here before and remember "lower KL = win", that framing is wrong under the current eval. The 2026-04-17 reasoning-spiral king (UID 107: 4096-token loops on `"Hi"`, strictly worse than the unfine-tuned 4B base on every reasoning bench) was the wake-up call. The composite, the on-policy RKL axis, and the `reasoning_density` axis exist specifically to close that gap. Read the axis-by-axis playbook below before training. See [`paper/off_policy_cot_collapse.md`](../paper/off_policy_cot_collapse.md) for the full diagnosis.
 
@@ -126,11 +126,11 @@ Each student is scored on many **independent axes**; the leaderboard is ordered 
 composite.final = α × worst_K_mean + (1 - α) × weighted
 ```
 
-Live tuning: **α = 0.85, K = 5** (was α = 0.7, K = 3 pre-v31.1). So 85% of your score comes from the **mean of your 5 lowest non-broken axes**, and 15% comes from the **standard weighted mean of every axis**. The API field is still named `worst_3_mean` for back-compat but the math is `mean(bottom 5)`. This:
+Live tuning: **α = 0.75, K = 3** (since v32.5, 2026-05-13; was α = 0.85, K = 5 between v31.1 and v32.4; was α = 0.7, K = 3 pre-v31.1). So 75% of your score comes from the **mean of your 3 lowest non-broken axes**, and 25% comes from the **standard weighted mean of every axis**. The API field is named `worst_3_mean` and now actually contains `mean(bottom 3)`. This:
 
-- **Smooths single-axis noise** — K=5 instead of single-axis min averages out the per-round RNG drift on small-n axes (<6% false-positive dethrone vs ~27% under legacy `worst()`).
-- **Preserves anti-Goodhart pressure** — 85% of the score is still "your worst axes", so you can't camp specialists.
-- **Rewards all-around competence** — the 15% weighted contribution stops you being penalised by a single quirky sub-axis floor.
+- **Smooths single-axis noise** — K=3 instead of single-axis min averages out the per-round RNG drift while keeping the worst-axis pressure tighter than the K=5 sweep, which under-penalised specialists.
+- **Preserves anti-Goodhart pressure** — 75% of the score is still "your worst axes", so you can't camp specialists.
+- **Rewards all-around competence** — the 25% weighted contribution stops you being penalised by a single quirky sub-axis floor and gives credit for sustained strength on the other ~20 axes.
 
 The legacy `composite.worst` (single-axis min) is still **emitted as telemetry** in the API + dashboard, but it's no longer the dethrone gate.
 

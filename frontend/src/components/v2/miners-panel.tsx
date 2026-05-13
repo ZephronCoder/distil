@@ -149,13 +149,13 @@ export function MinersPanel({
             <Th>#</Th>
             <Th>UID</Th>
             <Th>Model · revision</Th>
-            <Th align="right" title="composite.worst — legacy single-axis min (kept for back-compat). The actual ranking key is composite.final = 0.7·worst_5_mean + 0.3·weighted.">
+            <Th align="right" title="composite.worst — legacy single-axis min (kept for back-compat). The actual ranking key is composite.final = 0.75·worst_3_mean + 0.25·weighted.">
               Worst
             </Th>
             <Th align="right" title="composite.weighted — the weighted tier (Σ wᵢ·axisᵢ / Σ wᵢ)">
               Weighted
             </Th>
-            <Th title="The single axis bottlenecking this miner. Train data here to push it up — and into the worst_5_mean band.">
+            <Th title="The single axis bottlenecking this miner. Train data here to push it up — and into the worst_3_mean band.">
               Limiting axis
             </Th>
             <Th align="right" title="KL axis only — one of 25+, never the gate">
@@ -261,9 +261,9 @@ export function MinersPanel({
       </table>
 
       <p className="text-[10px] text-meta mt-4 leading-relaxed max-w-2xl">
-        <strong className="text-foreground">Composite.final</strong> = 0.85·worst_5_mean
-        + 0.15·weighted is the v31.3 ranking key (worst_5_mean = mean of the
-        5 lowest axes after dropping reference-broken axes).{" "}
+        <strong className="text-foreground">Composite.final</strong> = 0.75·worst_3_mean
+        + 0.25·weighted is the v32.5 ranking key (worst_3_mean = mean of the
+        3 lowest axes after dropping reference-broken axes).{" "}
         <strong className="text-foreground">Worst</strong> shown here is the
         legacy single-axis min — kept for back-compat, no longer the gate.{" "}
         <strong className="text-foreground">KL (1/25+)</strong> is the

@@ -287,7 +287,7 @@ CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "2"))
 JUDGE_PROBE_MIN_VALID = int(os.environ.get("JUDGE_PROBE_MIN_VALID", "4"))
 
 # Dethrone gate: final = alpha * worst_3_mean + (1-alpha) * weighted.
-COMPOSITE_FINAL_BOTTOM_WEIGHT = float(os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.85"))
+COMPOSITE_FINAL_BOTTOM_WEIGHT = float(os.environ.get("COMPOSITE_FINAL_BOTTOM_WEIGHT", "0.75"))
 WORST_3_MEAN_K = int(os.environ.get("WORST_3_MEAN_K", "3"))
 
 # Long-form axes: long_form_judge (rubric) + long_gen_coherence (statistical).
@@ -1072,7 +1072,7 @@ def _blended_final_score(
 ) -> float | None:
     """Blend the bottom-K mean with the weighted mean (v30.2 ranking).
 
-    Default ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` is 0.7 so the worst-axis
+    Default ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` is 0.75 so the worst-axis
     component dominates while the weighted mean stops a strong all-rounder
     from being shut out by a single noisy axis. Falls back to whichever
     component is non-None when only one is computable; returns None if

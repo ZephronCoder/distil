@@ -16,7 +16,7 @@ const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"]
 export const metadata: Metadata = {
   title: "Distil — SN97",
   description:
-    "Bittensor Subnet 97 — Distil. Miners distil the Kimi-K2.6 teacher (1T MoE, ~32B active) into smaller deepseek_v3 students (≤33B). Validators score every miner on a 25+ axis composite — 11 v31 procedural axes (gsm_symbolic, code_humaneval_plus, logic_grid, dyval_arith, long_context_ruler, multi_hop_kg, ifeval_verifiable, truthfulness_calibration, consistency_paraphrase, math_competition, math_robustness) plus distillation, judge, and discipline tiers. composite.final = 0.7·worst_5_mean + 0.3·weighted is the ranking key.",
+    "Bittensor Subnet 97 — Distil. Miners distil the Kimi-K2.6 teacher (1T MoE, ~32B active) into smaller deepseek_v3 students (≤33B). Validators score every miner on a 25+ axis composite — 11 v31 procedural axes (gsm_symbolic, code_humaneval_plus, logic_grid, dyval_arith, long_context_ruler, multi_hop_kg, ifeval_verifiable, truthfulness_calibration, consistency_paraphrase, math_competition, math_robustness) plus distillation, judge, and discipline tiers. composite.final = 0.75·worst_3_mean + 0.25·weighted is the ranking key.",
 };
 
 /**

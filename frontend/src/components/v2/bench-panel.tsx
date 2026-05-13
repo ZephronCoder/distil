@@ -32,10 +32,10 @@ interface BenchmarkPayload {
    */
   composite_worst?: number | null;
   composite_weighted?: number | null;
-  /** v31.2 — composite.final is the canonical ranking key
-   * (0.7·worst_5_mean + 0.3·weighted). The API field is still
-   * named ``composite_worst_3_mean`` for back-compat but the math
-   * uses K=5 since v31.1.
+  /** v32.5 — composite.final is the canonical ranking key
+   * (0.75·worst_3_mean + 0.25·weighted; K reverted from 5 to 3 in
+   * v32.5 on 2026-05-13). The API field name ``composite_worst_3_mean``
+   * now matches the math again.
    */
   composite_final?: number | null;
   composite_worst_3_mean?: number | null;

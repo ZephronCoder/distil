@@ -118,7 +118,7 @@ const PHASE_EXPLAINERS: Record<string, string> = {
   bench:
     "Running the bench battery: 11 v31 procedural axes (math gsm_symbolic / competition / robustness, code humaneval_plus, ifeval_verifiable, logic_grid, dyval_arith, long_context_ruler, knowledge_multi_hop_kg, truthfulness_calibration, consistency_paraphrase) + legacy telemetry axes. All items block-seeded.",
   composite:
-    "Computing composite.final = 0.7·worst_5_mean + 0.3·weighted across 25+ axes. The v31 procedural axes carry ~50% of weight; v31.1 widened the worst-K mean from 3 to 5 for variance reduction.",
+    "Computing composite.final = 0.75·worst_3_mean + 0.25·weighted across 25+ axes. The v31 procedural axes carry ~50% of weight; v32.5 narrowed the worst-K mean back from 5 to 3 (and α from 0.85 to 0.75) on 2026-05-13.",
   king_select:
     "Selecting the king (highest composite.final, 5% margin to dethrone — v31.1 raised from 3% on 2026-05-10).",
   weights:

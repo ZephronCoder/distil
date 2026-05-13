@@ -392,7 +392,7 @@ function RadialView({
   const worst = primary.composite?.worst ?? null;
   const weighted = primary.composite?.weighted ?? null;
   const presentCount = primary.composite?.present_count ?? null;
-  const finalAlpha = primary.composite?.final_alpha ?? 0.7;
+  const finalAlpha = primary.composite?.final_alpha ?? 0.75;
 
   return (
     <>
@@ -410,12 +410,12 @@ function RadialView({
           {compare ? " comparison miner" : " compare-target (pick one above to overlay)"}.
         </div>
         <div className="text-meta mt-2">
-          The v31.2 ranking key is{" "}
+          The v32.5 ranking key is{" "}
           <strong className="text-foreground num">composite.final</strong>{" "}
-          = {finalAlpha.toFixed(2)} × <code>worst_5_mean</code> +{" "}
+          = {finalAlpha.toFixed(2)} × <code>worst_3_mean</code> +{" "}
           {(1 - finalAlpha).toFixed(2)} × <code>weighted</code>. For this
           miner: final = {finalScore != null ? <strong className="text-foreground num">{finalScore.toFixed(3)}</strong> : "—"}{" "}
-          (worst_5_mean = {worst3 != null ? <span className="num">{worst3.toFixed(3)}</span> : "—"},{" "}
+          (worst_3_mean = {worst3 != null ? <span className="num">{worst3.toFixed(3)}</span> : "—"},{" "}
           weighted = {weighted != null ? <span className="num">{weighted.toFixed(3)}</span> : "—"}).
           Dethrone margin = 5% (v31.1 raised from 3% after the variance
           reduction sweep). Legacy <code>worst</code> (single-axis min) ={" "}
@@ -751,8 +751,8 @@ function RadialLegend({
 
       <p className="text-[10px] text-meta leading-relaxed pt-3 border-t border-border">
         Macro-axis values are <strong className="text-foreground">means</strong>{" "}
-        of their constituent v31.2 sub-axes. The v31.2 ranker uses{" "}
-        <code>composite.final</code> = α·worst_5_mean + (1−α)·weighted
+        of their constituent v31.2 sub-axes. The v32.5 ranker uses{" "}
+        <code>composite.final</code> = α·worst_3_mean + (1−α)·weighted
         — see Scores tab for per-axis breakdown.
       </p>
     </div>
@@ -845,7 +845,7 @@ function ScoresView({
         </strong>
         . The amber bar = primary; the grey marker = compare. The
         ranking key is{" "}
-          <code>composite.final = 0.85 × worst_5_mean + 0.15 × weighted</code>{" "}
+          <code>composite.final = 0.75 × worst_3_mean + 0.25 × weighted</code>{" "}
           — see the <strong>v31 · Math/Code/Reasoning/Knowledge/Honesty</strong>{" "}
           sections first (those carry ~50% of composite weight), then{" "}
           <strong>Teacher-Similarity</strong>, then the rest. The{" "}
